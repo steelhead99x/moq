@@ -94,6 +94,21 @@ obs_data_t *obs_service_get_settings(const obs_service_t *)
 
 void obs_data_release(obs_data_t *) {}
 
+bool obs_data_get_bool(obs_data_t *, const char *)
+{
+	return false;
+}
+
+long long obs_data_get_int(obs_data_t *, const char *)
+{
+	return 0;
+}
+
+const char *obs_data_get_string(obs_data_t *, const char *)
+{
+	return "";
+}
+
 obs_encoder_t *obs_output_get_video_encoder2(const obs_output_t *, size_t idx)
 {
 	return idx == 0 ? reinterpret_cast<obs_encoder_t *>(0x2) : nullptr;

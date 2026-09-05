@@ -2,7 +2,7 @@
 
 ## Implementation Status: Complete
 
-Pull Request: https://github.com/steelhead99x/moq/pull/7  
+Pull Request: https://github.com/steelhead99x/moq/pull/7\
 Issue: https://github.com/steelhead99x/moq/issues/6
 
 ## What Was Built
@@ -12,6 +12,7 @@ Issue: https://github.com/steelhead99x/moq/issues/6
 **Files:** `src/moq-event.h`, `src/moq-event.cpp`
 
 A standalone event management system that:
+
 - Tracks event lifecycle (start/end)
 - Manages SCTE-35 marker scheduling with PTS-based timing
 - Handles slate references and activation
@@ -20,12 +21,14 @@ A standalone event management system that:
 - Thread-safe marker processing
 
 **Key Classes:**
+
 - `MoQEventController`: Main controller
 - `MoQEventConfig`: Configuration structure
 - `ScteMarker`: SCTE-35 marker representation
 - `EventSlate`: Slate tracking structure
 
 **SCTE-35 Support:**
+
 - Standard segmentation types (program start/end, ad breaks, chapter markers)
 - PTS-accurate marker insertion
 - Configurable durations
@@ -36,6 +39,7 @@ A standalone event management system that:
 **Files:** `src/moq-dock.h`, `src/moq-dock.cpp`
 
 Extended MoQ dock with:
+
 - **Mode selector**: Simple Broadcast vs Live Event
 - **Event controls group** (shown only in event mode):
   - Auto-start/end slate checkboxes
@@ -52,6 +56,7 @@ Extended MoQ dock with:
 **Files:** `src/moq-output.h`, `src/moq-output.cpp`
 
 Integrated event controller into streaming pipeline:
+
 - Reads event config from service settings
 - Creates event controller when event mode enabled
 - Processes markers on every video frame PTS
@@ -64,6 +69,7 @@ Integrated event controller into streaming pipeline:
 **Files:** `EVENT_API.md`, `UPSTREAM_NOTES.md`, `README.md`
 
 Comprehensive documentation covering:
+
 - **API Contract**: How external applications (Colorbars) can configure and control events
 - **Integration Points**: Service settings, WebSocket control, callbacks
 - **SCTE-35 Reference**: Marker structures, segmentation types, timing
@@ -82,21 +88,25 @@ Comprehensive documentation covering:
 ### Key Trade-offs
 
 **Decision: Log markers instead of encoding SCTE-35 binary**
-- **Rationale**: Binary encoding requires complex splice_insert() construction
+
+- **Rationale**: Binary encoding requires complex splice\_insert() construction
 - **Trade-off**: External tool must parse logs or use callbacks
 - **Future**: Add binary encoding as enhancement
 
 **Decision: Reference slates by OBS source name, don't switch scenes**
+
 - **Rationale**: Keeps plugin vendor-neutral
 - **Trade-off**: External control needed for actual slate switching
 - **Benefit**: Allows Colorbars to implement custom UX
 
 **Decision: PTS-based marker insertion in video data path**
+
 - **Rationale**: Video frames have accurate PTS, audio can jitter
 - **Trade-off**: Markers only inserted when video is encoding
 - **Benefit**: Frame-accurate placement
 
 **Decision: Event mode opt-in, not always-on**
+
 - **Rationale**: Simple broadcast users don't need complexity
 - **Trade-off**: Two code paths to maintain
 - **Benefit**: Each mode stays clean and focused
@@ -111,11 +121,13 @@ Comprehensive documentation covering:
 ### Performance Impact
 
 **Event Mode Disabled (Simple Broadcast):**
+
 - Zero overhead: Controller not created
 - No PTS checks, no marker processing
 - Identical to pre-implementation behavior
 
 **Event Mode Enabled:**
+
 - Per-frame PTS check: O(1), negligible
 - Marker processing: O(n) where n = pending markers (typically 0-2)
 - UI updates: 1Hz timer, minimal overhead
@@ -165,7 +177,7 @@ TEST(MoQOutput, EventModeEnabled) { ... }
 TEST(MoQOutput, SimpleModeFallback) { ... }
 ```
 
-**Blocker:** OBS plugin testing requires stubbing `libobs`, which is non-trivial.  
+**Blocker:** OBS plugin testing requires stubbing `libobs`, which is non-trivial.\
 **Workaround:** Manual testing + production validation in Colorbars deployment.
 
 ## Integration with Colorbars
@@ -189,16 +201,19 @@ TEST(MoQOutput, SimpleModeFallback) { ... }
 ### Control Flow
 
 **Option A: OBS WebSocket** (Recommended)
+
 - Colorbars connects to OBS WebSocket
 - Sends `CallVendorRequest` to trigger ad breaks
 - Monitors `StreamStateChanged` events
 
 **Option B: Direct Plugin API**
+
 - Colorbars links obs-moq as library
 - Calls `MoQEventController` methods directly
 - Requires tighter coupling
 
 **Option C: File-Based**
+
 - Colorbars writes schedule to JSON
 - Plugin polls/watches file for updates
 - Simple but less responsive
@@ -206,6 +221,7 @@ TEST(MoQOutput, SimpleModeFallback) { ... }
 ### Monitoring
 
 Colorbars can:
+
 - Read OBS log files for marker insertion
 - Listen to event status via WebSocket
 - Query output state via OBS frontend API
@@ -237,6 +253,7 @@ Colorbars can:
 ### Future Enhancements
 
 #### Phase 1: SCTE Binary Encoding
+
 ```cpp
 std::vector<uint8_t> EncodeSCTE35(const ScteMarker &marker) {
     // Build splice_insert() or time_signal() binary
@@ -245,6 +262,7 @@ std::vector<uint8_t> EncodeSCTE35(const ScteMarker &marker) {
 ```
 
 #### Phase 2: Track Metadata
+
 ```cpp
 // Embed markers in MoQ broadcast metadata track
 int marker_track = moq_publish_track(broadcast, "scte35", 6);
@@ -252,12 +270,14 @@ moq_publish_track_frame(marker_track, scte_bytes.data(), scte_bytes.size(), pts_
 ```
 
 #### Phase 3: Timeline UI
+
 - Visual rundown in dock
 - Drag-drop slate scheduling
 - Real-time marker preview
 - Integration with OBS scenes
 
 #### Phase 4: WebSocket API
+
 ```cpp
 // Custom OBS WebSocket vendor requests
 {
@@ -273,17 +293,20 @@ moq_publish_track_frame(marker_track, scte_bytes.data(), scte_bytes.size(), pts_
 ### Phase 1: Core Controller (Ready Now)
 
 **Propose to moq-dev/moq:**
+
 - `moq-event.h/cpp` (full implementation)
 - SCTE-35 structures
 - Event config pattern
 - Documentation
 
 **PR Description:**
+
 > Adds professional live event support to obs-moq. Vendor-neutral event controller with SCTE-35 marker management, configurable slates, and external control API. Opt-in feature; simple broadcast remains default.
 
 ### Phase 2: UI Integration (After Phase 1 Accepted)
 
 **Propose:**
+
 - Dock mode selector
 - Event controls group
 - Settings persistence
@@ -294,6 +317,7 @@ Shows complete user-facing workflow. Demonstrates simple/event separation.
 ### Phase 3: Advanced Features (Future)
 
 **Consider upstreaming:**
+
 - SCTE binary encoding
 - Track metadata embedding
 - WebSocket remote API
@@ -305,30 +329,30 @@ Wait for adoption and feedback before proposing.
 
 ### Completion Criteria (All Met ✅)
 
-- [x] Event controller implemented and integrated
-- [x] UI mode selector and event controls added
-- [x] SCTE marker structures defined
-- [x] Simple broadcast mode preserved
-- [x] Documentation complete (API + upstream notes)
-- [x] Settings persistence working
-- [x] Code committed and PR opened
+- \[x] Event controller implemented and integrated
+- \[x] UI mode selector and event controls added
+- \[x] SCTE marker structures defined
+- \[x] Simple broadcast mode preserved
+- \[x] Documentation complete (API + upstream notes)
+- \[x] Settings persistence working
+- \[x] Code committed and PR opened
 
 ### Validation Criteria (Manual Testing Required)
 
-- [ ] Simple mode works without event features
-- [ ] Event mode inserts markers at correct PTS
-- [ ] Ad breaks schedule out + in markers
-- [ ] Slate tracking callbacks fire
-- [ ] Mode selection persists
-- [ ] Controls enable/disable correctly
+- \[ ] Simple mode works without event features
+- \[ ] Event mode inserts markers at correct PTS
+- \[ ] Ad breaks schedule out + in markers
+- \[ ] Slate tracking callbacks fire
+- \[ ] Mode selection persists
+- \[ ] Controls enable/disable correctly
 
 ### Production Criteria (Colorbars Integration)
 
-- [ ] Colorbars can configure events via settings
-- [ ] External control triggers ad breaks
-- [ ] Markers logged for processing
-- [ ] No performance degradation
-- [ ] No crashes or memory leaks
+- \[ ] Colorbars can configure events via settings
+- \[ ] External control triggers ad breaks
+- \[ ] Markers logged for processing
+- \[ ] No performance degradation
+- \[ ] No crashes or memory leaks
 
 ## Maintenance Notes
 
@@ -356,11 +380,11 @@ cpp/obs/
 
 When reviewing changes to event code:
 
-- [ ] Does it maintain simple broadcast mode?
-- [ ] Is it vendor-neutral (no Colorbars branding)?
-- [ ] Are settings backward-compatible?
-- [ ] Does UI stay clean (no clutter)?
-- [ ] Is documentation updated?
+- \[ ] Does it maintain simple broadcast mode?
+- \[ ] Is it vendor-neutral (no Colorbars branding)?
+- \[ ] Are settings backward-compatible?
+- \[ ] Does UI stay clean (no clutter)?
+- \[ ] Is documentation updated?
 
 ## References
 
@@ -372,8 +396,8 @@ When reviewing changes to event code:
 
 ## Credits
 
-Implemented by: Claude (Cursor Agent)  
-Requested by: steelhead99x  
+Implemented by: Claude (Cursor Agent)\
+Requested by: steelhead99x\
 Purpose: Colorbars Live Events integration
 
 ## Changelog

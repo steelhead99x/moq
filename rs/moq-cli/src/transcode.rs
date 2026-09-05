@@ -141,6 +141,9 @@ pub async fn run(moq: MoqSide, args: Args, net: Net) -> anyhow::Result<()> {
 	// source directly. An empty reference would name the derivative broadcast itself, which
 	// publishes the rungs and nothing else.
 	config.source = source_path.relative(&output_path).filter(|rel| !rel.is_empty());
+	// Persistent across reconnects. `None` while disconnected, so the ladder
+	// stays fixed-rate until the session has an estimate.
+	config.bandwidth = Some(session.send_bandwidth());
 
 	let output = publish
 		.create_broadcast(&output_path, moq_net::broadcast::Route::new().with_announce(true))
