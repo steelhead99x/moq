@@ -11,6 +11,7 @@
 #include <mutex>
 #include <string>
 #include "logger.h"
+#include "moq-event.h"
 
 class MoQOutput {
 public:
@@ -53,7 +54,11 @@ private:
 	void AudioInit(obs_encoder_t *encoder);
 	void AudioData(struct encoder_packet *packet);
 
+	void ProcessEventMarkers(uint64_t pts_us);
+
 	obs_output_t *output;
+
+	std::unique_ptr<MoQEventController> event_controller;
 
 	// Serializes reporting the output's fate to OBS against tearing it down, and
 	// is held across the OBS calls themselves. Without it the status callback can
