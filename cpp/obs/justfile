@@ -296,13 +296,18 @@ _unit mode="plain":
     trap 'rm -rf "$out"' EXIT
 
     # One binary per source under test: each test file defines its own libobs and
-    # libmoq stubs, so two of them can't share a link.
+    # libmoq stubs, so two of them can't share a link. The output tests the real
+    # event controller too, because MoQOutput constructs one unconditionally.
     for name in moq-output moq-source; do
+        extra=()
+        if [ "$name" = moq-output ]; then
+            extra+=(src/moq-event.cpp)
+        fi
         # shellcheck disable=SC2086
         # $ffmpeg stays unquoted on purpose: pkg-config hands back one
         # space-separated string, and splitting it is the intended reading.
         "$cxx" "${flags[@]}" "${includes[@]}" $ffmpeg \
-            -o "$out/$name-test" "test/$name-test.cpp" "src/$name.cpp"
+            -o "$out/$name-test" "test/$name-test.cpp" "src/$name.cpp" "${extra[@]}"
         TSAN_OPTIONS="halt_on_error=1" "$out/$name-test"
     done
 
