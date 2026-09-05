@@ -9,7 +9,7 @@ extern "C" {
 #include "moq.h"
 }
 
-MoQOutput::MoQOutput(obs_data_t *, obs_output_t *output)
+MoQOutput::MoQOutput(obs_data_t *settings, obs_output_t *output)
 	: output(output),
 	  server_url(),
 	  path(),
@@ -22,6 +22,20 @@ MoQOutput::MoQOutput(obs_data_t *, obs_output_t *output)
 	  session_attempt(0),
 	  session_connected(false)
 {
+	MoQEventConfig event_config;
+	if (settings) {
+		event_config.enabled = obs_data_get_bool(settings, "event_mode_enabled");
+		event_config.auto_start_slate = obs_data_get_bool(settings, "event_auto_start_slate");
+		event_config.auto_end_slate = obs_data_get_bool(settings, "event_auto_end_slate");
+		event_config.default_ad_duration_sec = (uint32_t)obs_data_get_int(settings, "event_ad_duration");
+		const char *start_slate = obs_data_get_string(settings, "event_start_slate_source");
+		const char *end_slate = obs_data_get_string(settings, "event_end_slate_source");
+		if (start_slate)
+			event_config.start_slate_source = start_slate;
+		if (end_slate)
+			event_config.end_slate_source = end_slate;
+	}
+	event_controller = std::make_unique<MoQEventController>(event_config);
 }
 
 MoQOutput::~MoQOutput()
@@ -424,6 +438,8 @@ void MoQOutput::VideoData(struct encoder_packet *packet)
 
 	auto pts_us = util_mul_div64(pts, 1000000ULL * packet->timebase_num, packet->timebase_den);
 
+	ProcessEventMarkers(pts_us);
+
 	auto result = moq_publish_media_frame(handle, packet->data, packet->size, pts_us);
 	if (result < 0) {
 		LOG_ERROR("Failed to write video frame: %d", result);
@@ -431,6 +447,18 @@ void MoQOutput::VideoData(struct encoder_packet *packet)
 	}
 
 	total_bytes_sent += packet->size;
+}
+
+void MoQOutput::ProcessEventMarkers(uint64_t pts_us)
+{
+	if (!event_controller || !event_controller->GetConfig().enabled)
+		return;
+
+	auto markers = event_controller->GetPendingMarkers(pts_us);
+	for (const auto &marker : markers) {
+		LOG_INFO("SCTE-35 marker: event_id=%u, type=%u, out=%d, duration=%uus", marker.event_id,
+			 (uint8_t)marker.segmentation_type, marker.out_of_network, marker.duration_us);
+	}
 }
 
 void MoQOutput::VideoInit(obs_encoder_t *encoder)
