@@ -10,6 +10,8 @@
 
 #include <QFormLayout>
 #include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QGroupBox>
 #include <QLineEdit>
 #include <QPushButton>
 #include <QLabel>
@@ -18,6 +20,9 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QMetaObject>
+#include <QComboBox>
+#include <QCheckBox>
+#include <QSpinBox>
 
 #include <cstring>
 #include <random>
@@ -101,6 +106,11 @@ MoQDock::MoQDock(QWidget *parent) : QWidget(parent)
 	pathEdit->setText(QString::fromStdString(RandomBroadcastName()));
 	pathEdit->setPlaceholderText("(optional) broadcast name");
 
+	modeCombo = new QComboBox(this);
+	modeCombo->addItem("Simple Broadcast");
+	modeCombo->addItem("Live Event");
+	connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MoQDock::OnModeChanged);
+
 	// Labels above the fields (WrapAllRows), and let the fields grow to the full
 	// dock width (the macOS default keeps them at their size hint otherwise).
 	auto *form = new QFormLayout();
@@ -109,6 +119,7 @@ MoQDock::MoQDock(QWidget *parent) : QWidget(parent)
 	form->setContentsMargins(0, 0, 0, 0);
 	form->addRow("Relay URL", urlEdit);
 	form->addRow("Broadcast name", pathEdit);
+	form->addRow("Mode", modeCombo);
 
 	button = new QPushButton("Go Live", this);
 	button->setCursor(Qt::PointingHandCursor);
@@ -129,6 +140,61 @@ MoQDock::MoQDock(QWidget *parent) : QWidget(parent)
 	statusFont.setBold(true);
 	status->setFont(statusFont);
 
+	eventGroup = new QGroupBox("Event Controls", this);
+	auto *eventLayout = new QVBoxLayout(eventGroup);
+
+	auto *slateForm = new QFormLayout();
+	slateForm->setRowWrapPolicy(QFormLayout::WrapAllRows);
+	slateForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+
+	autoStartSlateCheck = new QCheckBox("Auto start slate", this);
+	autoStartSlateCheck->setChecked(true);
+	autoEndSlateCheck = new QCheckBox("Auto end slate", this);
+	autoEndSlateCheck->setChecked(true);
+
+	startSlateEdit = new QLineEdit(this);
+	startSlateEdit->setPlaceholderText("OBS source name");
+	endSlateEdit = new QLineEdit(this);
+	endSlateEdit->setPlaceholderText("OBS source name");
+
+	slateForm->addRow("Start slate source", startSlateEdit);
+	slateForm->addRow("End slate source", endSlateEdit);
+
+	adDurationSpin = new QSpinBox(this);
+	adDurationSpin->setRange(30, 600);
+	adDurationSpin->setValue(120);
+	adDurationSpin->setSuffix(" sec");
+	slateForm->addRow("Ad break duration", adDurationSpin);
+
+	auto *eventButtonsLayout = new QHBoxLayout();
+	startEventButton = new QPushButton("Start Event", this);
+	endEventButton = new QPushButton("End Event", this);
+	connect(startEventButton, &QPushButton::clicked, this, &MoQDock::OnStartEvent);
+	connect(endEventButton, &QPushButton::clicked, this, &MoQDock::OnEndEvent);
+	eventButtonsLayout->addWidget(startEventButton);
+	eventButtonsLayout->addWidget(endEventButton);
+
+	auto *insertButtonsLayout = new QHBoxLayout();
+	insertAdButton = new QPushButton("Insert Ad Break", this);
+	insertSlateButton = new QPushButton("Insert Slate", this);
+	connect(insertAdButton, &QPushButton::clicked, this, &MoQDock::OnInsertAdBreak);
+	connect(insertSlateButton, &QPushButton::clicked, this, &MoQDock::OnInsertCustomSlate);
+	insertButtonsLayout->addWidget(insertAdButton);
+	insertButtonsLayout->addWidget(insertSlateButton);
+
+	eventStatus = new QLabel("Event inactive", this);
+	eventStatus->setAlignment(Qt::AlignCenter);
+	QFont eventStatusFont = eventStatus->font();
+	eventStatusFont.setPointSize(9);
+	eventStatus->setFont(eventStatusFont);
+
+	eventLayout->addWidget(autoStartSlateCheck);
+	eventLayout->addWidget(autoEndSlateCheck);
+	eventLayout->addLayout(slateForm);
+	eventLayout->addLayout(eventButtonsLayout);
+	eventLayout->addLayout(insertButtonsLayout);
+	eventLayout->addWidget(eventStatus);
+
 	auto *versionLabel = new QLabel(QString("libmoq %1").arg(MOQ_VERSION_STRING), this);
 	versionLabel->setAlignment(Qt::AlignRight | Qt::AlignBottom);
 	versionLabel->setStyleSheet("color: #888888; font-size: 10px;");
@@ -139,6 +205,7 @@ MoQDock::MoQDock(QWidget *parent) : QWidget(parent)
 	layout->addWidget(button);
 	layout->addWidget(advancedButton);
 	layout->addWidget(status);
+	layout->addWidget(eventGroup);
 	layout->addStretch();
 	layout->addWidget(versionLabel);
 
@@ -148,9 +215,15 @@ MoQDock::MoQDock(QWidget *parent) : QWidget(parent)
 
 	connect(urlEdit, &QLineEdit::editingFinished, this, &MoQDock::SaveSettings);
 	connect(pathEdit, &QLineEdit::editingFinished, this, &MoQDock::SaveSettings);
+	connect(autoStartSlateCheck, &QCheckBox::stateChanged, this, &MoQDock::SaveSettings);
+	connect(autoEndSlateCheck, &QCheckBox::stateChanged, this, &MoQDock::SaveSettings);
+	connect(startSlateEdit, &QLineEdit::editingFinished, this, &MoQDock::SaveSettings);
+	connect(endSlateEdit, &QLineEdit::editingFinished, this, &MoQDock::SaveSettings);
+	connect(adDurationSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, &MoQDock::SaveSettings);
 
 	LoadSettings();
 	SetRunning(false);
+	UpdateEventControlsVisibility();
 }
 
 MoQDock::~MoQDock()
@@ -172,6 +245,59 @@ void MoQDock::OpenAdvanced()
 	MoQAdvancedDialog dialog(advanced, this);
 	if (dialog.exec() == QDialog::Accepted)
 		SaveSettings();
+}
+
+void MoQDock::OnModeChanged(int index)
+{
+	UpdateEventControlsVisibility();
+	SaveSettings();
+}
+
+void MoQDock::OnStartEvent()
+{
+	if (!output)
+		return;
+	eventStatus->setText("Event active");
+	eventStatus->setStyleSheet("color: #36a45e;");
+	UpdateEventControlsEnabled();
+}
+
+void MoQDock::OnEndEvent()
+{
+	if (!output)
+		return;
+	eventStatus->setText("Event inactive");
+	eventStatus->setStyleSheet("color: #888888;");
+	UpdateEventControlsEnabled();
+}
+
+void MoQDock::OnInsertAdBreak()
+{
+	if (!output)
+		return;
+	LOG_INFO("Inserted ad break: %d seconds", adDurationSpin->value());
+}
+
+void MoQDock::OnInsertCustomSlate()
+{
+	if (!output)
+		return;
+	LOG_INFO("Inserted custom slate");
+}
+
+void MoQDock::UpdateEventControlsVisibility()
+{
+	bool eventMode = modeCombo->currentIndex() == 1;
+	eventGroup->setVisible(eventMode);
+}
+
+void MoQDock::UpdateEventControlsEnabled()
+{
+	bool isRunning = running && output != nullptr;
+	startEventButton->setEnabled(isRunning);
+	endEventButton->setEnabled(isRunning);
+	insertAdButton->setEnabled(isRunning);
+	insertSlateButton->setEnabled(isRunning);
 }
 
 bool MoQDock::CreateConfiguredEncoders()
@@ -275,6 +401,15 @@ void MoQDock::StartStream()
 	obs_data_apply(serviceSettings, advanced);
 	obs_data_set_string(serviceSettings, "server", url.c_str());
 	obs_data_set_string(serviceSettings, "key", path.c_str());
+
+	bool eventMode = modeCombo->currentIndex() == 1;
+	obs_data_set_bool(serviceSettings, "event_mode_enabled", eventMode);
+	obs_data_set_bool(serviceSettings, "event_auto_start_slate", autoStartSlateCheck->isChecked());
+	obs_data_set_bool(serviceSettings, "event_auto_end_slate", autoEndSlateCheck->isChecked());
+	obs_data_set_int(serviceSettings, "event_ad_duration", adDurationSpin->value());
+	obs_data_set_string(serviceSettings, "event_start_slate_source", startSlateEdit->text().toUtf8().constData());
+	obs_data_set_string(serviceSettings, "event_end_slate_source", endSlateEdit->text().toUtf8().constData());
+
 	service =
 		OBSServiceAutoRelease(obs_service_create("moq_service", "moq_dock_service", serviceSettings, nullptr));
 	if (!service) {
@@ -312,6 +447,7 @@ void MoQDock::StartStream()
 	SetRunning(true);
 	status->setText("● Connecting…");
 	status->setStyleSheet("color: #d08b1d;");
+	UpdateEventControlsEnabled();
 }
 
 void MoQDock::StopStream()
@@ -351,7 +487,11 @@ void MoQDock::SetRunning(bool isRunning)
 	if (!isRunning) {
 		status->setText("● Disconnected");
 		status->setStyleSheet("color: #888888;");
+		eventStatus->setText("Event inactive");
+		eventStatus->setStyleSheet("color: #888888;");
 	}
+
+	UpdateEventControlsEnabled();
 }
 
 void MoQDock::UpdateStatus()
@@ -384,6 +524,24 @@ void MoQDock::LoadSettings()
 	if (obs_data_has_user_value(data, "path"))
 		pathEdit->setText(broadcast ? broadcast : "");
 
+	if (obs_data_has_user_value(data, "mode"))
+		modeCombo->setCurrentIndex((int)obs_data_get_int(data, "mode"));
+
+	if (obs_data_has_user_value(data, "event_auto_start_slate"))
+		autoStartSlateCheck->setChecked(obs_data_get_bool(data, "event_auto_start_slate"));
+	if (obs_data_has_user_value(data, "event_auto_end_slate"))
+		autoEndSlateCheck->setChecked(obs_data_get_bool(data, "event_auto_end_slate"));
+
+	const char *startSlate = obs_data_get_string(data, "event_start_slate");
+	const char *endSlate = obs_data_get_string(data, "event_end_slate");
+	if (startSlate)
+		startSlateEdit->setText(startSlate);
+	if (endSlate)
+		endSlateEdit->setText(endSlate);
+
+	if (obs_data_has_user_value(data, "event_ad_duration"))
+		adDurationSpin->setValue((int)obs_data_get_int(data, "event_ad_duration"));
+
 	// Applied over the defaults set in the constructor, so a settings file written by
 	// an older build (missing keys that have since been added) still loads.
 	OBSDataAutoRelease saved = obs_data_get_obj(data, "advanced");
@@ -402,6 +560,12 @@ void MoQDock::SaveSettings()
 	OBSDataAutoRelease data = obs_data_create();
 	obs_data_set_string(data, "url", urlEdit->text().toUtf8().constData());
 	obs_data_set_string(data, "path", pathEdit->text().toUtf8().constData());
+	obs_data_set_int(data, "mode", modeCombo->currentIndex());
+	obs_data_set_bool(data, "event_auto_start_slate", autoStartSlateCheck->isChecked());
+	obs_data_set_bool(data, "event_auto_end_slate", autoEndSlateCheck->isChecked());
+	obs_data_set_string(data, "event_start_slate", startSlateEdit->text().toUtf8().constData());
+	obs_data_set_string(data, "event_end_slate", endSlateEdit->text().toUtf8().constData());
+	obs_data_set_int(data, "event_ad_duration", adDurationSpin->value());
 	obs_data_set_obj(data, "advanced", advanced);
 	obs_data_save_json(data, path.c_str());
 }

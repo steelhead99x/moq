@@ -158,6 +158,8 @@ target_sources(
     src/moq-settings.h
     src/moq-source.cpp
     src/moq-source.h
+    src/moq-event.cpp
+    src/moq-event.h
 )
 
 # The dock requires both the frontend API (to register it) and Qt (to build it).
