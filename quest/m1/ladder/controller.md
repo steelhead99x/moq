@@ -43,7 +43,9 @@ advertised maximum moving; the 5 Mbps over 2.5 Mbps boundary landing near
 unsupported encoder holding its maximum and not recovering early; and no
 bandwidth input preserving existing behavior exactly.
 
-## Required
-
-- [Rung order](/quest/m1/ladder/order.md) - the band formula reads the next
-  lower rendition's configured maximum
+The band formula, applied-vs-requested targets, `BitrateUnsupported` fallback,
+idle-rung recovery, descending track priority, and catalog `stalled` from the
+applied encoder target live in `rs/moq-transcode` (`order_rungs`,
+`stall_boundary`, the ladder controller). What remains is FETCH using the
+shared applied target across a source catalog refresh (see
+[Fetch and catalog](/quest/m1/ladder/fetch.md)).

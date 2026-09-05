@@ -12,7 +12,7 @@ It loads into a stock OBS Studio install (no OBS source build required) and link
 - **Flexible Control**: In-app dock UI or external control via OBS WebSocket
 - **Standards-Based**: SCTE-35 signaling for broadcast interoperability
 
-See [EVENT_API.md](EVENT_API.md) for live event API documentation and [UPSTREAM_NOTES.md](UPSTREAM_NOTES.md) for contribution guidance.
+See [EVENT\_API.md](EVENT_API.md) for live event API documentation and [UPSTREAM\_NOTES.md](UPSTREAM_NOTES.md) for contribution guidance.
 
 Build instructions for each platform live in [`doc/bin/obs.md`](../../doc/bin/obs.md).
 In short, from the repo root:

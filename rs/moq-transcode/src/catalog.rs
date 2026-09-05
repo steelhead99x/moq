@@ -142,6 +142,7 @@ fn is_supported_av1(av1: &AV1) -> bool {
 /// The names are placeholders: [`Names`] decides whether a rung keeps the name
 /// its predecessor was serving or takes a fresh one.
 pub(crate) fn resolve_rungs(rungs: &[Rung], source_name: &str, source: &VideoConfig) -> Result<Vec<Resolved>, Error> {
+	let rungs = crate::order_rungs(rungs)?;
 	let Some((source_width, source_height)) = dimensions(source) else {
 		return Err(Error::SourceDimensions(source_name.to_string()));
 	};
@@ -289,7 +290,30 @@ mod tests {
 		let names: Vec<_> = resolved.iter().map(|r| r.name.as_str()).collect();
 		// A 480p source keeps only the strictly-lower rungs: the 480p rung is
 		// admitted only because its bitrate (1.2M) undercuts the source (2M).
-		assert_eq!(names, ["video/480p", "video/360p", "video/240p"]);
+		// Canonical order is ascending bitrate, not the config's top-first list.
+		assert_eq!(names, ["video/240p", "video/360p", "video/480p"]);
+	}
+
+	#[test]
+	fn resolve_rungs_orders_an_out_of_order_config() {
+		let rungs = vec![Rung::new(360, 600_000), Rung::new(120, 80_000), Rung::new(240, 300_000)];
+		let resolved = resolve_rungs(&rungs, "video", &source(1920, 1080, Some(6_000_000))).unwrap();
+		assert_eq!(
+			resolved.iter().map(|r| r.bitrate).collect::<Vec<_>>(),
+			[80_000, 300_000, 600_000]
+		);
+	}
+
+	#[test]
+	fn resolve_rungs_rejects_a_duplicate_ceiling() {
+		assert!(matches!(
+			resolve_rungs(
+				&[Rung::new(360, 600_000), Rung::new(240, 600_000)],
+				"video",
+				&source(1920, 1080, Some(6_000_000))
+			),
+			Err(Error::DuplicateCeiling { bitrate: 600_000, .. })
+		));
 	}
 
 	#[test]

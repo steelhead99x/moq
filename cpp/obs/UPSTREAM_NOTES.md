@@ -9,10 +9,12 @@ The following architectural components are vendor-neutral and provide general va
 ### Core Event Architecture
 
 **Files:**
+
 - `src/moq-event.h`
 - `src/moq-event.cpp`
 
 **What:**
+
 - `MoQEventController` class and API
 - SCTE-35 marker structure definitions
 - Event configuration structure
@@ -20,6 +22,7 @@ The following architectural components are vendor-neutral and provide general va
 - Marker scheduling and PTS tracking
 
 **Why Upstream:**
+
 - Standard broadcast protocol support (SCTE-35)
 - Generic slate reference system (uses OBS source names)
 - No vendor-specific logic or branding
@@ -31,15 +34,18 @@ The following architectural components are vendor-neutral and provide general va
 ### Mode Selection Framework
 
 **Files:**
+
 - `src/moq-dock.cpp` (mode combo and visibility logic)
 - `src/moq-output.cpp` (event mode handling)
 
 **What:**
+
 - Simple broadcast vs. live event mode toggle
 - Conditional feature enablement
 - Settings persistence for mode
 
 **Why Upstream:**
+
 - Keeps simple use cases simple
 - Professional features opt-in, not forced
 - Clean separation of concerns
@@ -50,15 +56,18 @@ The following architectural components are vendor-neutral and provide general va
 ### SCTE Integration Points
 
 **Files:**
+
 - `src/moq-output.cpp` (`ProcessEventMarkers` method)
 - `src/moq-event.cpp` (marker insertion logic)
 
 **What:**
+
 - PTS-based marker insertion
 - SCTE segmentation type enums
 - Marker logging and callback system
 
 **Why Upstream:**
+
 - Industry-standard protocol
 - Needed for professional broadcast workflows
 - No moq-specific wire changes required (markers are application-level)
@@ -73,11 +82,13 @@ Components that should remain in `steelhead99x/moq` only:
 ### Colorbars Branding
 
 **What:**
+
 - Colorbars-specific default URLs
 - Product-specific terminology in UI strings
 - Hardcoded relay paths for colorbars.dev
 
 **Why Fork-Only:**
+
 - Product branding, not generic functionality
 - May confuse users of other services
 - Colorbars owns their own UX
@@ -87,11 +98,13 @@ Components that should remain in `steelhead99x/moq` only:
 ### Product Integration Details
 
 **What:**
+
 - Colorbars API authentication flows
 - Product-specific config schemas
 - Colorbars-specific event templates
 
 **Why Fork-Only:**
+
 - Service-specific implementation
 - Not reusable by other deployments
 - Couples plugin to external service
@@ -103,7 +116,8 @@ Components that should remain in `steelhead99x/moq` only:
 ### Phase 1: Core Event Controller (Immediate)
 
 Submit PR to moq-dev/moq with:
-- `moq-event.h/cpp` 
+
+- `moq-event.h/cpp`
 - `MoQEventController` API
 - SCTE-35 structures and enums
 - Documentation of event mode concept
@@ -113,6 +127,7 @@ Submit PR to moq-dev/moq with:
 ### Phase 2: UI Integration (After Phase 1)
 
 Submit PR with:
+
 - Mode selector in dock
 - Event control panel
 - Settings persistence
@@ -123,6 +138,7 @@ Submit PR with:
 ### Phase 3: Advanced Features (Future)
 
 Consider upstreaming:
+
 - SCTE-35 binary encoding
 - Track-level marker embedding
 - WebSocket remote control API
@@ -135,6 +151,7 @@ Consider upstreaming:
 ### Fork Maintenance
 
 When upstream accepts changes:
+
 1. Cherry-pick upstream improvements back to fork
 2. Keep fork's Colorbars-specific features as additive layer
 3. Avoid diverging core logic (merge conflicts)
@@ -142,12 +159,14 @@ When upstream accepts changes:
 ### Testing Both Codebases
 
 Both fork and upstream should pass:
+
 - Simple broadcast mode (no event features)
 - Event mode with SCTE insertion
 - Slate reference validation
 - Mode switching
 
 Fork additionally tests:
+
 - Colorbars integration endpoints
 - Product-specific workflows
 
@@ -180,6 +199,7 @@ When proposing changes:
 5. Include tests for mode switching
 
 Avoid:
+
 - Mentioning Colorbars in commit messages
 - Product-specific configuration examples
 - Assuming external service integration
@@ -196,6 +216,7 @@ If upstream rejects event features:
 ## Licensing Note
 
 All code added here is GPL-2.0-or-later, matching `cpp/obs/LICENSE`. This applies to both:
+
 - Code intended for upstream
 - Fork-specific additions
 
@@ -204,6 +225,7 @@ No license change is required for contribution back to moq-dev/moq.
 ## Current Status
 
 As of this implementation:
+
 - ✅ Core event controller complete
 - ✅ UI integration complete
 - ✅ Mode selection complete
@@ -216,19 +238,20 @@ As of this implementation:
 
 Before proposing upstream:
 
-- [x] Simple broadcast mode works without event features
-- [ ] Event mode inserts markers at correct PTS
-- [ ] Mode switching doesn't break existing streams
-- [ ] Settings persist across OBS restarts
-- [ ] Slate references resolve to valid OBS sources
-- [ ] Ad breaks schedule both out and in markers
-- [ ] Multiple events can run in succession
-- [ ] Event controls disabled when not streaming
-- [ ] No Colorbars-specific code in proposal
+- \[x] Simple broadcast mode works without event features
+- \[ ] Event mode inserts markers at correct PTS
+- \[ ] Mode switching doesn't break existing streams
+- \[ ] Settings persist across OBS restarts
+- \[ ] Slate references resolve to valid OBS sources
+- \[ ] Ad breaks schedule both out and in markers
+- \[ ] Multiple events can run in succession
+- \[ ] Event controls disabled when not streaming
+- \[ ] No Colorbars-specific code in proposal
 
 ## Contact
 
 For questions about upstream strategy:
+
 - Fork maintainer: steelhead99x/moq
 - Upstream: moq-dev/moq (issues/discussions)
 

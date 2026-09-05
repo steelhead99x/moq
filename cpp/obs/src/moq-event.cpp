@@ -2,8 +2,13 @@
 #include "moq-event.h"
 #include "logger.h"
 
+#include <utility>
+
 MoQEventController::MoQEventController(const MoQEventConfig &config)
-	: config_(config), event_active_(false), next_event_id_(1), event_start_pts_us_(0)
+	: config_(config),
+	  event_active_(false),
+	  next_event_id_(1),
+	  event_start_pts_us_(0)
 {
 }
 
@@ -167,13 +172,13 @@ void MoQEventController::SetSlateCallback(std::function<void(const EventSlate &,
 
 void MoQEventController::ScheduleMarker(ScteMarker marker)
 {
-	scheduled_markers_[marker.event_id] = marker;
+	scheduled_markers_.insert_or_assign(marker.event_id, std::move(marker));
 }
 
 void MoQEventController::ScheduleSlate(EventSlate slate)
 {
 	uint32_t event_id = next_event_id_++;
-	active_slates_[event_id] = slate;
+	active_slates_.insert_or_assign(event_id, std::move(slate));
 }
 
 void MoQEventController::ProcessMarkers(uint64_t current_pts_us)
@@ -198,6 +203,4 @@ void MoQEventController::ProcessMarkers(uint64_t current_pts_us)
 	}
 }
 
-void register_moq_event()
-{
-}
+void register_moq_event() {}

@@ -28,7 +28,7 @@ private slots:
 	void ToggleStream();
 	void UpdateStatus();
 	void OpenAdvanced();
-	void OnModeChanged(int index);
+	void OnModeChanged();
 	void OnStartEvent();
 	void OnEndEvent();
 	void OnInsertAdBreak();
