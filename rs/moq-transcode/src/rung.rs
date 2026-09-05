@@ -14,6 +14,7 @@
 //! lands on the same content.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use hang::catalog::VideoConfig;
@@ -22,6 +23,7 @@ use tokio::sync::Semaphore;
 
 use crate::Error;
 use crate::catalog::Resolved;
+use crate::controller;
 use crate::feed::{Feed, Item};
 
 /// Cap on transcode pipelines a single rung builds concurrently for on-demand
@@ -80,6 +82,8 @@ pub(crate) struct Rung {
 	pub active: crate::active::Producer,
 	/// Fires when the ladder resizes past this rung.
 	pub retire: Retire,
+	/// Ladder controller, when the transcoder is following an uplink estimate.
+	pub control: Option<controller::Producer>,
 }
 
 impl Rung {
@@ -113,7 +117,35 @@ impl Rung {
 		// Keyframes are forced at every group boundary; the GOP is only a
 		// backstop against pathologically long source groups.
 		config.gop = self.info.framerate.saturating_mul(8).max(1);
-		Ok(moq_video::encode::Sink::open(&config).await?)
+		let mut encoder = moq_video::encode::Sink::open(&config).await?;
+		// Open at the advertised maximum, then retune to the last requested
+		// target. An unsupported encoder stays at the maximum and reports it.
+		apply_encoder_target(&mut encoder, self).await;
+		Ok(encoder)
+	}
+}
+
+/// Retune `encoder` to the controller's requested target, recording what it accepted.
+async fn apply_encoder_target(encoder: &mut moq_video::encode::Sink, rung: &Rung) {
+	let Some(control) = &rung.control else {
+		return;
+	};
+	let Some(target) = control.requested(&rung.info.name) else {
+		return;
+	};
+	match encoder.set_bitrate(target).await {
+		Ok(()) => control.accept(&rung.info.name, target),
+		Err(moq_video::Error::BitrateUnsupported(name)) => {
+			tracing::warn!(
+				encoder = name,
+				rung = %rung.info.name,
+				"encoder cannot follow the ladder target; holding the configured maximum"
+			);
+			control.unsupported(&rung.info.name, Instant::now());
+		}
+		Err(err) => {
+			tracing::warn!(%err, rung = %rung.info.name, target, "failed to apply encoder target");
+		}
 	}
 }
 
@@ -130,7 +162,12 @@ pub(crate) async fn serve(rung: Rung, request: moq_net::track::Request) -> Resul
 	// Grab the group-request handle before accepting: a Request is dynamic from
 	// birth, so a fetch racing the acceptance queues instead of failing.
 	let dynamic = request.dynamic();
-	let info = hang::container::track_info();
+	let priority = rung
+		.control
+		.as_ref()
+		.map(|control| control.priority(&rung.info.name))
+		.unwrap_or(hang::catalog::PRIORITY.video);
+	let info = hang::container::track_info().with_priority(priority);
 	let mut producer = request.accept(info);
 	let (finished, mut finishing) = tokio::sync::watch::channel(false);
 
@@ -199,6 +236,11 @@ async fn live(rung: &Rung, producer: &mut moq_net::track::Producer) -> Result<En
 		// until this pipeline encodes one, so a subscriber waiting on a stalled
 		// source is not billed for a session that produced nothing.
 		let active = rung.active.attach(&rung.info);
+		let _demand = rung
+			.control
+			.as_ref()
+			.map(|control| controller::Demand::new(control.clone(), rung.info.name.clone(), Instant::now()));
+		let mut targets = rung.control.as_ref().map(|control| control.consume());
 
 		// One listener + encoder per demand session: rate control persists
 		// across groups, while every group still opens with a forced IDR.
@@ -217,6 +259,19 @@ async fn live(rung: &Rung, producer: &mut moq_net::track::Producer) -> Result<En
 		'session: loop {
 			let item = tokio::select! {
 				item = listener.recv() => item,
+				changed = async {
+					match &mut targets {
+						Some(watch) => watch.changed().await,
+						None => std::future::pending().await,
+					}
+				} => {
+					if changed {
+						if let Some(encoder) = &mut encoder {
+							apply_encoder_target(encoder, rung).await;
+						}
+					}
+					continue;
+				}
 				_ = demand.unused() => {
 					if let Some(output) = current.take() {
 						// Signal downstream that the group is incomplete.
@@ -504,6 +559,10 @@ async fn fetch(rung: Rung, request: moq_net::track::GroupRequest) -> Result<(), 
 	// live path is idle. Reference counted, so overlapping the live session
 	// bills the rendition once rather than twice.
 	let active = rung.active.attach(&rung.info);
+	let _demand = rung
+		.control
+		.as_ref()
+		.map(|control| controller::Demand::new(control.clone(), rung.info.name.clone(), Instant::now()));
 	transcode_group(pipeline, &container, &mut source, output, &active).await?;
 	Ok(())
 }

@@ -25,12 +25,14 @@ pub mod active;
 
 mod catalog;
 mod config;
+mod controller;
 mod error;
 mod feed;
 mod ladder;
 mod rung;
 
-pub use config::{Config, Rung};
+pub use config::{Config, Rung, order_rungs};
+pub use controller::stall_boundary;
 
 #[allow(deprecated)]
 pub use config::source_reference;
@@ -79,6 +81,8 @@ impl Transcoder {
 		mut output: moq_net::broadcast::Producer,
 		config: Config,
 	) -> Result<Self, Error> {
+		// Fail the ambiguous ladders before anything is announced.
+		let _ = order_rungs(&config.rungs)?;
 		// The catalog starts empty and fills in during `run`, exactly like a
 		// media importer that hasn't seen parameter sets yet.
 		let derived = moq_mux::catalog::Producer::new(&mut output)?;
@@ -136,9 +140,20 @@ impl Transcoder {
 		let mut ladder =
 			ladder::Ladder::new(source.clone(), config.clone(), active, source_name, source_config).await?;
 
+		let adaptive = config.bandwidth.is_some();
+		let controller = controller::Producer::new(ladder.rungs().iter().map(|published| &published.rung), adaptive);
+		if let Some(bandwidth) = &config.bandwidth {
+			controller.set_estimate(bandwidth.peek(), std::time::Instant::now());
+		}
+		ladder.set_control(controller.clone());
+		let mut bandwidth = config.bandwidth.clone();
+		let mut control_watch = controller.consume();
+
 		// Publish the derivative catalog before any encoder exists, so subscribers
 		// can pick a rung immediately.
+		let mut snapshot = snapshot;
 		{
+			controller::apply_stalled(ladder.rungs_mut(), &controller);
 			let mut guard = derived.lock();
 			catalog::populate(&mut guard, &snapshot, ladder.rungs(), config.source.as_ref())?;
 		}
@@ -155,9 +170,23 @@ impl Transcoder {
 						None => request.reject(moq_net::Error::NotFound),
 					}
 				},
+				estimate = next_estimate(&mut bandwidth) => {
+					controller.set_estimate(estimate, std::time::Instant::now());
+				}
+				changed = control_watch.changed() => {
+					if !changed {
+						break;
+					}
+					controller::apply_stalled(ladder.rungs_mut(), &controller);
+					let mut guard = derived.lock();
+					catalog::populate(&mut guard, &snapshot, ladder.rungs(), config.source.as_ref())?;
+				}
 				update = catalogs.next() => match update {
-					Ok(Some(snapshot)) => {
+					Ok(Some(next)) => {
+						snapshot = next;
 						ladder.follow(&snapshot.video).await?;
+						controller.reconcile(ladder.rungs().iter().map(|published| &published.rung), std::time::Instant::now());
+						controller::apply_stalled(ladder.rungs_mut(), &controller);
 						let mut guard = derived.lock();
 						catalog::populate(&mut guard, &snapshot, ladder.rungs(), config.source.as_ref())?;
 					}
@@ -187,6 +216,23 @@ impl Transcoder {
 		derived.finish()?;
 		output.finish();
 		Ok(())
+	}
+}
+
+/// Next uplink estimate, or forever when the controller is not adaptive.
+///
+/// A closed estimate source is retired rather than reported as `None` on every
+/// poll, so `select!` does not spin.
+async fn next_estimate(bandwidth: &mut Option<moq_net::bandwidth::Consumer>) -> Option<u64> {
+	match bandwidth {
+		Some(consumer) => match consumer.changed().await {
+			Ok(estimate) => estimate,
+			Err(_) => {
+				*bandwidth = None;
+				None
+			}
+		},
+		None => std::future::pending().await,
 	}
 }
 
@@ -1103,6 +1149,72 @@ mod tests {
 			.expect("the retired rung aborted instead of finishing");
 		assert!(ended.is_none(), "expected a clean end, got a group");
 		subscribe(&consumer, "video/120p.2").await;
+
+		transcoder.abort();
+	}
+
+	/// Catalog `stalled` follows the target the encoder accepted, so a rung
+	/// whose applied rate sits on the band is advertised as stalled.
+	#[tokio::test]
+	async fn catalog_publishes_stalled_from_applied_target() {
+		let source = source_broadcast(3, 5);
+		let bandwidth = moq_net::bandwidth::Producer::new();
+		let config = Config {
+			rungs: vec![Rung::new(120, 100_000)],
+			encoder: moq_video::encode::Kind::Software,
+			decoder: moq_video::decode::Kind::Software,
+			source: None,
+			bandwidth: Some(bandwidth.consume()),
+			..Default::default()
+		};
+
+		let output = moq_net::broadcast::Info::default().produce();
+		let consumer = output.consume();
+		let transcoder = tokio::spawn(run(source.broadcast.consume(), output, config));
+
+		let track = loop {
+			match consumer.track(hang::Catalog::DEFAULT_NAME) {
+				Ok(track) => break track,
+				Err(moq_net::Error::NotFound) => tokio::task::yield_now().await,
+				Err(err) => panic!("catalog track: {err}"),
+			}
+		};
+		let mut catalogs = moq_mux::catalog::hang::Consumer::<()>::new(track.subscribe(None).await.unwrap());
+		await_catalog(&mut catalogs, |snapshot| {
+			snapshot.video.renditions.contains_key("video/120p")
+		})
+		.await;
+
+		// Open the encoder so a later target can be applied, not just requested.
+		let mut subscriber = consumer.track("video/120p").unwrap().subscribe(None).await.unwrap();
+		let mut group = subscriber.next_group().await.unwrap().unwrap();
+		group.read_frame().await.unwrap().unwrap();
+
+		// 1 kbps is under the 120p band (100 kbps / 3), so the applied target
+		// clamps and the catalog must publish stalled.
+		bandwidth.set(Some(1_000)).unwrap();
+		let derived = tokio::time::timeout(
+			std::time::Duration::from_secs(10),
+			await_catalog(&mut catalogs, |snapshot| {
+				snapshot
+					.video
+					.renditions
+					.get("video/120p")
+					.and_then(|rung| rung.stalled)
+					== Some(true)
+			}),
+		)
+		.await
+		.expect("catalog never published stalled");
+		assert_eq!(
+			derived.video.renditions.get("video/120p").and_then(|rung| rung.stalled),
+			Some(true)
+		);
+		assert_eq!(
+			derived.video.renditions.get("video/120p").and_then(|rung| rung.bitrate),
+			Some(100_000),
+			"the advertised maximum must not follow the applied target"
+		);
 
 		transcoder.abort();
 	}

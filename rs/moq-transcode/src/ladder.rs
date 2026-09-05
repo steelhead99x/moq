@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use hang::catalog::{Video, VideoConfig};
 
 use crate::catalog::{self, Names, Published};
+use crate::controller;
 use crate::feed::Feed;
 use crate::{Config, Error, active, rung};
 
@@ -44,6 +45,9 @@ pub(crate) struct Ladder {
 	/// always the newest task for it and a signal sent to one that already ended
 	/// goes nowhere.
 	serving: HashMap<String, tokio::sync::watch::Sender<bool>>,
+	/// Shared ladder controller. `None` until [`Self::set_control`] after the
+	/// first resolve, so a probe failure cannot leave a half-built controller.
+	control: Option<controller::Producer>,
 }
 
 impl Ladder {
@@ -70,6 +74,7 @@ impl Ladder {
 			rungs: Vec::new(),
 			names: Names::default(),
 			serving: HashMap::new(),
+			control: None,
 		};
 
 		// `resolve` takes the source it resolves against, since `follow` calls it
@@ -130,6 +135,16 @@ impl Ladder {
 		&self.rungs
 	}
 
+	/// The rungs currently published, for writing catalog `stalled` bits.
+	pub(crate) fn rungs_mut(&mut self) -> &mut [Published] {
+		&mut self.rungs
+	}
+
+	/// Attach the controller that owns encoder targets and catalog `stalled`.
+	pub(crate) fn set_control(&mut self, control: controller::Producer) {
+		self.control = Some(control);
+	}
+
 	/// The rung to serve a requested track with, or `None` if the ladder has no
 	/// such rung right now.
 	pub(crate) fn rung(&mut self, name: &str) -> Result<Option<rung::Rung>, Error> {
@@ -150,6 +165,7 @@ impl Ladder {
 			active: self.active.clone(),
 			info: published.rung.clone(),
 			retire,
+			control: self.control.clone(),
 		}))
 	}
 
