@@ -27,15 +27,29 @@ public:
 
 	// Point-in-time QUIC/WebTransport health for the live session. False when
 	// there is no session or libmoq is between reconnects (no live connection).
+	// Fields already returned by one moq_session_stats call; reconnects comes from
+	// the status-callback epoch (no extra libmoq work).
 	struct ConnectionStats {
+		int reconnects = 0;
 		bool rtt_valid = false;
 		double rtt_ms = 0;
 		bool send_rate_valid = false;
 		double send_rate_bps = 0;
+		bool recv_rate_valid = false;
+		double recv_rate_bps = 0;
+		bool bytes_sent_valid = false;
+		uint64_t bytes_sent = 0;
 		bool loss_valid = false;
 		double loss_pct = 0;
 	};
 	bool TryGetConnectionStats(ConnectionStats *out);
+
+	// Successful (re)connects after the first for this Start(); 0 until epoch >= 2.
+	inline int GetReconnectCount()
+	{
+		const int epoch = session_epoch.load(std::memory_order_relaxed);
+		return epoch > 1 ? epoch - 1 : 0;
+	}
 
 private:
 	// Handed to libmoq as the status callback's user_data. Carries everything a
@@ -103,6 +117,9 @@ private:
 	// Written by the session status callback (libmoq runtime thread), read by
 	// GetConnectTime() (OBS thread); atomic to avoid a data race.
 	std::atomic<int> connect_time_ms;
+	// Latest connect epoch from libmoq (>0 while this attempt has connected).
+	// Epoch 1 is the first connect; 2+ means reconnects. Cleared with connect_time_ms.
+	std::atomic<int> session_epoch;
 
 	int origin;
 	int broadcast;
