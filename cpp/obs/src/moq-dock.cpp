@@ -215,8 +215,8 @@ MoQDock::MoQDock(QWidget *parent) : QWidget(parent)
 
 	connect(urlEdit, &QLineEdit::editingFinished, this, &MoQDock::SaveSettings);
 	connect(pathEdit, &QLineEdit::editingFinished, this, &MoQDock::SaveSettings);
-	connect(autoStartSlateCheck, &QCheckBox::stateChanged, this, &MoQDock::SaveSettings);
-	connect(autoEndSlateCheck, &QCheckBox::stateChanged, this, &MoQDock::SaveSettings);
+	connect(autoStartSlateCheck, &QCheckBox::toggled, this, &MoQDock::SaveSettings);
+	connect(autoEndSlateCheck, &QCheckBox::toggled, this, &MoQDock::SaveSettings);
 	connect(startSlateEdit, &QLineEdit::editingFinished, this, &MoQDock::SaveSettings);
 	connect(endSlateEdit, &QLineEdit::editingFinished, this, &MoQDock::SaveSettings);
 	connect(adDurationSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, &MoQDock::SaveSettings);
@@ -247,7 +247,7 @@ void MoQDock::OpenAdvanced()
 		SaveSettings();
 }
 
-void MoQDock::OnModeChanged(int index)
+void MoQDock::OnModeChanged()
 {
 	UpdateEventControlsVisibility();
 	SaveSettings();

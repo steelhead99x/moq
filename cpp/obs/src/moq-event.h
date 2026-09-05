@@ -72,7 +72,10 @@ struct EventSlate {
 	bool auto_return;
 
 	EventSlate(const std::string &src, ScteSegmentationType trig, uint32_t dur, bool auto_ret)
-		: source_name(src), trigger_type(trig), duration_sec(dur), auto_return(auto_ret)
+		: source_name(src),
+		  trigger_type(trig),
+		  duration_sec(dur),
+		  auto_return(auto_ret)
 	{
 	}
 };
