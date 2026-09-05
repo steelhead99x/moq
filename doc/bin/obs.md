@@ -130,6 +130,35 @@ The archives are **unsigned**, so macOS Gatekeeper and Windows SmartScreen will 
 3. Enter the relay URL and broadcast path
 4. The stream will appear in your scene
 
+### Reconnect
+
+libmoq retries the connection after a drop. Transient failures stay inside the
+library: the plugin is not told until reconnect permanently gives up (or you stop).
+
+Tune pacing under **Advanced** (Settings → Stream, or the dock's **Advanced…** button):
+
+- **Reconnect delay** / **Reconnect delay cap**: backoff floor and ceiling
+- **Give up after**: total budget before the attempt ends; `0` retries forever.
+  That budget is also how long the broadcast stays available to viewers across the gap.
+
+On the publish side, a permanent failure after a successful connect is reported as
+a disconnect so OBS can restart the output. The MoQ Source blanks and stays down
+until you change its settings (or recreate it); it does not open a second retry loop.
+
+### Status / stats
+
+The MoQ dock polls connection health about once a second while live:
+
+| Status | Meaning |
+| --- | --- |
+| Connecting… | Start pressed; first connect callback has not fired yet |
+| Connected | Live session; may include RTT, estimated send rate, and packet loss |
+| Reconnecting… | Was connected; libmoq is between attempts (no live stats) |
+| Disconnected | Not streaming |
+
+RTT and send rate come from `moq_session_stats` when the transport backend reports them.
+Missing fields are omitted rather than shown as zero.
+
 ### Advanced settings
 
 The defaults are what you want for streaming to a normal relay. The advanced settings
