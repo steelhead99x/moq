@@ -62,6 +62,16 @@ const broadcast = new Watch.Broadcast({ connection, enabled: true, name: "alice.
 is a signal from [`@moq/signals`](/lib/js/signals). Load from a CDN
 (`https://esm.sh/@moq/watch/element`) for a no-build embed.
 
+## Spatial playback
+
+`Audio.Decoder` can take a shared `AudioContext` as the `context` constructor
+knob. Every remote then lives in one graph (one `AudioListener`, many
+`PannerNode`s). The decoder never closes an injected context; match its sample
+rate to the decoded PCM (typically 48 kHz Opus). Connect `decoder.out.root` to
+your panner or gain node. Do not use `Audio.Emitter` for positioned sources: it
+always wires the root to `destination`. Set `enabled` false to stop downloading
+a remote that is out of earshot.
+
 ## Buffered playback
 
 By default the player minimizes latency: it skips ahead whenever the buffer
