@@ -109,9 +109,37 @@ Both find the `libobs` headers the same way `just obs compile` does, and regener
 
 The plugin statically links `libmoq`, so it ships with every libmoq release rather than on its own schedule. The [`libmoq` workflow](https://github.com/moq-dev/moq/blob/main/.github/workflows/libmoq.yml) (triggered by a `libmoq-v*` tag) rebuilds the plugin against the libmoq release it just published, then cuts a matching `obs-moq-v<version>` release with **macOS (arm64)** and **Windows (x64)** binaries. `cpp/obs/build.sh --libmoq-release <version>` drives each build (it fetches the prebuilt libmoq archive, so no second cargo build).
 
-The archives are **unsigned**, so macOS Gatekeeper and Windows SmartScreen will warn on first load (right-click → Open on macOS). Extract the archive into your OBS plugins directory: the `.plugin` bundle on macOS, or the `obs-moq/` folder (containing `bin/64bit/` + `data/`) on Windows.
+### Download
 
-**Linux is build-from-source for now** (see the Linux section above). A prebuilt Linux binary isn't shipped: the plugin needs ffmpeg to decode subscribed video, and a Linux build links the nix/distro ffmpeg rather than the version OBS bundles, so it wouldn't load portably. (A future native decoder via `moq-video` would remove the ffmpeg dependency and let Linux ship a binary too.)
+Latest and older builds: [moq-dev/moq Releases](https://github.com/moq-dev/moq/releases) (filter tags named `obs-moq-v*`).
+
+Each `obs-moq-v*` release attaches platform archives. Pick the one for your OS; you do not need to build from source to use the plugin on macOS or Windows.
+
+### Install (prebuilt)
+
+Archives are **unsigned**, so macOS Gatekeeper and Windows SmartScreen will warn on first load (right-click → Open on macOS).
+
+**macOS (arm64)**
+
+1. Download the macOS archive from the `obs-moq-v*` release.
+2. Extract `obs-moq.plugin`.
+3. Copy it into `~/Library/Application Support/obs-studio/plugins/`.
+4. Restart OBS Studio. MoQ appears as a service (Settings → Stream), a source, and a dock.
+
+**Windows (x64)**
+
+1. Download the Windows archive from the `obs-moq-v*` release.
+2. Extract the `obs-moq/` folder (it contains `bin/64bit/` and `data/`).
+3. Copy that folder into your OBS plugins directory, typically `%AppData%\obs-studio\plugins\`.
+4. Restart OBS Studio.
+
+**Linux**
+
+No portable prebuilt yet (the plugin links ffmpeg for subscribed decode, and a distro/nix ffmpeg is not loadable into stock OBS). Build from source with `nix develop` and `just obs build` (see [Linux](#linux-nix) above).
+
+### Discoverability
+
+GitHub Releases are the supported download path today. An OBS Forum / plugin-directory listing is deferred until binaries are signed and (for Linux) a portable artifact exists; unsigned one-click installs fight Gatekeeper/SmartScreen and confuse first-run support.
 
 ## Usage
 
@@ -152,12 +180,13 @@ The MoQ dock polls connection health about once a second while live:
 | Status | Meaning |
 | --- | --- |
 | Connecting… | Start pressed; first connect callback has not fired yet |
-| Connected | Live session; may include RTT, estimated send rate, and packet loss |
-| Reconnecting… | Was connected; libmoq is between attempts (no live stats) |
+| Connected | Live session; may include reconnects, RTT, ↑/↓ rates, loss, bytes sent |
+| Reconnecting… | Was connected; libmoq is between attempts (no live stats); reconnect count kept |
 | Disconnected | Not streaming |
 
-RTT and send rate come from `moq_session_stats` when the transport backend reports them.
-Missing fields are omitted rather than shown as zero.
+Figures come from the existing 1 Hz dock poll: reconnect count from the libmoq
+connect epoch, and the rest from one `moq_session_stats` snapshot. Missing fields
+are omitted rather than shown as zero. No extra network traffic.
 
 ### Advanced settings
 

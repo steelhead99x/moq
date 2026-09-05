@@ -15,6 +15,7 @@ MoQOutput::MoQOutput(obs_data_t *, obs_output_t *output)
 	  path(),
 	  total_bytes_sent(0),
 	  connect_time_ms(0),
+	  session_epoch(0),
 	  origin(moq_origin_create()),
 	  broadcast(0),
 	  outstanding_sessions(0),
@@ -220,6 +221,7 @@ void MoQOutput::Reset()
 		session_attempt++;
 		session_connected = false;
 		connect_time_ms = 0;
+		session_epoch = 0;
 		stale = session;
 		session = 0;
 	}
@@ -266,12 +268,16 @@ bool MoQOutput::TryGetConnectionStats(ConnectionStats *out)
 	if (moq_session_stats(handle, &raw) != 0)
 		return false;
 
+	*out = {};
+	out->reconnects = GetReconnectCount();
 	out->rtt_valid = raw.rtt_valid;
 	out->rtt_ms = raw.rtt_valid ? static_cast<double>(raw.rtt_us) / 1000.0 : 0;
 	out->send_rate_valid = raw.send_rate_valid;
 	out->send_rate_bps = raw.send_rate_valid ? static_cast<double>(raw.send_rate_bps) : 0;
-	out->loss_valid = false;
-	out->loss_pct = 0;
+	out->recv_rate_valid = raw.recv_rate_valid;
+	out->recv_rate_bps = raw.recv_rate_valid ? static_cast<double>(raw.recv_rate_bps) : 0;
+	out->bytes_sent_valid = raw.bytes_sent_valid;
+	out->bytes_sent = raw.bytes_sent_valid ? raw.bytes_sent : 0;
 	if (raw.packets_sent_valid && raw.packets_lost_valid && raw.packets_sent > 0) {
 		out->loss_valid = true;
 		out->loss_pct = 100.0 * static_cast<double>(raw.packets_lost) / static_cast<double>(raw.packets_sent);
@@ -310,6 +316,7 @@ void MoQOutput::SessionConnected(const SessionRef &ref, int epoch)
 		// the same lock as the stamp check: a restart must not be able to clear it
 		// between the two and leave the old attempt's time showing.
 		connect_time_ms = ms;
+		session_epoch = epoch;
 	}
 
 	LOG_INFO("MoQ session connected (%d ms, epoch %d): %s", ms, epoch, ref.url.c_str());
@@ -345,6 +352,7 @@ void MoQOutput::SessionClosed(const SessionRef &ref, int code)
 			session_attempt++;
 			session_connected = false;
 			connect_time_ms = 0;
+			session_epoch = 0;
 		}
 	}
 

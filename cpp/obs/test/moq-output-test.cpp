@@ -256,6 +256,10 @@ int32_t moq_session_stats(uint32_t session, moq_connection_stats *dst)
 	dst->rtt_valid = true;
 	dst->send_rate_bps = 2'500'000;
 	dst->send_rate_valid = true;
+	dst->recv_rate_bps = 120'000;
+	dst->recv_rate_valid = true;
+	dst->bytes_sent = 4'000'000;
+	dst->bytes_sent_valid = true;
 	dst->packets_sent = 100;
 	dst->packets_sent_valid = true;
 	dst->packets_lost = 1;
@@ -595,23 +599,37 @@ int main()
 	printf("connect time cleared on teardown: ok\n");
 
 	// Dock polls TryGetConnectionStats once a second; it must succeed on a live
-	// handle and fail once the session is gone.
+	// handle and fail once the session is gone. Reconnect count tracks the epoch.
 	{
 		reset();
 		MoQOutput o(nullptr, out);
 		MoQOutput::ConnectionStats stats;
 		CHECK(!o.TryGetConnectionStats(&stats));
+		CHECK(o.GetReconnectCount() == 0);
 		CHECK(o.Start());
 		CHECK(o.TryGetConnectionStats(&stats));
 		CHECK(stats.rtt_valid);
 		CHECK(stats.rtt_ms > 0);
 		CHECK(stats.send_rate_valid);
 		CHECK(stats.send_rate_bps > 0);
+		CHECK(stats.recv_rate_valid);
+		CHECK(stats.bytes_sent_valid);
 		CHECK(stats.loss_valid);
+		CHECK(stats.reconnects == 0);
+		CHECK(o.GetReconnectCount() == 0);
 		fire(1);
+		CHECK(o.GetReconnectCount() == 0);
 		CHECK(o.TryGetConnectionStats(&stats));
+		CHECK(stats.reconnects == 0);
+		fire(2);
+		CHECK(o.GetReconnectCount() == 1);
+		CHECK(o.TryGetConnectionStats(&stats));
+		CHECK(stats.reconnects == 1);
+		fire(5);
+		CHECK(o.GetReconnectCount() == 4);
 		o.Stop(false);
 		fire(0);
+		CHECK(o.GetReconnectCount() == 0);
 		CHECK(!o.TryGetConnectionStats(&stats));
 	}
 	printf("connection stats snapshot: ok\n");
