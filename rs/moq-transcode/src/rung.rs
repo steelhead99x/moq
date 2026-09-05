@@ -265,10 +265,8 @@ async fn live(rung: &Rung, producer: &mut moq_net::track::Producer) -> Result<En
 						None => std::future::pending().await,
 					}
 				} => {
-					if changed {
-						if let Some(encoder) = &mut encoder {
-							apply_encoder_target(encoder, rung).await;
-						}
+					if changed && let Some(encoder) = &mut encoder {
+						apply_encoder_target(encoder, rung).await;
 					}
 					continue;
 				}
