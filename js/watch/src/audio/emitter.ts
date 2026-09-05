@@ -20,7 +20,7 @@ type EmitterOutput = {
 	enabled: Signal<boolean>;
 };
 
-// A helper that emits audio directly to the speakers.
+/** A helper that emits audio directly to the speakers. Not for spatial graphs; connect `Decoder.out.root` yourself. */
 export class Emitter {
 	readonly source: Decoder;
 

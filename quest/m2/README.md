@@ -28,6 +28,12 @@ can act on. Each still carries its own plan and regression test.
   ACK progress, reliable reset, hierarchical scheduling, and qmux
 - [Bandwidth estimate release](/quest/m2/web-transport-bandwidth-estimate.md) - web-transport-quinn reports quinn's BBR bandwidth estimate and ships a release carrying it
 - [#2847](/quest/m2/2847-the-quinn-backends-send-bandwidth-estimate-is-cwnd-rtt.md) - quinn backend: bump to the releases that report the controller bandwidth estimate instead of cwnd/rtt
+- [Benchmark comparisons](/quest/m2/performance-comparisons.md) - retained evidence, repeated paired runs, and uncertainty for performance claims
+- [Relay profiling](/quest/m2/performance-profiles.md) - reproducible CPU and allocation captures under the existing workloads
+- [Browser benchmarks](/quest/m2/browser-benchmarks.md) - measure JS transport, container, decode, and render costs in an identified browser
+- [Reader buffering](/quest/m2/stream-buffering.md) - measure and bound repeated prefix copying under fragmented input
+- [Traffic counter contention](/quest/m2/stats-contention.md) - quantify shared atomic accounting costs across fanout workers
+- [CMAF copies](/quest/m2/cmaf-copy-budget.md) - establish and reduce the browser container copy budget without changing ownership
 - [Relay memory](/quest/m2/relay-memory.md) - remeasure what an announcement costs after prefix routes
 - [Route gauge](/quest/m2/route-gauge.md) - an operator sees how many routes a relay holds for a path
 - [PoP skipping](/quest/m2/pop-skipping/README.md) - short cold paths for unpopular broadcasts without losing warm backhaul dedup
@@ -35,6 +41,8 @@ can act on. Each still carries its own plan and regression test.
 - [SEI](/quest/m2/sei/README.md) - H.26x SEI moves into its own track, readable without subscribing to video
 - [Processor](/quest/m2/processor/README.md) - a customer-run worker publishes an on-demand contribution with scoped access
 - [Timeline wall](/quest/m2/timeline-wall.md) - every built-in publisher anchors its timeline to wall time; the anchor is data, never a sync source
+- [Duration marker](/quest/m2/duration-marker.md) - a video group ends with an empty frame that closes its last frame's duration; audio never writes one
+- [LOC duration marker](/quest/m2/loc-duration-marker.md) - LOC producers write the marker once released consumers skip it
 - [#2278](/quest/m2/2278-watch-absolute-wall-clock-latency-target-for-synchronized.md) - hang: a timeline consumer exposes the wall anchor, and the library never syncs playback on it
 - [#2279](/quest/m2/2279-hang-typed-scte-35-ad-cue-signaling-carried-opaquely.md) - hang: SCTE-35 cues ride a per-rendition sidecar a player can act on
 - [Caption import](/quest/m2/captions-import.md) - fMP4 and MKV subtitle tracks import as text renditions instead of erroring or being dropped
@@ -69,6 +77,7 @@ can act on. Each still carries its own plan and regression test.
 - [#3137](/quest/m2/3137-moqsrc-bound-the-pending-rendition-subscriptions-a.md) - moqsrc: bound the pending rendition subscriptions a catalog can open
 - [#3115](/quest/m2/3115-moqsink-the-publication-has-no-generation-so-a-flush.md) - moqsink: a flushing restart after EOS opens a new publication generation
 - [#709](/quest/m2/709-automatic-letsencrypt-support.md) - the relay provisions and renews its own ACME certificate over HTTP-01, persisted on disk
+- [Shared watch AudioContext](/quest/m2/watch-shared-audio-context.md) - several audio Decoders render into one application-owned AudioContext
 - [Room SDK](/quest/m2/room-sdk.md) - a headless room package: a room is a path prefix, no service, no storage
 - [LiveKit shim](/quest/m2/livekit-shim.md) - a drop-in livekit-client-compatible package running rooms over MoQ
 - [Auth verdict](/quest/m2/auth-verdict.md) - the relay hands an opaque credential to its auth API and is told the grant; lands as the proxy mode in #3044

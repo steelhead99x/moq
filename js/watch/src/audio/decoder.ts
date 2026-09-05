@@ -22,9 +22,21 @@ import { Warmup } from "./warmup";
 const LATENCY_REANCHOR_DEBOUNCE_MS = 150;
 const LEGACY_WARMUP_CALLBACKS = 3;
 
+// Shared contexts load the render processor once; a second addModule for the same name throws.
+const loadedRenderModules = new WeakSet<BaseAudioContext>();
+
 export type DecoderInput = {
 	// Enable to download the audio track.
 	enabled: Getter<boolean>;
+};
+
+/** Constructor options: wired inputs plus the optional shared AudioContext knob. */
+export type DecoderProps = Inputs<DecoderInput> & {
+	/**
+	 * Render into this AudioContext instead of creating one. Spatial playback needs every remote in
+	 * the same context (one listener, many panners). The decoder never closes an injected context.
+	 */
+	context?: AudioContext | Signal<AudioContext | undefined>;
 };
 
 type DecoderOutput = {
@@ -57,11 +69,20 @@ export interface Stats {
  * Downloads audio from a track and emits it to an AudioContext.
  *
  * The user is responsible for hooking up audio to speakers, an analyzer, etc.
+ * For spatial playback, inject one shared AudioContext via {@link Decoder.context} and connect
+ * {@link Decoder.out.root} to a PannerNode. Do not use {@link Emitter} for positioned sources;
+ * it always wires the root to `destination`.
  */
 export class Decoder {
 	readonly in: Readonlys<DecoderInput>;
 	readonly source: Source;
 	readonly sync: Sync;
+
+	/**
+	 * When set, the decoder renders into this context and never closes it. Unset means the decoder
+	 * owns a private AudioContext.
+	 */
+	readonly context: Signal<AudioContext | undefined>;
 
 	readonly #out: DecoderOutput = {
 		context: new Signal<AudioContext | undefined>(undefined),
@@ -98,10 +119,11 @@ export class Decoder {
 
 	#signals = new Effect();
 
-	constructor(source: Source, sync: Sync, props?: Inputs<DecoderInput>) {
+	constructor(source: Source, sync: Sync, props?: DecoderProps) {
 		this.in = {
 			enabled: getter(props?.enabled ?? false),
 		};
+		this.context = Signal.from(props?.context);
 
 		this.source = source;
 		this.sync = sync;
@@ -132,24 +154,37 @@ export class Decoder {
 		// Expose the rate the graph actually runs at.
 		effect.set(this.#out.sampleRate, sampleRate);
 
-		const context = new AudioContext({
-			latencyHint: "interactive", // We don't use real-time because of the buffer.
-			sampleRate,
-		});
+		const injected = effect.get(this.context);
+		let context: AudioContext;
+		if (injected) {
+			context = injected;
+			if (injected.sampleRate !== sampleRate) {
+				console.warn(
+					`audio: injected AudioContext is ${injected.sampleRate}Hz, decoded audio is ${sampleRate}Hz; keep them matched or resample in the app`,
+				);
+			}
+		} else {
+			context = new AudioContext({
+				latencyHint: "interactive", // We don't use real-time because of the buffer.
+				sampleRate,
+			});
+			effect.cleanup(() => context.close());
+		}
 		effect.set(this.#out.context, context);
-
-		effect.cleanup(() => context.close());
 
 		effect.spawn(async () => {
 			// Register the AudioWorklet processor, racing the load against teardown. If teardown wins,
 			// `loaded` is undefined and we bail before constructing the node: the module registration was
 			// abandoned, so building against its name would throw. Gate on the race result, not
 			// `context.state`, because `AudioContext.close()` only flips `.state` to "closed" synchronously
-			// on Chrome (Firefox/Safari report "suspended").
-			const loaded = await Promise.race([
-				context.audioWorklet.addModule(RenderWorklet).then(() => true),
-				effect.cancel,
-			]);
+			// on Chrome (Firefox/Safari report "suspended"). Shared contexts skip a second addModule.
+			const load = loadedRenderModules.has(context)
+				? Promise.resolve(true)
+				: context.audioWorklet.addModule(RenderWorklet).then(() => {
+						loadedRenderModules.add(context);
+						return true as const;
+					});
+			const loaded = await Promise.race([load, effect.cancel]);
 			if (!loaded) return;
 
 			// Create the worklet node. outputChannelCount must be set explicitly
