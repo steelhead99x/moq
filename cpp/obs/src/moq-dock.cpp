@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "moq-dock.h"
 #include "moq-advanced-dialog.h"
+#include "moq-output.h"
 #include "moq-settings.h"
 #include "logger.h"
 
@@ -18,6 +19,7 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QMetaObject>
+#include <QStringList>
 
 #include <cstring>
 #include <random>
@@ -87,6 +89,15 @@ std::string RandomBroadcastName()
 	for (int i = 0; i < 6; i++)
 		s += charset[dist(gen)];
 	return s;
+}
+
+QString FormatSendRate(double bps)
+{
+	if (bps >= 1'000'000.0)
+		return QString("%1 Mbps").arg(bps / 1'000'000.0, 0, 'f', 1);
+	if (bps >= 1'000.0)
+		return QString("%1 kbps").arg(bps / 1'000.0, 0, 'f', 0);
+	return QString("%1 bps").arg(bps, 0, 'f', 0);
 }
 
 } // namespace
@@ -359,12 +370,34 @@ void MoQDock::UpdateStatus()
 	if (!output || !running)
 		return;
 
-	// libmoq surfaces connection state via the session-connect callback, which
-	// MoQOutput records as the output's connect time; until that fires we're
-	// still connecting. There's no per-frame stats API to show beyond this.
-	const bool connected = obs_output_get_connect_time_ms(output) > 0;
-	status->setText(connected ? "● Connected" : "● Connecting…");
-	status->setStyleSheet(connected ? "color: #36a45e;" : "color: #d08b1d;");
+	const bool everConnected = obs_output_get_connect_time_ms(output) > 0;
+	if (!everConnected) {
+		status->setText("● Connecting…");
+		status->setStyleSheet("color: #d08b1d;");
+		return;
+	}
+
+	auto *moq = static_cast<MoQOutput *>(obs_obj_get_data(output));
+	MoQOutput::ConnectionStats stats;
+	if (!moq || !moq->TryGetConnectionStats(&stats)) {
+		// libmoq reconnects under the same session handle; stats fail while
+		// there is no live connection between attempts.
+		status->setText("● Reconnecting…");
+		status->setStyleSheet("color: #d08b1d;");
+		return;
+	}
+
+	QStringList parts;
+	parts << "● Connected";
+	if (stats.rtt_valid)
+		parts << QString("RTT %1 ms").arg(stats.rtt_ms, 0, 'f', stats.rtt_ms < 10.0 ? 1 : 0);
+	if (stats.send_rate_valid)
+		parts << FormatSendRate(stats.send_rate_bps);
+	if (stats.loss_valid)
+		parts << QString("loss %1%").arg(stats.loss_pct, 0, 'f', stats.loss_pct < 10.0 ? 1 : 0);
+
+	status->setText(parts.join(" · "));
+	status->setStyleSheet("color: #36a45e;");
 }
 
 void MoQDock::LoadSettings()

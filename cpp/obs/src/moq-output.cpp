@@ -249,6 +249,36 @@ void MoQOutput::Reset()
 	}
 }
 
+bool MoQOutput::TryGetConnectionStats(ConnectionStats *out)
+{
+	if (!out)
+		return false;
+
+	uint32_t handle;
+	{
+		std::lock_guard<std::mutex> lock(session_mutex);
+		handle = static_cast<uint32_t>(session);
+	}
+	if (handle == 0)
+		return false;
+
+	moq_connection_stats raw{};
+	if (moq_session_stats(handle, &raw) != 0)
+		return false;
+
+	out->rtt_valid = raw.rtt_valid;
+	out->rtt_ms = raw.rtt_valid ? static_cast<double>(raw.rtt_us) / 1000.0 : 0;
+	out->send_rate_valid = raw.send_rate_valid;
+	out->send_rate_bps = raw.send_rate_valid ? static_cast<double>(raw.send_rate_bps) : 0;
+	out->loss_valid = false;
+	out->loss_pct = 0;
+	if (raw.packets_sent_valid && raw.packets_lost_valid && raw.packets_sent > 0) {
+		out->loss_valid = true;
+		out->loss_pct = 100.0 * static_cast<double>(raw.packets_lost) / static_cast<double>(raw.packets_sent);
+	}
+	return true;
+}
+
 // libmoq status codes (>= 0.3.0): > 0 = (re)connected, carrying the connection
 // epoch; 0 = closed cleanly (terminal); < 0 = fatal, reconnection gave up (terminal).
 void MoQOutput::SessionStatus(void *user_data, int code)

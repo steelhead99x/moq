@@ -25,6 +25,18 @@ public:
 
 	inline int GetConnectTime() { return connect_time_ms; }
 
+	// Point-in-time QUIC/WebTransport health for the live session. False when
+	// there is no session or libmoq is between reconnects (no live connection).
+	struct ConnectionStats {
+		bool rtt_valid = false;
+		double rtt_ms = 0;
+		bool send_rate_valid = false;
+		double send_rate_bps = 0;
+		bool loss_valid = false;
+		double loss_pct = 0;
+	};
+	bool TryGetConnectionStats(ConnectionStats *out);
+
 private:
 	// Handed to libmoq as the status callback's user_data. Carries everything a
 	// callback needs about its own Start() attempt, so it never has to read a
