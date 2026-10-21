@@ -11,7 +11,7 @@ function decodeJson(raw: Uint8Array): Record<string, unknown> {
 
 test("decodes a draft-00 catalog with a numeric version", () => {
 	// Example 1 from draft-ietf-moq-msf-00, trimmed. Numeric version plus unmodeled
-	// fields (namespace, targetLatency, generatedAt) which must be ignored.
+	// fields (targetLatency, generatedAt) which must be ignored.
 	const catalog = decode(
 		encodeJson({
 			version: 1,
@@ -185,23 +185,93 @@ test("preserves SAP fields through decode and encode", () => {
 	expect(wireTracks[0].jitter).toBe(15);
 });
 
-test.each([
-	["omitted", undefined],
-	["false", false],
-	["true", true],
-] as const)("preserves %s stalled state through decode and encode", (_name, stalled) => {
+test("preserves delay through decode and encode", () => {
+	const catalog = decode(
+		encodeJson({
+			version: "draft-01",
+			tracks: [
+				{
+					name: "video0",
+					packaging: "loc",
+					isLive: true,
+					role: "video",
+					codec: "avc1.640028",
+					delay: 200,
+				},
+			],
+		}),
+	);
+
+	expect(catalog.tracks[0].delay).toBe(200);
+
+	const wire = decodeJson(encode(catalog));
+	const wireTracks = wire.tracks as { delay?: number }[];
+	expect(wireTracks[0].delay).toBe(200);
+});
+
+test("carries extension root members through decode and encode", () => {
+	// An extension section (here `mpegts`) rides the catalog root untouched, and a
+	// section this build has never heard of survives the same way.
+	const catalog = decode(
+		encodeJson({
+			version: "draft-01",
+			generatedAt: 1746104606044,
+			tracks: [],
+			mpegts: { program: { transportStreamId: 4660, programNumber: 1, pmtPid: 100 } },
+			somethingElse: [1, 2, 3],
+		}),
+	);
+
+	expect(Object.keys(catalog.ext ?? {})).toEqual(["mpegts", "somethingElse"]);
+
+	const wire = decodeJson(encode(catalog));
+	expect(wire.mpegts).toEqual({ program: { transportStreamId: 4660, programNumber: 1, pmtPid: 100 } });
+	expect(wire.somethingElse).toEqual([1, 2, 3]);
+	// `generatedAt` is MSF's own field, not an extension section, so it is not smuggled back.
+	expect(wire.generatedAt).toBeUndefined();
+});
+
+test("refuses an extension section named after a reserved root field", () => {
+	expect(() => encode({ tracks: [], ext: { tracks: "nope" } })).toThrow(/reserved root field/);
+});
+
+test("round-trips a __proto__ extension member as data", () => {
+	// Assigning `__proto__` to an ordinary object invokes the prototype setter: the member
+	// vanishes from the catalog and its value becomes the map's prototype. Built as raw JSON,
+	// since `__proto__:` in an object literal is that same setter syntax and never lands as a key.
+	const raw = '{"version":"draft-01","tracks":[],"__proto__":{"polluted":1},"ok":2}';
+	const catalog = decode(new TextEncoder().encode(raw));
+
+	const ext = catalog.ext ?? {};
+	expect(Object.keys(ext).sort()).toEqual(["__proto__", "ok"]);
+	expect(Object.getPrototypeOf(ext)).toBeNull();
+
+	const wire = decodeJson(encode(catalog));
+	expect(Object.keys(wire)).toContain("__proto__");
+	expect(wire.ok).toBe(2);
+});
+
+test("caption role, label, language and codec survive the wire", () => {
 	const track = {
-		name: "video0",
+		name: "captions.en",
 		packaging: "loc",
 		isLive: true,
-		role: "video",
-		codec: "av01.0.08M.10.0.110.09",
-		...(stalled === undefined ? {} : { stalled }),
+		role: "caption",
+		codec: "ttml",
+		lang: "en",
+		label: "English SDH",
 	};
-	const catalog = decode(encodeJson({ version: "draft-01", tracks: [track] }));
+	expect(decode(encode({ tracks: [track] })).tracks).toEqual([track]);
+});
 
-	expect(catalog.tracks[0].stalled).toBe(stalled);
-	const wire = decodeJson(encode(catalog));
-	const tracks = wire.tracks as { stalled?: boolean }[];
-	expect(tracks[0].stalled).toBe(stalled);
+test("preserves a track namespace through MSF decoding and encoding", () => {
+	for (const version of [1, "draft-01"]) {
+		const wire = encodeJson({
+			version,
+			tracks: [{ name: "video", namespace: "room/left", packaging: "loc", role: "video", codec: "vp8" }],
+		});
+		expect(decodeJson(encode(decode(wire))).tracks).toEqual([
+			{ name: "video", namespace: "room/left", packaging: "loc", role: "video", codec: "vp8", isLive: false },
+		]);
+	}
 });

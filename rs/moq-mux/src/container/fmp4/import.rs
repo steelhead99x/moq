@@ -4,7 +4,7 @@ use moq_net::Timestamp;
 use mp4_atom::{Any, Atom, DecodeMaybe, Encode, Mdat, Moof, Moov, Trak};
 use std::collections::{HashMap, HashSet};
 
-use super::Error;
+use super::{Error, Kind, sample};
 use crate::Result;
 use crate::catalog::Estimator;
 
@@ -16,8 +16,8 @@ use crate::catalog::Estimator;
 /// ## Supported Codecs
 ///
 /// **Video:**
-/// - H.264 (AVC1)
-/// - H.265 (HEVC/HEV1/HVC1)
+/// - H.264 (AVC1/AVC3)
+/// - H.265 (HEV1/HVC1)
 /// - VP8
 /// - VP9
 /// - AV1
@@ -26,6 +26,9 @@ use crate::catalog::Estimator;
 /// - AAC (MP4A)
 /// - Opus
 /// - FLAC
+///
+/// **Text:** WebVTT (`wvtt`), reconstructed as timed text, and TTML (`stpp`) documents moved onto the
+/// catalog clock; unsupported subtitle codecs, including other XML namespaces, are skipped.
 pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	/// The broadcast being produced
 	broadcast: moq_net::broadcast::Producer,
@@ -33,16 +36,21 @@ pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	/// The catalog being produced
 	catalog: crate::catalog::Producer<E>,
 
-	/// Held until the moov's track set is declared, so the catalog is withheld from the broadcast
-	/// until every rendition is in (and, when composed with other importers, until they finish too).
-	/// Dropped in [`init`](Self::init).
+	/// Held until the first fragment anchors the clock, so the catalog is withheld from the broadcast
+	/// until every rendition is in and its root `clock` is final (and, when composed with other
+	/// importers, until they release theirs too).
 	initial_reservation: Option<crate::catalog::Reserved<E>>,
+
+	/// The source's timestamp base: the first fragment anchors it, and every fragment's timestamp
+	/// shifts by its offset onto the catalog clock. The `tfdt` inside a fragment stays verbatim.
+	timebase: crate::catalog::Timebase<E>,
 
 	// Which track roles to publish. `None` imports every supported track.
 	select: Option<crate::select::Broadcast>,
 
 	// A lookup to tracks in the broadcast
-	tracks: HashMap<u32, Fmp4Track>,
+	tracks: HashMap<u32, Fmp4Track<E>>,
+	text: HashMap<u32, super::text::Track>,
 
 	// Track ids skipped by `select`, so their moof fragments are ignored rather
 	// than treated as referencing an unknown track.
@@ -58,48 +66,83 @@ pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	// Bytes carried across calls: a partial atom at the tail of one `decode` waits
 	// here for the rest to arrive on the next call.
 	buffer: BytesMut,
+
+	// A segment boundary (a styp or an explicit `cut()`) waiting to land on the next fragment.
+	pending_cut: bool,
+
+	// Which segment the fragments arriving now belong to. Bumped at each boundary; a track whose
+	// open group belongs to an older one rolls, so every track segments identically.
+	segment: u64,
+
+	// The current segment's boundary was declared by the source (rather than inferred from a
+	// keyframe), so each track cuts its timeline where it opens its group for the segment.
+	declared: bool,
+	dropped_metadata: u64,
 }
 
-#[derive(PartialEq, Debug)]
-enum TrackKind {
-	Video,
-	Audio,
+/// The catalog entry for one imported track, whichever section it lives in.
+///
+/// Both arms own the private catalog entry, so publishing what the estimator measured and retiring
+/// the entry on drop is the same code either way.
+enum Rendition<E: crate::catalog::hang::CatalogExt> {
+	Video(crate::catalog::VideoTrack<E>),
+	Audio(crate::catalog::AudioTrack<E>),
 }
 
-struct Fmp4Track {
-	kind: TrackKind,
+impl<E: crate::catalog::hang::CatalogExt> Rendition<E> {
+	fn estimate(&mut self, estimate: crate::catalog::Estimate) -> crate::Result<()> {
+		match self {
+			Self::Video(rendition) => rendition.estimate(estimate),
+			Self::Audio(rendition) => rendition.estimate(estimate),
+		}
+	}
+}
+
+struct Fmp4Track<E: crate::catalog::hang::CatalogExt> {
+	kind: Kind,
+
+	/// The `trex` values this track's samples fall back to.
+	defaults: sample::Defaults,
+
+	/// The catalog entry, which owns the published bitrate and jitter and removes itself on drop.
+	rendition: Rendition<E>,
 
 	track: moq_net::track::Producer,
 	group: Option<moq_net::group::Producer>,
 
-	// Indexes this track's group opens into its `<name>.timeline.z` timeline, advertised in the
-	// rendition's config. Passthrough writes groups by hand (no `container::Producer`), so the
-	// recorder is fed directly at each keyframe rather than through `with_recorder`.
-	// `None` once recording has failed, matching `container::Producer`: the timeline is an
-	// optional sidecar, so losing it must not take the media down with it.
+	// Reports this track's fragments into its timeline. Passthrough writes groups by hand (no
+	// `container::Producer`), so the recorder is fed directly rather than through `with_recorder`.
 	recorder: Option<crate::timeline::Recorder>,
 
-	// The minimum buffer required for the track.
-	jitter: Option<Timestamp>,
+	// The decode time of the last fragment, which the next one has to advance past.
+	last_decode_time: Option<u64>,
 
-	// The last timestamp seen for this track.
-	last_timestamp: Option<Timestamp>,
-
-	// The minimum duration between frames for this track.
-	min_duration: Option<Timestamp>,
+	// The shortest declared sample duration, used when a final sample leaves its end open.
+	sample_duration: Option<Timestamp>,
 
 	// Sequence to use for the next group, set by `Import::seek`.
 	pending_sequence: Option<u64>,
 
-	// Measures the track bitrate from fragment sizes, used only when the CMAF descriptor didn't
-	// declare one. Jitter comes from the fragment timing above, not this estimator.
+	// The segment this track's open group belongs to. A mismatch with `Import::segment` rolls the
+	// group, which is what keeps audio on the same boundaries as video.
+	segment: Option<u64>,
+
+	// Measures the track's catalog jitter and bitrate from the fragments; the descriptor's own
+	// bitrate, when it declares one, still wins over what this measures.
 	estimator: Estimator,
 
-	// The last bitrate written to the catalog, so an unchanged one doesn't republish it.
-	bitrate: Option<u64>,
+	/// Peak-hold claim on the connection allocator. Passthrough writes groups by
+	/// hand, so this sits beside the estimator the same way it does on a
+	/// [`container::Producer`](crate::container::Producer).
+	claim: crate::catalog::Claim,
+}
 
-	// Whether the descriptor left the bitrate unset, so the estimator should fill it.
-	detect_bitrate: bool,
+impl<E: crate::catalog::hang::CatalogExt> Fmp4Track<E> {
+	fn publish_estimate(&mut self) -> crate::Result<()> {
+		let estimate = self.estimator.estimate();
+		self.claim.update(&self.track.demand(), estimate.bitrate);
+		self.rendition.estimate(estimate)
+	}
 }
 
 impl<E: crate::catalog::hang::CatalogExt> Import<E> {
@@ -109,16 +152,41 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	pub fn new(broadcast: moq_net::broadcast::Producer, reserved: crate::catalog::Reserved<E>) -> Self {
 		Self {
 			catalog: reserved.producer(),
+			timebase: reserved.timebase(),
 			initial_reservation: Some(reserved),
 			select: None,
 			tracks: HashMap::default(),
+			text: HashMap::default(),
 			skipped: HashSet::default(),
 			moov: None,
 			moof: None,
 			moof_size: 0,
 			broadcast,
 			buffer: BytesMut::new(),
+			pending_cut: false,
+			segment: 0,
+			declared: false,
+			dropped_metadata: 0,
 		}
+	}
+
+	/// Return the number of metadata units discarded by this importer.
+	pub fn dropped_metadata(&self) -> u64 {
+		self.dropped_metadata
+	}
+
+	/// Declare that the next fragment starts a new segment, for callers that know the source's
+	/// segmentation out of band (e.g. an HLS import following its playlist).
+	///
+	/// A `styp` atom (a CMAF segment on disk) does this on its own, so an importer reading a
+	/// segmented file needs no help. Each track's timeline then closes a record where that track
+	/// opens its group for the new segment, following the source's segmentation instead of the
+	/// minimum-duration pacing.
+	///
+	/// This is where groups are drawn too: every track rolls its group at a segment boundary, so
+	/// a group is a segment and each fragment inside it is a frame.
+	pub fn cut(&mut self) {
+		self.pending_cut = true;
 	}
 
 	/// Restrict which track roles are published.
@@ -134,11 +202,11 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	}
 
 	/// Whether `kind` is selected for import (every role when unset).
-	fn selects(&self, kind: &TrackKind) -> bool {
+	fn selects(&self, kind: &Kind) -> bool {
 		match (&self.select, kind) {
 			(None, _) => true,
-			(Some(select), TrackKind::Video) => select.has_video(),
-			(Some(select), TrackKind::Audio) => select.has_audio(),
+			(Some(select), Kind::Video) => select.has_video(),
+			(Some(select), Kind::Audio) => select.has_audio(),
 		}
 	}
 
@@ -176,7 +244,16 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 		for (atom, start, size) in parsed {
 			match atom {
-				Any::Ftyp(_) | Any::Styp(_) => {}
+				Any::Ftyp(_) => {}
+				Any::Emsg(_) => {
+					self.dropped_metadata += 1;
+					if self.dropped_metadata == 1 {
+						tracing::warn!(count = self.dropped_metadata, "discarding fMP4 emsg metadata");
+					}
+				}
+				// A styp opens a CMAF segment: the on-disk segmentation is the boundary,
+				// landing on the next fragment.
+				Any::Styp(_) => self.pending_cut = true,
 				Any::Moov(moov) => {
 					self.init(moov)?;
 				}
@@ -202,25 +279,28 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	}
 
 	fn init(&mut self, moov: Moov) -> Result<()> {
-		// Clone the catalog to avoid the borrow checker.
-		let mut catalog = self.catalog.clone();
-		let mut catalog = catalog.lock();
+		// A second moov would re-declare a track set the catalog already advertises.
+		if self.moov.is_some() {
+			return Err(Error::DuplicateMoov.into());
+		}
+		// Only `finish()` releases the reservation before a moov, since a fragment needs one.
+		let reserved = self.initial_reservation.clone().ok_or(Error::MoovAfterFinish)?;
 
 		for trak in &moov.trak {
 			let track_id = trak.tkhd.track_id;
 			let handler = &trak.mdia.hdlr.handler;
 			let suffix = ".m4s";
 
-			let kind = match handler.as_ref() {
-				b"vide" => TrackKind::Video,
-				b"soun" => TrackKind::Audio,
-				b"sbtl" => return Err(Error::UnsupportedSubtitle.into()),
-				handler => {
-					let mut buf = [0u8; 4];
-					buf[..handler.len().min(4)].copy_from_slice(&handler[..handler.len().min(4)]);
-					return Err(Error::UnknownTrackHandler(buf).into());
+			if matches!(handler.as_ref(), b"sbtl" | b"subt" | b"text") {
+				if self.init_text(trak, &moov, &reserved)? {
+					continue;
 				}
-			};
+				tracing::warn!(track_id, handler = %handler, "unsupported fMP4 subtitle encoding, skipping");
+				self.skipped.insert(track_id);
+				continue;
+			}
+
+			let kind = Kind::from_handler(*handler)?;
 
 			// Drop tracks whose role isn't selected before minting or publishing them; their
 			// moof fragments are ignored in `extract`.
@@ -229,34 +309,34 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				continue;
 			}
 
-			// Declare the track at the fMP4's native timescale. Frame timestamps are
-			// emitted at this same scale (see below), so they satisfy the track's
-			// timescale invariant and ride the wire for the relay, redundant with the
-			// timing already inside each CMAF fragment.
+			// Declare the track at the fMP4's native timescale, which the moq-hang draft requires
+			// of a CMAF track: frame timestamps are emitted at this same scale (see below), so
+			// each one carries its fragment's earliest presentation time exactly.
 			let timescale = moq_net::Timescale::new(trak.mdia.mdhd.timescale as u64)?;
 			let track = self.broadcast.create_track(
 				self.broadcast.unique_name(suffix),
-				self.catalog.track_info().with_timescale(timescale),
+				self.catalog.track_info(kind.priority()).with_timescale(timescale),
 			)?;
 
-			// Each track indexes its own group opens: audio and video group boundaries differ, so a
-			// per-track timeline (the 1:1 default) is correct here, not a shared one.
-			let timeline = self.catalog.timeline(track.name())?;
+			// Enroll every track in the broadcast's timelines: passthrough writes groups by hand
+			// (no `container::Producer`), so the recorder is fed directly at each fragment. The
+			// reservation holds the archive entry back until the whole track set is declared.
+			let recorder = self.catalog.enroll(track.name(), None)?;
 
-			let detect_bitrate = match kind {
-				TrackKind::Video => {
-					let mut config = self.init_video(trak, &moov)?;
-					let detect = config.bitrate.is_none();
-					config.timeline = Some(timeline.section());
-					catalog.video.renditions.insert(track.name().to_string(), config);
-					detect
+			// Whatever the descriptor declared (a bitrate) is authoritative; the rest is filled by
+			// `estimate` as fragments arrive.
+			let rendition = match kind {
+				Kind::Video => {
+					let config = self.init_video(trak, &moov)?;
+					let mut rendition = reserved.init(track.name())?;
+					rendition.set(config)?;
+					Rendition::Video(rendition)
 				}
-				TrackKind::Audio => {
-					let mut config = self.init_audio(trak, &moov)?;
-					let detect = config.bitrate.is_none();
-					config.timeline = Some(timeline.section());
-					catalog.audio.renditions.insert(track.name().to_string(), config);
-					detect
+				Kind::Audio => {
+					let config = self.init_audio(trak, &moov)?;
+					let mut rendition = reserved.init(track.name())?;
+					rendition.set(config)?;
+					Rendition::Audio(rendition)
 				}
 			};
 
@@ -264,28 +344,70 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				track_id,
 				Fmp4Track {
 					kind,
+					defaults: sample::Defaults::from_moov(&moov, track_id),
+					rendition,
 					track,
 					group: None,
-					recorder: Some(timeline.recorder()),
-					jitter: None,
-					last_timestamp: None,
-					min_duration: None,
+					segment: None,
+					recorder: Some(recorder),
+					last_decode_time: None,
+					sample_duration: None,
 					pending_sequence: None,
 					estimator: Estimator::new(),
-					bitrate: None,
-					detect_bitrate,
+					claim: crate::catalog::Claim::new(self.catalog.bandwidth()),
 				},
 			);
 		}
 
-		drop(catalog);
-
-		// The moov's full track set is declared now; release the reservation so the catalog publishes.
-		self.initial_reservation = None;
+		// The reservation stays held until the first fragment anchors the clock, unless no track
+		// was declared: then no fragment ever will.
+		if self.tracks.is_empty() && self.text.is_empty() {
+			self.initial_reservation = None;
+		}
 
 		self.moov = Some(moov);
 
 		Ok(())
+	}
+
+	fn init_text(&mut self, trak: &Trak, moov: &Moov, reserved: &crate::catalog::Reserved<E>) -> Result<bool> {
+		let (format, mut config) = match trak.mdia.minf.stbl.stsd.codecs.as_slice() {
+			[mp4_atom::Codec::Wvtt(codec)] => {
+				if codec.plaintext.data_reference_index != 1 {
+					return Err(Error::InvalidSubtitle("external subtitle data reference").into());
+				}
+				let header = crate::container::text::header(&codec.config.config).map_err(Error::InvalidSubtitle)?;
+				let mut config = hang::catalog::TextConfig::new(hang::catalog::TextFormat::Vtt);
+				config.role = crate::container::text::role(&header);
+				(super::text::Format::Vtt { header }, config)
+			}
+			[mp4_atom::Codec::Unknown(kind, body)] if kind.as_ref() == b"stpp" && super::text::stpp(body)? => (
+				super::text::Format::Ttml,
+				hang::catalog::TextConfig::new(hang::catalog::TextFormat::Ttml),
+			),
+			_ => return Ok(false),
+		};
+		config.lang = Some(trak.mdia.mdhd.language.clone());
+		// The picker label is the HandlerBox name; `vlab` is an opaque source identifier.
+		config.label = (!trak.mdia.hdlr.name.is_empty()).then(|| trak.mdia.hdlr.name.clone());
+		let wire = crate::catalog::hang::Container::new(&config.container, crate::container::Kind::Data)?;
+		let track = self.broadcast.create_track(
+			self.broadcast.unique_name(".mp4-t"),
+			self.catalog.track_info(hang::catalog::PRIORITY.text),
+		)?;
+		let producer = reserved.text(track, wire, config)?;
+		self.text.insert(
+			trak.tkhd.track_id,
+			super::text::Track {
+				producer,
+				format,
+				defaults: sample::Defaults::from_moov(moov, trak.tkhd.track_id),
+				timescale: moq_net::Timescale::new(trak.mdia.mdhd.timescale as u64)?,
+				end_decode_time: None,
+				discontinuity: false,
+			},
+		);
+		Ok(true)
 	}
 
 	fn container(&self, trak: &Trak, moov: &Moov) -> Result<Container> {
@@ -340,39 +462,47 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			_ => return Err(Error::MultipleCodecs.into()),
 		};
 
-		let config = match codec {
-			mp4_atom::Codec::Avc1(avc1) => {
-				let avcc = &avc1.avcc;
-
-				let mut description = BytesMut::new();
-				avcc.encode_body(&mut description)?;
-
-				let mut config = VideoConfig::new(H264 {
-					profile: avcc.avc_profile_indication,
-					constraints: avcc.profile_compatibility,
-					level: avcc.avc_level_indication,
-					inline: false,
-				});
-				config.coded_width = Some(avc1.visual.width as _);
-				config.coded_height = Some(avc1.visual.height as _);
-				config.description = Some(description.freeze());
-				config.container = container;
-				config
-			}
-			mp4_atom::Codec::Hev1(hev1) => self.init_h265(true, &hev1.hvcc, &hev1.visual, container)?,
-			mp4_atom::Codec::Hvc1(hvc1) => self.init_h265(false, &hvc1.hvcc, &hvc1.visual, container)?,
+		let (mut config, colr, pasp) = match codec {
+			mp4_atom::Codec::Avc1(avc1) => (
+				self.init_h264(false, &avc1.avcc, &avc1.visual, container)?,
+				avc1.colr.as_ref(),
+				avc1.pasp.as_ref(),
+			),
+			mp4_atom::Codec::Avc3(avc3) => (
+				self.init_h264(true, &avc3.avcc, &avc3.visual, container)?,
+				avc3.colr.as_ref(),
+				avc3.pasp.as_ref(),
+			),
+			mp4_atom::Codec::Hev1(hev1) => (
+				self.init_h265(true, &hev1.hvcc, &hev1.visual, container)?,
+				hev1.colr.as_ref(),
+				hev1.pasp.as_ref(),
+			),
+			mp4_atom::Codec::Hvc1(hvc1) => (
+				self.init_h265(false, &hvc1.hvcc, &hvc1.visual, container)?,
+				hvc1.colr.as_ref(),
+				hvc1.pasp.as_ref(),
+			),
 			mp4_atom::Codec::Vp08(vp08) => {
 				let mut config = VideoConfig::new(VideoCodec::VP8);
+				// vpcC carries VP8's colour too; its range is always explicit.
+				let vpcc = &vp08.vpcc;
+				config.color = crate::codec::color::cicp(
+					vpcc.color_primaries,
+					vpcc.transfer_characteristics,
+					vpcc.matrix_coefficients,
+					Some(vpcc.video_full_range_flag),
+				);
 				config.coded_width = Some(vp08.visual.width as _);
 				config.coded_height = Some(vp08.visual.height as _);
 				config.container = container;
-				config
+				(config, vp08.colr.as_ref(), vp08.pasp.as_ref())
 			}
 			mp4_atom::Codec::Vp09(vp09) => {
 				// https://github.com/gpac/mp4box.js/blob/325741b592d910297bf609bc7c400fc76101077b/src/box-codecs.js#L238
 				let vpcc = &vp09.vpcc;
 
-				let mut config = VideoConfig::new(VP9 {
+				let vp9 = VP9 {
 					profile: vpcc.profile,
 					level: vpcc.level,
 					bit_depth: vpcc.bit_depth,
@@ -381,23 +511,72 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 					transfer_characteristics: vpcc.transfer_characteristics,
 					matrix_coefficients: vpcc.matrix_coefficients,
 					full_range: vpcc.video_full_range_flag,
-				});
+				};
+				let mut config = VideoConfig::new(vp9.clone());
+				config.color = crate::codec::vp9::color(&vp9);
 				config.coded_width = Some(vp09.visual.width as _);
 				config.coded_height = Some(vp09.visual.height as _);
 				config.container = container;
-				config
+				(config, vp09.colr.as_ref(), vp09.pasp.as_ref())
 			}
 			mp4_atom::Codec::Av01(av01) => {
 				let mut config = VideoConfig::new(crate::codec::av1::av1_from_av1c(&av01.av1c));
+				config.color = crate::codec::av1::color(&av01.av1c.config_obus);
 				config.coded_width = Some(av01.visual.width as _);
 				config.coded_height = Some(av01.visual.height as _);
 				config.container = container;
-				config
+				(config, av01.colr.as_ref(), av01.pasp.as_ref())
 			}
-			mp4_atom::Codec::Unknown(unknown) => return Err(Error::UnknownCodec(*unknown).into()),
+			mp4_atom::Codec::Unknown(unknown, _) => return Err(Error::UnknownCodec(*unknown).into()),
 			unsupported => return Err(Error::UnsupportedCodec(Box::new(unsupported.clone())).into()),
 		};
+		// The codec config outranks the colr box a muxer added, which only fills its gaps.
+		let colr = colr.map(super::colr_color).transpose()?.flatten();
+		crate::codec::color::fill(&mut config.color, colr.as_ref(), "colr");
+		if let Some(pasp) = pasp {
+			let width = config.coded_width.ok_or(Error::InvalidAspect("missing width"))?;
+			let height = config.coded_height.ok_or(Error::InvalidAspect("missing height"))?;
+			let aspect = crate::codec::video::reduce_aspect(
+				u128::from(width) * u128::from(pasp.h_spacing),
+				u128::from(height) * u128::from(pasp.v_spacing),
+			)
+			.ok_or(Error::InvalidAspect("invalid or unrepresentable pasp"))?;
+			// Square samples add no catalog field, but can still contradict an SPS.
+			if pasp.h_spacing != pasp.v_spacing || config.display_aspect_width.is_some() {
+				crate::codec::video::fill_display_aspect(&mut config, aspect, "pasp");
+			}
+		}
 
+		Ok(config)
+	}
+
+	/// The avcC stays the description even for avc3, where it may list no parameter
+	/// sets: it still carries the NAL length size the samples are framed with.
+	fn init_h264(
+		&mut self,
+		inline: bool,
+		avcc: &mp4_atom::Avcc,
+		visual: &mp4_atom::Visual,
+		container: Container,
+	) -> Result<VideoConfig> {
+		let mut description = BytesMut::new();
+		avcc.encode_body(&mut description)?;
+		let metadata = crate::codec::h264::config(&description)?;
+
+		let mut config = VideoConfig::new(H264 {
+			profile: avcc.avc_profile_indication,
+			constraints: avcc.profile_compatibility,
+			level: avcc.avc_level_indication,
+			inline,
+		});
+		config.coded_width = Some(visual.width as _);
+		config.coded_height = Some(visual.height as _);
+		config.framerate = metadata.framerate;
+		config.display_aspect_width = metadata.display_aspect_width;
+		config.display_aspect_height = metadata.display_aspect_height;
+		config.color = metadata.color;
+		config.description = Some(description.freeze());
+		config.container = container;
 		Ok(config)
 	}
 
@@ -423,6 +602,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		config.description = Some(description.freeze());
 		config.coded_width = Some(visual.width as _);
 		config.coded_height = Some(visual.height as _);
+		crate::codec::h265::apply_hvcc_sps(hvcc, &mut config)?;
 		config.container = container;
 		Ok(config)
 	}
@@ -466,11 +646,20 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				config
 			}
 			mp4_atom::Codec::Opus(opus) => {
-				let mut config = AudioConfig::new(
-					AudioCodec::Opus,
-					opus.audio.sample_rate.integer() as _,
-					opus.audio.channel_count as _,
-				);
+				// dOps carries the OpusHead fields in ISOBMFF byte order; republish them as the
+				// OpusHead description so decoders apply its pre-skip and gain. mp4-atom already
+				// refuses a nonzero channel mapping family, so the table is never dropped here.
+				let dops = &opus.dops;
+				let mut head =
+					crate::codec::opus::Config::new(dops.input_sample_rate, dops.output_channel_count as u32)
+						.with_pre_skip(dops.pre_skip);
+				head.output_gain = dops.output_gain;
+
+				// The shared conversion sets the decoder's 48 kHz output rate and Opus warmup,
+				// whatever the sample entry or the informational input rate claims.
+				let description = head.encode()?;
+				let mut config: AudioConfig = head.into();
+				config.description = Some(description);
 				config.container = container;
 				config
 			}
@@ -514,23 +703,94 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				config.container = container;
 				config
 			}
-			mp4_atom::Codec::Unknown(unknown) => return Err(Error::UnknownCodec(*unknown).into()),
+			mp4_atom::Codec::Unknown(unknown, _) => return Err(Error::UnknownCodec(*unknown).into()),
 			unsupported => return Err(Error::UnsupportedCodec(Box::new(unsupported.clone())).into()),
 		};
 
 		Ok(config)
 	}
 
+	/// Whether the fragments in `moof` open a new segment, and so roll a group on every track.
+	///
+	/// A segment is the unit a group carries: each fragment inside it becomes a frame, which is
+	/// what lets audio (whose samples are all independently decodable, so it has no boundary of
+	/// its own) follow the same segmentation as video instead of opening a group per fragment.
+	fn starts_segment(&self, moof: &Moof, has_video: bool) -> bool {
+		if self.pending_cut {
+			return true;
+		}
+
+		if !has_video {
+			// Audio-only and unsegmented: nothing in the container says where a segment ends, so
+			// fall back to a group per fragment. Bounded, unlike one group for the whole source.
+			return true;
+		}
+
+		// A video keyframe starts a segment, but only once the current segment already has its
+		// video group open. Otherwise this IS that segment's opening fragment, arriving after a
+		// `styp` or a `cut()` that already declared the boundary, and bumping a second time would
+		// strand video a segment ahead of the audio that rolled on the declaration.
+		if !self.video_rolled() {
+			return false;
+		}
+
+		moof.traf.iter().any(|traf| {
+			let Some(track) = self.tracks.get(&traf.tfhd.track_id) else {
+				return false;
+			};
+			track.kind == Kind::Video
+				&& traf
+					.trun
+					.iter()
+					.flat_map(|trun| trun.entries.iter())
+					.any(|entry| track.defaults.resolve(&traf.tfhd, entry).is_sync())
+		})
+	}
+
+	/// Whether every video track has already opened its group for the current segment.
+	fn video_rolled(&self) -> bool {
+		self.tracks
+			.values()
+			.filter(|track| track.kind == Kind::Video)
+			.all(|track| track.segment == Some(self.segment))
+	}
+
 	// Extract all frames out of an mdat atom using CMAF passthrough.
 	fn extract(&mut self, mdat: Mdat, mdat_raw: &[u8]) -> Result<()> {
-		let moov = self.moov.as_ref().ok_or(Error::NoMoov)?;
+		let has_video = self.tracks.values().any(|t| t.kind == Kind::Video);
 		let moof = self.moof.take().ok_or(Error::NoMoof)?;
 		let moof_size = self.moof_size;
 		let header_size = mdat_raw.len() - mdat.data.len();
 
+		// Resolve the segment boundary BEFORE the per-track loop. A moof can carry both an audio
+		// and a video traf, and whichever comes first must see the same answer, or the other rolls
+		// a fragment late and the two tracks stop agreeing on where segments fall.
+		if self.starts_segment(&moof, has_video) {
+			self.segment += 1;
+			// A boundary the source declared is also a timeline boundary; one merely inferred
+			// from a keyframe is not, since the default pacing already sees that group open.
+			self.declared = self.pending_cut;
+			self.pending_cut = false;
+		}
+
+		let moov = self.moov.as_ref().ok_or(Error::NoMoov)?;
+
 		// Loop over all of the traf boxes in the moof.
 		for traf in &moof.traf {
 			let track_id = traf.tfhd.track_id;
+			if let Some(track) = self.text.get_mut(&track_id) {
+				track.extract(
+					super::text::Fragment {
+						traf,
+						data: &mdat.data,
+						moof_size,
+						header_size,
+					},
+					&mut self.timebase,
+				)?;
+				self.initial_reservation = None;
+				continue;
+			}
 			let track = match self.tracks.get_mut(&track_id) {
 				Some(track) => track,
 				// A fragment for a track `select` dropped: ignore it.
@@ -544,19 +804,25 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				.iter()
 				.find(|trak| trak.tkhd.track_id == track_id)
 				.ok_or(Error::UnknownTrack(track_id))?;
-			let trex = moov
-				.mvex
-				.as_ref()
-				.and_then(|mvex| mvex.trex.iter().find(|trex| trex.track_id == track_id));
-
-			// The moov contains some defaults
-			let default_sample_duration = trex.map(|trex| trex.default_sample_duration).unwrap_or_default();
-			let default_sample_size = trex.map(|trex| trex.default_sample_size).unwrap_or_default();
-			let default_sample_flags = trex.map(|trex| trex.default_sample_flags).unwrap_or_default();
 
 			let tfdt = traf.tfdt.as_ref().ok_or(Error::MissingTfdt)?;
-			let mut dts = tfdt.base_media_decode_time;
 			let timescale = moq_net::Timescale::new(trak.mdia.mdhd.timescale as u64)?;
+			let mut dts = tfdt.base_media_decode_time;
+
+			// Every fragment restates its decode time, so a stale one puts two different samples
+			// on the same timestamp, which reads downstream as an undeclared hole.
+			if let Some(previous) = track.last_decode_time
+				&& dts <= previous
+			{
+				return Err(Error::NonMonotonicDecodeTime {
+					track: track_id,
+					decode_time: Timestamp::new(dts, timescale)?,
+					previous: Timestamp::new(previous, timescale)?,
+				}
+				.into());
+			}
+
+			track.last_decode_time = Some(dts);
 
 			let mut offset = traf.tfhd.base_data_offset.unwrap_or_default() as usize;
 			let mut track_data_start: Option<usize> = None;
@@ -565,9 +831,8 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				return Err(Error::MissingTrun.into());
 			}
 
-			// Keep track of the minimum and maximum timestamp for this track to compute the jitter.
 			let mut min_timestamp = None;
-			let mut max_timestamp = None;
+			let mut max_end = None;
 			let mut contains_keyframe = false;
 			let total_samples: usize = traf.trun.iter().map(|t| t.entries.len()).sum();
 			let mut sample_index = 0usize;
@@ -595,17 +860,9 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				}
 
 				for entry in &trun.entries {
-					let flags = entry
-						.flags
-						.unwrap_or(tfhd.default_sample_flags.unwrap_or(default_sample_flags));
-					let duration = entry
-						.duration
-						.or(tfhd.default_sample_duration)
-						.or(Some(default_sample_duration))
-						.filter(|duration| *duration != 0);
-					let size = entry
-						.size
-						.unwrap_or(tfhd.default_sample_size.unwrap_or(default_sample_size)) as usize;
+					let sample = track.defaults.resolve(tfhd, entry);
+					let duration = sample.duration;
+					let size = sample.size as usize;
 
 					// A non-final sample with no resolvable duration leaves the rest of the
 					// fragment's DTS ambiguous, so reject it rather than collapse timestamps.
@@ -620,6 +877,16 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 					// Preserve the fmp4 track's native timescale so a passthrough re-emit
 					// doesn't go through a lossy microsecond detour.
 					let timestamp = moq_net::Timestamp::new(pts, timescale)?;
+					let end = if let Some(duration) = duration {
+						let duration = Timestamp::new(duration as u64, timescale)?;
+						track.sample_duration = Some(track.sample_duration.map_or(duration, |min| min.min(duration)));
+						timestamp.checked_add(duration)?
+					} else if let Some(duration) = track.sample_duration {
+						timestamp.checked_add(duration)?
+					} else {
+						timestamp
+					};
+					max_end = Some(max_end.map_or(end, |max: Timestamp| max.max(end)));
 
 					let sample_end = offset.checked_add(size).ok_or(Error::InvalidDataOffset)?;
 					if sample_end > mdat.data.len() {
@@ -627,31 +894,15 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 					}
 
 					let keyframe = match track.kind {
-						TrackKind::Video => {
-							let keyframe = (flags >> 24) & 0x3 == 0x2;
-							let non_sync = (flags >> 16) & 0x1 == 0x1;
-							keyframe && !non_sync
-						}
-						TrackKind::Audio => true,
+						Kind::Video => sample.is_sync(),
+						Kind::Audio => true,
 					};
 
 					contains_keyframe |= keyframe;
 
-					if max_timestamp.is_none_or(|max| timestamp >= max) {
-						max_timestamp = Some(timestamp);
-					}
 					if min_timestamp.is_none_or(|min| timestamp <= min) {
 						min_timestamp = Some(timestamp);
 					}
-
-					if let Some(last_timestamp) = track.last_timestamp
-						&& let Ok(duration) = timestamp.checked_sub(last_timestamp)
-						&& track.min_duration.is_none_or(|min| duration < min)
-					{
-						track.min_duration = Some(duration);
-					}
-
-					track.last_timestamp = Some(timestamp);
 
 					if let Some(duration) = duration {
 						dts = dts.checked_add(duration as u64).ok_or(Error::PtsOverflow)?;
@@ -727,10 +978,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 					let trun_data_size: u64 = trun_mut
 						.entries
 						.iter()
-						.map(|e| {
-							e.size
-								.unwrap_or(traf_mut.tfhd.default_sample_size.unwrap_or(default_sample_size)) as u64
-						})
+						.map(|entry| u64::from(track.defaults.resolve(&traf_mut.tfhd, entry).size))
 						.sum();
 					cumulative_offset += trun_data_size;
 				}
@@ -746,11 +994,31 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 			let fragment_bytes = Bytes::from(moof_buf);
 
-			// Write the per-track fragment as a single MoQ frame (passthrough).
-			let mut g = if contains_keyframe {
+			// Carry the fragment's earliest presentation time as the frame timestamp, in the
+			// track's native timescale and shifted onto the catalog clock. Consumers present the
+			// fragment at it; `tfdt` only places the samples relative to each other. Anchor before
+			// releasing the reservation, so the first snapshot carries the final clock; the moov
+			// declared every track, so any track's fragment releases it.
+			let earliest = min_timestamp.ok_or(Error::MissingTrun)?;
+			let offset = self.timebase.anchor(earliest)?;
+			let timestamp = offset.apply(earliest)?;
+			let max_end = max_end.map(|end| offset.apply(end)).transpose()?;
+			self.initial_reservation = None;
+
+			// Write the per-track fragment as a single MoQ frame (passthrough). The group rolls
+			// once per segment, so a group is a segment and the fragments inside it are frames.
+			// The keyframe bit no longer decides that: audio flags every sample a sync sample, so
+			// keying off it opened a group (a QUIC stream) per audio fragment.
+			let new_segment = track.segment != Some(self.segment);
+			let start_group = track.group.is_none() || new_segment;
+			let mut g = if start_group {
 				if let Some(mut prev) = track.group.take() {
 					prev.finish()?;
+					if let Some(recorder) = track.recorder.as_mut() {
+						recorder.finish_group(prev.sequence);
+					}
 				}
+				track.segment = Some(self.segment);
 				match track.pending_sequence.take() {
 					Some(sequence) => track.track.create_group(moq_net::group::Info { sequence })?,
 					None => track.track.append_group()?,
@@ -759,75 +1027,47 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				track.group.take().ok_or(Error::NoKeyframe)?
 			};
 
-			// Carry the fragment's earliest presentation time as the frame timestamp,
-			// in the track's native timescale. The relay reads it off the wire; the
-			// consumer still drives playback from the fragment's internal timing.
-			let timestamp = min_timestamp.ok_or(Error::MissingTrun)?;
+			let position = hang::timeline::Position::new(g.sequence, g.frame_count() as u64);
 
-			// A keyframe fragment just opened a new group; index it in the track's timeline (throttled
-			// to the recorder's granularity) so a playlist/seek/VOD reader can map time to group.
-			// The timeline is an optional sidecar (consumers extrapolate across gaps), so a recording
-			// failure must NOT abort the passthrough. Drop the recorder and carry on.
-			if contains_keyframe {
-				let timeline_err = match track.recorder.as_mut() {
-					Some(recorder) => recorder.record(g.sequence, timestamp).err(),
-					None => None,
-				};
-				if let Some(err) = timeline_err {
-					tracing::warn!(?err, "timeline recording failed; dropping the timeline for this track");
-					track.recorder = None;
+			if start_group {
+				// A group opening for a declared segment is a boundary on this track's timeline. A
+				// group reopened mid-segment (after a `seek`) is not.
+				if new_segment
+					&& self.declared
+					&& let Some(recorder) = track.recorder.as_mut()
+				{
+					recorder.cut(timestamp);
 				}
-			}
 
-			// A keyframe fragment starts a new group: close the previous one for the bitrate
-			// estimator (used only when the descriptor didn't declare a bitrate).
-			if contains_keyframe {
+				// Close the previous group for the bitrate estimator (used only when the
+				// descriptor didn't declare a bitrate).
 				track.estimator.cut(Some(timestamp));
-				sync_bitrate(&mut self.catalog, track)?;
 			}
 			let fragment_len = fragment_bytes.len();
-
 			let mut frame = g.create_frame(moq_net::frame::Info {
 				size: fragment_bytes.len() as u64,
-				timestamp,
+				timestamp: Some(timestamp),
 			})?;
 			frame.write(fragment_bytes)?;
 			frame.finish()?;
 
+			// Only once published, so a rejected fragment is never indexed. Audio is always
+			// independently decodable; video says whether this fragment really begins on an IDR,
+			// which is what an HLS export reads to bootstrap an init segment.
+			if let Some(recorder) = track.recorder.as_mut() {
+				recorder.frame(position, timestamp, contains_keyframe);
+			}
+
 			track.group = Some(g);
 
 			track.estimator.write(timestamp, fragment_len);
-
-			if let (Some(min), Some(max), Some(min_duration)) = (min_timestamp, max_timestamp, track.min_duration) {
-				// All three share the track timescale (min/max are this fragment's frame
-				// timestamps, min_duration is derived from them).
-				let jitter = max.checked_sub(min)?.checked_add(min_duration)?;
-
-				if track.jitter.is_none_or(|j| jitter < j) {
-					track.jitter = Some(jitter);
-
-					let mut catalog = self.catalog.lock();
-
-					match track.kind {
-						TrackKind::Video => {
-							let config = catalog
-								.video
-								.renditions
-								.get_mut(track.track.name())
-								.ok_or_else(|| Error::MissingVideoTrack(track.track.name().to_string()))?;
-							config.jitter = Some(jitter.into());
-						}
-						TrackKind::Audio => {
-							let config = catalog
-								.audio
-								.renditions
-								.get_mut(track.track.name())
-								.ok_or_else(|| Error::MissingAudioTrack(track.track.name().to_string()))?;
-							config.jitter = Some(jitter.into());
-						}
-					}
-				}
+			let end = max_end.ok_or(Error::MissingTrun)?;
+			if let Some(recorder) = track.recorder.as_mut() {
+				recorder.end(end);
 			}
+			let span = end.checked_sub(timestamp)?;
+			track.estimator.burst(span.into());
+			track.publish_estimate()?;
 		}
 
 		Ok(())
@@ -837,13 +1077,23 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// Finish all tracks, flushing current groups.
 	pub fn finish(&mut self) -> Result<()> {
+		for track in self.text.values_mut() {
+			track.producer.finish()?;
+		}
+		// No frame follows to anchor the clock, so publish the declared track set now.
+		self.initial_reservation = None;
 		for track in self.tracks.values_mut() {
 			track.estimator.cut(None);
-			sync_bitrate(&mut self.catalog, track)?;
+			track.publish_estimate()?;
 			if let Some(mut g) = track.group.take() {
 				g.finish()?;
+				if let Some(recorder) = track.recorder.as_mut() {
+					recorder.finish_group(g.sequence);
+				}
 			}
 			track.track.finish()?;
+			// Dropping the recorder flushes the open record, so the track is advertised.
+			track.recorder = None;
 		}
 		Ok(())
 	}
@@ -851,7 +1101,10 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// Abort all tracks with `err` instead of finishing, so subscribers see the real
 	/// cause rather than [`moq_net::Error::Dropped`]. Consumes the importer.
 	pub fn abort(mut self, err: moq_net::Error) {
-		self.unregister();
+		for track in std::mem::take(&mut self.text).into_values() {
+			track.producer.abort(err.clone());
+		}
+		// Dropping each track's rendition retires its catalog entry.
 		for mut track in std::mem::take(&mut self.tracks).into_values() {
 			if let Some(g) = track.group.take() {
 				let _ = g.abort(err.clone());
@@ -860,91 +1113,42 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		}
 	}
 
-	/// Drop every rendition this importer registered from the catalog.
-	fn unregister(&mut self) {
-		let mut catalog = self.catalog.lock();
-		for track in self.tracks.values() {
-			match track.kind {
-				TrackKind::Video => {
-					catalog.video.renditions.remove(track.track.name());
-				}
-				TrackKind::Audio => {
-					catalog.audio.renditions.remove(track.track.name());
-				}
-			}
-		}
-	}
-
 	/// Close the current group on every track and open the next one at `sequence`.
 	///
 	/// Broadcast-wide: every track inside this fMP4 import advances together; per-track
-	/// control is intentionally not exposed.
+	/// control is intentionally not exposed. Skipping sequences is not a new timeline, so the
+	/// next fragment must still advance past the last decode time; see
+	/// [`discontinuity`](Self::discontinuity). Text spends a group per cue, so a text track that
+	/// is already past `sequence` continues from its own next group instead.
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
+		for track in self.text.values_mut() {
+			let next = track.producer.next_sequence();
+			track.producer.seek(sequence.max(next))?;
+		}
 		for track in self.tracks.values_mut() {
 			track.estimator.cut(None);
-			sync_bitrate(&mut self.catalog, track)?;
+			track.publish_estimate()?;
 			if let Some(mut g) = track.group.take() {
 				g.finish()?;
+				if let Some(recorder) = track.recorder.as_mut() {
+					recorder.finish_group(g.sequence);
+				}
 			}
 			track.pending_sequence = Some(sequence);
 		}
 		Ok(())
 	}
-}
 
-/// Advertise the measured bitrate when it moves, for a passthrough track whose CMAF descriptor
-/// didn't declare one.
-fn sync_bitrate<E: crate::catalog::hang::CatalogExt>(
-	catalog: &mut crate::catalog::Producer<E>,
-	track: &mut Fmp4Track,
-) -> Result<()> {
-	if !track.detect_bitrate {
-		return Ok(());
-	}
-	let Some(bitrate) = track.estimator.estimate().bitrate else {
-		return Ok(());
-	};
-	if track.bitrate == Some(bitrate) {
-		return Ok(());
-	}
-	track.bitrate = Some(bitrate);
-
-	set_detected_bitrate(catalog, track, bitrate)
-}
-
-/// Apply a measured bitrate to a track's catalog config, keeping the maximum seen.
-fn set_detected_bitrate<E: crate::catalog::hang::CatalogExt>(
-	catalog: &mut crate::catalog::Producer<E>,
-	track: &Fmp4Track,
-	bitrate: u64,
-) -> Result<()> {
-	let mut catalog = catalog.lock();
-	let field = match track.kind {
-		TrackKind::Video => {
-			&mut catalog
-				.video
-				.renditions
-				.get_mut(track.track.name())
-				.ok_or_else(|| Error::MissingVideoTrack(track.track.name().to_string()))?
-				.bitrate
+	/// The source signalled a new timeline (an HLS `EXT-X-DISCONTINUITY`), so the next
+	/// fragment's decode time is not compared with the last one on each track. A timeline that
+	/// restarts below where it was still fails: a track refuses a group that rewinds.
+	pub fn discontinuity(&mut self) {
+		for track in self.text.values_mut() {
+			track.end_decode_time = None;
+			track.discontinuity = true;
 		}
-		TrackKind::Audio => {
-			&mut catalog
-				.audio
-				.renditions
-				.get_mut(track.track.name())
-				.ok_or_else(|| Error::MissingAudioTrack(track.track.name().to_string()))?
-				.bitrate
+		for track in self.tracks.values_mut() {
+			track.last_decode_time = None;
 		}
-	};
-	if field.is_none_or(|current| bitrate > current) {
-		*field = Some(bitrate);
-	}
-	Ok(())
-}
-
-impl<E: crate::catalog::hang::CatalogExt> Drop for Import<E> {
-	fn drop(&mut self) {
-		self.unregister();
 	}
 }

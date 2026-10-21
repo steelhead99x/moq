@@ -1,11 +1,20 @@
-import { expect, test } from "bun:test";
+import { expect, jest, spyOn, test } from "bun:test";
+import { Milli } from "@moq/clock";
+import { Effect } from "@moq/signals";
 import * as Ietf from "../ietf/index.ts";
 import * as Lite from "../lite/index.ts";
 import { createMockTransportPair } from "../mock.ts";
-import * as Time from "../time.ts";
-import { accept, connect } from "./index.ts";
+import { type AcceptProps, accept as acceptSession, type ConnectProps, connect as connectSession } from "./index.ts";
 import { Reload } from "./reload.ts";
 import { type TransportStats, transportStats } from "./stats.ts";
+
+function connect(url: URL, props: Omit<ConnectProps, "url"> = {}) {
+	return connectSession({ url, ...props });
+}
+
+function accept(transport: WebTransport, url: URL, props: Omit<AcceptProps, "transport" | "url"> = {}) {
+	return acceptSession({ transport, url, ...props });
+}
 
 function fakeQuic(stats: TransportStats): WebTransport {
 	return { getStats: () => Promise.resolve(stats) } as unknown as WebTransport;
@@ -24,7 +33,7 @@ test("transportStats maps the W3C dictionary and normalizes a null send rate", a
 			packetsLost: 6,
 		}),
 	);
-	expect(stats.rtt).toBe(Time.Milli(25));
+	expect(stats.rtt).toBe(Milli(25));
 	expect(stats.estimatedSendRate).toBeUndefined();
 	expect(stats.bytesSent).toBe(1);
 	expect(stats.bytesReceived).toBe(2);
@@ -45,7 +54,7 @@ test("transportStats returns an empty snapshot without getStats or when it rejec
 });
 
 test("stats() snapshots the transport on demand", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP, {
+	const pair = createMockTransportPair(Lite.ALPN_06, {
 		stats: { estimatedSendRate: 2_000_000, bytesSent: 1_234, packetsLost: 3 },
 	});
 	const url = new URL("https://example.com/");
@@ -61,13 +70,13 @@ test("stats() snapshots the transport on demand", async () => {
 		pair.client.stats.bytesSent = 5_678;
 		expect((await client.stats()).bytesSent).toBe(5_678);
 	} finally {
-		client.close();
-		server.close();
+		client.abort();
+		server.abort();
 	}
 });
 
 test("stats() is empty on a transport without getStats", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
 	// Shadow the mock's getStats to imitate the qmux/WebSocket fallback.
 	(pair.client as unknown as { getStats?: unknown }).getStats = undefined;
 	const url = new URL("https://example.com/");
@@ -75,8 +84,8 @@ test("stats() is empty on a transport without getStats", async () => {
 	try {
 		expect(await client.stats()).toEqual({});
 	} finally {
-		client.close();
-		server.close();
+		client.abort();
+		server.abort();
 	}
 });
 
@@ -89,14 +98,14 @@ test("probe starts empty and stays empty without PROBE support", async () => {
 		expect(client.probe.peek()).toEqual({});
 		expect((await client.stats()).bytesReceived).toBe(42);
 	} finally {
-		client.close();
-		server.close();
+		client.abort();
+		server.abort();
 	}
 });
 
 test("Reload reports stats and probe only while connected", async () => {
 	const original = globalThis.WebTransport;
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP, { stats: { bytesSent: 99 } });
+	const pair = createMockTransportPair(Lite.ALPN_06, { stats: { bytesSent: 99 } });
 	// `new` on a function returning an object yields that object, handing connect() the mock.
 	const stub = function StubWebTransport() {
 		return pair.client;
@@ -112,7 +121,7 @@ test("Reload reports stats and probe only while connected", async () => {
 		expect((await reload.stats())?.bytesSent).toBe(99);
 		expect(reload.probe.peek()).toEqual({});
 
-		server.close();
+		server.abort();
 		while (reload.established.peek()) {
 			await new Promise((resolve) => setTimeout(resolve, 0));
 		}
@@ -123,5 +132,79 @@ test("Reload reports stats and probe only while connected", async () => {
 	} finally {
 		reload.close();
 		globalThis.WebTransport = original;
+	}
+});
+
+function drain(): Promise<void> {
+	return new Promise((resolve) => {
+		const channel = new MessageChannel();
+		channel.port1.onmessage = () => {
+			channel.port1.close();
+			channel.port2.close();
+			resolve();
+		};
+		channel.port2.postMessage(null);
+	});
+}
+
+test("a lite connection probes only while its estimate is observed", async () => {
+	jest.useFakeTimers();
+	const pair = createMockTransportPair(Lite.ALPN_06, { stats: { estimatedSendRate: 1_000_000 } });
+	const open = pair.client.createBidirectionalStream.bind(pair.client);
+	let finished = 0;
+	const opening = spyOn(pair.client, "createBidirectionalStream").mockImplementation(async (options) => {
+		const stream = await open(options);
+		const writer = stream.writable.getWriter();
+		return {
+			readable: stream.readable,
+			writable: new WritableStream<Uint8Array>({
+				write: (chunk) => writer.write(chunk),
+				close: () => {
+					finished++;
+					return writer.close();
+				},
+				abort: (reason) => writer.abort(reason),
+			}),
+		};
+	});
+	const url = new URL("https://example.com/");
+	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	let stop = () => {};
+	let effect: Effect | undefined;
+	try {
+		await drain();
+		expect(client.probe.peek()).toEqual({});
+		expect(pair.client.sendStreams.bidi).toHaveLength(0);
+		stop = client.probe.subscribe(() => {});
+		await drain();
+		expect(pair.client.sendStreams.bidi).toHaveLength(1);
+		const values: unknown[] = [];
+		effect = new Effect((effect) => {
+			values.push(effect.get(client.probe));
+		});
+		await drain();
+		jest.advanceTimersByTime(100);
+		await drain();
+		expect(values.at(-1)).toMatchObject({ estimatedRecvRate: 1_000_000 });
+		// A reactive one-shot listener reattaches without dropping demand between updates.
+		expect(pair.client.sendStreams.bidi).toHaveLength(1);
+		stop();
+		await drain();
+		expect(finished).toBe(0);
+		effect.close();
+		await drain();
+		expect(finished).toBe(1);
+		expect(client.probe.peek()).toEqual({});
+		stop = client.probe.subscribe(() => {});
+		await drain();
+		expect(pair.client.sendStreams.bidi).toHaveLength(2);
+	} finally {
+		stop();
+		effect?.close();
+		await drain();
+		client.abort();
+		server.abort();
+		opening.mockRestore();
+		jest.useRealTimers();
 	}
 });

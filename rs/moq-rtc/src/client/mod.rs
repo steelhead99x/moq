@@ -9,6 +9,7 @@ mod whep;
 mod whip;
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use url::Url;
 
@@ -19,6 +20,19 @@ pub struct Config {
 	/// Public UDP socket addresses to advertise as ICE host candidates in
 	/// our outbound offer. Same semantics as [`crate::server::Config::ice_candidates`].
 	pub ice_candidates: Vec<SocketAddr>,
+
+	/// How long relays keep a non-latest group of an ingested media track fetchable.
+	/// Same semantics as [`crate::server::Config::max_age`].
+	///
+	/// Ingest only ([`subscribe`](Client::subscribe) / WHEP): a WHIP
+	/// [`publish`](Client::publish) reads a broadcast someone else declared, so it
+	/// ignores this.
+	pub max_age: Option<Duration>,
+
+	/// Connection allocator each ingested track claims its peak-hold bitrate on.
+	/// Ingest only ([`subscribe`](Client::subscribe) / WHEP); a WHIP
+	/// [`publish`](Client::publish) ignores this.
+	pub bandwidth: moq_net::bandwidth::Allocator,
 }
 
 /// Outbound WHIP/WHEP dialer.
@@ -53,13 +67,17 @@ impl Client {
 
 	/// `client subscribe`: pull a remote WHEP feed and publish it as
 	/// `broadcast` on the local origin. Returns once the session is
-	/// running in the background.
-	pub async fn subscribe(&self, url: Url, broadcast: moq_net::broadcast::Producer) -> crate::Result<()> {
+	/// running in the background, returning its cumulative UDP payload source.
+	pub async fn subscribe(
+		&self,
+		url: Url,
+		broadcast: moq_net::broadcast::Producer,
+	) -> crate::Result<crate::wire::Source> {
 		whep::dial(self, url, broadcast).await
 	}
 
 	/// `client publish`: pull the broadcast at `path` from `origin` and push it to a
-	/// remote WHIP endpoint. Gated on the per-codec re-packetizer.
+	/// remote WHIP endpoint, returning its cumulative UDP payload source.
 	///
 	/// Taking the origin plus path (rather than a resolved [`moq_net::broadcast::Consumer`])
 	/// lets the egress resolve a rendition whose catalog `broadcast` field references a
@@ -69,7 +87,36 @@ impl Client {
 		url: Url,
 		origin: moq_net::origin::Consumer,
 		path: impl moq_net::AsPath,
-	) -> crate::Result<()> {
+	) -> crate::Result<crate::wire::Source> {
 		whip::dial(self, url, origin, path).await
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn http_error_redacts_url() {
+		// A freed port refuses the connection, so reqwest fails with the dialed URL attached.
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+		let address = listener.local_addr().expect("local address");
+		drop(listener);
+
+		let origin = moq_tokio::origin::spawn();
+		let broadcast = origin.create_broadcast("test").expect("create broadcast");
+		let url = format!("http://user:pass@{address}/whep/test?jwt=secret")
+			.parse()
+			.expect("WHEP URL");
+		let err = Client::new(Config::default())
+			.subscribe(url, broadcast)
+			.await
+			.expect_err("dial a closed port");
+
+		assert!(matches!(err, crate::Error::Http(_)), "unexpected error: {err}");
+		let printed = format!("{err} {err:?}");
+		for secret in ["jwt", "secret", "user:pass"] {
+			assert!(!printed.contains(secret), "error leaked {secret}: {printed}");
+		}
 	}
 }

@@ -5,20 +5,25 @@
  * `.stats/node/<node>` carrying JSON tracks that snapshot current activity. We
  * auto-discover all of those nodes (announcements under `.stats/node`), so this
  * works for a single relay and for a cluster alike, then aggregate each node and
- * let you drill into one.
+ * let you drill into one. A restarted relay announces a new epoch at the same
+ * path, which arrives as an end then a start, so its history starts over.
  *
  * Per-node tracks we read:
  *   publisher.json   egress  (relay -> downstream viewers)
  *   subscriber.json  ingress (upstream publishers -> relay)
- *   sessions.json    sessions by auth root
+ *   sessions.json    sessions by stats label
  *
  * Each frame is `{ "<broadcast path>": Snapshot }`. Counters are cumulative;
- * "active" = open - closed. The relay only includes currently-live entries, so
- * the latest frame is a snapshot of now. We sample the aggregate on an interval
- * to derive per-second throughput rates for the charts.
+ * "active" = started - ended. The relay includes every entry it still holds
+ * counters for, idle ones too, so the latest frame is a snapshot of now. We sample the aggregate on an interval
+ * to derive per-second throughput rates for the charts. A relay built after the
+ * started/ended rename still writes the legacy names beside the new ones; this
+ * dashboard prefers the canonical spelling and falls back so it also reads an
+ * older relay.
  */
 
 import "./highlight";
+import { Milli, Nano, wall } from "@moq/clock";
 import { Net, Signals } from "@moq/hang";
 
 const RELAY_URL = import.meta.env.VITE_RELAY_URL ?? "http://localhost:4443";
@@ -27,7 +32,7 @@ const RELAY_URL = import.meta.env.VITE_RELAY_URL ?? "http://localhost:4443";
 const STATS_PREFIX = ".stats/node";
 
 // Rolling history window for the charts.
-const SAMPLE_MS = 1000;
+const SAMPLE = Nano.fromMilli(Milli(1000));
 const MAX_SAMPLES = 90;
 
 const $ = <T extends HTMLElement>(id: string): T => {
@@ -39,13 +44,19 @@ const $ = <T extends HTMLElement>(id: string): T => {
 // ---- Frame shapes (see module comment) ------------------------------------
 
 interface Snapshot {
+	announces_started?: number;
 	announced?: number;
+	announces_ended?: number;
 	announced_closed?: number;
 	// Broadcast-name bytes charged for each announce/unannounce, separate from payload `bytes`.
 	announced_bytes?: number;
+	broadcasts_started?: number;
 	broadcasts?: number;
+	broadcasts_ended?: number;
 	broadcasts_closed?: number;
+	subscriptions_started?: number;
 	subscriptions?: number;
+	subscriptions_ended?: number;
 	subscriptions_closed?: number;
 	// One-shot group fetches requested (counted at request time, not on resolution).
 	fetches?: number;
@@ -59,7 +70,9 @@ interface Snapshot {
 type BroadcastFrame = Record<string, Snapshot>;
 
 interface SessionCounters {
+	sessions_started?: number;
 	sessions?: number;
+	sessions_ended?: number;
 	sessions_closed?: number;
 }
 type SessionFrame = Record<string, SessionCounters>;
@@ -70,7 +83,18 @@ interface NodeStats {
 	sessions: SessionFrame; // sessions.json
 }
 
-const active = (open?: number, closed?: number) => (open ?? 0) - (closed ?? 0);
+// Canonical spelling wins when a frame carries both names.
+const edge = (started?: number, legacy?: number) => started ?? legacy ?? 0;
+const active = (started?: number, ended?: number) => (started ?? 0) - (ended ?? 0);
+
+const announcesStarted = (s: Snapshot) => edge(s.announces_started, s.announced);
+const announcesEnded = (s: Snapshot) => edge(s.announces_ended, s.announced_closed);
+const broadcastsStarted = (s: Snapshot) => edge(s.broadcasts_started, s.broadcasts);
+const broadcastsEnded = (s: Snapshot) => edge(s.broadcasts_ended, s.broadcasts_closed);
+const subscriptionsStarted = (s: Snapshot) => edge(s.subscriptions_started, s.subscriptions);
+const subscriptionsEnded = (s: Snapshot) => edge(s.subscriptions_ended, s.subscriptions_closed);
+const sessionsStarted = (s: SessionCounters) => edge(s.sessions_started, s.sessions);
+const sessionsEnded = (s: SessionCounters) => edge(s.sessions_ended, s.sessions_closed);
 
 // Broadcasts whose path starts with "." are system broadcasts (e.g. the `.stats` feed
 // this dashboard itself reads). We exclude them from the user-facing counters.
@@ -84,18 +108,18 @@ const selectedNode = new Signals.Signal<string | undefined>(undefined);
 
 // The relay URL, editable at runtime (see the input binding below).
 const relayUrl = new Signals.Signal<URL | undefined>(new URL(RELAY_URL));
-const connection = new Net.Connection.Reload({ url: relayUrl, enabled: true });
+const connection = new Net.Connection({ url: relayUrl });
 
 // ---- Discover nodes + subscribe to each -----------------------------------
 
 const discovery = new Signals.Effect();
 discovery.run((effect) => {
-	const conn = effect.get(connection.established);
+	const origin = effect.get(connection.origin);
 	nodeStats.set({});
-	if (!conn) return;
+	if (!origin) return;
 
 	const prefix = Net.Path.from(STATS_PREFIX);
-	const announced = conn.announced(prefix);
+	const announced = origin.announced(Net.Path.Pattern.subtree(prefix));
 	effect.cleanup(() => announced.close());
 
 	// One sub-effect per node so we can tear a node's subscriptions down when it
@@ -107,29 +131,37 @@ discovery.run((effect) => {
 
 	effect.spawn(async () => {
 		for (;;) {
-			const entry = await Promise.race([effect.cancel, announced.next()]);
+			const entry = await effect.race(announced.next());
 			if (!entry) break;
-			const node = entry.path as string;
+			const path = entry.prefix;
+			const node = Net.Path.stripPrefix(prefix, path);
 			if (!node) continue;
-			const path = Net.Path.join(prefix, entry.path);
 
-			if (entry.active) {
-				if (subs.has(node)) continue;
-				const ne = new Signals.Effect();
-				subs.set(node, ne);
-				subscribeNode(ne, conn, path, node);
-			} else {
+			// The same node re-priced or failed over: its counters carry on.
+			if (entry.kind === "update") continue;
+			if (entry.kind === "start" && subs.has(node)) continue;
+
+			// An end, or a restart: another instance at the path counts from zero, so neither
+			// series may splice across it.
+			if (entry.kind !== "start") {
 				subs.get(node)?.close();
 				subs.delete(node);
 				nodeStats.mutate((s) => {
 					delete s[node];
 				});
+				history.delete(node);
+				clusterMembership = "";
 			}
+			if (entry.kind === "end") continue;
+
+			const ne = new Signals.Effect();
+			subs.set(node, ne);
+			subscribeNode(ne, origin, path, node);
 		}
 	});
 });
 
-function subscribeNode(effect: Signals.Effect, conn: Net.Connection.Established, path: Net.Path.Valid, node: string) {
+function subscribeNode(effect: Signals.Effect, origin: Net.Origin.Table, path: Net.Path.Valid, node: string) {
 	nodeStats.mutate((s) => {
 		s[node] = {
 			egress: {},
@@ -138,15 +170,18 @@ function subscribeNode(effect: Signals.Effect, conn: Net.Connection.Established,
 		};
 	});
 
-	const consumer = conn.consume(path);
-	effect.cleanup(() => consumer.close());
+	// The path was just announced, so the request resolves from the table immediately.
+	const request = origin.request(path);
+	effect.cleanup(() => request.close());
+	const consumer = request.active.peek();
+	if (!consumer) return;
 
 	const sub = <K extends keyof NodeStats>(trackName: string, key: K) => {
-		const track = consumer.subscribe(trackName);
+		const track = consumer.track(trackName).subscribe().ordered();
 		effect.cleanup(() => track.close());
 		effect.spawn(async () => {
 			for (;;) {
-				const data = await Promise.race([effect.cancel, track.readJson()]);
+				const data = await effect.race(track.readJson());
 				if (data === undefined) break;
 				nodeStats.mutate((s) => {
 					const cur = s[node];
@@ -179,7 +214,7 @@ function aggregate(ingress: BroadcastFrame, egress: BroadcastFrame) {
 
 	for (const [path, s] of Object.entries(ingress)) {
 		if (isSystem(path)) continue;
-		if (active(s.announced, s.announced_closed) > 0) broadcasters++;
+		if (active(announcesStarted(s), announcesEnded(s)) > 0) broadcasters++;
 		ingressBytes += s.bytes ?? 0;
 		announceBytes += s.announced_bytes ?? 0;
 		fetches += s.fetches ?? 0;
@@ -188,8 +223,8 @@ function aggregate(ingress: BroadcastFrame, egress: BroadcastFrame) {
 	for (const [path, s] of Object.entries(egress)) {
 		if (isSystem(path)) continue;
 		egressBytes += s.bytes ?? 0;
-		viewers += active(s.broadcasts, s.broadcasts_closed);
-		tracks += active(s.subscriptions, s.subscriptions_closed);
+		viewers += active(broadcastsStarted(s), broadcastsEnded(s));
+		tracks += active(subscriptionsStarted(s), subscriptionsEnded(s));
 		announceBytes += s.announced_bytes ?? 0;
 		fetches += s.fetches ?? 0;
 		datagrams += s.datagrams ?? 0;
@@ -198,7 +233,7 @@ function aggregate(ingress: BroadcastFrame, egress: BroadcastFrame) {
 }
 
 const countSessions = (f: SessionFrame) =>
-	Object.values(f).reduce((n, s) => n + active(s.sessions, s.sessions_closed), 0);
+	Object.values(f).reduce((n, s) => n + active(sessionsStarted(s), sessionsEnded(s)), 0);
 
 // ---- Time-series history ---------------------------------------------------
 
@@ -256,7 +291,7 @@ sampler.run((effect) => {
 	// Only sample while connected; the interval restarts on reconnect. Drop the
 	// rolling history when disconnected so a reconnect doesn't splice new
 	// samples onto stale ones across the downtime gap.
-	if (!effect.get(connection.established)) {
+	if (effect.get(connection.status) !== "connected") {
 		history.clear();
 		clusterMembership = "";
 		clock.update((n) => n + 1);
@@ -265,7 +300,7 @@ sampler.run((effect) => {
 	effect.interval(() => {
 		const all = nodeStats.peek();
 		const nodes = Object.keys(all).sort();
-		const t = Date.now();
+		const t = wall();
 
 		const agg: Sample = {
 			t,
@@ -307,7 +342,7 @@ sampler.run((effect) => {
 		}
 
 		clock.update((n) => n + 1);
-	}, SAMPLE_MS);
+	}, SAMPLE);
 });
 
 // Convert a cumulative-counter series into a per-second rate series.
@@ -459,8 +494,8 @@ ui.run((effect) => {
 				key: path,
 				cells: [
 					path,
-					active(i.announced, i.announced_closed) > 0 ? "yes" : "no",
-					String(active(i.subscriptions, i.subscriptions_closed)), // live tracks
+					active(announcesStarted(i), announcesEnded(i)) > 0 ? "yes" : "no",
+					String(active(subscriptionsStarted(i), subscriptionsEnded(i))), // live tracks
 					formatBytes(i.bytes ?? 0),
 					String(i.frames ?? 0),
 					String(i.groups ?? 0),
@@ -478,8 +513,8 @@ ui.run((effect) => {
 				key: path,
 				cells: [
 					path,
-					String(active(e.broadcasts, e.broadcasts_closed)), // viewers / peers
-					String(active(e.subscriptions, e.subscriptions_closed)), // live tracks
+					String(active(broadcastsStarted(e), broadcastsEnded(e))), // viewers / peers
+					String(active(subscriptionsStarted(e), subscriptionsEnded(e))), // live tracks
 					formatBytes(e.bytes ?? 0), // egress
 					String(e.frames ?? 0),
 					String(e.groups ?? 0),
@@ -490,14 +525,18 @@ ui.run((effect) => {
 			};
 		});
 
-	// Sessions connected under each auth root, counted regardless of data flow.
+	// Sessions connected under each stats label, counted regardless of data flow.
 	const sessionRows = Object.keys(stats.sessions)
 		.sort()
-		.map((root) => {
-			const s = stats.sessions[root] ?? {};
+		.map((label) => {
+			const s = stats.sessions[label] ?? {};
 			return {
-				key: root,
-				cells: [root || "(none)", String(active(s.sessions, s.sessions_closed)), String(s.sessions ?? 0)],
+				key: label,
+				cells: [
+					label || "(none)",
+					String(active(sessionsStarted(s), sessionsEnded(s))),
+					String(sessionsStarted(s)),
+				],
 			};
 		});
 
@@ -511,7 +550,7 @@ ui.run((effect) => {
 		["broadcast", "viewers", "tracks", "egress", "frames", "groups", "datagrams", "fetches", "announce"],
 		egressRows(stats.egress),
 	);
-	renderTable($("node-session-roots"), ["auth root", "connected", "total"], sessionRows);
+	renderTable($("node-session-labels"), ["label", "connected", "total"], sessionRows);
 
 	const sessions = countSessions(stats.sessions);
 	$("node-sessions").textContent = `${sessions} session${sessions === 1 ? "" : "s"}`;

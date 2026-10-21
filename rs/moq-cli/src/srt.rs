@@ -6,37 +6,101 @@ use std::time::Duration;
 
 use anyhow::Context;
 use hang::moq_net;
-use moq_native::RedactedUrl;
-use moq_srt::{Request, Server};
+use moq_srt::{Reject, Request, Server};
+use moq_tokio::RedactedUrl;
 use url::Url;
 
-use crate::moq::notify_ready;
+use crate::args::TsProgram;
+use crate::moq::{ImportTarget, notify_ready};
 
 /// SRT endpoint args: exactly one of `--connect` (dial) / `--listen` (bind).
-#[derive(clap::Args, Clone)]
-#[command(group = clap::ArgGroup::new("srt-mode").required(true).multiple(false).args(["srt-connect", "srt-listen"]))]
+#[derive(usage_rs::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+#[usage(group("srt-mode", required))]
 pub struct Args {
 	/// Dial `srt://host:port?streamid=...`.
-	#[arg(id = "srt-connect", long = "connect", value_name = "URL")]
+	#[usage(name = "srt-connect", long = "connect", value_name = "URL", group = "srt-mode")]
 	pub connect: Option<Url>,
 
 	/// Bind an SRT listener, bridging the single `--broadcast` (the SRT stream id
 	/// is accepted but not used for routing).
-	#[arg(id = "srt-listen", long = "listen", value_name = "ADDR")]
+	#[usage(name = "srt-listen", long = "listen", value_name = "ADDR", group = "srt-mode")]
 	pub listen: Option<SocketAddr>,
 
 	/// SRT receive latency: the buffering delay traded for loss-recovery headroom.
-	#[arg(long, default_value = "500ms", value_parser = humantime::parse_duration)]
-	pub latency: Duration,
+	#[usage(long, default = "500ms")]
+	pub latency: crate::duration::Duration,
 }
 
-/// Accept incoming SRT publishes into the Origin as `name`; reject requests (import).
+/// SRT import args: the endpoint, plus which programs of a multiplex to publish.
+#[derive(usage_rs::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+pub struct ImportArgs {
+	#[usage(flatten)]
+	pub endpoint: Args,
+
+	/// Import one program of a multi-program feed, by its PAT program number, or `all` to
+	/// publish each program as its own broadcast (`event.hang` becomes `event/1.hang`,
+	/// `event/2.hang`, ...). Without it, a feed carrying more than one program is refused.
+	#[usage(long)]
+	pub program: Option<TsProgram>,
+}
+
+/// SRT export args: the endpoint, plus how a broadcast ending or being replaced is followed.
+#[derive(usage_rs::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+pub struct ExportArgs {
+	#[usage(flatten)]
+	pub endpoint: Args,
+
+	/// How long to wait for the same publisher instance to come back once it ends (e.g. `10s`),
+	/// then carry on with the same stream. A replacement ends the stream unless `--stitch`
+	/// is passed.
+	/// Also bounds a stitched replacement through its first catalog; zero requires it already available.
+	#[usage(long, default = "0s")]
+	pub linger: crate::duration::Duration,
+
+	/// Follow another publisher instance that replaces the broadcast, as a full program switch
+	/// on the same SRT connection.
+	#[usage(long)]
+	pub stitch: bool,
+}
+
+impl ImportArgs {
+	/// The library's selection for `--program`.
+	pub fn program(&self) -> Option<moq_srt::Program> {
+		self.program.map(|program| match program {
+			TsProgram::One(program) => moq_srt::Program::One(program),
+			TsProgram::All => moq_srt::Program::All,
+		})
+	}
+}
+
+/// Point a multi-program refusal at the flag that resolves it.
+fn suggest_program(err: moq_srt::Error) -> anyhow::Error {
+	let multiplex = matches!(&err, moq_srt::Error::Mux(moq_mux::Error::Other(inner))
+		if inner.is::<moq_mux::container::ts::MultipleProgramsError>());
+	let err = anyhow::Error::from(err);
+	if multiplex {
+		err.context("choose one with `--program <n>`, or publish each with `--program all`")
+	} else {
+		err
+	}
+}
+
+/// Accept incoming SRT publishes into the Origin as `target.name`; reject requests (import).
 pub async fn listen_import(
-	origin: moq_net::origin::Producer,
+	target: ImportTarget,
 	addr: SocketAddr,
-	name: String,
 	latency: Duration,
+	program: Option<moq_srt::Program>,
 ) -> anyhow::Result<()> {
+	let ImportTarget {
+		origin,
+		name,
+		max_age,
+		bandwidth,
+	} = target;
 	let mut server = Server::bind(addr, latency).await?;
 	tracing::info!(%addr, %name, "SRT listening (import)");
 	notify_ready();
@@ -46,15 +110,23 @@ pub async fn listen_import(
 			Request::Publish(publish) => {
 				let origin = origin.clone();
 				let name = name.clone();
+				let bandwidth = bandwidth.clone();
 				tokio::spawn(async move {
-					if let Err(err) = publish.accept(&origin, &name).await {
-						tracing::warn!(%name, %err, "SRT ingest ended with error");
+					if let Err(err) = publish
+						.with_max_age(max_age)
+						.with_bandwidth(bandwidth)
+						.with_program(program)
+						.accept(&origin, &name)
+						.await
+					{
+						let err = suggest_program(err);
+						tracing::warn!(%name, err = format!("{err:#}"), "SRT ingest ended with error");
 					}
 				});
 			}
 			Request::Subscribe(subscribe) => {
 				tokio::spawn(async move {
-					let _ = subscribe.reject().await;
+					let _ = subscribe.reject(Reject::Forbidden).await;
 				});
 			}
 			_ => {}
@@ -69,9 +141,10 @@ pub async fn listen_export(
 	origin: moq_net::origin::Consumer,
 	addr: SocketAddr,
 	name: String,
-	latency: Duration,
+	args: ExportArgs,
 ) -> anyhow::Result<()> {
-	let mut server = Server::bind(addr, latency).await?;
+	let mut server = Server::bind(addr, args.endpoint.latency.into_std()).await?;
+	let (linger, stitch) = (args.linger.into_std(), args.stitch);
 	tracing::info!(%addr, %name, "SRT listening (export)");
 	notify_ready();
 
@@ -81,6 +154,7 @@ pub async fn listen_export(
 				let origin = origin.clone();
 				let name = name.clone();
 				tokio::spawn(async move {
+					let subscribe = subscribe.with_linger(linger).with_stitch(stitch);
 					if let Err(err) = subscribe.accept(&origin, &name).await {
 						tracing::warn!(%name, %err, "SRT request ended with error");
 					}
@@ -88,7 +162,7 @@ pub async fn listen_export(
 			}
 			Request::Publish(publish) => {
 				tokio::spawn(async move {
-					let _ = publish.reject().await;
+					let _ = publish.reject(Reject::Forbidden).await;
 				});
 			}
 			_ => {}
@@ -98,18 +172,24 @@ pub async fn listen_export(
 	Ok(())
 }
 
-/// Dial a remote SRT server and pull its stream into the Origin under `name` (import).
+/// Dial a remote SRT server and pull its stream into the Origin under `target.name` (import).
 pub async fn connect_import(
-	origin: moq_net::origin::Producer,
+	target: ImportTarget,
 	url: Url,
-	name: String,
 	latency: Duration,
+	program: Option<moq_srt::Program>,
 ) -> anyhow::Result<()> {
 	let (addr, resource) = parse_url(&url).await?;
+	let name = &target.name;
 	tracing::info!(url = %RedactedUrl::new(&url), %name, "SRT client pulling");
 	notify_ready();
 
-	Ok(moq_srt::dial::pull(addr, &resource, latency, &origin, &name).await?)
+	let client = moq_srt::Client::new(addr, resource)
+		.with_latency(latency)
+		.with_max_age(target.max_age)
+		.with_bandwidth(target.bandwidth)
+		.with_program(program);
+	client.pull(&target.origin, name).await.map_err(suggest_program)
 }
 
 /// Push a broadcast from the Origin to a remote SRT server (export).
@@ -117,13 +197,17 @@ pub async fn connect_export(
 	origin: moq_net::origin::Consumer,
 	url: Url,
 	name: String,
-	latency: Duration,
+	args: ExportArgs,
 ) -> anyhow::Result<()> {
 	let (addr, resource) = parse_url(&url).await?;
 	tracing::info!(url = %RedactedUrl::new(&url), %name, "SRT client pushing");
 	notify_ready();
 
-	Ok(moq_srt::dial::publish(addr, &resource, latency, &origin, &name).await?)
+	let client = moq_srt::Client::new(addr, resource)
+		.with_latency(args.endpoint.latency.into_std())
+		.with_linger(args.linger.into_std())
+		.with_stitch(args.stitch);
+	Ok(client.publish(&origin, &name).await?)
 }
 
 /// Parse `srt://host:port?streamid=<resource>` into a resolved address and resource.
@@ -173,6 +257,21 @@ mod tests {
 	#[tokio::test]
 	async fn rejects_non_srt_scheme() {
 		assert!(parse("udp://127.0.0.1:9000").await.is_err());
+	}
+
+	/// A multiplex refusal names the flag that resolves it; other errors pass through unchanged.
+	#[test]
+	fn a_multiplex_suggests_the_program_flag() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+		let mut import = moq_mux::container::ts::Import::new(broadcast, catalog.reserve());
+		let refused = import.decode(&crate::publish::tests::two_programs()).unwrap_err();
+		let err = suggest_program(moq_srt::Error::Mux(refused.into()));
+		let err = format!("{err:#}");
+		assert!(err.contains("--program") && err.contains("programs (1, 2)"), "{err}");
+
+		let err = format!("{:#}", suggest_program(moq_srt::Error::ListenerClosed));
+		assert!(!err.contains("--program"), "{err}");
 	}
 
 	#[tokio::test]

@@ -9,15 +9,17 @@ use std::task::Poll;
 
 use moq_net::{Timescale, Timestamp};
 
-use crate::container::{Container, Frame};
+use crate::container::{Container, Frame, Kind};
 
 /// LOC's catalog convention: timestamps are in microseconds when no per-frame
 /// 0x08 timescale property is present.
 const DEFAULT_TIMESCALE: Timescale = Timescale::MICRO;
 
-/// LOC wire format. Each moq frame holds one LOC frame.
-#[derive(Default)]
-pub struct Wire;
+/// LOC wire format configured for the track's media role.
+pub struct Wire(
+	/// The kind of content carried by the track.
+	pub Kind,
+);
 
 impl Container for Wire {
 	type Error = crate::Error;
@@ -33,7 +35,7 @@ impl Container for Wire {
 			// timescale), so a relay sees it without parsing the LOC payload.
 			let mut chunked = group.create_frame(moq_net::frame::Info {
 				size: data.len() as u64,
-				timestamp: frame.timestamp,
+				timestamp: Some(frame.timestamp),
 			})?;
 			chunked.write(data)?;
 			chunked.finish()?;
@@ -51,6 +53,11 @@ impl Container for Wire {
 		let Some(frame) = ready!(group.poll_read_frame(waiter)?) else {
 			return Poll::Ready(Ok(None));
 		};
+		// On a data track an object with no bytes is its discontinuity marker, not a frame.
+		// Elsewhere it is malformed, so it fails to decode below.
+		if self.0 == Kind::Data && frame.payload.is_empty() {
+			return Poll::Ready(Ok(Some(Vec::new())));
+		}
 
 		let loc = moq_loc::decode(frame.payload)?;
 		// `loc.timescale == Some(0)` is a malformed wire (caught by moq_loc::decode itself),
@@ -71,5 +78,34 @@ impl Container for Wire {
 			// LOC carries no per-frame duration.
 			duration: None,
 		}])))
+	}
+
+	fn kind(&self) -> Kind {
+		self.0
+	}
+
+	fn end(&self, frame: &Frame) -> Option<moq_net::Timestamp> {
+		(self.0 != Kind::Data && frame.payload.is_empty()).then_some(frame.timestamp)
+	}
+
+	fn finish_group(
+		&self,
+		group: &mut moq_net::group::Producer,
+		end: Option<moq_net::Timestamp>,
+	) -> Result<(), Self::Error> {
+		if self.0 == Kind::Video
+			&& let Some(timestamp) = end
+		{
+			self.write(
+				group,
+				&[Frame {
+					timestamp,
+					payload: bytes::Bytes::new(),
+					keyframe: false,
+					duration: None,
+				}],
+			)?;
+		}
+		Ok(())
 	}
 }

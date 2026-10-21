@@ -1,89 +1,10 @@
 # libmoq
 
-C bindings for Media over QUIC.
+`libmoq` is now [`moq-c`](https://crates.io/crates/moq-c), and this final
+release contains no code.
 
-## Building
-
-```bash
-cargo build --release
-```
-
-This will:
-
-- Build the static library (`libmoq.a` on Unix-like systems, `moq.lib` on Windows)
-- Generate the C header file at `target/include/moq.h`
-- Generate the pkg-config file at `target/release/lib/pkgconfig/moq.pc`
-
-There's also a [CMakeLists.txt](CMakeLists.txt) file that can be used to import/build the library.
-
-## C API
-
-The library exposes the following C functions, see [api.rs](src/api.rs) for full details:
-
-```c
-// Logging
-int32_t moq_log_level(const char *level, uintptr_t level_len);
-
-// Session
-int32_t moq_session_connect(const char *url, uintptr_t url_len, uint32_t origin_publish, uint32_t origin_consume, void (*on_status)(void *user_data, int32_t code), void *user_data);
-int32_t moq_session_close(uint32_t session);
-
-// Origin
-int32_t moq_origin_create(void);
-int32_t moq_origin_close(uint32_t origin);
-int32_t moq_origin_publish(uint32_t origin, const char *path, uintptr_t path_len);
-int32_t moq_origin_request(uint32_t origin, const char *path, uintptr_t path_len, void (*on_broadcast)(void *user_data, int32_t broadcast), void *user_data);
-int32_t moq_origin_request_close(uint32_t task);
-int32_t moq_origin_consume_announced(uint32_t origin, const char *path, uintptr_t path_len, void (*on_broadcast)(void *user_data, int32_t broadcast), void *user_data);
-int32_t moq_origin_consume_announced_close(uint32_t task);
-int32_t moq_origin_announced(uint32_t origin, void (*on_announce)(void *user_data, int32_t announced), void *user_data);
-int32_t moq_origin_announced_info(uint32_t announced, moq_announced *dst);
-int32_t moq_origin_announced_free(uint32_t announced);
-int32_t moq_origin_announced_close(uint32_t announced);
-
-// Publishing
-int32_t moq_publish_set_announce(uint32_t broadcast, bool announce);
-int32_t moq_publish_finish(uint32_t broadcast);
-int32_t moq_publish_media(uint32_t broadcast, const char *format, uintptr_t format_len, const uint8_t *init, uintptr_t init_size);
-int32_t moq_publish_media_finish(uint32_t media);
-int32_t moq_publish_media_frame(uint32_t media, const uint8_t *payload, uintptr_t payload_size, uint64_t timestamp_us);
-int32_t moq_publish_track(uint32_t broadcast, const char *name, uintptr_t name_len);
-int32_t moq_publish_track_group(uint32_t track);
-int32_t moq_publish_track_frame(uint32_t track, const uint8_t *payload, uintptr_t payload_size, uint64_t timestamp_us);
-int32_t moq_publish_group_frame(uint32_t group, const uint8_t *payload, uintptr_t payload_size, uint64_t timestamp_us);
-int32_t moq_publish_group_finish(uint32_t group);
-int32_t moq_publish_track_finish(uint32_t track);
-
-// Consuming
-int32_t moq_consume_close(uint32_t consume);
-
-// Consuming: Catalog
-int32_t moq_consume_catalog(uint32_t broadcast, void (*on_catalog)(void *user_data, int32_t catalog), void *user_data);
-int32_t moq_consume_catalog_close(uint32_t catalog);
-int32_t moq_consume_catalog_free(uint32_t catalog);
-int32_t moq_consume_video_config(uint32_t catalog, uint32_t index, moq_video_config *dst);
-int32_t moq_consume_video_stalled(uint32_t catalog, uint32_t index, bool *dst);
-int32_t moq_consume_audio_config(uint32_t catalog, uint32_t index, moq_audio_config *dst);
-
-// Consuming: Video
-int32_t moq_consume_video(uint32_t catalog, uint32_t index, uint64_t max_latency_ms, void (*on_frame)(void *user_data, int32_t frame), void *user_data);
-int32_t moq_consume_video_close(uint32_t track);
-
-// Consuming: Audio
-int32_t moq_consume_audio(uint32_t catalog, uint32_t index, uint64_t max_latency_ms, void (*on_frame)(void *user_data, int32_t frame), void *user_data);
-int32_t moq_consume_audio_close(uint32_t track);
-
-// Consuming: Frames
-int32_t moq_consume_frame(uint32_t frame, moq_frame *dst);
-int32_t moq_consume_frame_free(uint32_t frame);
-int32_t moq_consume_track(uint32_t broadcast, const char *name, uintptr_t name_len, void (*on_frame)(void *user_data, int32_t frame), void *user_data);
-int32_t moq_consume_track_frame(uint32_t frame, moq_frame *dst);
-int32_t moq_consume_track_frame_free(uint32_t frame);
-int32_t moq_consume_track_close(uint32_t track);
-```
-
-Raw track frames use the same `moq_frame` record as media frames. Use
-`moq_publish_track_frame` or `moq_publish_group_frame` to provide microsecond
-presentation timestamps; `moq_consume_track_frame` returns that timestamp in
-`moq_frame.timestamp_us`. libmoq creates raw tracks with a microsecond
-timescale, matching the C ABI's timestamp units.
+The C API is unchanged: the header is still `moq.h` and the library is still
+`libmoq.a` (`moq.lib` on Windows). Switch the crate to `moq-c`, CMake to
+`find_package(moq-c)` with the `moq::c` target, and pkg-config to `moq-c`.
+Release archives are tagged `moq-c-v*` on
+[GitHub](https://github.com/moq-dev/moq/releases?q=moq-c).

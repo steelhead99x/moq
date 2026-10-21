@@ -1,9 +1,9 @@
+import { Milli } from "@moq/clock";
 /**
  * Connection statistics: what the local transport counts, and what the peer reports.
  *
  * @module
  */
-import * as Time from "../time.ts";
 
 /**
  * A point-in-time snapshot of the transport's counters, from `WebTransport.getStats()`.
@@ -15,10 +15,10 @@ import * as Time from "../time.ts";
  * Every field is optional. The qmux/WebSocket fallback implements no `getStats()` at
  * all and reports nothing; see {@link Probe} for what the peer measures.
  *
- * The field names match Rust's `moq_net::ConnectionStats` but the counters keep each
+ * The field names match Rust's `moq_net::session::Stats` but the counters keep each
  * stack's own semantics rather than being normalized. Notably W3C excludes
- * retransmissions and QUIC overhead from the byte counts where quinn includes them,
- * and counts packets where quinn counts datagrams.
+ * retransmissions and QUIC overhead from the byte counts where native QUIC includes
+ * them, and counts packets where native QUIC counts datagrams.
  *
  * @public
  */
@@ -29,7 +29,7 @@ export interface Stats {
 	 * Usually absent: browsers don't report an RTT yet even though the W3C dictionary
 	 * has the field. Use {@link Probe.rtt}, which the peer measures.
 	 */
-	rtt?: Time.Milli;
+	rtt?: Milli;
 
 	/** Estimated send bandwidth from the congestion controller, in bits per second. */
 	estimatedSendRate?: number;
@@ -71,7 +71,7 @@ export interface Probe {
 	 * Measured through the peer's application layer, so it reads higher than a
 	 * transport-level RTT would.
 	 */
-	rtt?: Time.Milli;
+	rtt?: Milli;
 
 	/** The peer's estimate of the bitrate it is receiving from us, in bits per second. */
 	estimatedRecvRate?: number;
@@ -106,7 +106,7 @@ export async function transportStats(quic: WebTransport): Promise<Stats> {
 	try {
 		const stats = await getStats.call(quic);
 		return {
-			rtt: stats.smoothedRtt !== undefined ? Time.Milli(stats.smoothedRtt) : undefined,
+			rtt: stats.smoothedRtt !== undefined ? Milli(stats.smoothedRtt) : undefined,
 			estimatedSendRate: stats.estimatedSendRate ?? undefined,
 			bytesSent: stats.bytesSent,
 			bytesReceived: stats.bytesReceived,

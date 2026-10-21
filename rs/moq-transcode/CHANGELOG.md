@@ -7,6 +7,145 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/moq-dev/moq/compare/moq-transcode-v0.1.9...moq-transcode-v0.1.10) - 2026-10-05
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux, moq-video
+
+## [0.1.9](https://github.com/moq-dev/moq/compare/moq-transcode-v0.1.8...moq-transcode-v0.1.9) - 2026-10-03
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux, moq-video
+
+## [0.1.8](https://github.com/moq-dev/moq/compare/moq-transcode-v0.1.7...moq-transcode-v0.1.8) - 2026-09-30
+
+### Other
+
+- updated the following local packages: kio, moq-net, moq-mux, moq-video, hang
+
+## [0.1.7](https://github.com/moq-dev/moq/compare/moq-transcode-v0.1.6...moq-transcode-v0.1.7) - 2026-09-27
+
+### Fixed
+
+- *(egress)* single-rendition egress serves the best rendition ([#4293](https://github.com/moq-dev/moq/pull/4293))
+
+## [0.1.6](https://github.com/moq-dev/moq/compare/moq-transcode-v0.1.5...moq-transcode-v0.1.6) - 2026-09-26
+
+### Added
+
+- end a broadcast with close() in every language ([#4031](https://github.com/moq-dev/moq/pull/4031))
+
+## [0.1.5](https://github.com/moq-dev/moq/compare/moq-transcode-v0.1.4...moq-transcode-v0.1.5) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-video, hang, moq-mux
+
+## [0.1.4](https://github.com/moq-dev/moq/compare/moq-transcode-v0.1.3...moq-transcode-v0.1.4) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, moq-video, hang
+
+## [0.1.3](https://github.com/moq-dev/moq/compare/moq-transcode-v0.1.2...moq-transcode-v0.1.3) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux, moq-video
+
+## [0.1.2](https://github.com/moq-dev/moq/compare/moq-transcode-v0.1.1...moq-transcode-v0.1.2) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, hang, moq-video
+
+## [0.1.1](https://github.com/moq-dev/moq/compare/moq-transcode-v0.1.0...moq-transcode-v0.1.1) - 2026-09-24
+
+### Other
+
+- updated the following local packages: moq-net, moq-video, hang, moq-mux
+
+## [0.0.21](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.20...moq-transcode-v0.0.21) - 2026-09-23
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.0.20](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.19...moq-transcode-v0.0.20) - 2026-09-23
+
+### Added
+
+- *(video)* fork v4l in-tree with checked-in V4L2 bindings ([#3867](https://github.com/moq-dev/moq/pull/3867))
+- *(video)* [**breaking**] type the group configuration and make cut fallible ([#3876](https://github.com/moq-dev/moq/pull/3876))
+- preserve video capture timing ([#3849](https://github.com/moq-dev/moq/pull/3849))
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(hang)* [**breaking**] unify catalog APIs ([#3813](https://github.com/moq-dev/moq/pull/3813))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- *(hang)* [**breaking**] one continuous broadcast clock at the catalog root ([#3675](https://github.com/moq-dev/moq/pull/3675))
+- [**breaking**] refuse released spellings and drop unused deprecated APIs ([#3719](https://github.com/moq-dev/moq/pull/3719))
+
+### Fixed
+
+- *(video)* [**breaking**] confine synchronous codecs to their thread ([#3837](https://github.com/moq-dev/moq/pull/3837))
+
+### Other
+
+- *(quest)* complete the media release review ([#3878](https://github.com/moq-dev/moq/pull/3878))
+- *(video)* [**breaking**] separate decoder output from subscription policy ([#3875](https://github.com/moq-dev/moq/pull/3875))
+- Make media backends optional ([#3839](https://github.com/moq-dev/moq/pull/3839))
+- *(video)* [**breaking**] type frame conversions ([#3846](https://github.com/moq-dev/moq/pull/3846))
+- *(net)* [**breaking**] name path roles without new types ([#3826](https://github.com/moq-dev/moq/pull/3826))
+- *(quic)* [**breaking**] keep only the noq backend ([#3811](https://github.com/moq-dev/moq/pull/3811))
+- Merge origin/main into dev
+- Merge remote-tracking branch 'origin/main' into merge-main-into-dev-20260914
+
+### Changed
+
+- [**breaking**] Forward OpenH264 through the default `openh264` feature and
+  remove the deprecated `nvenc` and `nvdec` feature aliases.
+- Preserve a source catalog's `archive` entry on the derivative instead of
+  synthesizing a timeline for the transcode output.
+- [**breaking**] `Config::resize` is `moq_video::resize::Config` with a
+  native-or-CPU `output`, replacing the acceleration knob; `moq transcode
+  --resize-acceleration` becomes `--frames native|cpu`.
+- [**breaking**] Source frame rates are `Option<moq_video::Rate>`, unknown
+  when the source catalog carries none.
+
+## [0.0.19](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.18...moq-transcode-v0.0.19) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, hang, moq-video
+
+## [0.0.18](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.17...moq-transcode-v0.0.18) - 2026-09-13
+
+### Other
+
+- updated the following local packages: kio, moq-net, moq-video, hang, moq-mux
+
+## [0.0.17](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.16...moq-transcode-v0.0.17) - 2026-09-09
+
+### Added
+
+- *(moq-video)* add the VAAPI H.264 decoder and import its pictures zero-copy ([#3331](https://github.com/moq-dev/moq/pull/3331))
+- *(moq-transcode)* [**breaking**] validate and order the output ladder ([#3447](https://github.com/moq-dev/moq/pull/3447))
+- *(moq-video)* add the V4L2 stateful M2M hardware encoder and decoder ([#3332](https://github.com/moq-dev/moq/pull/3332))
+- *(audio,video)* compile the device, render, and VAAPI code by default ([#3353](https://github.com/moq-dev/moq/pull/3353))
+
+### Fixed
+
+- *(moq-net)* a group consumer is one cursor, so an evicted group skips instead of ending the export ([#3515](https://github.com/moq-dev/moq/pull/3515))
+- *(transcode)* follow a source resolution change with the ladder ([#3381](https://github.com/moq-dev/moq/pull/3381))
+- *(moq-video)* stop openh264 leaking its picture pool, and survive a lost picture ([#3357](https://github.com/moq-dev/moq/pull/3357))
+
+### Other
+
+- *(transcode)* cover retirement while a fetch has not claimed its group ([#3522](https://github.com/moq-dev/moq/pull/3522))
+- take every feature that needs a library or libclang at build time off the defaults ([#3464](https://github.com/moq-dev/moq/pull/3464))
+- *(transcode)* correct the retirement comments and record what the test covers ([#3460](https://github.com/moq-dev/moq/pull/3460))
+
 ## [0.0.16](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.15...moq-transcode-v0.0.16) - 2026-09-02
 
 ### Other

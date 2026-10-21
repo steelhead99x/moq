@@ -34,7 +34,7 @@ local with no extra hop:
 ```rust
 let mut rtmp = moq_rtmp::Config::default();
 rtmp.listen = Some("0.0.0.0:1935".parse()?);
-rtmp.prefix = "live/".to_string();
+rtmp.prefix = "live".into();
 
 // `origin` is your relay's local origin (e.g. `cluster.origin.clone()`).
 tokio::select! {
@@ -49,8 +49,10 @@ To gate access, drive the `Server` directly. `accept` runs the handshake and the
 connect exchange, then yields a `Request` once the client wants to publish or
 play. The `Request` is either a `Publish` or a `Play`; you inspect the app and
 stream key, make a decision, and `accept` or `reject` it. This mirrors
-`moq-native`'s `Server` / `Request`, so there's no callback: the auth policy lives
-in your loop.
+`moq-tokio`'s `Server` / `Request`, so there's no callback: the auth policy lives
+in your loop. To keep `run`'s first-publisher-wins rule, claim each publish's
+resolved path on a shared `moq_rtmp::ActivePaths` and hold the guard while the
+publish runs.
 
 ```rust
 let mut server = moq_rtmp::Server::bind("0.0.0.0:1935".parse()?).await?;
@@ -61,7 +63,7 @@ while let Some(request) = server.accept().await {
     // Spawn per connection: `accept` pumps media for the whole connection, so
     // handling it inline would serialize clients.
     tokio::spawn(async move {
-        // Treat the stream key as a token (e.g. a moq-token JWT) and the app as
+        // Treat the stream key as a token (e.g. a moq-auth JWT) and the app as
         // the broadcast path. Verify however you like; the origin can be scoped
         // per token with `with_root` / `scope`.
         match request {
@@ -83,23 +85,24 @@ while let Some(request) = server.accept().await {
 Two ways to serve `rtmps://`:
 
 - **Let the gateway terminate TLS.** Set `Config::tls` (or call
-  `Server::with_tls`) with a `rustls::ServerConfig`, and the listener speaks
-  RTMPS with no other change. Build the config from a `moq_native::tls::Server`
-  instance (RTMPS has no ALPN), or supply any `rustls::ServerConfig`. To serve
-  both RTMP and RTMPS, clone one base config so duplicate-publish rejection is
-  shared across both listeners, then call `run` with a cloned origin.
+  `Server::with_tls`) with a `rustls::ServerConfig`, and the listener serves
+  RTMPS alongside plaintext RTMP on the same port: a client that opens with a
+  TLS ClientHello is TLS-terminated, any other is served as plaintext. Build the
+  config from a `moq_tokio::tls::Listen` instance (RTMPS has no ALPN), or supply
+  any `rustls::ServerConfig`. Set `Config::plaintext = false` (or
+  `Server::with_plaintext(false)`) to serve RTMPS only: a plaintext client is
+  refused at its first byte, so stream keys never cross the network
+  unencrypted. Refusing plaintext without a TLS config is an error at startup.
 
   ```rust
-  let mut tls = moq_native::tls::Server::default();
+  let mut tls = moq_tokio::tls::Listen::default();
   tls.generate = vec!["your-domain.com".to_string()]; // or set tls.cert / tls.key
   let server_config = tls.server_config(vec![])?; // RTMPS has no ALPN
 
   let mut rtmp = moq_rtmp::Config::default();
   rtmp.listen = Some("0.0.0.0:1935".parse()?);
-
-  let mut rtmps = rtmp.clone();
-  rtmps.listen = Some("0.0.0.0:443".parse()?);
-  rtmps.tls = Some(server_config); // Arc<rustls::ServerConfig>
+  rtmp.tls = Some(server_config); // Arc<rustls::ServerConfig>: rtmp:// and rtmps://
+  rtmp.plaintext = false; // optional: rtmps:// only
   ```
 
 - **Bring your own transport.** Accept the connection and complete the TLS
@@ -159,6 +162,6 @@ the broadcast to be announced.
 The `run` entry point (and the `moq-cli` CLI built on it) is unauthenticated:
 anyone who can reach the TCP port can publish or play, so gate them with a host firewall or a
 private network. To authenticate, use the `Server` / `Request` API above and
-verify each request in your accept loop (e.g. the stream key as a moq-token JWT,
+verify each request in your accept loop (e.g. the stream key as a moq-auth JWT,
 the app as the broadcast path) before accepting it. That is the intended
 integration point for a relay that already has JWT/path auth.

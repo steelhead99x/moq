@@ -10,9 +10,29 @@ description: Async sequences for iOS and macOS via the Moq package
 The `Moq` Swift package: de-prefixed types, `AsyncSequence` on every
 consumer, `Sendable` handles, and `Task` cancellation that reaches the native
 side. It depends on `MoqFFI`, which ships a prebuilt XCFramework with arm64
-slices for iOS 15+, the iOS Simulator, and macOS 12.3+.
+slices for iOS 16+, the iOS Simulator, and macOS 12.3+.
 
-```swift
+`Media` owns catalogs, encoded-media importers, and container consumers.
+`Media.TrackProducer.audio` / `.video` take a broadcast, an init record, and a
+`.named(name:)` or `.requested(request)` target. `Media.CatalogProducer(broadcast:)`
+updates catalog properties and sections without keeping the broadcast open.
+Its writes fail after closing or releasing the broadcast.
+`Flate.SnapshotProducer` / `StreamProducer` publish opaque bytes with an optional `timestampUs`.
+A missing data timestamp stays untimed; the library never substitutes zero or now.
+`Json` consumers yield `Json.Timed` (`value`, `timestampUs`); a snapshot consumer yields each state in order,
+and `latest()` skips to the newest. Read timestamps are rounded down to a whole microsecond.
+Raw tracks with a `nil` timescale are untimed on both publish and receive.
+Whole-frame media writes require caller time; container imports keep their own timeline handling.
+Timed raw/data tracks require caller-supplied timestamps. Use `Media.CatalogProducer.now()` to stamp a locally
+created event on the broadcast clock; reading it fixes that clock for later media producers.
+Share `Media.Timebase(broadcast:)` through `ContainerInit` when several imports use one
+source timeline; omitting it keeps an independent offset. A timebase belongs to its
+broadcast and does not keep it open. `ContainerProducer` takes chunks split anywhere,
+so a raw byte stream needs no other importer.
+For arrival-order reads, decode each group from `TrackConsumer.recvGroup()` with
+`Media.GroupConsumer(group:container:)`; frames carry container media time as they land.
+
+```swift ignore
 dependencies: [
     .package(url: "https://github.com/moq-dev/moq-swift", from: "<version>"),   // latest: see the badge above
 ],
@@ -25,11 +45,20 @@ targets: [
 import Moq
 
 // Subscribe. The sequence is live, so run it in its own Task.
-let client = Client()
+let client = try Client()
 let session = try await client.connect(to: "https://relay.example.com")
 
-for try await announcement in try session.consumer.announced(prefix: "live/") {
-    for try await catalog in try announcement.broadcast.subscribeCatalog() {
+for try await event in try session.consume.announced(prefix: "live/", filter: "*/camera") {
+    // A restart is a new publisher run at the same path: request it again.
+    let announcement: Announce
+    switch event {
+    case .start(let started), .restart(let started): announcement = started
+    default: continue // .update or .end
+    }
+    // Prefixes stay origin-relative; captures reports what each wildcard matched.
+    print(announcement.captures ?? [])
+    let broadcast = try await session.consume.requestBroadcast(path: announcement.prefix)
+    for try await catalog in try await Media.CatalogConsumer.subscribe(broadcast: broadcast) {
         print(catalog)
     }
 }
@@ -38,30 +67,59 @@ for try await announcement in try session.consumer.announced(prefix: "live/") {
 ```swift
 // Publish encoded frames, or raw pixels with the codec inside the binding (VideoToolbox).
 // opusInit, packet, pts, and rgba come from your encoder or capture source.
-let broadcast = try session.publisher.createBroadcast(path: "my-stream.hang")
-let audio = try broadcast.publishMedia(format: "opus", initData: opusInit)
+let broadcast = try session.publish.createBroadcast(path: "my-stream.hang")
+let audio = try Media.TrackProducer.audio(broadcast: broadcast, initData: Media.AudioInit(format: .opus, data: opusInit))
 try audio.writeFrame(packet, timestampUs: 20_000)
+try audio.cut() // audio has no keyframes, so this is what gives it groups
 
-let video = try broadcast.publishVideo(
+let video = try Video.Producer(
+    catalog: Media.CatalogProducer(broadcast: broadcast),
     input: VideoEncoderInput(format: .rgba, width: 1280, height: 720, framerate: 30),
-    output: VideoEncoderOutput(codec: .h264, track: "camera", bitrate: nil, gop: nil, kind: .auto)
+    output: VideoEncoderOutput(codec: .h264, track: "camera", kind: .auto)
 )
 try video.write(VideoFrame(timestampUs: pts, data: rgba))
+try broadcast.announce(route: Route(epoch: mintEpoch())) // a fresh epoch per run
+try audio.finish()
+try video.finish()
+try broadcast.close()
 
-session.shutdown()
+try await session.shutdown()
 ```
 
-For a self-signed relay on your own test network, `client.setTlsVerify(false)`
-accepts any certificate; prefer `setTlsRoots` or a fingerprint anywhere else.
+## Things to know
 
-`Server` binds, generates or loads TLS, and hands you each request to
-`accept()` or `reject(code:)`. JSON tracks take `Codable` types
-(`publishJsonSnapshot(name:of:)`, `subscribeJsonStream(name:as:)`), and the
-rest of the [shared feature list](/lib/#what-every-binding-can-do) maps one
-to one: `fetchGroup`/`fetchMediaGroup`, `dynamic()`, `appendDatagram`/
-`datagrams`, `setCatalogSection`, `used()`/`unused()`. `MoqError.isAuth` and
-`isShutdown` classify errors.
+The rest of the [shared feature list](/lib/#what-every-binding-can-do) maps
+one to one; the API reference has the names, and [Layers](/lib/layers)
+shows which module holds each.
 
-- API reference: [Swift Package Index (DocC)](https://swiftpackageindex.com/moq-dev/moq-swift/documentation/moq)
+- **Audio needs cuts.** Video groups at its keyframes, but audio forms a group only where you call `cut()`: after every frame, or at a segment cadence to align with video.
+- **Live encoder timing.** After writing a frame you encoded yourself, call `flush(timestampUs:)` with the same timestamp so the catalog advertises your jitter. Skip it for file and network imports. On a seek or pause, call `discontinuity()`, then keep timestamps moving forward and resume video on a keyframe.
+- **Decoded frames hold decoder buffers.** Release each frame from a `Video.Consumer` promptly, or the decoder stalls. `resize` is best effort, so read each frame's `width()` and `height()`.
+- **Closing.** `try await session.shutdown()` drains for up to one second and throws on failure. `session.cancel(code:)` closes at once. Finish or abort live tracks first. Application delivery requires explicitly selecting `moq-lite-07-wip` on both peers; older Lite versions (including default lite-06) and IETF wait only for transport ACKs.
+- **Stats.** `session.stats()` reports `rttUs`, `estimatedSendRateBps`, and the byte and packet counters (`bytesSent`, `bytesReceived`, `bytesLost`, `packetsSent`, `packetsReceived`, `packetsLost`). A field is `nil` when the transport does not report it, which is not the same as zero. `version` names the negotiated protocol, and while a client session reconnects `session.failure()` says why. Hold the owned `Bandwidth.Consumer` returned by `session.recvBandwidth()` to receive bandwidth estimates. `peek()` reads the current estimate in bits per second and `changed()` waits for a new one. Release the consumer or call `cancel()` when finished; releasing the last consumer stops PROBE; the session and stats snapshots do not request it. Client consumers survive reconnects and report no estimate while disconnected.
+- **Errors.** Diagnostic cases use the `reason:` argument label; match their associated value to inspect it. Protocol errors carry `details`.
+- **Disabled renditions.** Audio and video convenience decoders reject a catalog configuration with `enabled: false`. Select an enabled rendition from the latest catalog before opening a decoder.
+- **Track demand.** Obtain a dynamic track request’s `demand()` before accepting it to watch subscribers through the handoff to its producer. The watch does not keep the track alive and ends when the track closes or the request is rejected.
+
+## Runtime
+
+Native I/O and background tasks run on a Tokio worker pool. Calls awaited by the
+host still poll in place; independent native wake callbacks can run concurrently.
+The generated bindings resume Swift continuations. Use the appropriate actor
+when updating UI state.
+A panic in a native background task reaches the pending and later fallible calls
+of every object that depends on it as a task error; other objects keep running.
+
+A session closed for exceeding the relay's request caps reports the protocol
+kind `ProtocolKind.tooManyRequests`. Reduce
+the simultaneous announcements or subscriptions, or ask the relay operator
+to adjust the [session limits](/bin/relay/config#session-and-peer), before
+reconnecting with the same workload.
+A session closed because its credential expired reports `ProtocolKind.expired`, and a request refused for an expired token raises `MoqError.Expired`; refresh the token before retrying.
+A catalog that needs a newer moq-hang draft than this build reads raises `MoqError.UnsupportedCatalog`; upgrade the library to read it.
+
+## Reference
+
+- API source: [swift/Sources/Moq](https://github.com/moq-dev/moq/tree/main/swift/Sources/Moq)
 - Source: [`swift/`](https://github.com/moq-dev/moq/tree/main/swift); `just swift check` builds and tests on a Mac
 - Packages SPM resolves: [moq-dev/moq-swift](https://github.com/moq-dev/moq-swift), [moq-dev/moq-swift-ffi](https://github.com/moq-dev/moq-swift-ffi)

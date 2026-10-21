@@ -1,4 +1,4 @@
-"""Publish or subscribe to a clock track. Python twin of `rs/moq-native/examples/clock.rs`.
+"""Publish or subscribe to a clock track. Python twin of `rs/moq-tokio/examples/clock.rs`.
 
 Each minute is a new group; each second is a frame inside that group. The first
 frame of every group is the "YYYY-MM-DD HH:MM:" prefix, followed by one "SS"
@@ -10,7 +10,7 @@ frame per second.
 
 import argparse
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import moq
 
@@ -18,19 +18,20 @@ import moq
 async def publish(url: str, broadcast_name: str, track_name: str, tls_verify: bool) -> None:
     async with moq.Client(url, tls_verify=tls_verify) as client:
         broadcast = client.create_broadcast(broadcast_name)
-        track = broadcast.publish_track(track_name)
+        track = broadcast.publish_track(track_name, moq.TrackInfo(timescale=1_000_000))
+        broadcast.announce()
         print(f"publishing {broadcast_name!r} track={track_name!r} at {url}")
 
         while True:
             now = datetime.now(timezone.utc).replace(microsecond=0)
-            timestamp_us = int(now.timestamp()) * 1_000_000
+            timestamp = timedelta(seconds=int(now.timestamp()))
             group = track.append_group()
-            group.write_frame(now.strftime("%Y-%m-%d %H:%M:").encode(), timestamp_us)
+            group.write_frame(now.strftime("%Y-%m-%d %H:%M:").encode(), timestamp)
 
             current_minute = now.minute
             while now.minute == current_minute:
-                timestamp_us = int(now.timestamp()) * 1_000_000
-                group.write_frame(now.strftime("%S").encode(), timestamp_us)
+                timestamp = timedelta(seconds=int(now.timestamp()))
+                group.write_frame(now.strftime("%S").encode(), timestamp)
                 await asyncio.sleep(1 - datetime.now(timezone.utc).microsecond / 1_000_000)
                 now = datetime.now(timezone.utc).replace(microsecond=0)
 

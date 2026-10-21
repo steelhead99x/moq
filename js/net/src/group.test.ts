@@ -1,5 +1,9 @@
 import { expect, test } from "bun:test";
-import { Lagged, MAX_GROUP_CACHE_BYTES, MAX_GROUP_FRAMES, Producer } from "./group.ts";
+import { Signal } from "@moq/signals";
+import { FrameTooLarge, GroupTooLarge, StreamCode, StreamError } from "./error.ts";
+import { MAX_GROUP_CACHE_BYTES, MAX_GROUP_FRAMES, Producer } from "./group.ts";
+import { hooks, type Replacement } from "./internal.ts";
+import { textFrame } from "./mock.ts";
 import { Timestamp } from "./time.ts";
 
 const dec = new TextDecoder();
@@ -8,21 +12,21 @@ test("used reflects mirror demand and unused resolves when the last reader leave
 	const producer = new Producer(0);
 
 	// No mirror readers: no demand.
-	expect(producer.used.peek()).toBe(false);
+	expect(producer.demand().used.peek()).toBe(false);
 
 	const a = producer.mirror();
 	const b = producer.mirror();
-	expect(producer.used.peek()).toBe(true);
+	expect(producer.demand().used.peek()).toBe(true);
 
 	// Closing one of two keeps demand, so unused() stays pending.
 	a.close();
-	expect(producer.used.peek()).toBe(true);
+	expect(producer.demand().used.peek()).toBe(true);
 
 	// Closing the last reader drops demand; unused() resolves. Fetch coalescing awaits this to
 	// cancel a download that everyone has abandoned (a group may never end on its own).
 	b.close();
-	await producer.unused();
-	expect(producer.used.peek()).toBe(false);
+	await producer.demand().unused();
+	expect(producer.demand().used.peek()).toBe(false);
 });
 
 function pair(sequence: number) {
@@ -30,90 +34,84 @@ function pair(sequence: number) {
 	return { producer, consumer: producer.consume() };
 }
 
-test("a group caps its frame count, dropping from the front", () => {
+test("a group caps its frame count and aborts on the next write", async () => {
 	const { producer, consumer } = pair(0);
 
-	const extra = 100;
-	for (let i = 0; i < MAX_GROUP_FRAMES + extra; i++) {
+	for (let i = 0; i < MAX_GROUP_FRAMES; i++) {
 		producer.writeFrame({ payload: new Uint8Array([i & 0xff]), timestamp: Timestamp.now() });
 	}
+	expect(() => producer.writeFrame({ payload: new Uint8Array([0]), timestamp: Timestamp.now() })).toThrow(
+		GroupTooLarge,
+	);
 
-	// Drain the buffered frames: exactly MAX_GROUP_FRAMES remain after eviction.
-	const frames: { sequence: number; payload: Uint8Array }[] = [];
-	for (let f = consumer.tryReadFrameSequence(); f; f = consumer.tryReadFrameSequence()) frames.push(f);
-	expect(frames.length).toBe(MAX_GROUP_FRAMES);
-	// Sequence numbers count every frame ever written (evicted included), so the first surviving
-	// frame is index `extra`, not 0: indices stay consistent across eviction.
-	expect(frames[0].sequence).toBe(extra);
-	expect(frames[0].payload[0]).toBe(extra & 0xff);
+	await expect(consumer.readFrame()).rejects.toBeInstanceOf(GroupTooLarge);
 });
 
-test("a group caps its byte size, dropping from the front", () => {
+test("a group caps its byte size and aborts on the next write", async () => {
 	const { producer, consumer } = pair(0);
 
-	// 40 x 1 MiB = 40 MiB, over the 32 MiB cap.
 	const oneMiB = 1024 * 1024;
-	for (let i = 0; i < 40; i++) {
+	for (let i = 0; i < MAX_GROUP_CACHE_BYTES / oneMiB; i++) {
 		producer.writeFrame({ payload: new Uint8Array(oneMiB), timestamp: Timestamp.now() });
 	}
+	expect(() => producer.writeFrame({ payload: new Uint8Array(1), timestamp: Timestamp.now() })).toThrow(
+		GroupTooLarge,
+	);
 
-	// Drain the buffered frames and sum their bytes: the cache stayed under the byte cap.
-	const frames: Uint8Array[] = [];
-	for (let f = consumer.tryReadFrame(); f; f = consumer.tryReadFrame()) frames.push(f.payload);
-	const bytes = frames.reduce((sum, f) => sum + f.byteLength, 0);
-	expect(bytes).toBeLessThanOrEqual(MAX_GROUP_CACHE_BYTES);
-	expect(frames.length).toBe(MAX_GROUP_CACHE_BYTES / oneMiB);
+	await expect(consumer.readFrame()).rejects.toBeInstanceOf(GroupTooLarge);
 });
 
-test("a caught-up reader does not trip the byte cache cap", async () => {
+test("a caught-up reader still trips the byte cache cap", async () => {
 	const { producer, consumer } = pair(0);
 
 	const oneMiB = 1024 * 1024;
-	const frames = MAX_GROUP_CACHE_BYTES / oneMiB + 8;
+	const frames = MAX_GROUP_CACHE_BYTES / oneMiB;
 	for (let i = 0; i < frames; i++) {
 		producer.writeFrame({ payload: new Uint8Array(oneMiB), timestamp: Timestamp.now() });
 		expect((await consumer.readFrame())?.payload.byteLength).toBe(oneMiB);
 	}
+	expect(() => producer.writeFrame({ payload: new Uint8Array(oneMiB), timestamp: Timestamp.now() })).toThrow(
+		GroupTooLarge,
+	);
 });
 
-test("reading a group whose frames were evicted throws Lagged", async () => {
-	const { producer, consumer } = pair(0);
-
-	// Overflow the frame cap without reading, so the front frames are evicted.
-	for (let i = 0; i < MAX_GROUP_FRAMES + 10; i++) {
+test("the writer sees GroupTooLarge when the group overflows", () => {
+	const producer = new Producer(0);
+	for (let i = 0; i < MAX_GROUP_FRAMES; i++) {
 		producer.writeFrame({ payload: new Uint8Array([i & 0xff]), timestamp: Timestamp.now() });
 	}
-
-	// The reader fell behind the eviction window: it must error, not skip the gap.
-	expect(consumer.readFrame()).rejects.toBeInstanceOf(Lagged);
+	expect(() => producer.writeFrame({ payload: new Uint8Array([0]), timestamp: Timestamp.now() })).toThrow(
+		GroupTooLarge,
+	);
+	expect(producer.closed.peek()).toBeInstanceOf(GroupTooLarge);
 });
 
-test("a read that starts above the eviction window skips the gap instead of throwing", async () => {
+test("a closed group rejects a further write without discarding committed frames", async () => {
 	const { producer, consumer } = pair(0);
-
-	// Overflow the frame cap without reading, evicting frames 0 through `extra - 1`.
-	const extra = 100;
-	for (let i = 0; i < MAX_GROUP_FRAMES + extra; i++) {
+	for (let i = 0; i < MAX_GROUP_FRAMES; i++) {
 		producer.writeFrame({ payload: new Uint8Array([i & 0xff]), timestamp: Timestamp.now() });
 	}
+	producer.close();
 
-	// `extra - 1` was the last frame evicted, so a reader that wanted it still has a gap; one
-	// above it is the lowest start that stays clear. Both are taken before the reads below,
-	// which drain the buffer a consume() handle shares with the producer.
-	const lagged = producer.mirror();
-	const clear = producer.mirror();
+	expect(() => producer.writeFrame({ payload: new Uint8Array([0]), timestamp: Timestamp.now() })).toThrow(
+		"group is closed",
+	);
+	expect(producer.closed.peek()).toBeNull();
+	expect((await consumer.readFrame())?.payload[0]).toBe(0);
+});
 
-	// Nothing at or above `from` was evicted, so the reader lost nothing it asked for and the
-	// frames below it are dropped rather than returned.
-	const from = 200;
-	expect(await consumer.readFrameSequence({ from })).toMatchObject({
-		sequence: from,
-		payload: new Uint8Array([from & 0xff]),
+test("a read that starts later skips frames below it instead of returning them", async () => {
+	const { producer, consumer } = pair(0);
+
+	for (let i = 0; i < 10; i++) {
+		producer.writeFrame({ payload: new Uint8Array([i]), timestamp: Timestamp.now() });
+	}
+
+	expect(await consumer.readFrameSequence({ from: 5 })).toMatchObject({
+		sequence: 5,
+		payload: new Uint8Array([5]),
 	});
-	expect(await consumer.readFrameSequence({ from })).toMatchObject({ sequence: from + 1 });
-
-	await expect(lagged.readFrameSequence({ from: extra - 1 })).rejects.toBeInstanceOf(Lagged);
-	await expect(clear.readFrameSequence({ from: extra })).resolves.toMatchObject({ sequence: extra });
+	expect(await consumer.readFrameSequence({ from: 5 })).toMatchObject({ sequence: 6 });
 });
 
 test("a group with no eviction reads every frame without error", async () => {
@@ -129,8 +127,8 @@ test("a group with no eviction reads every frame without error", async () => {
 
 test("tryReadFrame drains buffered frames then returns undefined", () => {
 	const { producer, consumer } = pair(0);
-	producer.writeString("a");
-	producer.writeString("b");
+	producer.writeFrame(textFrame("a"));
+	producer.writeFrame(textFrame("b"));
 
 	expect(dec.decode(consumer.tryReadFrame()?.payload)).toBe("a");
 	expect(dec.decode(consumer.tryReadFrame()?.payload)).toBe("b");
@@ -140,8 +138,8 @@ test("tryReadFrame drains buffered frames then returns undefined", () => {
 
 test("tryReadFrameSequence reports per-frame sequence numbers", () => {
 	const { producer, consumer } = pair(7);
-	producer.writeString("a");
-	producer.writeString("b");
+	producer.writeFrame(textFrame("a"));
+	producer.writeFrame(textFrame("b"));
 
 	expect(consumer.tryReadFrameSequence()).toMatchObject({ sequence: 0, payload: new TextEncoder().encode("a") });
 	expect(consumer.tryReadFrameSequence()).toMatchObject({ sequence: 1, payload: new TextEncoder().encode("b") });
@@ -150,8 +148,8 @@ test("tryReadFrameSequence reports per-frame sequence numbers", () => {
 
 test("readFrameSequence reports per-frame sequence numbers", async () => {
 	const { producer, consumer } = pair(7);
-	producer.writeString("a");
-	producer.writeString("b");
+	producer.writeFrame(textFrame("a"));
+	producer.writeFrame(textFrame("b"));
 
 	expect(await consumer.readFrameSequence()).toMatchObject({ sequence: 0, payload: new TextEncoder().encode("a") });
 	expect(await consumer.readFrameSequence()).toMatchObject({ sequence: 1, payload: new TextEncoder().encode("b") });
@@ -163,7 +161,7 @@ test("done distinguishes a finished group from one that is merely empty", () => 
 	expect(consumer.tryReadFrame()).toBeUndefined();
 	expect(consumer.done).toBe(false);
 
-	producer.writeString("a");
+	producer.writeFrame(textFrame("a"));
 	// Buffered but closed: still not done until the frame is drained.
 	producer.close();
 	expect(consumer.done).toBe(false);
@@ -172,6 +170,15 @@ test("done distinguishes a finished group from one that is merely empty", () => 
 	// Drained and closed: now done.
 	expect(consumer.tryReadFrame()).toBeUndefined();
 	expect(consumer.done).toBe(true);
+});
+
+test("a previously obtained closed handle peeks source closure synchronously", () => {
+	const { producer, consumer } = pair(0);
+	const closed = consumer.closed;
+
+	producer.close();
+
+	expect(closed.peek()).toBeNull();
 });
 
 test("readable resolves once a frame is buffered", async () => {
@@ -186,7 +193,7 @@ test("readable resolves once a frame is buffered", async () => {
 	expect(settled).toBe(false);
 
 	// Writing makes it resolve.
-	producer.writeString("hi");
+	producer.writeFrame(textFrame("hi"));
 	await readable; // must not hang
 	expect(dec.decode(consumer.tryReadFrame()?.payload)).toBe("hi");
 });
@@ -199,12 +206,248 @@ test("readable resolves once the group closes, even with nothing buffered", asyn
 	expect(consumer.tryReadFrame()).toBeUndefined();
 });
 
+test("readable waits past replayed frames after adopting an open replacement", async () => {
+	const producer = new Producer(0);
+	const consumer = producer.mirror();
+	const replacement = new Producer(0);
+	const route = new Signal(false);
+	const adopted = Promise.withResolvers<void>();
+	hooks.recoverGroup(consumer, {
+		changed: route,
+		wants: () => route.peek(),
+		replace: async (index) => {
+			expect(index).toBe(1);
+			return {
+				group: replacement.mirror(),
+				expiry: { expired: () => false, changed: [] },
+				adopt: () => {
+					route.set(false);
+					adopted.resolve();
+				},
+				discard: () => {},
+			};
+		},
+	});
+	producer.writeFrame(textFrame("zero"));
+	expect(await consumer.readString()).toBe("zero");
+	replacement.writeFrame(textFrame("zero"));
+	route.set(true);
+
+	let settled = false;
+	const readable = consumer.readable().then(() => {
+		settled = true;
+	});
+	await adopted.promise;
+	// Drain the adoption's microtasks without advancing wall-clock time.
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	expect(settled).toBe(false);
+
+	replacement.writeFrame(textFrame("one"));
+	await readable;
+	expect(consumer.tryReadFrameSequence()).toMatchObject({ sequence: 1, payload: textFrame("one").payload });
+	consumer.close();
+	producer.close();
+	replacement.close();
+});
+
+test("done ignores replayed frames an adopted copy buffers", async () => {
+	const producer = new Producer(0);
+	const consumer = producer.mirror();
+	const replacement = new Producer(0);
+	const route = new Signal(false);
+	const adopted = Promise.withResolvers<void>();
+	hooks.recoverGroup(consumer, {
+		changed: route,
+		wants: () => route.peek(),
+		replace: async () => ({
+			group: replacement.mirror(),
+			expiry: { expired: () => false, changed: [] },
+			adopt: () => {
+				route.set(false);
+				adopted.resolve();
+			},
+			discard: () => {},
+		}),
+	});
+	producer.writeFrame(textFrame("zero"));
+	expect(await consumer.readString()).toBe("zero");
+	route.set(true);
+
+	const readable = consumer.readable();
+	await adopted.promise;
+	// Drain the adoption's microtasks without advancing wall-clock time.
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	// The adopted copy ends having repeated only the frame already read.
+	replacement.writeFrame(textFrame("zero"));
+	replacement.close();
+	expect(consumer.done).toBe(true);
+	await readable;
+	expect(consumer.tryReadFrame()).toBeUndefined();
+	producer.close();
+});
+
 test("buffered frames are still readable after the group closes", async () => {
 	const { producer, consumer } = pair(0);
-	producer.writeString("a");
+	producer.writeFrame(textFrame("a"));
 	producer.close();
 
 	// Closing doesn't discard buffered frames; the blocking reader drains them before ending.
 	expect(await consumer.readString()).toBe("a");
 	expect(await consumer.readFrame()).toBeUndefined();
+});
+
+test("a frame larger than the cache is rejected rather than silently dropped", () => {
+	// A silent success would report a write that nothing can ever read. Rust rejects the same
+	// frame up front with `Error::FrameTooLarge`.
+	const producer = new Producer(0);
+	const oversized = new Uint8Array(MAX_GROUP_CACHE_BYTES + 1);
+
+	expect(() => producer.writeFrame({ payload: oversized, timestamp: Timestamp.now() })).toThrow(FrameTooLarge);
+
+	// Nothing was appended, so the group is still empty rather than holding a phantom frame.
+	const consumer = producer.consume();
+	producer.close();
+	expect(consumer.tryReadFrame()).toBeUndefined();
+});
+
+test("a group that ends on its own abandons the replacement it asked for", async () => {
+	const producer = new Producer(0);
+	const consumer = producer.mirror();
+	const route = new Signal(0);
+	let signal: AbortSignal | undefined;
+	hooks.recoverGroup(consumer, {
+		changed: route,
+		// A stall looks past the copy once the route moved.
+		wants: (failed) => failed !== undefined || route.peek() > 0,
+		replace: (_index, _failed, abort) => {
+			signal = abort;
+			return new Promise(() => {});
+		},
+	});
+	producer.writeFrame({ payload: new Uint8Array([0]) });
+	await consumer.readFrame();
+
+	route.set(1);
+	const read = consumer.readFrame();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(signal?.aborted).toBe(false);
+
+	producer.close();
+	expect(await read).toBeUndefined();
+	expect(signal?.aborted).toBe(true);
+});
+
+test("a group that ends as its replacement arrives ends rather than adopting it", async () => {
+	const producer = new Producer(0);
+	const consumer = producer.mirror();
+	const route = new Signal(0);
+	const replacement = new Producer(0);
+	let resolve: ((value: Replacement) => void) | undefined;
+	let adopted = false;
+	let discarded = false;
+	hooks.recoverGroup(consumer, {
+		changed: route,
+		wants: (failed) => failed !== undefined || route.peek() > 0,
+		replace: () =>
+			new Promise((r) => {
+				resolve = r;
+			}),
+	});
+	producer.writeFrame({ payload: new Uint8Array([0]) });
+	await consumer.readFrame();
+
+	route.set(1);
+	const read = consumer.readFrame();
+	await new Promise((r) => setTimeout(r, 0));
+	// Both land before the read looks again.
+	resolve?.({
+		group: replacement.mirror(),
+		expiry: { expired: () => false, changed: [] },
+		adopt: () => {
+			adopted = true;
+		},
+		discard: () => {
+			discarded = true;
+		},
+	});
+	producer.close();
+	expect(await read).toBeUndefined();
+	expect(adopted).toBe(false);
+	expect(discarded).toBe(true);
+});
+
+test("a group recovered twice reads on and settles", async () => {
+	const producer = new Producer(0);
+	const consumer = producer.mirror();
+	const route = new Signal(0);
+	const replacements = [new Producer(0), new Producer(0)];
+	let next = 0;
+	hooks.recoverGroup(consumer, {
+		changed: route,
+		wants: (failed) => failed !== undefined,
+		replace: async () => ({
+			group: replacements[next++].mirror(),
+			expiry: { expired: () => false, changed: [] },
+			adopt: () => {},
+			discard: () => {},
+		}),
+	});
+	void consumer.closed;
+	producer.writeFrame({ payload: new Uint8Array([0]) });
+	await consumer.readFrame();
+
+	// Two failures in a row: each moves the group to the next copy.
+	producer.close(new Error("route failed"));
+	replacements[0].writeFrame({ payload: new Uint8Array([0]) });
+	replacements[0].writeFrame({ payload: new Uint8Array([1]) });
+	expect((await consumer.readFrame())?.payload[0]).toBe(1);
+	replacements[0].close(new Error("route failed"));
+	for (const payload of [0, 1, 2]) replacements[1].writeFrame({ payload: new Uint8Array([payload]) });
+	replacements[1].close();
+	expect((await consumer.readFrame())?.payload[0]).toBe(2);
+	expect(await consumer.readFrame()).toBeUndefined();
+	expect(await consumer.closed).toBeNull();
+});
+
+test("a stalled group whose copy then fails asks again with the failure", async () => {
+	const producer = new Producer(0);
+	const consumer = producer.mirror();
+	const route = new Signal(0);
+	const verdict = new Error("refused");
+	hooks.recoverGroup(consumer, {
+		changed: route,
+		wants: (failed) => failed !== undefined || route.peek() > 0,
+		// A stall waits for the route; a failure gets the route's verdict.
+		replace: (_index, failed) => (failed ? Promise.reject(verdict) : new Promise(() => {})),
+	});
+	producer.writeFrame({ payload: new Uint8Array([0]) });
+	await consumer.readFrame();
+
+	route.set(1);
+	const read = consumer.readFrame();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	producer.close(new Error("route failed"));
+	await expect(read).rejects.toBe(verdict);
+});
+
+test("a drained unfinished group fails with Old when its budget gives up", async () => {
+	const { producer, consumer } = pair(0);
+	producer.writeFrame(textFrame("a"));
+	const expired = new Signal(false);
+	hooks.expireGroup(consumer, { expired: () => expired.peek(), changed: [expired] });
+
+	expect(await consumer.readString()).toBe("a");
+	const pending = consumer.readFrame();
+	expired.set(true);
+
+	// The producer never finished the group, so a clean end would pass the prefix off as whole.
+	const err = await pending.then(
+		() => undefined,
+		(e: unknown) => e,
+	);
+	expect(err).toBeInstanceOf(StreamError);
+	expect((err as StreamError).code).toBe(StreamCode.Old);
+	await expect(consumer.readFrame()).rejects.toBe(err);
+	expect(consumer.done).toBe(true);
+	expect(await consumer.closed).toBe(err as StreamError);
 });

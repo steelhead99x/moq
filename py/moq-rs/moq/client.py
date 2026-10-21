@@ -2,12 +2,37 @@
 
 from __future__ import annotations
 
-from moq_ffi import MoqClient
+from collections.abc import Sequence
+from datetime import timedelta
 
-from .origin import Announced, AnnouncedBroadcast, OriginConsumer, OriginProducer
+from moq_ffi import (
+    MoqClient,
+    MoqClientConfig,
+    MoqClientTls,
+    MoqCongestionControl,
+    MoqQuicConfig,
+    MoqWebSocketConfig,
+    moq_qlog_supported,
+    moq_versions,
+)
+
+from ._records import Backoff, _opt_us, _strs
+from .origin import AnnounceConsumer, AnnouncedBroadcast, OriginConsumer, OriginProducer
 from .publish import BroadcastProducer
 from .session import Session
 from .subscribe import BroadcastConsumer
+
+CongestionControl = MoqCongestionControl
+
+
+def versions() -> list[str]:
+    """The protocol versions offered by default, most preferred first, as ``versions`` spells them."""
+    return moq_versions()
+
+
+def qlog_supported() -> bool:
+    """Whether this build can write qlog traces; ``qlog`` raises `moq.Error` otherwise."""
+    return moq_qlog_supported()
 
 
 class Client:
@@ -17,17 +42,40 @@ class Client:
     announced here is also discoverable here:
 
         async with Client("https://relay.example.com") as client:
-            async for ann in client.announced():
+            async for event in client.announced():
                 ...
 
     In advanced mode, provide your own origin for full control:
 
         origin = OriginProducer()
-        client = Client("https://relay.example.com", publish=origin, subscribe=origin)
+        client = Client("https://relay.example.com", publish=origin, consume=origin)
+
+    The WebSocket fallback races QUIC for ``http(s)`` URLs after a 200 ms head start.
+    Pass ``websocket_enabled=False`` against a QUIC-only relay, or a ``websocket_delay``
+    to change the head start:
+
+        client = Client("https://relay.example.com", websocket_delay=timedelta(milliseconds=50))
 
     For a relay that requires mTLS, pass a paired client certificate and key:
 
         client = Client("https://relay.example.com", tls_cert="client.pem", tls_key="client.key")
+
+    The session automatically reconnects with backoff when the transport drops, and
+    broadcasts consumed through it ride out the gap. Pass ``reconnect=False`` for a
+    one-shot dial, or a :class:`Backoff` to tune the retry pacing; watch
+    :meth:`Session.status` for the connect/disconnect transitions.
+
+    ``versions`` restricts the protocol versions offered, most preferred first, spelled
+    like ``"moq-lite-03"``; empty offers every supported version, which :func:`versions` lists.
+
+    ``timeout`` bounds one connect, dial and handshake together (zero waits forever).
+    ``race`` and ``resolution_delay`` pace Happy Eyeballs. ``tls_host_name`` verifies the
+    certificate against another name (SNI). ``idle_timeout``, ``keep_alive`` (zero disables
+    it), ``gso``, ``mtu_discovery``, ``congestion_control``, and ``qlog`` (a directory, when
+    :func:`qlog_supported`) tune QUIC. ``None`` keeps the library default throughout.
+
+    ``keylog=True`` writes TLS session secrets to the file ``SSLKEYLOGFILE`` names, for
+    decrypting a capture; without ``SSLKEYLOGFILE`` the client refuses to build.
     """
 
     def __init__(
@@ -35,28 +83,69 @@ class Client:
         url: str,
         *,
         tls_verify: bool = True,
-        tls_roots: list[str] | None = None,
+        tls_roots: Sequence[str] = (),
         tls_system_roots: bool | None = None,
-        tls_fingerprints: list[str] | None = None,
+        tls_fingerprints: Sequence[str] = (),
         tls_cert: str | None = None,
         tls_key: str | None = None,
+        tls_host_name: str | None = None,
         bind: str | None = None,
+        versions: Sequence[str] = (),
+        timeout: timedelta | None = None,
+        race: timedelta | None = None,
+        resolution_delay: timedelta | None = None,
+        max_streams: int | None = None,
+        idle_timeout: timedelta | None = None,
+        keep_alive: timedelta | None = None,
+        gso: bool | None = None,
+        mtu_discovery: bool | None = None,
+        congestion_control: CongestionControl | None = None,
+        qlog: str | None = None,
+        keylog: bool = False,
+        websocket_enabled: bool | None = None,
+        websocket_delay: timedelta | None = None,
+        reconnect: bool = True,
+        backoff: Backoff | None = None,
         publish: OriginProducer | None = None,
-        subscribe: OriginProducer | None = None,
+        consume: OriginProducer | None = None,
     ) -> None:
         self._url = url
-        self._tls_verify = tls_verify
-        self._tls_roots = tls_roots
-        self._tls_system_roots = tls_system_roots
-        self._tls_fingerprints = tls_fingerprints
-        self._tls_cert = tls_cert
-        self._tls_key = tls_key
-        self._bind = bind
-
         # With neither side given, moq-ffi wires one shared origin to both, so a broadcast
         # announced here is discoverable via announced() (loopback).
-        self._publish_origin = publish
-        self._consume_origin = subscribe
+        self._config = MoqClientConfig(
+            bind=bind,
+            versions=_strs(versions, "versions"),
+            timeout_us=_opt_us(timeout, "timeout"),
+            race_us=_opt_us(race, "race"),
+            resolution_delay_us=_opt_us(resolution_delay, "resolution_delay"),
+            tls=MoqClientTls(
+                insecure=not tls_verify,
+                roots=_strs(tls_roots, "tls_roots"),
+                system_roots=tls_system_roots,
+                fingerprints=_strs(tls_fingerprints, "tls_fingerprints"),
+                cert=tls_cert,
+                key=tls_key,
+                host_name=tls_host_name,
+            ),
+            quic=MoqQuicConfig(
+                max_streams=max_streams,
+                idle_timeout_us=_opt_us(idle_timeout, "idle_timeout"),
+                keep_alive_us=_opt_us(keep_alive, "keep_alive"),
+                gso=gso,
+                mtu_discovery=mtu_discovery,
+                congestion_control=congestion_control,
+                qlog=qlog,
+                keylog=keylog,
+            ),
+            websocket=MoqWebSocketConfig(
+                enabled=websocket_enabled,
+                delay_us=_opt_us(websocket_delay, "websocket_delay"),
+            ),
+            once=not reconnect,
+            backoff=(backoff or Backoff())._ffi(),
+            publish=None if publish is None else publish._inner,
+            consume=None if consume is None else consume._inner,
+        )
 
         self._publisher: OriginProducer | None = None
         self._consumer: OriginConsumer | None = None
@@ -64,64 +153,56 @@ class Client:
         self._session: Session | None = None
 
     async def __aenter__(self):
-        self._inner = MoqClient()
-
-        if not self._tls_verify:
-            self._inner.set_tls_disable_verify(True)
-        if self._tls_roots:
-            self._inner.set_tls_roots(self._tls_roots)
-        if self._tls_system_roots is not None:
-            self._inner.set_tls_system_roots(self._tls_system_roots)
-        if self._tls_fingerprints:
-            self._inner.set_tls_fingerprints(self._tls_fingerprints)
-        if self._tls_cert is not None:
-            self._inner.set_tls_cert(self._tls_cert)
-        if self._tls_key is not None:
-            self._inner.set_tls_key(self._tls_key)
-        if self._bind is not None:
-            self._inner.set_bind(self._bind)
-
-        if self._publish_origin is not None:
-            self._inner.set_publish(self._publish_origin._inner)
-        if self._consume_origin is not None:
-            self._inner.set_consume(self._consume_origin._inner)
-
-        self._session = Session(await self._inner.connect(self._url))
+        self._inner = MoqClient(self._config)
+        try:
+            self._session = Session(await self._inner.connect(self._url))
+        except BaseException:
+            self._inner.cancel()
+            self._inner = None
+            raise
 
         # The session always exposes both sides, wired from the origins above or
         # auto-created, so publishing and discovery always have somewhere to go.
-        self._publisher = self._session.publisher()
-        self._consumer = self._session.consumer()
+        self._publisher = self._session.publish()
+        self._consumer = self._session.consume()
 
         return self
 
     async def __aexit__(self, *exc) -> None:
         self._publisher = None
         self._consumer = None
-        if self._session is not None:
-            self._session.shutdown()
+        try:
+            if self._session is not None:
+                # A body error is the failure worth reporting. Draining behind it would
+                # wait out the deadline and replace it with a delivery timeout. Cancel
+                # rather than skip: dropping the last session closes the transport, so
+                # one the caller kept a reference to would otherwise stay open.
+                if exc[0] is None:
+                    await self._session.shutdown()
+                else:
+                    self._session.cancel(0)
+        finally:
             self._session = None
-        if self._inner is not None:
-            self._inner.cancel()
-            self._inner = None
-        self._session = None
+            if self._inner is not None:
+                self._inner.cancel()
+                self._inner = None
 
     def create_broadcast(self, path: str) -> BroadcastProducer:
-        """Create a live broadcast at ``path`` so subscribers can discover it.
+        """Create an unannounced broadcast at ``path``, invisible until announced. Announce it after populating tracks.
 
         See :meth:`OriginProducer.create_broadcast`.
         """
         return self._require_publisher().create_broadcast(path)
 
-    def announced(self, prefix: str = "") -> Announced:
-        """Async-iterate broadcasts announced under ``prefix`` (empty matches all).
+    def announced(self, prefix: str = "", *, filter: str | None = None, hidden: bool = False) -> AnnounceConsumer:
+        """Async-iterate broadcasts under ``prefix`` matching an optional pattern.
 
         See :meth:`OriginConsumer.announced`.
         """
-        return self._require_consumer().announced(prefix)
+        return self._require_consumer().announced(prefix, filter=filter, hidden=hidden)
 
     def announced_broadcast(self, path: str) -> AnnouncedBroadcast:
-        """Await announcement of the broadcast at exactly ``path``.
+        """Follow the broadcast at exactly ``path`` across its publisher instances.
 
         See :meth:`OriginConsumer.announced_broadcast`.
         """
@@ -151,14 +232,31 @@ def connect(
     url: str,
     *,
     tls_verify: bool = True,
-    tls_roots: list[str] | None = None,
+    tls_roots: Sequence[str] = (),
     tls_system_roots: bool | None = None,
-    tls_fingerprints: list[str] | None = None,
+    tls_fingerprints: Sequence[str] = (),
     tls_cert: str | None = None,
     tls_key: str | None = None,
+    tls_host_name: str | None = None,
     bind: str | None = None,
+    versions: Sequence[str] = (),
+    timeout: timedelta | None = None,
+    race: timedelta | None = None,
+    resolution_delay: timedelta | None = None,
+    max_streams: int | None = None,
+    idle_timeout: timedelta | None = None,
+    keep_alive: timedelta | None = None,
+    gso: bool | None = None,
+    mtu_discovery: bool | None = None,
+    congestion_control: CongestionControl | None = None,
+    qlog: str | None = None,
+    keylog: bool = False,
+    websocket_enabled: bool | None = None,
+    websocket_delay: timedelta | None = None,
+    reconnect: bool = True,
+    backoff: Backoff | None = None,
     publish: OriginProducer | None = None,
-    subscribe: OriginProducer | None = None,
+    consume: OriginProducer | None = None,
 ) -> Client:
     """Shorthand for constructing a :class:`Client`.
 
@@ -175,7 +273,24 @@ def connect(
         tls_fingerprints=tls_fingerprints,
         tls_cert=tls_cert,
         tls_key=tls_key,
+        tls_host_name=tls_host_name,
         bind=bind,
+        versions=versions,
+        timeout=timeout,
+        race=race,
+        resolution_delay=resolution_delay,
+        max_streams=max_streams,
+        idle_timeout=idle_timeout,
+        keep_alive=keep_alive,
+        gso=gso,
+        mtu_discovery=mtu_discovery,
+        congestion_control=congestion_control,
+        qlog=qlog,
+        keylog=keylog,
+        websocket_enabled=websocket_enabled,
+        websocket_delay=websocket_delay,
+        reconnect=reconnect,
+        backoff=backoff,
         publish=publish,
-        subscribe=subscribe,
+        consume=consume,
     )

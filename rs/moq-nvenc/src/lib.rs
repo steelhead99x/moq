@@ -27,6 +27,7 @@
 //! [`cuvid`] exposes the NVDEC (CUVID) entry points as a dlopen'd function
 //! table; there is no higher-level safe wrapper yet.
 
+#![warn(missing_docs)]
 // Vendored third-party bindings: keep the workspace's `clippy -D warnings` and
 // `rustdoc -D warnings` from churning upstream code (broken intra-doc links, the
 // strict clippy lints the crate opted into, etc.).
@@ -35,8 +36,5 @@
 pub mod cuvid;
 pub mod safe;
 pub mod sys;
-
-#[macro_use]
-extern crate lazy_static;
 
 pub use safe::*;

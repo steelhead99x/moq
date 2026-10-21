@@ -1,14 +1,14 @@
 import { describe, expect, it } from "bun:test";
+import type { Milli } from "@moq/clock";
 import type * as Catalog from "@moq/hang/catalog";
-import type { Time } from "@moq/net";
-import { caughtUp, renditionJitter } from "./playhead";
+import { caughtUp, renditionJitter, switchJitter } from "./playhead";
 
 // `jitter` is a branded u53 in the catalog schema, so build the config through a cast.
-function config(props: { jitter?: number; framerate?: number }): Catalog.VideoConfig {
+function config(props: { jitter?: number; delay?: number; framerate?: number }): Catalog.VideoConfig {
 	return { codec: "avc1.640028", container: { kind: "legacy" }, ...props } as Catalog.VideoConfig;
 }
 
-const ms = (value: number) => value as Time.Milli;
+const ms = (value: number) => value as Milli;
 
 describe("renditionJitter", () => {
 	it("prefers the catalog value", () => {
@@ -25,6 +25,12 @@ describe("renditionJitter", () => {
 
 	it("is undefined when the catalog declares neither", () => {
 		expect(renditionJitter(config({}))).toBeUndefined();
+	});
+
+	it("adds the delay behind the earliest rendition", () => {
+		expect(renditionJitter(config({ delay: 200, jitter: 60 }))).toBe(ms(260));
+		expect(renditionJitter(config({ delay: 200, framerate: 30 }))).toBe(ms(234));
+		expect(renditionJitter(config({ delay: 200 }))).toBe(ms(200));
 	});
 });
 
@@ -48,5 +54,18 @@ describe("caughtUp", () => {
 		// outgoing playhead. Promoting at the live edge would replay everything in between, so the
 		// bar stays the outgoing playhead however far live falls behind it.
 		expect(caughtUp({ playhead: ms(8000), active: ms(10_000) })).toBe(false);
+	});
+});
+
+describe("switchJitter", () => {
+	it("covers both renditions until promotion", () => {
+		expect(switchJitter({ active: ms(20), pending: ms(100) })).toBe(ms(100));
+		expect(switchJitter({ active: ms(100), pending: ms(20) })).toBe(ms(100));
+	});
+
+	it("settles to the remaining rendition", () => {
+		expect(switchJitter({ active: ms(20) })).toBe(ms(20));
+		expect(switchJitter({ pending: ms(100) })).toBe(ms(100));
+		expect(switchJitter({})).toBeUndefined();
 	});
 });

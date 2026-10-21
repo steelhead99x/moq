@@ -1,3 +1,4 @@
+import { Milli, Nano, now } from "@moq/clock";
 import type { Effect, Getter } from "@moq/signals";
 import * as DOM from "@moq/signals/dom";
 import type MoqPublish from "../../element";
@@ -5,7 +6,7 @@ import { formatBitrate, formatFps, formatHz } from "../format";
 import { graph } from "../graph";
 import { audio as audioIcon, icon, video as videoIcon, wifi as wifiIcon } from "../icons";
 
-const POLL_MS = 250;
+const POLL = Nano.fromMilli(Milli(250));
 
 type Kind = "network" | "video" | "audio";
 
@@ -70,7 +71,8 @@ export function statsTab(parent: Effect, publish: MoqPublish): HTMLElement {
 
 	// Resolution/codec from the live capture (display) + catalog; card hides when not capturing video.
 	parent.run((effect) => {
-		const display = effect.get(publish.capture.out.display);
+		const capture = effect.get(publish.video.in.capture);
+		const display = capture ? effect.get(capture.out.display) : undefined;
 		const cfg = effect.get(publish.video.out.catalog);
 		videoCard.el.style.display = display ? "" : "none";
 		vRes.textContent = display ? `${display.width}×${display.height}` : "—";
@@ -99,19 +101,40 @@ export function statsTab(parent: Effect, publish: MoqPublish): HTMLElement {
 	// Live graphs: frame rate from captured frames, bitrate measured from the bytes we encoded.
 	// The congestion controller's send estimate would be simpler, but Safari's WebTransport has no
 	// getStats(), so it has no estimate at all and the graph stayed empty there.
+	// Counted off our own stream rather than a signal, which would coalesce a burst of frames into
+	// one notification and undercount the rate.
 	let frames = 0;
-	parent.subscribe(publish.capture.out.frame, () => {
-		frames++;
+	parent.run((effect) => {
+		const capture = effect.get(publish.video.in.capture);
+		const fanout = capture ? effect.get(capture.out.frames) : undefined;
+		if (!fanout) return;
+
+		const reader = fanout.subscribe(effect).getReader();
+		effect.cleanup(() => {
+			reader.cancel().catch(() => {});
+		});
+
+		// Not raced against teardown, which would drop a frame whose read had already resolved.
+		effect.spawn(async () => {
+			for (;;) {
+				const { value: frame } = await reader.read();
+				if (!frame) break;
+
+				frames++;
+				frame.close();
+			}
+		});
 	});
 
 	const encoded = () => publish.video.out.stats.peek().bytes;
 
 	let prevFrames = 0;
 	let prevBytes = encoded();
-	let prevWhen = performance.now();
+	const at = () => Nano.toMilli(Nano(now()));
+	let prevWhen = at();
 
 	parent.interval(() => {
-		const now = performance.now();
+		const now = at();
 		const elapsed = now - prevWhen;
 		prevWhen = now;
 
@@ -123,7 +146,7 @@ export function statsTab(parent: Effect, publish: MoqPublish): HTMLElement {
 		const byteDelta = bytes - prevBytes;
 		prevBytes = bytes;
 		vBitrateGraph.push(elapsed > 0 && byteDelta > 0 ? (byteDelta * 8) / (elapsed / 1000) : undefined);
-	}, POLL_MS);
+	}, POLL);
 
 	return container;
 }

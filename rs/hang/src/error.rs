@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 /// Error types for the hang media library.
 ///
 /// This enum represents all possible errors that can occur when working with
@@ -13,7 +11,28 @@ pub enum Error {
 
 	/// JSON serialization/deserialization error.
 	#[error("json error: {0}")]
-	Json(Arc<serde_json::Error>),
+	Json(String),
+
+	/// A catalog has more media renditions than a consumer will hold.
+	#[error("catalog has {count} renditions, over the limit of {max}")]
+	TooManyRenditions {
+		/// How many renditions the catalog lists.
+		count: usize,
+		/// The most renditions the consumer accepts.
+		max: usize,
+	},
+
+	/// A catalog uses one rendition ID for both a video and an audio rendition.
+	#[error("catalog rendition ID is both video and audio: {0}")]
+	DuplicateRendition(String),
+
+	/// A catalog needs a newer moq-hang draft than this reader implements.
+	#[error("unsupported catalog version {0}: upgrade to read it")]
+	UnsupportedVersion(u64),
+
+	/// A catalog broadcast reference escapes its root.
+	#[error("catalog broadcast reference escapes the root: {0}")]
+	EscapingBroadcast(String),
 
 	/// The specified codec is invalid or malformed.
 	#[error("invalid codec")]
@@ -25,7 +44,7 @@ pub enum Error {
 
 	/// Failed to decode hexadecimal data.
 	#[error("hex error: {0}")]
-	Hex(#[from] hex::FromHexError),
+	Hex(String),
 
 	/// The timestamp is too large.
 	#[error("timestamp overflow")]
@@ -41,7 +60,7 @@ pub enum Error {
 
 	/// Failed to parse a URL.
 	#[error("url parse error: {0}")]
-	Url(#[from] url::ParseError),
+	Url(String),
 
 	/// A group contained zero frames.
 	#[error("empty group")]
@@ -55,6 +74,14 @@ pub enum Error {
 	#[error("duplicate track: {0}")]
 	Duplicate(String),
 
+	/// A catalog timescale is zero, so no timestamp can be expressed in it.
+	#[error("invalid timescale: {0}")]
+	InvalidTimescale(u64),
+
+	/// A catalog wall-clock value is outside the JSON-safe integer range.
+	#[error("invalid wall clock: {0}")]
+	InvalidWall(u64),
+
 	/// The shared video rotation is not a finite number.
 	#[error("video rotation must be finite")]
 	InvalidVideoRotation,
@@ -66,9 +93,21 @@ pub enum Error {
 /// for `std::result::Result<T, hang::Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
-// Wrap in an Arc so it is Clone
+// Foreign errors are flattened to their message so they stay out of this crate's public API.
 impl From<serde_json::Error> for Error {
 	fn from(err: serde_json::Error) -> Self {
-		Error::Json(Arc::new(err))
+		Error::Json(err.to_string())
+	}
+}
+
+impl From<hex::FromHexError> for Error {
+	fn from(err: hex::FromHexError) -> Self {
+		Error::Hex(err.to_string())
+	}
+}
+
+impl From<url::ParseError> for Error {
+	fn from(err: url::ParseError) -> Self {
+		Error::Url(err.to_string())
 	}
 }

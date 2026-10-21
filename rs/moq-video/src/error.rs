@@ -12,9 +12,45 @@ pub enum Error {
 	#[error("no usable video decoder found (tried: {0})")]
 	NoDecoder(String),
 
+	/// `Kind::Named` asked for an encoder this build does not have for that
+	/// codec: a name that is not a backend, one whose feature is off, or one
+	/// that does not encode the codec requested.
+	#[error("no encoder named {name} for {codec:?} (this build has: {available})")]
+	UnknownEncoder {
+		/// The name that was asked for.
+		name: String,
+		/// The codec it was asked for.
+		codec: crate::encode::Codec,
+		/// The encoders this build does have for that codec.
+		available: String,
+	},
+
+	/// `Kind::Named` asked for a decoder this build does not have for that
+	/// codec: a name that is not a backend, one whose feature is off, or one
+	/// that does not decode the codec requested.
+	#[error("no decoder named {name} for {codec:?} (this build has: {available})")]
+	UnknownDecoder {
+		/// The name that was asked for.
+		name: String,
+		/// The codec it was asked for.
+		codec: crate::decode::Codec,
+		/// The decoders this build does have for that codec.
+		available: String,
+	},
+
 	/// A track's codec is not supported by the native decoders.
 	#[error("unsupported codec for native decode: {0}")]
 	UnsupportedCodec(String),
+
+	/// The codec session is over: its worker thread stopped, or a cancelled
+	/// call left it out of step with the stream it was decoding.
+	///
+	/// Distinct from [`Codec`](Self::Codec), which describes the bytes of one
+	/// picture and which a caller can reasonably skip past. Nothing about this
+	/// one improves by reading on: the session that would have decoded the next
+	/// picture no longer exists, and only a new encoder or decoder recovers it.
+	#[error("codec session ended: {0}")]
+	CodecGone(String),
 
 	/// The requested capture source or enumeration has no implementation on this
 	/// platform (the message names what is missing).
@@ -37,6 +73,28 @@ pub enum Error {
 	/// congestion-control estimate. Encoding continues at the configured rate.
 	#[error("encoder {0} cannot change bitrate while running")]
 	BitrateUnsupported(&'static str),
+
+	/// This encoder can't force a group boundary, so a cut was refused rather
+	/// than queued. Groups keep falling where its configured GOP puts them.
+	#[error("encoder {0} cannot cut a group on request")]
+	CutUnsupported(&'static str),
+
+	/// A frame's samples are in a different color space than the one the
+	/// encoder writes into the bitstream, so encoding it would mislabel it.
+	/// Open the encoder with [`encode::Config::color`](crate::encode::Config::color)
+	/// set to the frame's [`Surface::color`](crate::Surface::color).
+	#[error("frame is {frame:?} but the encoder signals {encoder:?}")]
+	ColorMismatch {
+		/// The space the frame's samples are in.
+		frame: crate::Color,
+		/// The space the encoder was opened with.
+		encoder: crate::Color,
+	},
+
+	/// The group configuration can't be honored by any backend (the message
+	/// says why).
+	#[error("invalid group configuration: {0}")]
+	InvalidGop(String),
 
 	/// GPU rendering failure: building the pipeline, importing a frame's surface
 	/// as a texture, or the device itself.

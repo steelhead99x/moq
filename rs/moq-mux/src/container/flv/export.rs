@@ -1,22 +1,25 @@
 //! FLV muxer.
 //!
-//! [`Export`] subscribes to a MoQ broadcast and produces a single FLV byte
-//! stream: the file header, the video/audio sequence headers, then one tag per
-//! media frame interleaved by timestamp. Legacy H.264 + AAC + MP3 are muxed as
-//! the classic CodecID tags; HEVC, AV1, VP9, Opus, AC-3, and E-AC-3 are muxed as
-//! the enhanced-RTMP (E-RTMP) FourCC payloads. Frames flow through [`ExportSource`],
-//! which normalizes H.264/H.265 to length-prefixed NALU plus a resolved
-//! avcC/hvcC (parsing inline avc3/hev1 parameter sets when needed) and hands the
-//! other codecs through unchanged.
+//! [`Export`] reads a catalog stream and the broadcast it describes, and produces
+//! a single FLV byte stream: the file header, the video/audio sequence headers,
+//! then one tag per media frame interleaved by timestamp. Legacy H.264 + AAC + MP3
+//! are muxed as the classic CodecID tags; HEVC, AV1, VP9, Opus, AC-3, and E-AC-3
+//! are muxed as the enhanced-RTMP (E-RTMP) FourCC payloads. Frames flow through
+//! [`ExportSource`], which normalizes H.264/H.265 to length-prefixed NALU plus a
+//! resolved avcC/hvcC (parsing inline avc3/hev1 parameter sets when needed) and
+//! hands the other codecs through unchanged.
 //!
-//! By default FLV carries a single video and a single audio stream, so only the
-//! first rendition of each kind is muxed and the rest are ignored. With
-//! [`with_multitrack`](Export::with_multitrack) every rendition is muxed instead,
-//! each as an enhanced-RTMP multitrack track addressed by its own track id (use
-//! this only for a player that advertised the `Multitrack` capability).
+//! Narrow renditions with [`Stream::select`](crate::catalog::Stream::select)
+//! before construction. By default FLV carries a single video and a single audio
+//! stream, so only the best video rendition (see [`Video::ranked`](hang::catalog::Video::ranked))
+//! and the best audio rendition (see [`Audio::ranked`](hang::catalog::Audio::ranked))
+//! the stream yields are muxed and the rest are ignored. Each pick follows the
+//! catalog until the stream header goes out, then stays. With
+//! [`with_multitrack`](Export::with_multitrack) every rendition the stream yields
+//! is muxed instead, each as an enhanced-RTMP multitrack track addressed by its own
+//! track id (use this only for a player that advertised the `Multitrack` capability).
 
 use std::task::Poll;
-use std::time::Duration;
 
 use anyhow::Context;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -28,8 +31,24 @@ use super::{
 	FRAME_TYPE_KEY, MP3_AUDIO_TAG_HEADER, MULTITRACK_ONE_TRACK, TAG_AUDIO, TAG_HEADER_LEN, TAG_VIDEO, VIDEO_CODEC_AVC,
 	VIDEO_EX_HEADER, VIDEO_PACKET_CODED_FRAMES, VIDEO_PACKET_MULTITRACK, VIDEO_PACKET_SEQUENCE_START,
 };
-use crate::catalog::{CatalogFormat, Stream};
+use crate::catalog::Stream;
 use crate::container::{ExportSource, Frame};
+
+/// Before the header, unbind every track the catalog no longer lists (removed, or disabled),
+/// so the header declares only what the snapshot offers. A single-track stream also follows the
+/// best rendition, so a snapshot that lacks it doesn't fix the pick. Unbinding unsubscribes the
+/// track; nothing was emitted from it yet.
+fn unbind<C>(tracks: &mut Vec<FlvTrack>, renditions: &[(&String, &C)], multitrack: bool) {
+	if multitrack {
+		tracks.retain(|track| renditions.iter().any(|(name, _)| **name == track.name));
+	} else if tracks.first().map(|track| &track.name) != renditions.first().map(|(name, _)| *name) {
+		tracks.clear();
+	}
+	// Ids follow bind order, so close the gaps an unbind left.
+	for (id, track) in tracks.iter_mut().enumerate() {
+		track.track_id = id as u8;
+	}
+}
 
 /// Which FLV payload shape a bound track is muxed as: a legacy CodecID
 /// (`Avc`/`Aac`) or an enhanced-RTMP FourCC codec.
@@ -87,11 +106,12 @@ impl Flavor {
 	}
 }
 
-/// Subscribe to a broadcast and produce an FLV byte stream.
+/// Produce an FLV byte stream from a broadcast, following a catalog stream.
 ///
 /// Use [`next`](Self::next) to pull byte chunks. The first chunk is the FLV file
 /// header followed by the AVC/AAC sequence headers; each subsequent chunk is the
-/// tag for one media frame. Returns `None` when the broadcast ends.
+/// tag for one media frame. Returns `None` when the broadcast ends. Narrow the
+/// renditions first with [`Stream::select`](crate::catalog::Stream::select).
 ///
 /// ## Avc3 sources
 ///
@@ -101,12 +121,14 @@ impl Flavor {
 /// header is deferred until that codec config is available (typically the first
 /// keyframe). Only Legacy and LOC container tracks (raw codec payloads) are
 /// supported; CMAF tracks are rejected.
-pub struct Export {
+pub struct Export<S: Stream> {
 	source: crate::Source,
-	catalog: Option<crate::catalog::Consumer>,
-	latency: Duration,
+	catalog: Option<S>,
+	delay: std::time::Duration,
+	/// Frames with their tag timestamp, encoded only once released.
+	jitter: crate::jitter::Buffer<(u8, usize), (Frame, u32)>,
 	/// Emit every rendition as an enhanced-RTMP multitrack track, rather than only
-	/// the first video + first audio rendition.
+	/// the best video and audio rendition.
 	multitrack: bool,
 
 	video: Vec<FlvTrack>,
@@ -123,7 +145,9 @@ struct FlvTrack {
 	/// used when muxing multitrack; a single-track FLV stream carries no id.
 	track_id: u8,
 	source: ExportSource,
-	pending: Option<Frame>,
+	pending: Option<crate::jitter::Arrival<Frame>>,
+	/// When the source was last empty, bounding the next frame's arrival.
+	empty: moq_clock::Instant,
 	finished: bool,
 	/// The FLV payload shape (legacy CodecID vs enhanced FourCC) to mux this
 	/// track as, fixed from its catalog codec when it's bound.
@@ -163,41 +187,41 @@ impl FlvTrack {
 	}
 }
 
-impl Export {
-	/// Subscribe to `source` and produce FLV byte chunks, using the default
-	/// catalog format ([`CatalogFormat::Hang`]).
-	pub async fn new(source: crate::Source) -> Result<Self, crate::Error> {
-		Self::with_catalog_format(source, CatalogFormat::default()).await
-	}
-
-	/// Subscribe to `source` and produce FLV byte chunks, selecting an explicit
-	/// `catalog_format` for track discovery.
-	pub async fn with_catalog_format(
-		source: crate::Source,
-		catalog_format: CatalogFormat,
-	) -> Result<Self, crate::Error> {
-		let broadcast = source.broadcast().await?;
-		let catalog = crate::catalog::Consumer::new(&broadcast, catalog_format).await?;
-		Ok(Self {
+impl<S: Stream> Export<S> {
+	/// Subscribe to `source` and produce FLV byte chunks, driving track
+	/// subscription from `catalog`.
+	///
+	/// `catalog` is any [`Stream`] of catalog snapshots, typically a
+	/// [`catalog::Consumer`](crate::catalog::Consumer) directly, or narrowed to
+	/// one rendition set via [`Stream::select`](crate::catalog::Stream::select).
+	pub fn new(source: crate::Source, catalog: S) -> Self {
+		Self {
 			source,
 			catalog: Some(catalog),
-			latency: Duration::ZERO,
+			delay: std::time::Duration::ZERO,
+			jitter: crate::jitter::Buffer::new(std::time::Duration::ZERO),
 			multitrack: false,
 			video: Vec::new(),
 			audio: Vec::new(),
 			header_emitted: false,
-		})
+		}
 	}
 
-	/// Set the maximum buffering latency for each per-track source.
-	pub fn with_latency(mut self, latency: Duration) -> Self {
-		self.latency = latency;
+	/// Release frames a fixed delay after their decode time, dropping late frames.
+	///
+	/// A source whose clock runs further off ours than the output's may follow fails the export
+	/// once it has used half the delay. The same delay bounds each source's staleness. Zero (the default) releases each frame as
+	/// soon as it is read and drops none as late, but a stalled group is still skipped once a
+	/// newer one is ready.
+	pub fn with_delay(mut self, delay: std::time::Duration) -> Self {
+		self.delay = delay;
+		self.jitter = crate::jitter::Buffer::new(delay);
 		self
 	}
 
 	/// Mux every rendition as an enhanced-RTMP multitrack track (one FLV stream
-	/// carrying several video and/or audio tracks), rather than only the first
-	/// video + first audio rendition.
+	/// carrying several video and/or audio tracks), rather than only the best
+	/// video and audio rendition.
 	///
 	/// Only enable this for a player that advertised the enhanced-RTMP
 	/// `Multitrack` capability in its `connect` `capsEx`; a legacy player can't
@@ -226,31 +250,12 @@ impl Export {
 			}
 		}
 
-		// 2. Pull frames from each track into `pending`. Pre-header, drop slices
-		// that arrived before the track's codec config is ready: a mid-GOP joiner
-		// can't render them, and parking would block polling for the next SPS/PPS.
-		let waiting_for_header = !self.header_emitted;
-		for track in self.video.iter_mut().chain(self.audio.iter_mut()) {
-			if track.pending.is_some() || track.finished {
-				continue;
-			}
-			loop {
-				match track.source.poll_read(waiter)? {
-					Poll::Ready(Some(frame)) => {
-						if waiting_for_header && !track.source.header_ready() {
-							continue;
-						}
-						track.pending = Some(frame);
-						break;
-					}
-					Poll::Ready(None) => {
-						track.finished = true;
-						break;
-					}
-					Poll::Pending => break,
-				}
-			}
-		}
+		self.jitter.expect(
+			(0..self.video.len())
+				.map(|i| (0, i))
+				.chain((0..self.audio.len()).map(|i| (1, i))),
+		);
+		self.fill(waiter)?;
 
 		// 3. Emit the header once every track's codec config has resolved.
 		if !self.header_emitted {
@@ -267,16 +272,13 @@ impl Export {
 			return Poll::Pending;
 		}
 
-		// 4. Emit the smallest FLV tag timestamp as one tag.
-		if let Some((is_video, index)) = self.pick_next_track()? {
-			let track = if is_video {
-				&mut self.video[index]
-			} else {
-				&mut self.audio[index]
-			};
-			let frame = track.pending.take().unwrap();
-			let chunk = self.encode_frame(is_video, index, frame)?;
-			return Poll::Ready(Ok(Some(chunk)));
+		if let Poll::Ready(ready) = self.jitter.poll_next(waiter) {
+			let (kind, index) = ready.track;
+			let (frame, timestamp) = ready.item;
+			return Poll::Ready(Ok(Some(self.encode_frame(kind == 0, index, frame, timestamp)?)));
+		}
+		if !self.jitter.is_empty() {
+			return Poll::Pending;
 		}
 
 		// 5. End-of-stream once every subscribed track is drained.
@@ -300,43 +302,164 @@ impl Export {
 		!self.video.is_empty() || !self.audio.is_empty()
 	}
 
-	fn update_catalog(&mut self, mut catalog: Catalog) -> anyhow::Result<()> {
-		self.source.retain_valid_media(&mut catalog);
+	#[cfg(test)]
+	pub(super) fn next_deadline(&self) -> Option<moq_clock::Instant> {
+		self.jitter.next_deadline()
+	}
 
-		// A single-track FLV stream binds only the first rendition of each kind;
-		// multitrack binds them all. Bind newly-seen renditions in name order (the
-		// catalog is a BTreeMap) so each keeps a stable track id.
+	/// How many frames the export holds between its sources and the output.
+	#[cfg(test)]
+	pub(super) fn buffered(&self) -> usize {
+		self.jitter.len()
+	}
+
+	#[cfg(test)]
+	pub(super) fn with_replay(mut self) -> Self {
+		self.jitter = self.jitter.replay();
+		self
+	}
+
+	/// Read each track until it has a frame due, preserving ingress timing before buffering.
+	fn fill(&mut self, waiter: &kio::Waiter) -> anyhow::Result<()> {
+		for kind in [0, 1] {
+			let count = if kind == 0 { self.video.len() } else { self.audio.len() };
+			for index in 0..count {
+				loop {
+					if self.header_emitted && self.jitter.full(&(kind, index)) {
+						break;
+					}
+					let track = if kind == 0 {
+						&mut self.video[index]
+					} else {
+						&mut self.audio[index]
+					};
+					if !self.header_emitted && track.pending.is_some() {
+						break;
+					}
+					let arrival = if let Some(pending) = track.pending.take() {
+						pending
+					} else {
+						if track.finished {
+							break;
+						}
+						let frame = match track.source.poll_read(waiter)? {
+							Poll::Ready(Some(frame)) => frame,
+							Poll::Ready(None) => {
+								track.finished = true;
+								break;
+							}
+							Poll::Pending => {
+								track.empty = moq_clock::now();
+								break;
+							}
+						};
+						if !self.header_emitted && !track.source.header_ready() {
+							continue;
+						}
+						crate::jitter::Arrival {
+							arrived: track.empty,
+							read: moq_clock::now(),
+							decode: frame.timestamp,
+							restart: track.source.markers(),
+							skip: track.source.skips(),
+							cut: track.source.cuts(),
+							sync: kind == 1 || frame.keyframe,
+							leading: false,
+							item: frame,
+						}
+					};
+					if !self.header_emitted {
+						track.pending = Some(arrival);
+						break;
+					}
+					let timestamp = track.tag_timestamp(&arrival.item)?;
+					if track.flavor.has_composition_time() {
+						track.last_dts = Some(timestamp);
+					}
+					let crate::jitter::Arrival {
+						arrived,
+						read,
+						restart,
+						skip,
+						cut,
+						sync,
+						leading,
+						item,
+						..
+					} = arrival;
+					if self.jitter.push(
+						(kind, index),
+						crate::jitter::Arrival {
+							arrived,
+							read,
+							decode: moq_net::Timestamp::from_millis(u64::from(timestamp))?,
+							restart,
+							skip,
+							cut,
+							sync,
+							leading,
+							item: (item, timestamp),
+						},
+					)? == crate::jitter::Push::Late
+					{
+						tracing::warn!(
+							kind,
+							index,
+							dropped = self.jitter.dropped(),
+							"frame missed its deadline; dropped"
+						);
+					}
+				}
+			}
+		}
+		Ok(())
+	}
+
+	fn update_catalog(&mut self, mut catalog: Catalog) -> anyhow::Result<()> {
+		self.source.retain_selectable(&mut catalog);
+
+		// A single-track FLV stream binds one rendition of each kind; multitrack
+		// binds them all.
 		//
 		// Only bind before the header is emitted: the sequence-header (config) tags
 		// go out with the header, and there's no in-band way to introduce a new
 		// track's config mid-stream, so a rendition first seen afterward is left
-		// unmuxed rather than emitted as undecodable config-less frames. (This
-		// mirrors the single-track path ignoring extra renditions.)
+		// unmuxed rather than emitted as undecodable config-less frames. Until then a
+		// single-track stream rebinds to a better-ranked rendition.
 		if !self.header_emitted {
 			self.bind_video(&catalog)?;
 			self.bind_audio(&catalog)?;
-		} else if catalog.video.renditions.len() > self.video.len() || catalog.audio.renditions.len() > self.audio.len()
+		} else if self.multitrack
+			&& (catalog.video.renditions.len() > self.video.len() || catalog.audio.renditions.len() > self.audio.len())
 		{
 			tracing::warn!("ignoring FLV rendition that appeared after the stream header");
 		}
 
-		// A bound track vanishing from the catalog is a layout change FLV can't express.
-		for track in self.tracks() {
-			let present = if is_video_flavor(track.flavor) {
-				catalog.video.renditions.contains_key(&track.name)
-			} else {
-				catalog.audio.renditions.contains_key(&track.name)
-			};
-			anyhow::ensure!(present, "FLV track '{}' removed mid-stream", track.name);
-		}
-
+		// A bound track leaving the catalog is read to its own end rather than refused. A
+		// publisher retires a rendition as its track finishes or drops, and the catalog
+		// update races that end on another stream, so only the track's end can say which it
+		// was: a finish ends it cleanly, and a drop is the error the export reports.
 		Ok(())
 	}
 
 	fn bind_video(&mut self, catalog: &Catalog) -> anyhow::Result<()> {
-		for (name, config) in &catalog.video.renditions {
+		let renditions: Vec<_> = if self.multitrack {
+			// Name order (the catalog is a BTreeMap), so each keeps a stable track id.
+			catalog.video.renditions.iter().collect()
+		} else {
+			// The best rendition FLV can carry, whatever the names. The rest follow in
+			// rank order so a catalog with nothing FLV carries fails on its best one.
+			let mut ranked: Vec<_> = catalog.video.ranked().collect();
+			ranked.sort_by_key(|(_, config)| {
+				video_flavor(config).is_err() || !matches!(config.container, Container::Legacy | Container::Loc)
+			});
+			ranked
+		};
+
+		unbind(&mut self.video, &renditions, self.multitrack);
+
+		for (name, config) in renditions {
 			if !self.multitrack && !self.video.is_empty() {
-				tracing::warn!("FLV export only supports one video track; ignoring the rest (enable multitrack)");
 				break;
 			}
 			if self.video.iter().any(|t| &t.name == name) {
@@ -350,7 +473,7 @@ impl Export {
 				(VideoCodec::AV1(av1), None) => Some(Bytes::copy_from_slice(&av1c_bytes(av1))),
 				_ => None,
 			};
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.latency)? else {
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.delay)? else {
 				continue;
 			};
 			let track_id = u8::try_from(self.video.len()).context("too many FLV video tracks")?;
@@ -359,6 +482,7 @@ impl Export {
 				track_id,
 				source,
 				pending: None,
+				empty: moq_clock::now(),
 				finished: false,
 				flavor,
 				fallback_description,
@@ -370,7 +494,22 @@ impl Export {
 	}
 
 	fn bind_audio(&mut self, catalog: &Catalog) -> anyhow::Result<()> {
-		for (name, config) in &catalog.audio.renditions {
+		let renditions: Vec<_> = if self.multitrack {
+			// Name order (the catalog is a BTreeMap), so each keeps a stable track id.
+			catalog.audio.renditions.iter().collect()
+		} else {
+			// The best rendition FLV can carry, whatever the names. The rest follow in
+			// rank order so a catalog with nothing FLV carries fails on its best one.
+			let mut ranked: Vec<_> = catalog.audio.ranked().collect();
+			ranked.sort_by_key(|(_, config)| {
+				audio_flavor(config).is_err() || !matches!(config.container, Container::Legacy | Container::Loc)
+			});
+			ranked
+		};
+
+		unbind(&mut self.audio, &renditions, self.multitrack);
+
+		for (name, config) in renditions {
 			if !self.multitrack && !self.audio.is_empty() {
 				tracing::warn!("FLV export only supports one audio track; ignoring the rest (enable multitrack)");
 				break;
@@ -380,7 +519,7 @@ impl Export {
 			}
 			let flavor = audio_flavor(config)?;
 			ensure_legacy(&config.container, "audio", name)?;
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.latency)? else {
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.delay)? else {
 				continue;
 			};
 			let track_id = u8::try_from(self.audio.len()).context("too many FLV audio tracks")?;
@@ -389,6 +528,7 @@ impl Export {
 				track_id,
 				source,
 				pending: None,
+				empty: moq_clock::now(),
 				finished: false,
 				flavor,
 				fallback_description: None,
@@ -439,40 +579,15 @@ impl Export {
 		Ok(out.freeze())
 	}
 
-	/// Pick the track with the smallest pending FLV tag timestamp. Returns whether
-	/// it's a video track and its index within that kind, or `None` if no frame is
-	/// pending. Video wins ties, matching the single-track interleave.
-	fn pick_next_track(&self) -> anyhow::Result<Option<(bool, usize)>> {
-		let mut best: Option<(u32, bool, usize)> = None;
-		for (index, track) in self.video.iter().enumerate() {
-			if let Some(frame) = &track.pending {
-				let ts = track.tag_timestamp(frame)?;
-				if best.is_none_or(|(b, _, _)| ts < b) {
-					best = Some((ts, true, index));
-				}
-			}
-		}
-		for (index, track) in self.audio.iter().enumerate() {
-			if let Some(frame) = &track.pending {
-				let ts = frame_timestamp_ms(frame)?;
-				if best.is_none_or(|(b, _, _)| ts < b) {
-					best = Some((ts, false, index));
-				}
-			}
-		}
-		Ok(best.map(|(_, is_video, index)| (is_video, index)))
-	}
-
-	/// Encode one frame as a single FLV tag.
-	fn encode_frame(&mut self, is_video: bool, index: usize, frame: Frame) -> anyhow::Result<Bytes> {
+	/// Encode one frame as a single FLV tag at its authored `timestamp_ms`.
+	fn encode_frame(&self, is_video: bool, index: usize, frame: Frame, timestamp_ms: u32) -> anyhow::Result<Bytes> {
 		let mut out = BytesMut::with_capacity(TAG_HEADER_LEN + frame.payload.len() + 8);
 		let multitrack = self.multitrack;
 		if is_video {
-			let track = &mut self.video[index];
+			let track = &self.video[index];
 			let flavor = track.flavor;
 			let track_id = track.track_id;
 			let pts_ms = frame_timestamp_ms(&frame)?;
-			let timestamp_ms = track.tag_timestamp(&frame)?;
 			let frame_type = if frame.keyframe {
 				FRAME_TYPE_KEY
 			} else {
@@ -513,16 +628,12 @@ impl Export {
 					}
 				}
 			}
-			if flavor.has_composition_time() {
-				track.last_dts = Some(timestamp_ms);
-			}
 			body.put_slice(&frame.payload);
 			write_tag(&mut out, TAG_VIDEO, timestamp_ms, &body)?;
 		} else {
 			let track = &self.audio[index];
 			let flavor = track.flavor;
 			let track_id = track.track_id;
-			let timestamp_ms = frame_timestamp_ms(&frame)?;
 			let mut body = BytesMut::with_capacity(7 + frame.payload.len());
 			if multitrack {
 				body.put_u8((AUDIO_FORMAT_EX << 4) | AUDIO_PACKET_MULTITRACK);
@@ -653,10 +764,6 @@ fn ensure_legacy(container: &Container, kind: &str, name: &str) -> anyhow::Resul
 			unknown.kind().unwrap_or("<missing>")
 		),
 	}
-}
-
-fn is_video_flavor(flavor: Flavor) -> bool {
-	matches!(flavor, Flavor::Avc | Flavor::Hevc | Flavor::Av1 | Flavor::Vp9)
 }
 
 fn video_flavor(config: &hang::catalog::VideoConfig) -> anyhow::Result<Flavor> {

@@ -15,16 +15,26 @@ use moq_net::Timestamp;
 /// drains a tail from [`Encoder::finish`](super::Encoder::finish) still stamps
 /// each access unit with the time of the picture it encoded.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Encoded {
 	/// Presentation timestamp, from the raw frame this was encoded from.
 	pub timestamp: Timestamp,
 	/// The access unit, in the framing the matching catalog importer expects.
 	pub payload: Bytes,
+	/// Whether this access unit is a keyframe, one a decoder can start from.
+	///
+	/// Set on every keyframe, whether [`Encoder::cut`](super::Encoder::cut) forced
+	/// it or the encoder placed it on its own [`Gop`](super::Gop) cadence.
+	pub keyframe: bool,
 }
 
 impl Encoded {
-	/// An encoded access unit shown at `timestamp`.
-	pub fn new(payload: Bytes, timestamp: Timestamp) -> Self {
-		Self { timestamp, payload }
+	/// An encoded access unit shown at `timestamp`, and whether it is a keyframe.
+	pub fn new(payload: Bytes, timestamp: Timestamp, keyframe: bool) -> Self {
+		Self {
+			timestamp,
+			payload,
+			keyframe,
+		}
 	}
 }

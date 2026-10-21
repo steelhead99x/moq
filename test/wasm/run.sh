@@ -9,9 +9,9 @@
 # generated `js/wasm/dist` loaded by a real browser.
 #
 # One relay per protocol flavour, because negotiation is the part that broke:
-#   lite   default versions        -> moq-lite-05 over its own ALPN
-#   ietf   --server-version 19     -> moq-transport-19 over its own ALPN
-#   setup  --server-version lite-02 -> the "moql" ALPN, version chosen by SETUP
+#   lite   default versions        -> moq-lite-06 over its own ALPN
+#   ietf   --listen-version 19     -> moq-transport-19 over its own ALPN
+#   setup  --listen-version lite-02 -> the "moql" ALPN, version chosen by SETUP
 #
 # The publisher is @moq/net (TypeScript) and the subscriber is @moq/wasm (Rust),
 # so each case is also an interop check. See README.md.
@@ -20,16 +20,37 @@ set -euo pipefail
 WASM_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WORKSPACE=$(cd "$WASM_DIR/../.." && pwd)
 
+# Run directory, reserved ports, and process-group ownership. See test/README.md.
+# shellcheck source-path=SCRIPTDIR source=../lib/harness.sh
+source "$WASM_DIR/../lib/harness.sh"
+
+# Captured before the parse below consumes it, so the rerun command carries every
+# flag and every environment override this run was actually given.
+RERUN="$(harness_env WASM_TIMEOUT WASM_PORT WASM_PROFILE RELAY_BIN)just test wasm$(harness_argv "$@")"
+
 TIMEOUT="${WASM_TIMEOUT:-30}"
-PORT="${WASM_PORT:-4460}"
+# Empty means "any reserved port per flavour"; WASM_PORT pins the first instead.
+PORT="${WASM_PORT:-}"
 
 # Cargo profile for the relay. Debug compiles faster, which is what a test
 # fixture wants; the workload is three connections and a few hundred KiB.
+BASELINE=
+UNIFFI=
 PROFILE="${WASM_PROFILE:-debug}"
 RELAY="${RELAY_BIN:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --baseline)
+            BASELINE=true
+            export MOQ_TEST_KEEP=1
+            shift
+            ;;
+        --uniffi)
+            # moq-ffi over ubrn's wasm2 player, as a third backend. See README.md.
+            UNIFFI=true
+            shift
+            ;;
         --timeout)
             if [[ $# -lt 2 || -z "${2:-}" || "$2" == -* ]]; then
                 echo "error: --timeout requires a value" >&2
@@ -55,32 +76,20 @@ fi
 # name:version-flag:expected-version. An empty flag leaves the relay at its
 # defaults, which is the ALPN both sides prefer.
 FLAVOURS=(
-    "lite::moq-lite-05"
+    "lite::moq-lite-06"
     "ietf:moq-transport-19:moq-transport-19"
     "setup:moq-lite-02:moq-lite-02"
 )
 
-# The relays take PORT and the next few, so the whole span has to be bindable.
-# Port 0 is the trap worth naming: the relay would bind an arbitrary port while
-# this script polls 0 forever.
-if [[ ! "$PORT" =~ ^[0-9]+$ ]] || ((PORT < 1024 || PORT + ${#FLAVOURS[@]} - 1 > 65535)); then
-    echo "error: port must be 1024..$((65535 - ${#FLAVOURS[@]} + 1)) (got '$PORT')" >&2
+# WASM_PORT pins the first relay and the rest are reserved individually, so only
+# the first has to be a real port. Port 0 is the trap worth naming: the relay
+# would bind an arbitrary port while this script polls 0 forever.
+if [[ -n "$PORT" ]] && ! harness_valid_port "$PORT"; then
+    echo "error: port must be 1024..65535 (got '$PORT')" >&2
     exit 2
 fi
 
-TMP=$(mktemp -d)
-RELAY_PIDS=()
-
-# shellcheck disable=SC2329  # invoked indirectly via 'trap cleanup EXIT'
-cleanup() {
-    local pid
-    for pid in ${RELAY_PIDS[@]+"${RELAY_PIDS[@]}"}; do
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-    done
-    rm -rf "$TMP"
-}
-trap cleanup EXIT
+harness_begin wasm "$RERUN"
 
 for tool in cargo bun; do
     command -v "$tool" >/dev/null 2>&1 || {
@@ -95,12 +104,17 @@ command -v wasm-bindgen >/dev/null 2>&1 || {
 
 # ── build ───────────────────────────────────────────────────────────────────
 echo "building @moq/wasm..."
-(cd "$WORKSPACE" && just wasm)
+(cd "$WORKSPACE" && just js wasm)
+
+if [[ -n $UNIFFI ]]; then
+    echo "building moq-ffi over ubrn (UniFFI 0.31 pin, scratch checkout)..."
+    "$WASM_DIR/uniffi/build.sh"
+fi
 
 echo "building moq-relay ($PROFILE)..."
 flag=()
 [[ "$PROFILE" == "debug" ]] || flag=(--profile "$PROFILE")
-(cd "$WORKSPACE" && "${RUST_CARGO:-cargo}" build --locked ${flag[@]+"${flag[@]}"} -p moq-relay)
+(cd "$WORKSPACE" && cargo build --locked ${flag[@]+"${flag[@]}"} -p moq-relay)
 TARGET_BASE="${CARGO_TARGET_DIR:-$WORKSPACE/target}"
 [[ -n "$RELAY" ]] || RELAY="$TARGET_BASE/$PROFILE/moq-relay"
 
@@ -110,51 +124,68 @@ bun install --frozen-lockfile
 # it already, in which case this is a no-op anyway.
 bunx playwright install chromium
 
-# Type-check against the .d.ts wasm-bindgen just generated. This is the only
-# thing that reads it, and it is worth reading: wasm-bindgen resolves a type in
-# a signature by its Rust identifier alone, so a binding can compile, run, and
-# still publish typings that name the wrong class. Not part of `just check`,
-# which never builds js/wasm/dist.
+# Type-check against wasm-bindgen's generated .d.ts, as the shared harness check does.
+# wasm-bindgen resolves a type in a signature by its Rust identifier alone, so a
+# binding can compile, run, and still publish typings that name the wrong class.
 echo "type-checking against js/wasm/dist/moq.d.ts..."
 bunx tsc --noEmit
+# The generated TypeScript opts out with @ts-nocheck, so this checks what callers see.
+[[ -z $UNIFFI ]] || bunx tsc --noEmit -p uniffi/tsconfig.json
 
 echo "bundling the harness page..."
 rm -rf dist
-bun build src/main.ts --outdir dist --target browser >/dev/null
-cp index.html dist/index.html
+driver=driver.ts
+if [[ -n $BASELINE ]]; then
+    bun test baseline/fixture.test.ts
+    bun build baseline/publisher.ts baseline/consumer.ts --outdir dist --target browser >/dev/null
+    bun build ../../js/net/src/index.ts --outfile dist/net.js --target browser --minify >/dev/null
+    driver=baseline/driver.ts
+    if [[ -n $UNIFFI ]]; then
+        bun build uniffi/dist/index.ts --outfile dist/uniffi.js --target browser --minify >/dev/null
+        export MOQ_WASM_UNIFFI=1
+    fi
+else
+    bun build src/main.ts --outdir dist --target browser >/dev/null
+    cp index.html dist/index.html
+fi
+[[ -z $UNIFFI ]] || bun build uniffi/cases.ts --outfile dist/uniffi-cases.js --target browser >/dev/null
 
 # ── relays ──────────────────────────────────────────────────────────────────
+# One reservation per flavour rather than a span from a fixed base: a span means
+# every concurrent run needs a different base, and nothing was handing them out.
 entries=()
-offset=0
+want="$PORT"
 for flavour in "${FLAVOURS[@]}"; do
     IFS=':' read -r name version_flag expected <<<"$flavour"
-    port=$((PORT + offset))
-    offset=$((offset + 1))
+    harness_port "$name" "$want"
+    port="$HARNESS_PORT"
+    # WASM_PORT pins only the first; the rest come from the reservation walk.
+    want=""
     url="http://127.0.0.1:${port}"
 
-    if curl -sf "$url/certificate.sha256" >/dev/null 2>&1; then
+    # The reservation covers other harness runs, not the rest of the machine, so
+    # still refuse a port some unrelated process is already serving on.
+    if harness_probe "$url/certificate.sha256"; then
         echo "error: something is already listening on 127.0.0.1:${port} (stale relay?)" >&2
         exit 1
     fi
 
-    args=("$WASM_DIR/relay.toml" --server-bind "127.0.0.1:${port}" --web-http-listen "127.0.0.1:${port}")
-    [[ -z "$version_flag" ]] || args+=(--server-version "$version_flag")
+    args=("$WASM_DIR/relay.toml" --listen "127.0.0.1:${port}" --web-http-listen "127.0.0.1:${port}")
+    [[ -z "$version_flag" ]] || args+=(--listen-version "$version_flag")
 
     echo "starting $name relay on 127.0.0.1:${port}..."
-    "$RELAY" "${args[@]}" >"$TMP/relay-$name.log" 2>&1 &
-    RELAY_PIDS+=($!)
+    # moq-net at debug logs each request's answer and end, so a case that stalls shows
+    # which hop stopped: the page's own log has the far end, and the relay's only shows
+    # requests starting at info.
+    harness_spawn "relay-$name" "$HARNESS_RUN/relay-$name.log" \
+        env RUST_LOG="${RUST_LOG:-info,moq_net=debug}" "$RELAY" "${args[@]}"
 
-    # Polled tight rather than on a half-second tick: a relay binds in about
-    # 130ms, so a coarse interval spends most of the wait asleep, three times over.
-    for _ in $(seq 1 600); do
-        curl -sf "$url/certificate.sha256" >/dev/null 2>&1 && break
-        sleep 0.05
-    done
-    if ! curl -sf "$url/certificate.sha256" >/dev/null 2>&1; then
+    if ! harness_ready "$url/certificate.sha256" 30 "$HARNESS_PID"; then
         echo "$name relay never became ready" >&2
-        sed 's/^/  relay: /' "$TMP/relay-$name.log" >&2 || true
+        sed 's/^/  relay: /' "$HARNESS_RUN/relay-$name.log" >&2 || true
         exit 1
     fi
+    harness_endpoint "$name" "$url"
 
     entries+=("{\"name\":\"$name\",\"url\":\"$url\",\"version\":\"$expected\"}")
 done
@@ -162,17 +193,26 @@ done
 printf '[%s]\n' "$(
     IFS=,
     echo "${entries[*]}"
-)" >"$TMP/relays.json"
+)" >"$HARNESS_RUN/relays.json"
 
 # ── run ─────────────────────────────────────────────────────────────────────
+# Spawned rather than run in the foreground so a SIGTERM lands while the shell is
+# in `wait`, where a trap can run: bash defers a trap until a foreground child
+# returns, which would leave Chromium behind for as long as the driver hangs.
 status=0
-bun driver.ts --relays "$TMP/relays.json" --timeout "$TIMEOUT" || status=$?
+harness_spawn driver - bun "$driver" --relays "$HARNESS_RUN/relays.json" --timeout "$TIMEOUT"
+harness_wait "$HARNESS_PID" || status=$?
+
+if [[ $status -eq 0 && -n $UNIFFI ]]; then
+    harness_spawn uniffi - bun uniffi/driver.ts --relays "$HARNESS_RUN/relays.json"
+    harness_wait "$HARNESS_PID" || status=$?
+fi
 
 if [[ $status -ne 0 ]]; then
     for flavour in "${FLAVOURS[@]}"; do
         name="${flavour%%:*}"
         echo "── $name relay log ──" >&2
-        sed 's/^/  /' "$TMP/relay-$name.log" >&2 || true
+        sed 's/^/  /' "$HARNESS_RUN/relay-$name.log" >&2 || true
     done
 fi
 

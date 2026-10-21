@@ -1,11 +1,16 @@
 import type { Getter } from "@moq/signals";
 import type * as announce from "../announced.ts";
-import type * as broadcast from "../broadcast.ts";
+import type * as Auth from "../auth.ts";
 import type * as Path from "../path.ts";
 import type { Probe, Stats } from "./stats.ts";
 import type { Transport } from "./transport.ts";
 
-/** An established MoQ session, implemented by both the moq-lite and moq-ietf protocols. */
+/**
+ * An established MoQ session, implemented by both the moq-lite and moq-ietf protocols.
+ *
+ * Publishing goes through an origin, not the session: pass an `Origin.Consumer` as the
+ * `publish` connect option and the session announces and serves that origin's broadcasts.
+ */
 export interface Established {
 	/** URL of the connected server. */
 	readonly url: URL;
@@ -18,39 +23,27 @@ export interface Established {
 
 	/**
 	 * Estimates measured by the peer, updated as PROBE messages arrive. Stays empty on
-	 * versions without PROBE. See {@link Stats} for what the local transport counts.
+	 * versions without PROBE. Observe it to request updates; `peek()` alone is passive.
+	 * See {@link Stats} for what the local transport counts.
 	 */
 	readonly probe: Getter<Probe>;
 
 	/**
-	 * Whether the relay supports broadcast discovery: announcing which broadcasts exist under a
-	 * prefix. When false, {@link announced} never yields, so a consumer must subscribe blind
-	 * rather than wait for an announcement. Set via `discovery` on the connect options.
+	 * The tokens this side presented and the grant they earned, plus the tokens the peer
+	 * presents. On moq-lite-07-wip, and on moq-transport draft-17+ when both sides negotiate
+	 * MoQ Auth, each side presents its connection's credential right after setup.
+	 * Otherwise the grant stays undefined.
 	 */
-	readonly discovery: boolean;
-
-	/** Subscribe to broadcast announcements under an optional path prefix, returning paths relative to that prefix. */
-	announced(prefix?: Path.Valid): announce.Consumer;
-
-	/** Publish a broadcast at the given path. */
-	publish(path: Path.Valid, broadcast: broadcast.Producer): void;
+	readonly auth: Auth.Handle;
 
 	/**
-	 * Consume the broadcast at the given path, immediately.
-	 *
-	 * The subscription is reset if nobody publishes the path, so use
-	 * {@link announcedBroadcast} instead when the broadcast may not be online yet.
+	 * Subscribe to broadcast announcements matching `scope`, any pattern (`foo/**`
+	 * for a subtree, `room/* /chat` for each room's chat, default `**`). Paths are
+	 * relative to the session; captures report what the scope's wildcards stood for.
+	 * Hidden routes are left out unless `options.hidden` opts in. A peer without
+	 * discovery refuses or resets the stream.
 	 */
-	consume(path: Path.Valid): broadcast.Consumer;
-
-	/**
-	 * A reactive handle to the broadcast at the given path, live only while it is announced.
-	 *
-	 * The announcement-gated counterpart to {@link consume}: it waits for the broadcast to come
-	 * online instead of resetting, and drops back to `undefined` when it goes away. See
-	 * {@link announce.Broadcast}. Close the handle when done.
-	 */
-	announcedBroadcast(path: Path.Valid): announce.Broadcast;
+	announced(scope?: Path.Pattern, options?: announce.Options): announce.Consumer;
 
 	/**
 	 * Snapshot the transport's counters, querying it fresh on each call.
@@ -60,9 +53,21 @@ export interface Established {
 	 */
 	stats(): Promise<Stats>;
 
-	/** Close the session. */
-	close(): void;
+	/**
+	 * Withdraw announcements and drain for up to one second, then close the session.
+	 *
+	 * Explicit lite-07-wip waits for the subscriber to receive finished tails; older
+	 * Lite versions wait only for transport ACKs. IETF media streams are not drained.
+	 */
+	close(): Promise<void>;
 
-	/** Resolves when the session closes. */
-	closed: Promise<void>;
+	/** End the session immediately without waiting for delivery. */
+	abort(): void;
+
+	/**
+	 * Resolves when the session closes: `null` for a clean close, an `Error.Session` when the
+	 * peer closed with a code (e.g. `SessionCode.Unauthorized` for an auth rejection), or the
+	 * transport's own failure. Never rejects.
+	 */
+	closed: Promise<Error | null>;
 }

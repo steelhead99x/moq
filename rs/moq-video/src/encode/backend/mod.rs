@@ -14,19 +14,20 @@
 //!
 //! [`open`] picks the best backend for a [`Codec`](super::Codec) +
 //! [`Kind`](super::Kind): only candidates that support the requested codec are
-//! considered, hardware (platform-gated) before the always-available openh264
-//! software fallback.
+//! considered, hardware (platform-gated) before the OpenH264 software fallback
+//! when this build enables it.
 
-use super::encoder::{Codec, Config, Kind};
+use super::encoder::{Applied, Codec, Config, Kind};
 use crate::encode::Encoded;
 use crate::{Error, Frame};
 
+#[cfg(feature = "openh264")]
 mod openh264;
 
 #[cfg(test)]
 pub(crate) mod probe;
 
-#[cfg(target_os = "macos")]
+#[cfg(apple)]
 mod videotoolbox;
 
 #[cfg(target_os = "windows")]
@@ -46,12 +47,15 @@ mod vaapi;
 
 /// An opened video encoder. Feed it frames at the configured resolution; get
 /// back zero or more access units in the codec's wire framing, each stamped with
-/// the timestamp of the frame it came from.
-pub(crate) trait Backend: Send {
-	/// Encode one frame, forcing an IDR when `keyframe` is set. Backends key frames
-	/// automatically per [`Config::gop`], so this is only the caller's extra
-	/// request, arriving via [`Encoder::keyframe`](super::Encoder::keyframe).
-	fn encode(&mut self, frame: &Frame, keyframe: bool) -> Result<Vec<Encoded>, Error>;
+/// the timestamp of the frame it came from and marked when it is a keyframe,
+/// whether forced by `cut` or placed by the backend's own GOP cadence.
+pub(crate) trait Backend {
+	/// Encode one frame, opening a group at it (an IDR) when `cut` is set.
+	/// Backends place group boundaries on their own per [`Config::gop`], so this
+	/// is only the caller's extra request, arriving via
+	/// [`Encoder::cut`](super::Encoder::cut), and only on a backend whose
+	/// [`can_cut`](Self::can_cut) said yes.
+	fn encode(&mut self, frame: &Frame, cut: bool) -> Result<Vec<Encoded>, Error>;
 
 	/// Return every access unit the codec is still holding, leaving the encoder
 	/// usable for the frames that follow.
@@ -79,49 +83,150 @@ pub(crate) trait Backend: Send {
 	/// than inherit a silent no-op and quietly ignore congestion.
 	fn set_bitrate(&mut self, bitrate: u64) -> Result<(), Error>;
 
-	/// The encoder name in use, e.g. `"videotoolbox"` (for logging).
-	fn name(&self) -> &str;
+	/// Whether [`encode`](Self::encode) honors `cut`.
+	///
+	/// Known at open: a V4L2 driver either has the force-keyframe control or
+	/// does not, and the encoder refuses a cut up front on one that does not
+	/// rather than queue a request the codec ignores. No default, for the same
+	/// reason as `set_bitrate`: a backend that cannot cut has to say so, not
+	/// inherit a yes and let the refusal surface as a mislaid group boundary.
+	fn can_cut(&self) -> bool;
+
+	/// The encoder name in use, e.g. `"videotoolbox"` (for logging and errors).
+	fn name(&self) -> &'static str;
+
+	/// The latency and compression controls this backend applied at open for
+	/// [`Config::preset`](super::Config::preset).
+	///
+	/// The default claims nothing, which is the honest answer for a backend that
+	/// has not confirmed its controls took effect.
+	fn applied(&self) -> Applied {
+		Applied::default()
+	}
 }
 
-/// A backend constructor: name, the codecs it can emit, and an opener.
+/// Whether one NAL unit (header first, no start code) is a keyframe slice: an
+/// H.264 IDR (type 5), or an H.265 IRAP picture (BLA/IDR/CRA, types 16..=23).
+#[cfg(any(
+	apple,
+	target_os = "windows",
+	all(target_os = "linux", any(feature = "nvidia", feature = "vaapi", feature = "v4l2")),
+	test
+))]
+fn keyframe_nal(codec: Codec, nal: &[u8]) -> bool {
+	let Some(&header) = nal.first() else {
+		return false;
+	};
+	match codec {
+		Codec::H264 => header & 0x1f == 5,
+		Codec::H265 => (16..=23).contains(&((header >> 1) & 0x3f)),
+	}
+}
+
+/// Whether an Annex-B access unit is a keyframe, for a backend whose codec API
+/// hands back only the bytes. Decided by the first slice, since every slice of a
+/// picture shares its type; the parameter sets and SEI ahead of it are skipped.
+#[cfg(any(
+	target_os = "windows",
+	all(target_os = "linux", any(feature = "nvidia", feature = "vaapi", feature = "v4l2")),
+	test
+))]
+fn keyframe_annexb(codec: Codec, mut annexb: &[u8]) -> bool {
+	while let Some((at, len)) = moq_mux::codec::annexb::find_start_code(annexb) {
+		annexb = &annexb[at + len..];
+		let Some(&header) = annexb.first() else { break };
+		let slice = match codec {
+			Codec::H264 => (1..=5).contains(&(header & 0x1f)),
+			Codec::H265 => (header >> 1) & 0x3f < 32,
+		};
+		if slice {
+			return keyframe_nal(codec, annexb);
+		}
+	}
+	false
+}
+
+/// Every encoder backend this crate has a name for, on any platform.
+///
+/// Platform-complete on purpose, where the candidate lists this module selects
+/// from are gated to what this build compiled. A caller offering
+/// [`Kind::Named`](super::Kind) as a choice needs the whole vocabulary, because
+/// a name it does not offer is a name nobody can ask for, and whether a given
+/// machine has that backend is answered by trying it rather than by the list.
+///
+/// The test below asserts every candidate compiled into this build appears
+/// here, so a rename fails on the platform that renamed it rather than
+/// silently leaving a name nothing answers to.
+pub const NAMES: &[&str] = &[
+	"videotoolbox",
+	"mediafoundation",
+	"mediacodec",
+	"nvenc",
+	"vaapi",
+	"v4l2",
+	"openh264",
+];
+
+/// A backend constructor: name, the codecs it can emit, an opener, and whether it can always cut.
 struct Candidate {
 	name: &'static str,
 	codecs: &'static [Codec],
 	open: fn(&Config) -> Result<Box<dyn Backend>, Error>,
+	/// Whether every encoder this opens honors a cut ([`Backend::can_cut`]), known before
+	/// opening one. V4L2 learns it from the driver at open, so it cannot promise.
+	#[cfg_attr(not(feature = "capture"), allow(dead_code))]
+	cuts: bool,
+	#[cfg(target_os = "linux")]
+	vulkan: bool,
 }
 
 /// Hardware backends, in priority order. Platform-gated so only the ones that
 /// could plausibly work on this target are even listed.
 const HARDWARE: &[Candidate] = &[
-	#[cfg(target_os = "macos")]
+	#[cfg(apple)]
 	Candidate {
 		name: videotoolbox::NAME,
 		codecs: &[Codec::H264, Codec::H265],
 		open: videotoolbox::VideoToolbox::open,
+		cuts: true,
+		#[cfg(target_os = "linux")]
+		vulkan: false,
 	},
 	#[cfg(target_os = "windows")]
 	Candidate {
 		name: mediafoundation::NAME,
 		codecs: &[Codec::H264, Codec::H265],
 		open: mediafoundation::MediaFoundation::open,
+		cuts: true,
+		#[cfg(target_os = "linux")]
+		vulkan: false,
 	},
 	#[cfg(all(target_os = "android", feature = "mediacodec"))]
 	Candidate {
 		name: mediacodec::NAME,
 		codecs: &[Codec::H264, Codec::H265],
 		open: mediacodec::MediaCodec::open,
+		cuts: true,
+		#[cfg(target_os = "linux")]
+		vulkan: false,
 	},
 	#[cfg(all(target_os = "linux", feature = "nvidia"))]
 	Candidate {
 		name: nvenc::NAME,
 		codecs: &[Codec::H264, Codec::H265],
 		open: nvenc::Nvenc::open,
+		cuts: true,
+		#[cfg(target_os = "linux")]
+		vulkan: true,
 	},
 	#[cfg(all(target_os = "linux", feature = "vaapi"))]
 	Candidate {
 		name: vaapi::NAME,
 		codecs: &[Codec::H264],
 		open: vaapi::Vaapi::open,
+		cuts: true,
+		#[cfg(target_os = "linux")]
+		vulkan: false,
 	},
 	// Last of the Linux hardware encoders: the SoC blocks it drives are the only
 	// hardware on a board that has neither an NVIDIA GPU nor a VAAPI stack, so it
@@ -131,27 +236,49 @@ const HARDWARE: &[Candidate] = &[
 		name: v4l2::NAME,
 		codecs: &[Codec::H264],
 		open: v4l2::V4l2::open,
+		cuts: false,
+		#[cfg(target_os = "linux")]
+		vulkan: false,
 	},
 ];
 
-/// Software fallbacks, all platforms, always available so a box with no usable
-/// hardware encoder can still encode. Only H.264 (openh264) has one; H.265 is
-/// hardware-only. A slice so future software codecs slot in.
-const SOFTWARE: &[Candidate] = &[Candidate {
-	name: openh264::NAME,
-	codecs: &[Codec::H264],
-	open: openh264::Openh264::open,
-}];
+/// Software fallbacks compiled into this build. Only H.264 (OpenH264) has one;
+/// H.265 is hardware-only. A slice so a build can omit it entirely and future
+/// software codecs can slot in.
+const SOFTWARE: &[Candidate] = &[
+	#[cfg(feature = "openh264")]
+	Candidate {
+		name: openh264::NAME,
+		codecs: &[Codec::H264],
+		open: openh264::Openh264::open,
+		cuts: true,
+		#[cfg(target_os = "linux")]
+		vulkan: false,
+	},
+];
 
 /// Test-only backends. Deliberately in neither list above, so `Auto` /
 /// `Hardware` / `Software` can never select one: they exist to be asked for by
 /// name.
 #[cfg(test)]
-const NAMED_ONLY: &[Candidate] = &[Candidate {
-	name: probe::NAME,
-	codecs: &[Codec::H264],
-	open: probe::Probe::open,
-}];
+const NAMED_ONLY: &[Candidate] = &[
+	Candidate {
+		name: probe::NAME,
+		codecs: &[Codec::H264],
+		open: probe::Probe::open,
+		cuts: true,
+		#[cfg(target_os = "linux")]
+		vulkan: false,
+	},
+	Candidate {
+		name: probe::NO_CUT,
+		codecs: &[Codec::H264],
+		open: probe::Probe::open_no_cut,
+		cuts: false,
+		#[cfg(target_os = "linux")]
+		vulkan: false,
+	},
+];
 
 #[cfg(not(test))]
 const NAMED_ONLY: &[Candidate] = &[];
@@ -183,12 +310,24 @@ impl<'a> Attempt<'a> {
 /// Open the best encoder for `config.codec` + `config.kind`, trying candidates
 /// in priority order and falling back until one succeeds.
 pub(crate) fn open(config: &Config) -> Result<Box<dyn Backend>, Error> {
-	let codec = config.codec;
+	select(attempts(config.codec, &config.kind), config)
+}
+
+/// Whether whichever backend [`open`] picks for `codec` + `kind` honors a cut, answered
+/// before opening one: every candidate it may fall to must promise it.
+#[cfg_attr(not(feature = "capture"), allow(dead_code))]
+pub(crate) fn always_cuts(codec: Codec, kind: &Kind) -> bool {
+	let attempts = attempts(codec, kind);
+	!attempts.is_empty() && attempts.iter().all(|attempt| attempt.candidate.cuts)
+}
+
+/// The candidates [`open`] tries for `codec` + `kind`, in order.
+fn attempts(codec: Codec, kind: &Kind) -> Vec<Attempt<'static>> {
 	let supports = move |c: &Candidate| c.codecs.contains(&codec);
 	let hardware = HARDWARE.iter().filter(|c| supports(c)).map(Attempt::hardware);
 	let software = SOFTWARE.iter().filter(|c| supports(c)).map(Attempt::software);
 
-	let attempts: Vec<Attempt> = match &config.kind {
+	match kind {
 		Kind::Auto => hardware.chain(software).collect(),
 		Kind::Hardware => hardware.collect(),
 		Kind::Software => software.collect(),
@@ -198,9 +337,7 @@ pub(crate) fn open(config: &Config) -> Result<Box<dyn Backend>, Error> {
 			.chain(SOFTWARE.iter().chain(NAMED_ONLY.iter()).map(Attempt::software))
 			.filter(|a| supports(a.candidate) && a.candidate.name == name)
 			.collect(),
-	};
-
-	select(attempts, config)
+	}
 }
 
 /// Try `attempts` in order and return the first encoder that opens, warning when
@@ -210,13 +347,22 @@ pub(crate) fn open(config: &Config) -> Result<Box<dyn Backend>, Error> {
 /// consts: what `Auto` has to fall back *from* depends on the machine, so a test
 /// supplies its own attempts instead of hoping the host has the right GPU.
 fn select(attempts: Vec<Attempt>, config: &Config) -> Result<Box<dyn Backend>, Error> {
-	let mut tried = Vec::new();
+	// Each entry is "name: why it refused". The names alone say which backends
+	// exist, which is what a reader already knows; the reasons say why this
+	// machine has none, which is the question being asked.
+	let mut tried: Vec<String> = Vec::new();
 	let mut refused = Vec::new();
 
 	for attempt in attempts {
 		let name = attempt.candidate.name;
-		tried.push(name);
 
+		#[cfg(target_os = "linux")]
+		if let Some(device) = config.input
+			&& (!attempt.hardware || !attempt.candidate.vulkan)
+		{
+			tried.push(format!("{name}: cannot import external Vulkan {device}"));
+			continue;
+		}
 		match (attempt.candidate.open)(config) {
 			Ok(backend) => {
 				// `Auto` returning a software encoder is otherwise invisible except for
@@ -239,6 +385,7 @@ fn select(attempts: Vec<Attempt>, config: &Config) -> Result<Box<dyn Backend>, E
 			}
 			Err(e) => {
 				tracing::debug!(encoder = name, error = %e, "encoder unavailable, trying next");
+				tried.push(format!("{name}: {e}"));
 				if attempt.hardware {
 					refused.push(format!("{name}: {e}"));
 				}
@@ -246,10 +393,52 @@ fn select(attempts: Vec<Attempt>, config: &Config) -> Result<Box<dyn Backend>, E
 		}
 	}
 
+	// Nothing was tried at all, so no candidate matched. For a named request
+	// that is a name this build does not have: a typo, a feature that is off,
+	// or a backend that does not take this codec. Reporting it as "no usable
+	// encoder (tried: )" tells the caller nothing, and naming what is here is
+	// most of the answer.
+	#[cfg(target_os = "linux")]
+	if let Some(device) = config.input {
+		return Err(Error::NoEncoder(format!(
+			"no backend can import external Vulkan {device} (tried: {})",
+			tried.join(", ")
+		)));
+	}
+	if tried.is_empty() {
+		let available = available_names(config.codec);
+		return match &config.kind {
+			Kind::Named(name) => Err(Error::UnknownEncoder {
+				name: name.clone(),
+				codec: config.codec,
+				available: available.join(", "),
+			}),
+			kind => Err(Error::NoEncoder(format!(
+				"nothing compiled in for {:?} at {kind:?} (this build has: {})",
+				config.codec,
+				available.join(", "),
+			))),
+		};
+	}
+
 	Err(Error::NoEncoder(tried.join(", ")))
 }
 
+/// Returns the encoders this build has for `codec`, in priority order.
+///
+/// Only the ones a user could ask for: the test-only list is left out, since it
+/// exists to be named by a test rather than offered to anybody.
+fn available_names(codec: Codec) -> Vec<&'static str> {
+	HARDWARE
+		.iter()
+		.chain(SOFTWARE.iter())
+		.filter(|candidate| candidate.codecs.contains(&codec))
+		.map(|candidate| candidate.name)
+		.collect()
+}
+
 #[cfg(test)]
+#[cfg_attr(not(feature = "openh264"), allow(dead_code))]
 pub(crate) mod test_util {
 	use h264_reader::nal::sps::SeqParameterSet;
 	use h264_reader::nal::{Nal, RefNal, UnitType};
@@ -276,7 +465,7 @@ pub(crate) mod test_util {
 	/// BT.601 goes out as SMPTE 170M primaries and matrix (code point 6) with the
 	/// BT.709 transfer curve (1). The two curves are defined identically, and
 	/// CoreVideo's SMPTE 170M transfer constant is deprecated while Media
-	/// Foundation has none at all, so 1 is the only value all four backends can
+	/// Foundation has none at all, so 1 is the only value all five backends can
 	/// actually emit.
 	pub(crate) const BT601_DESCRIBED: Described = Described {
 		primaries: 6,
@@ -330,6 +519,8 @@ pub(crate) mod test_util {
 
 #[cfg(test)]
 mod tests {
+	#![cfg_attr(not(feature = "openh264"), allow(dead_code, unused_imports))]
+
 	use super::*;
 
 	/// A backend that opens and encodes nothing. Stands in for a real candidate so
@@ -343,7 +534,7 @@ mod tests {
 	}
 
 	impl Backend for Stub {
-		fn encode(&mut self, _frame: &Frame, _keyframe: bool) -> Result<Vec<Encoded>, Error> {
+		fn encode(&mut self, _frame: &Frame, _cut: bool) -> Result<Vec<Encoded>, Error> {
 			Ok(Vec::new())
 		}
 
@@ -359,7 +550,11 @@ mod tests {
 			Ok(())
 		}
 
-		fn name(&self) -> &str {
+		fn can_cut(&self) -> bool {
+			true
+		}
+
+		fn name(&self) -> &'static str {
 			"stub"
 		}
 	}
@@ -368,6 +563,9 @@ mod tests {
 		name: "stub",
 		codecs: &[Codec::H264],
 		open: Stub::open,
+		cuts: true,
+		#[cfg(target_os = "linux")]
+		vulkan: false,
 	};
 
 	/// Compiled in but refusing at runtime, the way NVENC does on a host whose
@@ -376,10 +574,30 @@ mod tests {
 		name: "driverless",
 		codecs: &[Codec::H264],
 		open: |_| Err(Error::Codec(anyhow::anyhow!("driver libraries not found"))),
+		cuts: true,
+		#[cfg(target_os = "linux")]
+		vulkan: false,
 	};
 
 	fn config() -> Config {
-		Config::new(320, 240, 30)
+		Config::new(320, 240, crate::Rate::new(30, 1).unwrap())
+	}
+
+	/// Only a selection whose every candidate promises cuts may advertise them, and a
+	/// candidate's promise holds for the encoder it opens.
+	#[test]
+	fn always_cuts_needs_every_candidate_to_promise() {
+		let named = |name: &str| Kind::Named(name.to_owned());
+		assert!(always_cuts(Codec::H264, &named(probe::NAME)));
+		assert!(!always_cuts(Codec::H264, &named(probe::NO_CUT)));
+		assert!(!always_cuts(Codec::H264, &named("v4l2")), "V4L2 learns it at open");
+		assert!(!always_cuts(Codec::H264, &named("nonexistent")), "nothing to open");
+
+		let _probe = probe::exclusive();
+		for candidate in NAMED_ONLY {
+			let backend = (candidate.open)(&config()).unwrap();
+			assert_eq!(backend.can_cut(), candidate.cuts, "{}", candidate.name);
+		}
 	}
 
 	#[tracing_test::traced_test]
@@ -422,6 +640,58 @@ mod tests {
 		assert!(!logs_contain("falling back to software"));
 	}
 
+	/// A name no candidate answers to has to say so. It used to come back as
+	/// `NoEncoder("")`, which names neither the mistake nor the alternatives.
+	#[test]
+	fn an_unknown_name_names_itself_and_the_alternatives() {
+		let mut config = config();
+		config.kind = Kind::Named("vappi".to_owned());
+
+		match open(&config) {
+			Err(Error::UnknownEncoder { name, codec, available }) => {
+				assert_eq!(name, "vappi");
+				assert_eq!(codec, config.codec);
+				#[cfg(feature = "openh264")]
+				assert!(available.contains(openh264::NAME), "nothing offered: {available}");
+				#[cfg(not(feature = "openh264"))]
+				assert!(!available.contains("openh264"), "disabled backend offered: {available}");
+			}
+			Err(other) => panic!("expected UnknownEncoder, got {other:?}"),
+			Ok(backend) => panic!("expected UnknownEncoder, opened {}", backend.name()),
+		}
+	}
+
+	#[cfg(not(feature = "openh264"))]
+	#[test]
+	fn disabled_software_backend_is_not_selected() {
+		let mut config = config();
+		config.kind = Kind::Software;
+		assert!(matches!(open(&config), Err(Error::NoEncoder(_))));
+
+		config.kind = Kind::Named("openh264".to_owned());
+		assert!(matches!(open(&config), Err(Error::UnknownEncoder { .. })));
+	}
+
+	/// The reason each candidate refused belongs in the error. Only the DEBUG
+	/// line used to carry it, which is no use to a caller holding the `Err`.
+	#[test]
+	fn every_candidate_refusing_reports_why() {
+		let mut config = config();
+		config.kind = Kind::Named("driverless".to_owned());
+
+		match select(vec![Attempt::hardware(&REFUSING)], &config) {
+			Err(Error::NoEncoder(tried)) => {
+				assert!(tried.contains("driverless"), "does not name the backend: {tried}");
+				assert!(
+					tried.contains("driver libraries not found"),
+					"does not carry the reason: {tried}"
+				);
+			}
+			Err(other) => panic!("expected NoEncoder, got {other:?}"),
+			Ok(backend) => panic!("expected NoEncoder, opened {}", backend.name()),
+		}
+	}
+
 	#[tracing_test::traced_test]
 	#[test]
 	fn hardware_that_opens_is_not_a_fallback() {
@@ -431,5 +701,57 @@ mod tests {
 		)
 		.unwrap();
 		assert!(!logs_contain("falling back to software"));
+	}
+
+	/// Every backend this build compiled has to be in the public name list, or
+	/// a caller offering the list as a choice offers a name nothing answers to.
+	#[test]
+	fn every_compiled_backend_is_named_publicly() {
+		for candidate in HARDWARE.iter().chain(SOFTWARE.iter()) {
+			assert!(
+				NAMES.contains(&candidate.name),
+				"{} is compiled in but missing from NAMES",
+				candidate.name,
+			);
+		}
+	}
+
+	/// The keyframe is decided by the first slice, past the parameter sets and SEI
+	/// that lead an H.264 IDR, and by either start code length.
+	#[test]
+	fn an_h264_keyframe_is_its_idr_slice() {
+		let idr = [
+			0, 0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x68, 0xce, 0, 0, 1, 0x06, 0x05, 0, 0, 1, 0x65, 0x88,
+		];
+		assert!(keyframe_annexb(Codec::H264, &idr));
+
+		let delta = [0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x41, 0x9a];
+		assert!(!keyframe_annexb(Codec::H264, &delta));
+
+		// Parameter sets with no slice are not a picture at all.
+		assert!(!keyframe_annexb(
+			Codec::H264,
+			&[0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x68, 0xce]
+		));
+		assert!(!keyframe_annexb(Codec::H264, &[]));
+	}
+
+	/// Every H.265 IRAP type (BLA, IDR, CRA) is a keyframe; a trailing picture is not.
+	#[test]
+	fn an_h265_keyframe_is_any_irap_slice() {
+		// VPS (32), SPS (33), PPS (34), then the slice, each with a two-byte header.
+		let with_slice = |nal_type: u8| {
+			let mut annexb = Vec::new();
+			for header in [32, 33, 34, nal_type] {
+				annexb.extend_from_slice(&[0, 0, 0, 1, header << 1, 0x01, 0xaf]);
+			}
+			annexb
+		};
+		for irap in 16..=23 {
+			assert!(keyframe_annexb(Codec::H265, &with_slice(irap)), "type {irap}");
+		}
+		for trailing in [0, 1] {
+			assert!(!keyframe_annexb(Codec::H265, &with_slice(trailing)), "type {trailing}");
+		}
 	}
 }

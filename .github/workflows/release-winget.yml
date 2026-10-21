@@ -25,7 +25,6 @@ on:
     workflows:
       - moq-cli
       - moq-relay
-      - moq-token-cli
     types:
       - completed
   workflow_dispatch:
@@ -87,9 +86,8 @@ jobs:
           crate="${BASH_REMATCH[1]}"
           version="${BASH_REMATCH[2]}"
           case "$crate" in
-            moq-cli)       identifier="moq-dev.moq-cli" ;;
+            moq-cli)       identifier="moq-dev.moq" ;;
             moq-relay)     identifier="moq-dev.moq-relay" ;;
-            moq-token-cli) identifier="moq-dev.moq-token-cli" ;;
             *)
               echo "No winget identifier mapped for crate: $crate" >&2
               exit 1
@@ -138,7 +136,7 @@ jobs:
 
       - name: Submit to winget-pkgs
         if: steps.mode.outputs.dry_run == 'false' && steps.gate.outputs.enabled == 'true'
-        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        uses: vedantmgoyal9/winget-releaser@b7370d4d152efdce803a26cc6ca9eee58cb2ad54 # v2
         with:
           identifier: ${{ steps.parse.outputs.identifier }}
           version: ${{ steps.parse.outputs.version }}

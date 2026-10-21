@@ -1,0 +1,58 @@
+name: X11 capture
+
+# Xvfb exercises the real X protocol and SHM path, not desktop hardware.
+# Correctness is gated; paired timings are retained without a runner-speed threshold.
+on:
+  workflow_call:
+  pull_request:
+    # Main PRs skip it; nightly.yml runs it on main. `edited` catches a main PR
+    # retargeted to release.
+    branches: [release]
+    types: [opened, synchronize, reopened, edited]
+    paths:
+      - "rs/moq-video/**"
+      - "rs/justfile"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - "flake.nix"
+      - "flake.lock"
+      - ".github/workflows/x11.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: x11-capture-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    name: SHM and GetImage
+    runs-on: ubuntu-24.04-arm
+    # `main` and its merge queue write the Rust cache; see .github/actions/rust-cache.
+    environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/gh-readonly-queue/main/')) && 'cache-write' || '' }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/nix
+      - name: Rust cache
+        uses: ./.github/actions/rust-cache
+        with:
+          access-key-id: ${{ secrets.MBX_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MBX_R2_SECRET_ACCESS_KEY }}
+      - name: Capture comparison
+        run: nix develop --command just rs x11-bench-ci
+        env:
+          MOQ_X11_BENCH_LOG: ${{ runner.temp }}/x11-capture-benchmark.log
+      - name: Keep capture measurements
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: x11-capture-benchmark
+          path: ${{ runner.temp }}/x11-capture-benchmark.log
+          retention-days: 30
+          if-no-files-found: error

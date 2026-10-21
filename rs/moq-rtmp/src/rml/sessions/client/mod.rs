@@ -17,15 +17,15 @@ pub use self::result::ClientSessionResult;
 pub use self::state::ClientState;
 
 use self::outstanding_transaction::{OutstandingTransaction, TransactionPurpose};
+use crate::rml::amf0::Amf0Value;
 use crate::rml::chunk_io::{ChunkDeserializer, ChunkSerializer, Packet};
 use crate::rml::messages::{RtmpMessage, UserControlEventType};
 use crate::rml::sessions::StreamMetadata;
 use crate::rml::time::RtmpTimestamp;
 use bytes::Bytes;
-use rml_amf0::Amf0Value;
+use moq_clock::Instant;
 use std::collections::HashMap;
 use std::mem;
-use std::time::SystemTime;
 
 type ClientResult = Result<Vec<ClientSessionResult>, ClientSessionError>;
 
@@ -50,7 +50,7 @@ type ClientResult = Result<Vec<ClientSessionResult>, ClientSessionError>;
 /// Any violation of these points have a high probability of causing RTMP chunk parsing errors
 /// by either the `ClientSession` or the peer.
 pub struct ClientSession {
-	start_time: SystemTime,
+	start_time: Instant,
 	serializer: ChunkSerializer,
 	deserializer: ChunkDeserializer,
 	config: ClientSessionConfig,
@@ -72,7 +72,7 @@ impl ClientSession {
 	/// such as setting the outbound chunk size
 	pub fn new(config: ClientSessionConfig) -> Result<(ClientSession, Vec<ClientSessionResult>), ClientSessionError> {
 		let session = ClientSession {
-			start_time: SystemTime::now(),
+			start_time: Instant::now(),
 			serializer: ChunkSerializer::new(),
 			deserializer: ChunkDeserializer::new(),
 			next_transaction_id: 1,
@@ -155,6 +155,11 @@ impl ClientSession {
 						RtmpMessage::WindowAcknowledgement { size } => self.handle_window_ack_size(size)?,
 
 						RtmpMessage::SetChunkSize { size } => self.handle_set_chunk_size(size)?,
+
+						RtmpMessage::Abort { stream_id } => {
+							self.deserializer.abort(stream_id);
+							Vec::new()
+						}
 
 						_ => vec![ClientSessionResult::UnhandleableMessageReceived(payload)],
 					};
@@ -555,25 +560,33 @@ impl ClientSession {
 		Ok(vec![ClientSessionResult::RaisedEvent(event)])
 	}
 
-	fn handle_amf0_data(&mut self, mut data: Vec<Amf0Value>, stream_id: u32) -> ClientResult {
-		if data.len() == 0 {
-			// No data so just do nothing
-			return Ok(Vec::new());
+	fn handle_amf0_data(&mut self, data: Vec<Amf0Value>, stream_id: u32) -> ClientResult {
+		// Anything that isn't stream metadata is still raised, so the caller can
+		// account for script data it doesn't carry instead of losing it silently.
+		let event = match self.stream_metadata(&data, stream_id) {
+			Some(metadata) => ClientSessionEvent::StreamMetadataReceived { metadata },
+			None => ClientSessionEvent::UnhandleableAmf0Data { values: data },
+		};
+
+		Ok(vec![ClientSessionResult::RaisedEvent(event)])
+	}
+
+	/// Parse `onMetaData({...})` sent on the active stream.
+	fn stream_metadata(&self, data: &[Amf0Value], stream_id: u32) -> Option<StreamMetadata> {
+		if self.active_stream_id != Some(stream_id) {
+			return None;
 		}
 
-		// Validate we are active on the stream this message came from
-		match self.active_stream_id {
-			None => return Ok(Vec::new()), // not active on any stream
-			Some(active_stream_id) if active_stream_id != stream_id => return Ok(Vec::new()), // not active on this stream
-			Some(_) => (),
+		let [Amf0Value::Utf8String(name), Amf0Value::Object(properties), ..] = data else {
+			return None;
+		};
+		if name != "onMetaData" {
+			return None;
 		}
 
-		let first_element = data.remove(0);
-		match first_element {
-			Amf0Value::Utf8String(ref value) if value == "onMetaData" => self.handle_amf0_data_on_meta_data(data),
-
-			_ => Ok(Vec::new()),
-		}
+		let mut metadata = StreamMetadata::new();
+		metadata.apply_metadata_values(properties.clone());
+		Some(metadata)
 	}
 
 	fn handle_amf0_command(
@@ -825,24 +838,6 @@ impl ClientSession {
 		Ok(vec![ClientSessionResult::RaisedEvent(event)])
 	}
 
-	fn handle_amf0_data_on_meta_data(&mut self, mut data: Vec<Amf0Value>) -> ClientResult {
-		if data.len() < 1 {
-			// No data so ignore it
-			return Ok(Vec::new());
-		}
-
-		let properties = match data.remove(0) {
-			Amf0Value::Object(properties) => properties,
-			_ => return Ok(Vec::new()), // malformed so ignore it
-		};
-
-		let mut metadata = StreamMetadata::new();
-		metadata.apply_metadata_values(properties);
-
-		let event = ClientSessionEvent::StreamMetadataReceived { metadata };
-		Ok(vec![ClientSessionResult::RaisedEvent(event)])
-	}
-
 	fn handle_acknowledgement(&mut self, sequence_number: u32) -> ClientResult {
 		let event = ClientSessionEvent::AcknowledgementReceived {
 			bytes_received: sequence_number,
@@ -894,22 +889,29 @@ impl ClientSession {
 	}
 
 	fn get_epoch(&self) -> RtmpTimestamp {
-		match self.start_time.elapsed() {
-			Ok(duration) => {
-				let milliseconds = (duration.as_secs() * 1000) + (duration.subsec_nanos() as u64 / 1_000_000);
-
-				// Casting to u32 should auto-wrap the value as expected.  If not a stream will probably
-				// break after 49 days but testing shows it should wrap
-				RtmpTimestamp::new(milliseconds as u32)
-			}
-
-			Err(_) => RtmpTimestamp::new(0), // Time went backwards, so just consider time as at epoch
-		}
+		// RTMP timestamps wrap every 2^32 milliseconds.
+		RtmpTimestamp::new(self.start_time.elapsed().as_millis() as u32)
 	}
 
 	fn get_next_transaction_id(&mut self) -> u32 {
 		let transaction_id = self.next_transaction_id;
 		self.next_transaction_id += 1;
 		transaction_id
+	}
+}
+
+#[cfg(test)]
+mod clock_tests {
+	use super::*;
+
+	#[moq_clock::test]
+	async fn session_epoch_uses_the_timer_clock() {
+		let (session, _) = ClientSession::new(ClientSessionConfig::new()).unwrap();
+		moq_clock::sleep(std::time::Duration::from_millis(12_345)).await;
+		assert_eq!(session.get_epoch(), RtmpTimestamp::new(12_345));
+		moq_clock::sim::step_wall(moq_clock::Wall::UNIX_EPOCH);
+		assert_eq!(session.get_epoch(), RtmpTimestamp::new(12_345));
+		moq_clock::sleep(std::time::Duration::from_millis(1 << 32)).await;
+		assert_eq!(session.get_epoch(), RtmpTimestamp::new(12_345));
 	}
 }

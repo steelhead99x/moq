@@ -14,7 +14,8 @@ Nothing is encoded until someone asks, Cloudflare-style just-in-time per rung:
   active rung of a source shares one subscription and one decoder, so decode
   cost scales with sources, not ladder depth.
 - **Fetch** a specific group and the transcoder fetches that same group from
-  the source and transcodes just that group. Output groups mirror source group
+  the source and transcodes just that group. If every caller leaves before the
+  request is accepted, nothing is encoded. Output groups mirror source group
   sequence numbers 1:1, so group N of every rung is the same content as source
   group N and rendition switches land cleanly.
 
@@ -25,8 +26,13 @@ are eligible when a matching decoder is available. On an NVIDIA GPU the pipeline
 is fully GPU-resident: NVDEC decodes and scales in hardware and NVENC encodes the
 CUDA frame in place, with no CPU copies. macOS also resizes on the GPU. Windows
 uses the Direct3D11 video processor by default; set
-`Config::resize.acceleration` to `resize::Acceleration::Cpu` to force a download
-and CPU resize.
+`Config::resize.output` to `Output::Cpu` to decode to CPU pixels and resize
+there.
+
+The features mirror `moq-video`: `nvidia` is on by default and the `openh264`
+software fallback is opt-in, so a GPU-less host needs `--features openh264` to
+encode at all. A software-only build can use
+`--no-default-features --features openh264`.
 
 ## Library
 
@@ -38,23 +44,37 @@ broadcast.
 let mut config = moq_transcode::Config::default();
 // The derivative is announced at `<source>/transcode.hang`, so the source
 // renditions are referenced through its parent.
-config.source = Some(moq_net::PathRelativeOwned::from(".".to_string()));
+config.source = Some(moq_net::path::RelativeOwned::from(".".to_string()));
 
-let output = origin.create_broadcast(
-    format!("{path}/transcode.hang"),
-    moq_net::broadcast::Route::new().with_announce(true),
-)?;
+let output = origin.create_broadcast(format!("{path}/transcode.hang"))?;
+output.announce(Default::default())?;
 
 moq_transcode::run(source, output, config).await?;
 ```
 
-Only renditions strictly below the source survive the ladder: a 480p source is
-never transcoded up to 720p, and a same-height rung is only offered when it
-undercuts a known source bitrate.
+Rung sizes measure the coded frame's short side: a 1080x1920 source produces
+720x1280 and 360x640 rungs, while catalog rotation is preserved. Only renditions
+strictly below the source survive: a 480-pixel short side is never upscaled to
+720, and a same-size rung is only offered when it undercuts a known source bitrate.
+
+`Config::ladder` is a `Ladder`, built from rungs in any order:
+
+```rust
+config.ladder = moq_transcode::Ladder::new([
+    moq_transcode::Rung::new(720, moq_net::bandwidth::Rate::from_bps(2_500_000)),
+    moq_transcode::Rung::new(360, moq_net::bandwidth::Rate::from_bps(600_000)),
+])?;
+```
+
+It ranks them by bitrate, lowest first, so every rung above the lowest has a next lower
+rendition. A ladder with no such ranking is an error rather than a guess: two
+rungs sharing a bitrate have no lower one, and a rung that costs more without
+having a larger short side means bitrate and resolution disagree about which rendition is
+below which. Filtering against the source drops rungs but never reorders them.
 
 ## Example
 
-Publish something first (e.g. `moq publish camera` from
+Publish something first (e.g. `moq import capture` from
 [`moq-cli`](../moq-cli)), then:
 
 ```bash

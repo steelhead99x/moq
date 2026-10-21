@@ -8,18 +8,28 @@ on:
   push:
     tags:
       - "moq-dart-v*"
+  # Dry-run: check the source package, publish nothing. Only a tag push
+  # publishes, so nightly.yml calls this on main in place of main PRs.
+  workflow_call:
+  # `edited` catches a main PR retargeted to release.
   pull_request:
+    branches: [release]
+    types: [opened, synchronize, reopened, edited]
     paths:
       - ".github/workflows/release-dart.yml"
       - "dart/moq/**"
-      - "dart/scripts/**"
+      - "sh/dart/**"
 
 permissions:
   contents: read
 
+# Only publishing runs share the serialized group. GitHub keeps a single pending
+# run per group and drops the older one, so a PR (or nightly dry-run) sharing it
+# silently cancelled a queued release. Dry-runs get a per-ref group instead and
+# cancel their superseded builds.
 concurrency:
-  group: release-dart
-  cancel-in-progress: false
+  group: release-dart-${{ github.event_name == 'push' && 'publish' || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
   package:
@@ -33,23 +43,25 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260 # v1.7.2
+      - uses: ./.github/actions/just
+
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
 
       - name: Resolve version
         id: version
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+          if [[ "$EVENT_NAME" != "push" ]]; then
             VERSION=$(sed -n 's/^version: //p' dart/moq/pubspec.yaml | head -1)
           else
-            .github/scripts/release.sh parse-version moq-dart
+            just gh release parse-version moq-dart
             exit 0
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Check source package (PR)
-        if: github.event_name == 'pull_request'
+      - name: Check source package (dry-run)
+        if: github.event_name != 'push'
         working-directory: dart/moq
         run: |
           if [ -f pubspec.lock ]; then
@@ -65,7 +77,7 @@ jobs:
         env:
           BUILD_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          ./dart/scripts/package.sh \
+          just dart package \
             --package moq \
             --version "$BUILD_VERSION" \
             --output release-out
@@ -86,7 +98,7 @@ jobs:
 
       - name: Upload package
         if: github.event_name == 'push'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dart-package
           path: release-out/*
@@ -103,12 +115,12 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: dart-package
           path: package
 
-      - uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260 # v1.7.2
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
 
       - name: Publish
         env:

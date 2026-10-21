@@ -1,13 +1,29 @@
-import { Time } from "@moq/net";
+import { Micro, Second } from "@moq/clock";
 
 // Control array slot indices. The playhead is not here: see `state`.
 const WRITE = 0;
 const LATENCY = 1;
+/**
+ * Whether playback is held while the ring refills. The one slot both threads write.
+ *
+ * The writer clears it once the ring holds the target, the reader raises it when the ring runs
+ * dry. Neither needs a compare-exchange. The reader only raises it having observed an empty ring,
+ * which means it already drained everything the writer published, and the writer only clears it
+ * having published enough to cover the target. A raise landing after a clear costs one quantum of
+ * silence and the next insert undoes it, since every insert re-checks. A clear landing after a
+ * raise is correct on its face: the samples are there.
+ */
 const STALLED = 2;
-const CONTROL_SLOTS = 3;
+// Timeline identity changes only on re-anchor, independently of the packed mutation epoch.
+const TIMELINE = 3;
+// The size of the most recent insert, i.e. one decoded chunk. See `read`.
+const CHUNK = 4;
+// How many times the reader ran dry mid-playback. Diagnostics only.
+const UNDERRUN = 5;
+const CONTROL_SLOTS = 6;
 
 /**
- * The playhead and the timeline it belongs to, packed into one 64-bit word: epoch in the high
+ * The playhead and its mutation epoch, packed into one 64-bit word: epoch in the high
  * half, read cursor in the low half.
  *
  * They have to move together. The reader samples the ring, copies, and only then publishes, and
@@ -23,9 +39,22 @@ function pack(epoch: number, read: number): bigint {
 	return (BigInt(epoch >>> 0) << 32n) | BigInt(read >>> 0);
 }
 
-/** The timeline half. Bumped by the writer on every re-anchor. */
+/**
+ * The mutation epoch. Even while settled, odd while `truncate` retreats WRITE.
+ *
+ * WRITE lives in a different word, so a retreat cannot move it and the epoch together. Marking
+ * the epoch on either side of the retreat is what covers the gap: a reader that snapshotted
+ * before the mark finds the word moved and its exchange fails, one that snapshots between the
+ * marks sees the odd epoch and renders silence, and one that snapshots after already reads the
+ * retreated WRITE. So the writer steps by two on a re-anchor, keeping odd for the retreat alone.
+ */
 function epochOf(state: bigint): number {
 	return Number(state >> 32n) | 0;
+}
+
+/** Whether a `truncate` is mid-retreat, so WRITE may still describe samples it is dropping. */
+function retreating(state: bigint): boolean {
+	return (epochOf(state) & 1) !== 0;
 }
 
 /** The playhead half, back as an i32 so the modular comparisons elsewhere still hold. */
@@ -152,19 +181,20 @@ export class SharedRingBuffer {
 	/**
 	 * Carry `source`'s playhead across, if the replacement is still the timeline it belongs to.
 	 *
-	 * `resize` copies the epoch, so a destination that re-anchored since has a different one and
-	 * the cursor is dropped rather than applied to audio the reader has never played. The check
-	 * and the write are the same exchange, so a re-anchor landing mid-handoff makes it fail
-	 * instead of slipping through the gap that separate operations would leave.
+	 * Truncation changes the mutation epoch but preserves timeline identity. Sample state before
+	 * identity: a re-anchor publishes identity first, then replaces state. Either the identity
+	 * check rejects the old cursor, the exchange fails, or the re-anchor overwrites the carried
+	 * cursor. A truncate only forces a retry, preserving audio consumed since the resize.
 	 */
 	#handoff(source: SharedRingBuffer): void {
 		if (source.channels !== this.channels || source.rate !== this.rate) return;
 
+		const timeline = Atomics.load(source.#control, TIMELINE);
 		const from = Atomics.load(source.#state, 0);
 
 		for (;;) {
 			const state = Atomics.load(this.#state, 0);
-			if (epochOf(state) !== epochOf(from)) return;
+			if (Atomics.load(this.#control, TIMELINE) !== timeline) return;
 			if (((readOf(from) - readOf(state)) | 0) <= 0) return;
 
 			const next = pack(epochOf(state), readOf(from));
@@ -190,13 +220,26 @@ export class SharedRingBuffer {
 	}
 
 	/**
+	 * Step the epoch by `by`, leaving the playhead wherever the reader has taken it.
+	 *
+	 * Retries while the word changes under it: only the epoch half is the writer's to move.
+	 */
+	#step(by: number): void {
+		for (;;) {
+			const state = Atomics.load(this.#state, 0);
+			const next = pack((epochOf(state) + by) | 0, readOf(state));
+			if (Atomics.compareExchange(this.#state, 0, state, next) === state) return;
+		}
+	}
+
+	/**
 	 * Insert audio samples at the given timestamp.
 	 * Main thread only. Handles out-of-order writes, gap filling, and overflow.
 	 */
-	insert(timestamp: Time.Micro, data: Float32Array[]): void {
+	insert(timestamp: Micro, data: Float32Array[]): void {
 		if (data.length !== this.channels) throw new Error("wrong number of channels");
 
-		let start = Math.round(Time.Second.fromMicro(timestamp) * this.rate);
+		let start = Math.round(Second.fromMicro(timestamp) * this.rate);
 		const originalLength = data[0].length;
 		let offset = 0;
 
@@ -205,9 +248,11 @@ export class SharedRingBuffer {
 		if (!this.#anchored) {
 			this.#anchor = start;
 			// One store rebases both halves, so a reader's compare-exchange against the old word
-			// cannot land afterwards.
+			// cannot land afterwards. Two, because odd epochs belong to `truncate`.
 			const epoch = epochOf(Atomics.load(this.#state, 0));
-			Atomics.store(this.#state, 0, pack((epoch + 1) | 0, 0));
+			// Publish identity first so a handoff cannot apply an old cursor to the new state.
+			Atomics.add(this.#control, TIMELINE, 1);
+			Atomics.store(this.#state, 0, pack((epoch + 2) | 0, 0));
 			Atomics.store(this.#control, WRITE, 0);
 			this.#anchored = true;
 			this.#position = 0;
@@ -266,14 +311,27 @@ export class SharedRingBuffer {
 			}
 		}
 
+		// Publish the chunk size for the reader's skip band before the samples it describes become
+		// visible. The two stores are not one transaction, so the reader can land between them:
+		// this way it sees the wider band with the old cursor, which only makes it skip less, where
+		// the other order would have it measure a longer span against a narrower band and cut audio
+		// that is not actually late. The most recent insert, not a running maximum: one oversized
+		// decode would otherwise widen the band for the life of the ring, and a publisher that
+		// changes its frame duration is described within one insert.
+		Atomics.store(this.#control, CHUNK, originalLength);
+
 		// Advance WRITE (only forward)
 		Atomics.store(this.#control, WRITE, i32Max(Atomics.load(this.#control, WRITE), end));
 
-		// Un-stall: if buffered data >= LATENCY
-		const currentRead = readOf(Atomics.load(this.#state, 0));
-		const currentWrite = Atomics.load(this.#control, WRITE);
+		this.#resume();
+	}
+
+	// Un-stall once the buffered data covers LATENCY.
+	#resume(): void {
+		const read = readOf(Atomics.load(this.#state, 0));
+		const write = Atomics.load(this.#control, WRITE);
 		const latency = Atomics.load(this.#control, LATENCY);
-		if (((currentWrite - currentRead) | 0) >= latency && latency > 0) {
+		if (((write - read) | 0) >= latency && latency > 0) {
 			Atomics.store(this.#control, STALLED, 0);
 		}
 	}
@@ -290,22 +348,37 @@ export class SharedRingBuffer {
 		// arriving after sees the STALLED that `reset` raised and never starts.
 		const state = Atomics.load(this.#state, 0);
 		if (Atomics.load(this.#control, STALLED) === 1) return 0;
+		// A retreat is in flight, so WRITE still describes samples `truncate` is dropping and a
+		// later exchange could not tell them apart. Render the quantum as silence instead.
+		if (retreating(state)) return 0;
 
 		let read = readOf(state);
 		const write = Atomics.load(this.#control, WRITE);
 		const latency = Atomics.load(this.#control, LATENCY);
 
-		// Latency skip: if buffered data exceeds LATENCY, skip ahead.
+		// Latency skip: skip ahead only once the ring holds a whole chunk more than the target,
+		// landing back on the target. Frames arrive one chunk at a time, so a ring sitting exactly
+		// on the target is a chunk above it the moment the next one lands; skipping on that
+		// overshoot discards audio on every single insert. The chunk of slack is the difference
+		// between tolerating normal arrival and cutting it.
 		// CAS ensures we never step backward relative to a concurrent writer advance.
 		// Disabled in buffered mode, where we deliberately play through the whole buffer.
 		const buffered = (write - read) | 0;
-		if (!this.buffered && latency > 0 && buffered > latency) {
+		const slack = Atomics.load(this.#control, CHUNK);
+		if (!this.buffered && latency > 0 && buffered > ((latency + slack) | 0)) {
 			const skipTo = (write - latency) | 0;
 			if (((skipTo - read) | 0) > 0) read = skipTo;
 		}
 
 		const available = (write - read) | 0;
 		const count = Math.min(available, output[0].length);
+		if (available <= 0) {
+			// Ran dry mid-playback. Re-stall so `insert` refills to the target before playback
+			// resumes: the alternative is playing the next chunk on an empty cushion, which
+			// underruns again on the very next quantum. See STALLED for the write discipline.
+			Atomics.store(this.#control, STALLED, 1);
+			Atomics.add(this.#control, UNDERRUN, 1);
+		}
 		if (count <= 0) {
 			// A latency skip still has to be published, and still only if nothing moved.
 			if (((read - readOf(state)) | 0) > 0) {
@@ -334,12 +407,36 @@ export class SharedRingBuffer {
 			return 0;
 		}
 
+		// A short quantum ends in silence, so it counts as an underrun even if a chunk lands before
+		// the next read. It does not park playback: the shortfall is under one quantum, and a
+		// refill would spend the whole target as silence to cover it.
+		if (count < output[0].length) Atomics.add(this.#control, UNDERRUN, 1);
+
 		return count;
 	}
 
-	/** Update the target latency in samples. */
+	/**
+	 * Update the target latency in samples. Main thread only.
+	 *
+	 * A deeper floor parks playback until it refills. Video holds the extra delay on its own, so
+	 * audio that kept draining at the old depth would run ahead by the difference. Parking keeps
+	 * what is buffered, so a rise costs only its own size in silence, and none if the buffer
+	 * already covers the new floor.
+	 */
 	setLatency(samples: number): void {
-		Atomics.store(this.#control, LATENCY, samples);
+		const previous = Atomics.exchange(this.#control, LATENCY, samples);
+		if (previous > 0 && samples > previous) {
+			Atomics.store(this.#control, STALLED, 1);
+			// A reader already past the STALLED check would still publish its quantum. Moving the
+			// word fails its exchange, and one that snapshots after this sees STALLED. Two keeps the
+			// epoch even, since odd belongs to `truncate`.
+			this.#step(2);
+		}
+
+		// Parked, the playhead holds still, so this measures exactly what is buffered. It also
+		// resumes a refill that a shallower floor has already covered, which `insert` would only
+		// notice on the next frame, never for a source that has stopped.
+		this.#resume();
 	}
 
 	/**
@@ -349,20 +446,25 @@ export class SharedRingBuffer {
 	 * A successor track overwrites the slots its own samples land on, but anything the previous
 	 * track wrote beyond them would otherwise still play once the successor runs out.
 	 */
-	truncate(timestamp: Time.Micro): void {
-		const target = (Math.round(Time.Second.fromMicro(timestamp) * this.rate) - this.#anchor) | 0;
+	truncate(timestamp: Micro): void {
+		const target = (Math.round(Second.fromMicro(timestamp) * this.rate) - this.#anchor) | 0;
+		if (((Atomics.load(this.#control, WRITE) - target) | 0) <= 0) return; // nothing past the new timeline
+
+		// Bracket the retreat with epoch steps, so a reader is never left holding a WRITE this
+		// dropped the tail of. See `epochOf`.
+		this.#step(1);
 		for (;;) {
 			const write = Atomics.load(this.#control, WRITE);
-			if (((write - target) | 0) <= 0) return; // nothing buffered past the new timeline
 			// Never retreat past the playhead: those samples are already due. The worklet can still
 			// advance READ past the value read here, leaving READ ahead of WRITE. That reads as an
 			// empty ring (read() returns nothing, insert() trims what the worklet already played) and
 			// heals on the first successor sample past the playhead, so it costs a quantum of silence
 			// rather than replaying anything.
 			const clamped = i32Max(target, readOf(Atomics.load(this.#state, 0)));
-			if (((write - clamped) | 0) <= 0) return;
-			if (Atomics.compareExchange(this.#control, WRITE, write, clamped) === write) return;
+			if (((write - clamped) | 0) <= 0) break;
+			if (Atomics.compareExchange(this.#control, WRITE, write, clamped) === write) break;
 		}
+		this.#step(1);
 	}
 
 	/**
@@ -414,10 +516,13 @@ export class SharedRingBuffer {
 			}
 		}
 
+		Atomics.store(dst.#control, TIMELINE, Atomics.load(this.#control, TIMELINE));
 		Atomics.store(dst.#state, 0, pack(epochOf(state), copyStart));
 		Atomics.store(dst.#control, WRITE, write);
 		Atomics.store(dst.#control, LATENCY, latency);
 		Atomics.store(dst.#control, STALLED, stalled);
+		Atomics.store(dst.#control, CHUNK, Atomics.load(this.#control, CHUNK));
+		Atomics.store(dst.#control, UNDERRUN, Atomics.load(this.#control, UNDERRUN));
 
 		// Carry the unwrapped playhead over, rebased onto dst's READ. Fold the same `read`
 		// snapshot the copy used so both sides agree on one observation; `copyStart` is at or
@@ -449,13 +554,18 @@ export class SharedRingBuffer {
 	 * Main thread only, and stateful: it advances the unwrapped read position, so it has to be
 	 * polled rather than sampled once. See `#position`.
 	 */
-	get timestamp(): Time.Micro {
-		return Time.Micro.fromSecond(((this.#anchor + this.#unwrapRead()) / this.rate) as Time.Second);
+	get timestamp(): Micro {
+		return Micro.fromSecond(((this.#anchor + this.#unwrapRead()) / this.rate) as Second);
 	}
 
 	/** Whether the buffer is stalled (waiting to fill). */
 	get stalled(): boolean {
 		return Atomics.load(this.#control, STALLED) === 1;
+	}
+
+	/** How many times the reader has run dry mid-playback. */
+	get underruns(): number {
+		return Atomics.load(this.#control, UNDERRUN);
 	}
 
 	/**

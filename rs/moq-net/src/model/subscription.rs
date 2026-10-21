@@ -1,4 +1,10 @@
-use std::{task::Poll, time::Duration};
+use std::{
+	ops::{Bound, RangeBounds, RangeFull, RangeTo, RangeToInclusive},
+	time::Duration,
+};
+
+mod window;
+pub(super) use window::{Resolved, Window};
 
 /// Subscriber-side preferences for receiving a track.
 ///
@@ -11,43 +17,236 @@ use std::{task::Poll, time::Duration};
 pub struct Subscription {
 	/// Delivery priority. Higher values preempt lower ones when bandwidth is constrained.
 	pub priority: u8,
-	/// Whether groups are prioritized in sequence order. Groups may always arrive
-	/// out-of-order (or not at all) over the network. Defaults to `false`; the
-	/// aggregate is ordered only when every live subscriber asks for it.
-	pub ordered: bool,
-	/// The maximum age of a non-latest group before it is skipped. `Duration::ZERO`
-	/// skips immediately (e.g. group 8 arriving means group 7 is skipped); a larger
-	/// value tolerates that much reordering before giving up on the older group.
+	/// How long a superseded group stays worth delivering to this subscriber.
 	///
-	/// This is the `Subscriber Max Latency` on the wire, enforced by the publisher's
-	/// cache. Receivers that buffer (e.g. a jitter buffer) enforce the same budget
-	/// locally, and a group is skipped once either measure exceeds it.
-	pub latency_max: Duration,
-	/// First group the publisher should deliver, or `None` to start at the latest group.
+	/// [`Duration::ZERO`] (the default) skips immediately: group 8 arriving means group 7
+	/// is abandoned, timed or not. A larger budget tolerates that much reordering before giving up.
+	/// This never *adds* delay, since the bound is only reached once newer data is
+	/// already that far ahead.
 	///
-	/// A request, aggregated across every live subscriber (the earliest explicit start
-	/// wins), so it says what the publisher sends, not what any one subscriber sees.
-	/// [`crate::track::Subscriber::start_at`] is the local read cursor; setting one does
-	/// not imply the other. See [Local cursor vs wire
-	/// preference](crate::track::Subscriber#local-cursor-vs-wire-preference).
-	pub group_start: Option<u64>,
-	/// Last group the publisher should deliver (inclusive), or `None` for no end.
+	/// This is the `Subscriber Max Age` on the wire, and it is stored here verbatim so
+	/// what was asked for stays readable. Encoded as milliseconds in a QUIC varint, so
+	/// a duration of `2^62` milliseconds or more cannot be put on the wire. Clamped to
+	/// the publisher's [`Info::max_age`](crate::track::Info::max_age), since waiting for
+	/// a group longer than it is kept around cannot produce it.
 	///
-	/// A request, aggregated across every live subscriber (any unbounded subscriber makes
-	/// the aggregate unbounded). [`crate::track::Subscriber::end_at`] is the local read
-	/// cursor; setting one does not imply the other. See [Local cursor vs wire
-	/// preference](crate::track::Subscriber#local-cursor-vs-wire-preference).
-	pub group_end: Option<u64>,
+	/// It caps every one of [`Self::ranges`]: a range names what may be delivered, and this
+	/// budget skips what inside it has gone stale.
+	///
+	/// # Where it is enforced
+	///
+	/// At both ends, and neither alone is enough. The publisher skips a group that has
+	/// aged out instead of putting it on the wire, which bounds a backlog before it
+	/// costs bandwidth. But what reaches the publisher is the aggregate across every
+	/// subscriber, resolved in favor of the most tolerant one, so that gate is only ever
+	/// as tight as the most patient viewer. The subscriber applies the same budget again
+	/// as it reads, where its own is the only one in play.
+	///
+	/// This bounds a *subscription*.
+	/// [`track::Consumer::fetch_group`](crate::track::Consumer::fetch_group) is exempt:
+	/// it names one old group explicitly, so there is no live edge to be late against.
+	///
+	/// # How delay is measured
+	///
+	/// By two clocks, and a group is stale once either reaches the budget. Both start at
+	/// its immediate servable successor, so the newest group is never stale.
+	///
+	/// In presentation time, a group is measured by its *reach*, where its successor
+	/// begins, against the newest frame of the latest group: it cannot present past its
+	/// successor, so once everything it could still hold falls outside the budget it is
+	/// provably useless. The candidate needs no timestamp of its own, so an empty or
+	/// stalled group is bounded by its stamped successor the same way.
+	///
+	/// In wall-clock time, a group is measured by how long ago its successor arrived at
+	/// this hop. That bounds what media time can't: a peer whose timestamps stop
+	/// advancing, a successor that never presents a frame, and an untimed track
+	/// (pre-Lite05 moq-lite, or moq-transport without TIMESCALE), which is judged by the
+	/// wall clock alone. A read waiting in a superseded group wakes at that deadline only
+	/// when something collects the track's cache pool: an origin's driver does, and a
+	/// standalone track needs [`Pool::gc`](crate::cache::Pool::gc) called, as its idle
+	/// expiry already does. Otherwise it is judged only when something else wakes the read.
+	pub max_delay: Duration,
+	/// The spans of the track to deliver; see [`Range`].
+	///
+	/// The default is [`Range::oldest`]: everything [`Self::max_delay`] still considers
+	/// fresh. [`Range::live`] starts at the latest group instead, and an empty list asks
+	/// for nothing.
+	///
+	/// A request to the publisher, aggregated across every live subscriber as the union of
+	/// their ranges, and this subscriber's read filter: it reads only the groups its own
+	/// ranges cover, whatever another subscriber widens the union to.
+	/// [`crate::track::Subscriber::set_groups`] narrows the reads further. See [Local cursor
+	/// vs wire preference](crate::track::Subscriber#local-cursor-vs-wire-preference).
+	pub ranges: Vec<Range>,
+	/// Which pending group the publisher sends first; see [`Order`].
+	///
+	/// Aggregated across every live subscriber: any [`Order::Descending`] subscriber makes
+	/// the aggregate descending, so a relay fanning one upstream request out keeps its live
+	/// subscribers fresh. Each subscriber's own publisher (a relay's downstream session)
+	/// still serves it in its own order.
+	pub order: Order,
+}
+
+/// Which of a subscription's pending groups the publisher sends first.
+///
+/// A transmission order only: it never decides *whether* a group is delivered, which is
+/// [`Subscription::max_delay`]'s job. An ascending subscriber that wants a backlog
+/// therefore needs a budget that covers it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Order {
+	/// Oldest first, draining a backlog in sequence order.
+	Ascending,
+	/// Newest first, so congestion sheds the backlog rather than the live edge.
+	#[default]
+	Descending,
+}
+
+/// Where one end of a [`Range`] falls: a fixed position, or a count of groups back from the
+/// latest one.
+///
+/// A relative anchor resolves against the latest group of the hop that serves it, when it
+/// starts serving and again whenever the subscriber replaces its ranges. Before any group
+/// exists it resolves at the first one, so [`Range::live`] starts there.
+///
+/// No published wire carries one yet: upstream, a relative start is no floor, the same
+/// request as [`Range::oldest`], and a relative end is no end. Behind a moq-transport
+/// upstream, which joins without a floor at the live group, `Relative(n)..` starts there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Anchor {
+	/// This exact position.
+	Absolute(Position),
+	/// The group this many before the latest, clamped to group 0: `Relative(0)` is the latest group.
+	Relative(u64),
+}
+
+/// A span of a track to deliver: from `start` up to `end`, or onward when `end` is `None`.
+///
+/// Relative anchors cover whole groups: a relative start is frame 0 of its group, and a
+/// relative end includes its group, so `Absolute(0)..Relative(0)` delivers through the latest
+/// group. An absolute end is exclusive, like the end of a [`std::ops::Range`]: see
+/// [`Position::after`] and [`Position::after_group`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Range {
+	/// Where delivery starts.
+	pub start: Anchor,
+	/// Where delivery stops, or `None` to keep following the live edge.
+	pub end: Option<Anchor>,
+}
+
+impl Range {
+	/// Everything from the latest group onward.
+	pub fn live() -> Self {
+		Self {
+			start: Anchor::Relative(0),
+			end: None,
+		}
+	}
+
+	/// Everything from the oldest group still around onward, the default.
+	///
+	/// Unlike `Absolute(0)..` this names no floor, so an older wire asks for the live edge
+	/// and lets [`Subscription::max_delay`] decide how far back to reach.
+	pub fn oldest() -> Self {
+		Self {
+			start: Anchor::Relative(u64::MAX),
+			end: None,
+		}
+	}
+
+	/// The whole groups in `groups`, such as `2..=5`, `2..`, or `..6`.
+	///
+	/// An omitted start is [`Self::oldest`]'s, and an inclusive end past the last group is
+	/// no end, as [`Position::after_group`] spells it.
+	pub fn groups(groups: impl RangeBounds<u64>) -> Self {
+		let unbounded_start = matches!(groups.start_bound(), Bound::Unbounded);
+		let (start, end) = sequence_bounds(groups);
+		Self {
+			start: match unbounded_start {
+				true => Self::oldest().start,
+				false => Anchor::Absolute(Position::group(start)),
+			},
+			end: end.map(|end| Anchor::Absolute(Position::group(end))),
+		}
+	}
+
+	/// Whether this range certainly delivers nothing, wherever the latest group lands.
+	pub(super) fn is_empty(&self) -> bool {
+		match (self.start, self.end) {
+			(Anchor::Absolute(start), Some(Anchor::Absolute(end))) => end <= start,
+			_ => false,
+		}
+	}
+}
+
+/// The union of `ranges` in a canonical order, without empty or redundant ranges: the
+/// reference for the track's incremental union.
+///
+/// Absolute spans merge where they overlap or touch. The rest can't be placed without the
+/// latest group, so only an open range drops what it certainly covers: the open absolute
+/// span drops ranges starting inside it, and the farthest open relative range drops
+/// relative ranges starting no farther back. [`Range::oldest`] covers everything.
+#[cfg(test)]
+pub(super) fn union(ranges: impl IntoIterator<Item = Range>) -> Vec<Range> {
+	let ranges: Vec<Range> = ranges.into_iter().filter(|range| !range.is_empty()).collect();
+	if ranges.contains(&Range::oldest()) {
+		return vec![Range::oldest()];
+	}
+
+	let mut spans: Vec<(Position, Option<Position>)> = ranges
+		.iter()
+		.filter_map(|range| match (range.start, range.end) {
+			(Anchor::Absolute(start), None) => Some((start, None)),
+			(Anchor::Absolute(start), Some(Anchor::Absolute(end))) => Some((start, Some(end))),
+			_ => None,
+		})
+		.collect();
+	spans.sort_unstable();
+	let mut runs: Vec<(Position, Option<Position>)> = Vec::new();
+	for (start, end) in spans {
+		match runs.last_mut() {
+			Some(last) if last.1.is_none_or(|last| start <= last) => {
+				last.1 = last.1.zip(end).map(|(last, end)| last.max(end));
+			}
+			_ => runs.push((start, end)),
+		}
+	}
+	let tail = runs.last().filter(|run| run.1.is_none()).map(|run| run.0);
+	let farthest = ranges
+		.iter()
+		.filter_map(|range| match (range.start, range.end) {
+			(Anchor::Relative(back), None) => Some(back),
+			_ => None,
+		})
+		.max();
+
+	let mut union: Vec<Range> = runs
+		.into_iter()
+		.map(|(start, end)| Range {
+			start: Anchor::Absolute(start),
+			end: end.map(Anchor::Absolute),
+		})
+		.collect();
+	union.extend(ranges.into_iter().filter(|range| match (range.start, range.end) {
+		(Anchor::Absolute(_), None | Some(Anchor::Absolute(_))) | (Anchor::Relative(_), None) => false,
+		(Anchor::Absolute(start), _) => tail.is_none_or(|tail| start < tail),
+		(Anchor::Relative(back), _) => farthest.is_none_or(|farthest| back > farthest),
+	}));
+	union.extend(farthest.map(|back| Range {
+		start: Anchor::Relative(back),
+		end: None,
+	}));
+	union.sort_unstable();
+	union.dedup();
+	union
 }
 
 impl Default for Subscription {
 	fn default() -> Self {
 		Self {
 			priority: 0,
-			ordered: false,
-			latency_max: Duration::ZERO,
-			group_start: None,
-			group_end: None,
+			max_delay: Duration::ZERO,
+			ranges: vec![Range::oldest()],
+			order: Order::Descending,
 		}
 	}
 }
@@ -59,71 +258,305 @@ impl Subscription {
 		self
 	}
 
-	/// Set whether groups are prioritized in sequence order, returning `self` for
-	/// chaining. Groups may always arrive out-of-order (or not at all) over the network.
-	pub fn with_ordered(mut self, ordered: bool) -> Self {
-		self.ordered = ordered;
-		self
-	}
-
-	/// Set the maximum age of a non-latest group before it is skipped, returning
+	/// Set how far a group may fall behind the live edge before it is skipped, returning
 	/// `self` for chaining.
-	pub fn with_latency_max(mut self, latency_max: Duration) -> Self {
-		self.latency_max = latency_max;
+	pub fn with_max_delay(mut self, max_delay: Duration) -> Self {
+		self.max_delay = max_delay;
 		self
 	}
 
-	/// Set the first group to deliver, returning `self` for chaining.
-	pub fn with_group_start(mut self, group_start: impl Into<Option<u64>>) -> Self {
-		self.group_start = group_start.into();
+	/// Replace [`Self::ranges`], returning `self` for chaining.
+	pub fn with_ranges(mut self, ranges: impl IntoIterator<Item = Range>) -> Self {
+		self.ranges = ranges.into_iter().collect();
 		self
 	}
 
-	/// Set the last group to deliver (inclusive), returning `self` for chaining.
-	pub fn with_group_end(mut self, group_end: impl Into<Option<u64>>) -> Self {
-		self.group_end = group_end.into();
+	/// Request the whole groups in `groups` as the only range; see [`Range::groups`].
+	/// Returns `self` for chaining.
+	pub fn with_groups(self, groups: impl RangeBounds<u64>) -> Self {
+		self.with_ranges([Range::groups(groups)])
+	}
+
+	/// Set which pending group the publisher sends first, returning `self` for chaining.
+	pub fn with_order(mut self, order: Order) -> Self {
+		self.order = order;
 		self
 	}
 
-	// Fold this subscription into the running aggregate: Ready with the merged
-	// result when it demands more than `combined`, Pending when it's a subset
-	// (so callers can skip a redundant broadcast of the same aggregate).
-	pub(super) fn poll_combined(&self, combined: &Option<Subscription>) -> Poll<Subscription> {
-		let Some(combined) = combined else {
-			return Poll::Ready(self.clone());
-		};
-
-		let merged = Subscription {
-			priority: self.priority.max(combined.priority),
-			// Sequence-first prioritization is enabled only when every subscriber wants it.
-			ordered: self.ordered && combined.ordered,
-			latency_max: self.latency_max.max(combined.latency_max),
-			group_start: min_some(self.group_start, combined.group_start),
-			group_end: max_unbounded(self.group_end, combined.group_end),
-		};
-
-		if &merged != combined {
-			return Poll::Ready(merged);
+	/// The lowest absolute position any range asks for, or `None` when one counts back
+	/// from the latest group (or none is asked for).
+	///
+	/// The form a wire without ranges carries: a floor below which nothing is requested.
+	// pending: /quest/m1/public-model/serve.md
+	pub(crate) fn start(&self) -> Option<Position> {
+		let mut floor: Option<Position> = None;
+		for range in &self.ranges {
+			let Anchor::Absolute(start) = range.start else {
+				return None;
+			};
+			floor = Some(floor.map_or(start, |floor| floor.min(start)));
 		}
+		floor
+	}
 
-		Poll::Pending
+	/// The exclusive end past every range, or `None` when one is open or counts back from
+	/// the latest group. An empty list is the empty range, `Position::group(0)`.
+	///
+	/// The form a wire without ranges carries, alongside [`Self::start`].
+	#[cfg(any(feature = "async", test))]
+	// pending: /quest/m1/public-model/serve.md
+	pub(crate) fn end(&self) -> Option<Position> {
+		let mut end = Some(Position::default());
+		for range in &self.ranges {
+			let Some(Anchor::Absolute(next)) = range.end else {
+				return None;
+			};
+			end = end.max(Some(next));
+		}
+		end
+	}
+
+	/// Replace the ranges with one from `start` (or [`Range::oldest`]'s) to `end`: the form
+	/// a wire without ranges carries.
+	#[cfg(any(feature = "async", test))]
+	// pending: /quest/m1/public-model/serve.md
+	pub(crate) fn set_bounds(&mut self, start: Option<Position>, end: Option<Position>) {
+		self.ranges = vec![Range {
+			start: start.map_or(Range::oldest().start, Anchor::Absolute),
+			end: end.map(Anchor::Absolute),
+		}];
+	}
+
+	/// Replace the start of [`Self::set_bounds`]'s one range, keeping its end.
+	#[cfg(feature = "async")]
+	// pending: /quest/m1/public-model/serve.md
+	pub(crate) fn with_start(mut self, start: impl Into<Option<Position>>) -> Self {
+		self.set_bounds(start.into(), self.end());
+		self
+	}
+
+	/// Replace the end of [`Self::set_bounds`]'s one range, keeping its start.
+	#[cfg(any(feature = "async", test))]
+	// pending: /quest/m1/public-model/serve.md
+	pub(crate) fn with_end(mut self, end: impl Into<Option<Position>>) -> Self {
+		self.set_bounds(self.start(), end.into());
+		self
+	}
+
+	/// These preferences with every range raised to start no earlier than `floor` and
+	/// stop no later than `end`, the exclusive end, without ever widening one.
+	///
+	/// `resolved` names where each range resolved, by index, so a relative anchor
+	/// becomes its own group, raised to `floor` or capped at `end`. A start not resolved
+	/// keeps its anchor, since the floor may lie before it, so the caller drops what it
+	/// resolves to below `floor`; an end not resolved becomes the bound.
+	pub(super) fn clamped(
+		&self,
+		floor: Option<Position>,
+		end: Option<Position>,
+		resolved: &[Option<Resolved>],
+	) -> Self {
+		let clamping = floor.is_some() || end.is_some();
+		let ranges = self
+			.ranges
+			.iter()
+			.enumerate()
+			.map(|(index, range)| {
+				let resolved = resolved.get(index).copied().flatten().filter(|_| clamping);
+				let start = match (range.start, resolved) {
+					(Anchor::Relative(_), Some(resolved)) => Anchor::Absolute(Position::group(resolved.start)),
+					(start, _) => start,
+				};
+				let requested = match (range.end, resolved.and_then(|resolved| resolved.end)) {
+					(Some(Anchor::Relative(_)), Some(resolved)) => Some(Anchor::Absolute(Position::group(resolved))),
+					(requested, _) => requested,
+				};
+				Range {
+					start: match (start, floor) {
+						(Anchor::Absolute(start), Some(floor)) => Anchor::Absolute(start.max(floor)),
+						(start, _) => start,
+					},
+					end: match (requested, end) {
+						(requested, None) => requested,
+						(Some(Anchor::Absolute(requested)), Some(end)) => Some(Anchor::Absolute(requested.min(end))),
+						(_, Some(end)) => Some(Anchor::Absolute(end)),
+					},
+				}
+			})
+			.collect();
+		Self { ranges, ..self.clone() }
+	}
+
+	/// Whether a subscriber joins at the live edge: a range counting back from the latest
+	/// group and following it. A fixed start resumes a known group instead, such as a route
+	/// switch picking up where the reader stopped.
+	pub(super) fn joins_live(&self) -> bool {
+		self.ranges
+			.iter()
+			.any(|range| matches!(range.start, Anchor::Relative(_)) && range.end.is_none())
 	}
 }
 
-/// The lower of two optional bounds, treating `None` as unbounded.
-pub(super) fn min_some(a: Option<u64>, b: Option<u64>) -> Option<u64> {
-	match (a, b) {
-		(Some(a), Some(b)) => Some(a.min(b)),
-		(Some(a), None) | (None, Some(a)) => Some(a),
-		(None, None) => None,
+/// The most demanding request across subscribers, folded in one at a time: the reference
+/// the track's counted aggregate is checked against.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct Combined(Option<Subscription>);
+
+#[cfg(test)]
+impl Combined {
+	/// Fold in one subscriber's preferences.
+	pub(super) fn add(&mut self, sub: &Subscription) {
+		let Some(combined) = &mut self.0 else {
+			self.0 = Some(sub.clone());
+			return;
+		};
+		combined.priority = combined.priority.max(sub.priority);
+		combined.max_delay = combined.max_delay.max(sub.max_delay);
+		combined.ranges.extend_from_slice(&sub.ranges);
+		// Sequence-first prioritization is enabled only when every subscriber wants it.
+		if let Order::Descending = sub.order {
+			combined.order = Order::Descending;
+		}
+	}
+
+	/// The aggregate, or `None` without a subscriber.
+	pub(super) fn finish(self) -> Option<Subscription> {
+		let mut combined = self.0?;
+		combined.ranges = union(std::mem::take(&mut combined.ranges));
+		Some(combined)
 	}
 }
 
-fn max_unbounded(a: Option<u64>, b: Option<u64>) -> Option<u64> {
-	match (a, b) {
-		(Some(a), Some(b)) => Some(a.max(b)),
-		(None, _) | (_, None) => None,
+/// A frame-precise point in a track: a group sequence and a frame index within it.
+///
+/// Ordered lexicographically, so comparing positions is the same as comparing groups
+/// and only falling back to frames within one. This is the model's counterpart of the
+/// wire's (`Group`, `Frame`) pairs on SUBSCRIBE and FETCH.
+///
+/// Pairing the two is the point: a frame index counts from the start of a group, so it
+/// means nothing on its own. Carrying them together makes "frame 5 of nothing"
+/// unrepresentable rather than merely undefined.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Position {
+	/// The group sequence.
+	pub group: u64,
+	/// The frame index within the group, numbered from 0 in write order.
+	pub frame: u64,
+}
+
+impl Position {
+	/// The first frame of `group`.
+	///
+	/// As an exclusive end this means "everything before `group`"; as a start it means
+	/// "`group` from the beginning".
+	pub fn group(group: u64) -> Self {
+		Self { group, frame: 0 }
 	}
+
+	/// The position just past `frame` of `group`: the exclusive end that includes it.
+	///
+	/// `None` when there is no such position, i.e. the very last frame of the very last
+	/// group. That is past everything, which an open [`Range::end`] spells `None` too, so
+	/// the two meanings line up.
+	pub fn after(group: u64, frame: u64) -> Option<Self> {
+		match frame.checked_add(1) {
+			Some(frame) => Some(Self { group, frame }),
+			// Past the last frame of a group is the head of the next one.
+			None => Self::after_group(group),
+		}
+	}
+
+	/// The position just past every frame of `group`: the exclusive end that includes
+	/// the group whole.
+	///
+	/// `None` past the last group, for the reason given on [`Self::after`].
+	pub fn after_group(group: u64) -> Option<Self> {
+		Some(Self::group(group.checked_add(1)?))
+	}
+
+	/// The bound this exclusive end puts on a group cursor, for
+	/// [`crate::track::Subscriber::set_groups`].
+	///
+	/// A head-of-group end excludes its group. A mid-group end includes it, so a frame
+	/// cap can apply within that group.
+	pub fn group_end(self) -> Bound<u64> {
+		if self.frame == 0 {
+			Bound::Excluded(self.group)
+		} else {
+			Bound::Included(self.group)
+		}
+	}
+
+	/// The first group this exclusive end excludes whole, `None` past the last group.
+	// pending: /quest/m1/public-model/serve.md
+	pub(crate) fn final_sequence(self) -> Option<u64> {
+		self.group.checked_add(u64::from(self.frame != 0))
+	}
+}
+
+/// Where a read cursor stops: a group sequence or frame index it will not deliver.
+///
+/// Built from a range so the call site says whether its bound is delivered: `..5` stops
+/// before 5, `..=5` reads through it, and `..` removes the cap. A [`Bound`] converts
+/// too, for callers holding one (a decoded wire field, or [`Position::group_end`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// pending: /quest/m1/public-model/serve.md
+pub(crate) struct Cap(Option<u64>);
+
+impl Cap {
+	/// The first index withheld, or `None` for no cap. Cursors store this form and
+	/// compare with [`before_end`]. An inclusive bound at `u64::MAX` has nothing above
+	/// it, so it is no cap at all.
+	pub(super) fn exclusive(self) -> Option<u64> {
+		self.0
+	}
+}
+
+impl From<Bound<u64>> for Cap {
+	fn from(bound: Bound<u64>) -> Self {
+		Self(match bound {
+			Bound::Included(index) => index.checked_add(1),
+			Bound::Excluded(index) => Some(index),
+			Bound::Unbounded => None,
+		})
+	}
+}
+
+impl From<RangeTo<u64>> for Cap {
+	fn from(range: RangeTo<u64>) -> Self {
+		Self(Some(range.end))
+	}
+}
+
+impl From<RangeToInclusive<u64>> for Cap {
+	fn from(range: RangeToInclusive<u64>) -> Self {
+		Bound::Included(range.end).into()
+	}
+}
+
+impl From<RangeFull> for Cap {
+	fn from(_: RangeFull) -> Self {
+		Self(None)
+	}
+}
+
+// Normalize discrete ranges once, including the empty range above the last index.
+pub(super) fn sequence_bounds(range: impl RangeBounds<u64>) -> (u64, Option<u64>) {
+	let start = match range.start_bound() {
+		Bound::Included(&start) => start,
+		Bound::Excluded(&start) => match start.checked_add(1) {
+			Some(start) => start,
+			None => return (u64::MAX, Some(u64::MAX)),
+		},
+		Bound::Unbounded => 0,
+	};
+	(start, Cap::from(range.end_bound().cloned()).exclusive())
+}
+
+/// Whether `sequence` is strictly below an exclusive cap. `None` is unbounded.
+pub(super) fn before_end(sequence: u64, end: Option<u64>) -> bool {
+	end.is_none_or(|end| sequence < end)
 }
 
 #[cfg(test)]
@@ -131,62 +564,246 @@ mod tests {
 	use super::*;
 
 	fn combine(subscriptions: &[Subscription]) -> Option<Subscription> {
-		let mut combined = None;
+		let mut combined = Combined::default();
 		for sub in subscriptions {
-			if let Poll::Ready(merged) = sub.poll_combined(&combined) {
-				combined = Some(merged);
-			}
+			combined.add(sub);
 		}
-		combined
+		combined.finish()
+	}
+
+	fn absolute(group: u64, frame: u64) -> Anchor {
+		Anchor::Absolute(Position { group, frame })
+	}
+
+	fn range(start: Anchor, end: impl Into<Option<Anchor>>) -> Range {
+		Range { start, end: end.into() }
+	}
+
+	fn ranges(subscriptions: &[Subscription]) -> Vec<Range> {
+		combine(subscriptions).unwrap().ranges
+	}
+
+	/// A group range spells both positions at once, in whichever form the caller has.
+	#[test]
+	fn group_ranges_build_whole_group_positions() {
+		assert_eq!(Range::groups(2..=5), range(absolute(2, 0), absolute(6, 0)));
+		assert_eq!(Range::groups(2..6), range(absolute(2, 0), absolute(6, 0)));
+		assert_eq!(Range::groups(..6), range(Range::oldest().start, absolute(6, 0)));
+		assert_eq!(Range::groups(2..), range(absolute(2, 0), None));
+		assert_eq!(Range::groups(..), Range::oldest());
+
+		// Through the last group is unbounded, as `after_group` spells it.
+		assert_eq!(Range::groups(..=u64::MAX).end, None);
+
+		let sub = Subscription::default().with_groups(2..=5).with_groups(..);
+		assert_eq!(sub, Subscription::default());
 	}
 
 	#[test]
-	fn combined_ordered_stays_ordered_for_multiple_ordered_viewers() {
-		let subscription = Subscription::default().with_ordered(true);
+	fn positions_are_total_at_the_extremes() {
+		// Past the last frame of a group is the head of the next one, not a wider frame
+		// in the same group.
+		assert_eq!(Position::after(5, u64::MAX), Some(Position::group(6)));
 
-		let combined = combine(&[subscription.clone(), subscription.clone(), subscription]).unwrap();
+		// Past everything has no position. An open range spells that `None` too, so the
+		// meanings coincide and the group is included rather than dropped.
+		assert_eq!(Position::after_group(u64::MAX), None);
+		assert_eq!(Position::after(u64::MAX, u64::MAX), None);
 
-		assert!(combined.ordered);
+		// A head-of-group end excludes that group; a mid-group end includes it.
+		assert_eq!(Position::group(0).group_end(), Bound::Excluded(0));
+		assert_eq!(Position::after_group(5).unwrap().group_end(), Bound::Excluded(6));
+		assert_eq!(Position::after(5, 2).unwrap().group_end(), Bound::Included(5));
+
+		// A cursor cap is the first index it withholds; an inclusive bound at the last
+		// index withholds nothing.
+		assert_eq!(Cap::from(..0).exclusive(), Some(0));
+		assert_eq!(Cap::from(..=5).exclusive(), Some(6));
+		assert_eq!(Cap::from(..=u64::MAX).exclusive(), None);
+		assert_eq!(Cap::from(..).exclusive(), None);
+		assert_eq!(Cap::from(Bound::Included(5)), Cap::from(..6));
+		assert_eq!(Cap::from(Bound::Unbounded), Cap::from(..));
+	}
+
+	/// A relative start counts back from the latest group and clamps at group 0. Before any
+	/// group exists only the farthest offset resolves, since it is group 0 regardless.
+	#[test]
+	fn relative_starts_resolve_against_the_latest_group() {
+		let floor = |sub: &Subscription, latest| Window::new(&sub.ranges, latest).floor();
+
+		let live = Subscription::default().with_ranges([Range::live()]);
+		assert_eq!(floor(&live, Some(7)), Some(7));
+		assert_eq!(floor(&live, None), None);
+
+		let buffering = Subscription::default().with_ranges([range(Anchor::Relative(3), None)]);
+		assert_eq!(floor(&buffering, Some(7)), Some(4));
+		assert_eq!(floor(&buffering, Some(1)), Some(0), "an offset past the start clamps");
+
+		assert_eq!(floor(&Subscription::default(), None), Some(0));
+
+		// The lowest range wins, and one unresolved range leaves the whole floor unresolved.
+		let mixed = Subscription::default().with_ranges([range(absolute(4, 0), None), Range::live()]);
+		assert_eq!(floor(&mixed, Some(3)), Some(3));
+		assert_eq!(floor(&mixed, Some(9)), Some(4));
+		assert_eq!(floor(&mixed, None), None);
+
+		// Nothing asked for floors nowhere, and an empty range asks for nothing.
+		assert_eq!(floor(&Subscription::default().with_ranges([]), None), Some(0));
+		let empty = Subscription::default().with_ranges([Range::groups(5..5), Range::groups(10..)]);
+		assert_eq!(floor(&empty, None), Some(10));
+	}
+
+	/// The bounds a wire without ranges carries: the lowest absolute start and the highest
+	/// absolute end, either one lost to a range that counts back from the latest group.
+	#[test]
+	fn bounds_project_the_ranges_for_older_wires() {
+		let sub = Subscription::default();
+		assert_eq!((sub.start(), sub.end()), (None, None));
+
+		let sub = Subscription::default().with_ranges([Range::groups(2..4), range(absolute(7, 1), absolute(9, 0))]);
+		assert_eq!(
+			(sub.start(), sub.end()),
+			(Some(Position::group(2)), Some(Position::group(9)))
+		);
+
+		// An explicit group 0 is a floor, unlike the default.
+		let sub = Subscription::default().with_groups(0..);
+		assert_eq!((sub.start(), sub.end()), (Some(Position::group(0)), None));
+
+		let sub = Subscription::default().with_ranges([Range::groups(2..4), Range::live()]);
+		assert_eq!((sub.start(), sub.end()), (None, None));
+
+		let sub = Subscription::default().with_ranges([range(absolute(2, 0), Anchor::Relative(0))]);
+		assert_eq!((sub.start(), sub.end()), (Some(Position::group(2)), None));
+
+		// Nothing asked for is the empty range.
+		let sub = Subscription::default().with_ranges([]);
+		assert_eq!(sub.end(), Some(Position::group(0)));
+
+		let mut sub = Subscription::default();
+		sub.set_bounds(Some(Position { group: 5, frame: 2 }), Position::after_group(9));
+		assert_eq!(
+			(sub.start(), sub.end()),
+			(Some(Position { group: 5, frame: 2 }), Some(Position::group(10)))
+		);
+		sub.set_bounds(None, None);
+		assert_eq!(sub, Subscription::default());
+	}
+
+	/// The aggregate is the union: overlapping and adjacent absolute ranges merge, an open
+	/// range absorbs what starts inside it, and the oldest range absorbs everything.
+	#[test]
+	fn combined_ranges_are_the_union() {
+		let sub = |ranges: &[Range]| Subscription::default().with_ranges(ranges.iter().copied());
+
+		assert_eq!(
+			ranges(&[sub(&[Range::groups(2..5)]), sub(&[Range::groups(4..8)])]),
+			vec![Range::groups(2..8)]
+		);
+		assert_eq!(
+			ranges(&[sub(&[Range::groups(2..5)]), sub(&[Range::groups(5..8)])]),
+			vec![Range::groups(2..8)],
+			"adjacent ranges merge"
+		);
+		assert_eq!(
+			ranges(&[sub(&[Range::groups(2..5)]), sub(&[Range::groups(6..8)])]),
+			vec![Range::groups(2..5), Range::groups(6..8)],
+			"a gap stays a gap"
+		);
+		assert_eq!(
+			ranges(&[
+				sub(&[Range::groups(2..5), Range::groups(9..)]),
+				sub(&[Range::groups(4..)])
+			]),
+			vec![Range::groups(2..)]
+		);
+		assert_eq!(
+			ranges(&[sub(&[Range::groups(2..5)]), Subscription::default()]),
+			vec![Range::oldest()]
+		);
+
+		// Relative ranges count back from the same latest group, so the widest open one covers
+		// every narrower one, whatever its end.
+		assert_eq!(
+			ranges(&[
+				sub(&[Range::live()]),
+				sub(&[range(Anchor::Relative(3), None)]),
+				sub(&[range(Anchor::Relative(1), Anchor::Relative(0))]),
+			]),
+			vec![range(Anchor::Relative(3), None)]
+		);
+
+		// An absolute floor above the live edge does not hide the live edge: both stay.
+		assert_eq!(
+			ranges(&[sub(&[Range::groups(4..)]), sub(&[Range::live()])]),
+			vec![Range::groups(4..), Range::live()]
+		);
+
+		// Empty ranges ask for nothing.
+		assert_eq!(ranges(&[sub(&[Range::groups(5..5)])]), Vec::<Range>::new());
+		assert_eq!(
+			ranges(&[sub(&[]), sub(&[Range::groups(1..2)])]),
+			vec![Range::groups(1..2)]
+		);
+	}
+
+	/// Ranges fold as whole positions: two ranges in the same group are separated only by
+	/// their frames, so folding group and frame independently would invent a bound.
+	#[test]
+	fn combined_ranges_fold_whole_positions() {
+		let sub = |range: Range| Subscription::default().with_ranges([range]);
+
+		assert_eq!(
+			ranges(&[
+				sub(range(absolute(5, 9), absolute(5, 10))),
+				sub(range(absolute(5, 2), absolute(5, 3)))
+			]),
+			vec![
+				range(absolute(5, 2), absolute(5, 3)),
+				range(absolute(5, 9), absolute(5, 10))
+			]
+		);
+		assert_eq!(
+			ranges(&[
+				sub(range(absolute(5, 2), absolute(5, 9))),
+				sub(range(absolute(5, 4), absolute(6, 0)))
+			]),
+			vec![range(absolute(5, 2), absolute(6, 0))]
+		);
+	}
+
+	/// Combining is order-independent and stops changing once it covers everyone.
+	#[test]
+	fn combined_ranges_settle() {
+		let a = Subscription::default().with_ranges([Range::groups(2..5), Range::live()]);
+		let b = Subscription::default().with_ranges([Range::groups(4..9)]);
+		assert_eq!(combine(&[a.clone(), b.clone()]), combine(&[b.clone(), a.clone()]));
+
+		let combined = combine(&[a.clone(), b]);
+		assert_eq!(
+			combine(&[combined.clone().unwrap(), a]),
+			combined,
+			"a subset adds nothing"
+		);
 	}
 
 	#[test]
-	fn combined_any_unordered_viewer_disables_ordered() {
-		let unordered = Subscription::default().with_ordered(false);
-		let ordered = Subscription::default().with_ordered(true);
+	fn combined_order_prefers_descending() {
+		let ascending = Subscription::default().with_order(Order::Ascending);
+		let descending = Subscription::default();
 
-		let combined = combine(&[unordered, ordered]).unwrap();
-
-		assert!(!combined.ordered);
-	}
-
-	#[test]
-	fn combined_group_start_uses_earliest_explicit_start() {
-		let live = Subscription::default().with_group_start(None);
-		let catchup = Subscription::default().with_group_start(10);
-		let older_catchup = Subscription::default().with_group_start(5);
-
-		let combined = combine(&[live, catchup, older_catchup]).unwrap();
-
-		assert_eq!(combined.group_start, Some(5));
-	}
-
-	#[test]
-	fn combined_group_end_keeps_live_subscription_unbounded() {
-		let live = Subscription::default().with_group_end(None);
-		let bounded = Subscription::default().with_group_end(10);
-
-		let combined = combine(&[live, bounded]).unwrap();
-
-		assert_eq!(combined.group_end, None);
-	}
-
-	#[test]
-	fn combined_group_end_uses_latest_bounded_end() {
-		let early = Subscription::default().with_group_end(10);
-		let late = Subscription::default().with_group_end(20);
-
-		let combined = combine(&[early, late]).unwrap();
-
-		assert_eq!(combined.group_end, Some(20));
+		assert_eq!(
+			combine(std::slice::from_ref(&ascending)).unwrap().order,
+			Order::Ascending
+		);
+		assert_eq!(
+			combine(&[ascending.clone(), ascending.clone()]).unwrap().order,
+			Order::Ascending
+		);
+		assert_eq!(
+			combine(&[ascending.clone(), descending.clone()]).unwrap().order,
+			Order::Descending
+		);
+		assert_eq!(combine(&[descending, ascending]).unwrap().order, Order::Descending);
 	}
 }

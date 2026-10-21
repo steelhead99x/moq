@@ -1,11 +1,32 @@
-//! Group-scoped DEFLATE: a stream of self-delimited frames sharing one compression window.
+//! Opaque byte tracks over [`moq-net`](moq_net), optionally compressed with group-scoped DEFLATE.
 //!
-//! A sequence of frame payloads is compressed into a single raw DEFLATE ([RFC 1951]) stream,
-//! sync-flushed at each frame boundary. Every frame is therefore self-delimited (byte-aligned, the
-//! window retained) while later frames reuse the earlier ones as context, so a stream of similar
-//! payloads (a snapshot followed by deltas, repeated records, log lines) compresses far better than
-//! each payload alone. The [`Encoder`]/[`Decoder`] hold that shared window; create a fresh pair per
-//! independent stream (in moq-net terms, per group).
+//! Two track modes carry the payloads:
+//!
+//! - [`snapshot`]: **lossy**. One value updated over time; `next` yields states inside the drift
+//!   budget, while `latest` skips to the newest state. Superseded groups may be lost.
+//! - [`stream`]: **lossless**. An ordered append-log of self-contained payloads, delivered in order
+//!   with nothing superseded. Bounded by the group budget: see [`stream`] for what happens once
+//!   it is spent.
+//!
+//! Pick [`snapshot`] when consumers care about "what is the value now" (a poster image, a
+//! serialized state blob) and [`stream`] when they care about every payload (an event log, a
+//! sequence of samples). The bytes are opaque: the tracks frame them and optionally compress them,
+//! and never look inside. For JSON documents reach for [`moq-json`](https://docs.rs/moq-json)
+//! instead, which adds RFC 7396 merge-patch deltas on top of the same two modes and codec.
+//!
+//! Compression is opt-in per track ([`Compression`]), so the crate name is not a promise that every
+//! track is deflated: [`Compression::None`] writes the bytes through untouched.
+//!
+//! # Codec
+//!
+//! Underneath, [`Encoder`]/[`Decoder`] compress a sequence of frame payloads into a single raw
+//! DEFLATE ([RFC 1951]) stream, sync-flushed at each frame boundary. Every frame is therefore
+//! self-delimited (byte-aligned, the window retained) while later frames reuse the earlier ones as
+//! context, so a stream of similar payloads (a snapshot followed by deltas, repeated records, log
+//! lines) compresses far better than each payload alone. The pair holds that shared window; create a
+//! fresh pair per independent stream (in moq-net terms, per group). A [`stream`] track therefore
+//! compresses each payload against the earlier ones in its group, while a [`snapshot`] group holds a
+//! single self-contained value.
 //!
 //! This is plain raw DEFLATE with a `Z_SYNC_FLUSH` after each frame, so any peer using the same
 //! primitive (zlib's sync flush, the browser's `deflate-raw`) interoperates on the wire. There is no
@@ -30,6 +51,15 @@
 //! [RFC 1951]: https://www.rfc-editor.org/rfc/rfc1951.html
 //! [RFC 7692]: https://www.rfc-editor.org/rfc/rfc7692.html#section-7.2.1
 
+#![warn(missing_docs)]
+// The browser transport is `!Send`, so on wasm the shared state behind the track modes' `Arc`s is
+// too and clippy suggests `Rc`. The same code is genuinely cross-thread on native, so `Arc` stays
+// and the lint is unactionable here.
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+
+pub mod snapshot;
+pub mod stream;
+
 use bytes::Bytes;
 use flate2::{Compress, Decompress, FlushCompress, FlushDecompress, Status};
 
@@ -46,8 +76,25 @@ const SYNC_FLUSH_TAIL: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
 /// Scratch buffer size for the streaming (de)compress loops.
 const CHUNK: usize = 8 * 1024;
 
-/// Errors produced while decoding a frame.
-#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+/// How a [`snapshot`] or [`stream`] track compresses its frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Compression {
+	/// Uncompressed payloads.
+	#[default]
+	None,
+
+	/// Group-scoped raw DEFLATE, sync-flushed at each frame boundary.
+	Deflate,
+}
+
+impl Compression {
+	pub(crate) const fn is_deflate(self) -> bool {
+		matches!(self, Self::Deflate)
+	}
+}
+
+/// Errors produced while decoding a frame or publishing and consuming a track.
+#[derive(thiserror::Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum Error {
 	/// A frame could not be decoded (malformed or truncated stream, or fed out of order).
@@ -57,6 +104,19 @@ pub enum Error {
 	/// A frame's decompressed size exceeded the configured limit (zip-bomb guard).
 	#[error("decompressed frame exceeded {0} bytes")]
 	TooLarge(u64),
+
+	/// An error from the underlying track.
+	#[error(transparent)]
+	Net(#[from] moq_net::Error),
+
+	/// A [`stream`] track carried a second group, which a lossless log cannot do.
+	///
+	/// A stream is a single group by construction: a publisher that cannot write a payload ends
+	/// the track rather than rolling. A second group therefore means the records that would have
+	/// completed the first one are gone, so the read fails instead of presenting the remainder as
+	/// a continuous log.
+	#[error("stream rolled to a second group")]
+	Rolled,
 }
 
 /// A [`Result`](std::result::Result) using this crate's [`Error`].
@@ -64,7 +124,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Encodes a stream's frame payloads into one shared DEFLATE window, one self-delimited slice per
 /// frame. Hold one per stream; create a fresh one for each independent stream.
-pub struct Encoder(Compress);
+// Boxed: zlib-rs keeps its ~140-byte stream header inline, which would bloat every type that embeds
+// an encoder or decoder.
+pub struct Encoder(Box<Compress>);
 
 impl Encoder {
 	/// Start a fresh encoder with a cold window at [`DEFAULT_LEVEL`].
@@ -76,7 +138,17 @@ impl Encoder {
 	/// smaller and slower). Values above `9` are clamped.
 	pub fn with_level(level: u32) -> Self {
 		// `false`: raw DEFLATE, no zlib header/trailer, matching `deflate-raw` on the browser side.
-		Self(Compress::new(flate2::Compression::new(level.min(9)), false))
+		Self(Box::new(Compress::new(flate2::Compression::new(level.min(9)), false)))
+	}
+
+	/// The most bytes [`frame`](Self::frame) can return for a payload of `len` bytes, at any level
+	/// and whatever the window already holds.
+	///
+	/// zlib's `deflateBound` for its default window and memory level, which both this crate and the
+	/// browser's pako use: incompressible input falls back to stored blocks, 5 bytes per 16 KiB. The
+	/// constant covers the block headers and the flush, whose fixed 4-byte marker is stripped anyway.
+	pub const fn bound(len: u64) -> u64 {
+		len + (len >> 12) + (len >> 14) + (len >> 25) + 13
 	}
 
 	/// Compress the next frame's `payload`, returning its slice of the stream: the DEFLATE bytes minus
@@ -106,8 +178,10 @@ impl Encoder {
 			}
 		}
 
-		// Drop the fixed sync-flush marker; the decoder re-appends it (see the module docs).
-		debug_assert!(
+		// Drop the fixed sync-flush marker; the decoder re-appends it (see the module docs). A missing
+		// marker means the backend returned before finishing the flush; panic rather than emit a
+		// truncated frame.
+		assert!(
 			out.ends_with(&SYNC_FLUSH_TAIL),
 			"a sync flush must end in the deflate marker"
 		);
@@ -125,7 +199,7 @@ impl Default for Encoder {
 /// Decodes a stream's frame slices back into the original payloads. Hold one per stream; feed slices
 /// in frame order (each frame builds on the earlier ones).
 pub struct Decoder {
-	inner: Decompress,
+	inner: Box<Decompress>,
 	max_frame_size: u64,
 }
 
@@ -142,7 +216,7 @@ impl Decoder {
 	pub fn with_max_frame_size(max_frame_size: u64) -> Self {
 		// `false`: raw DEFLATE, matching the encoder.
 		Self {
-			inner: Decompress::new(false),
+			inner: Box::new(Decompress::new(false)),
 			max_frame_size,
 		}
 	}
@@ -153,11 +227,19 @@ impl Decoder {
 	/// the configured cap (checked as output is produced, not from any declared size), and
 	/// [`Error::Decompress`] on malformed input.
 	pub fn frame(&mut self, slice: &[u8]) -> Result<Bytes> {
-		if slice.is_empty() {
-			return Ok(Bytes::new());
-		}
-
 		let mut out = Vec::new();
+		self.frame_into(slice, &mut out)?;
+		Ok(Bytes::from(out))
+	}
+
+	/// Inflate the next frame into a reusable buffer, replacing its previous contents.
+	///
+	/// A caller that consumes frames immediately can keep one buffer for the whole stream.
+	pub fn frame_into(&mut self, slice: &[u8], out: &mut Vec<u8>) -> Result<()> {
+		out.clear();
+		if slice.is_empty() {
+			return Ok(());
+		}
 		let mut tmp = [0u8; CHUNK];
 
 		// Feed the wire slice followed by the re-appended sync-flush marker, which delimits the frame
@@ -191,7 +273,7 @@ impl Decoder {
 			}
 		}
 
-		Ok(Bytes::from(out))
+		Ok(())
 	}
 }
 
@@ -224,6 +306,22 @@ mod test {
 	}
 
 	#[test]
+	fn frame_into_reuses_its_output_buffer() {
+		let mut encoder = Encoder::new();
+		let frames = [b"first payload".as_slice(), b"second payload".as_slice()];
+		let mut decoder = Decoder::new();
+		let mut out = Vec::with_capacity(64);
+		let ptr = out.as_ptr();
+		for frame in frames {
+			decoder.frame_into(&encoder.frame(frame), &mut out).unwrap();
+			assert_eq!(out, frame);
+			assert_eq!(out.as_ptr(), ptr);
+		}
+		decoder.frame_into(b"", &mut out).unwrap();
+		assert!(out.is_empty());
+	}
+
+	#[test]
 	fn empty_frames_roundtrip() {
 		assert!(Encoder::new().frame(b"").is_empty());
 		assert!(Decoder::new().frame(b"").unwrap().is_empty());
@@ -245,19 +343,24 @@ mod test {
 		);
 	}
 
-	#[test]
-	fn frame_larger_than_chunk_roundtrips() {
-		// High-entropy data barely compresses, so its slice exceeds the streaming `CHUNK` scratch
-		// buffer and the (de)compress loops must iterate. Verify it still round-trips byte for byte.
+	/// Deterministic high-entropy bytes: they barely compress, so slices outgrow `CHUNK`.
+	fn noise(len: usize) -> Vec<u8> {
 		let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-		let payload: Vec<u8> = (0..64 * 1024)
+		(0..len)
 			.map(|_| {
 				state ^= state << 13;
 				state ^= state >> 7;
 				state ^= state << 17;
 				(state >> 56) as u8
 			})
-			.collect();
+			.collect()
+	}
+
+	#[test]
+	fn frame_larger_than_chunk_roundtrips() {
+		// High-entropy data barely compresses, so its slice exceeds the streaming `CHUNK` scratch
+		// buffer and the (de)compress loops must iterate. Verify it still round-trips byte for byte.
+		let payload = noise(64 * 1024);
 
 		let mut enc = Encoder::new();
 		let slice = enc.frame(&payload);
@@ -268,9 +371,57 @@ mod test {
 	}
 
 	#[test]
+	fn block_boundary_at_frame_end_roundtrips() {
+		// Sweep frame sizes so a DEFLATE block closes within some frame's final bytes, while its sync
+		// flush is still pending (miniz_oxide closes one every ~31 KiB of incompressible input and
+		// then returned early, truncating the frame). Each frame is fresh noise; a repeat would match
+		// the window instead.
+		let lens: Vec<usize> = (31 * 1024..32 * 1024 + 256).step_by(16).collect();
+		let noise = noise(lens.iter().sum());
+
+		let mut enc = Encoder::new();
+		let mut dec = Decoder::new();
+		let mut rest = noise.as_slice();
+		for len in lens {
+			let (frame, next) = rest.split_at(len);
+			rest = next;
+			let got = dec
+				.frame(&enc.frame(frame))
+				.unwrap_or_else(|err| panic!("{len} byte frame: {err}"));
+			assert!(got == frame, "{len} byte frame corrupted");
+		}
+	}
+
+	/// The bound holds for incompressible input, the worst case, at sizes straddling the 16 KiB
+	/// block boundary, and on a window already primed by earlier frames.
+	#[test]
+	fn bound_covers_incompressible_frames() {
+		let lens = [1, 2, 100, 16_383, 16_384, 16_385, 65_535, 65_536, 1 << 20, 3 << 20];
+		// Each frame is fresh noise; a repeat would match the window instead.
+		let noise = noise(lens.iter().sum());
+		let mut rest = noise.as_slice();
+
+		let mut enc = Encoder::new();
+		for len in lens {
+			let (frame, next) = rest.split_at(len);
+			rest = next;
+			let slice = enc.frame(frame);
+			let bound = Encoder::bound(len as u64);
+			assert!(
+				slice.len() as u64 <= bound,
+				"{len} raw bytes deflated to {}, past the bound {bound}",
+				slice.len()
+			);
+		}
+	}
+
+	#[test]
 	fn decompress_rejects_garbage() {
 		let mut dec = Decoder::new();
-		assert_eq!(dec.frame(b"not a deflate stream at all"), Err(Error::Decompress));
+		assert!(matches!(
+			dec.frame(b"not a deflate stream at all"),
+			Err(Error::Decompress)
+		));
 	}
 
 	#[test]
@@ -280,7 +431,7 @@ mod test {
 		let slice = Encoder::new().frame(&payload);
 
 		let mut dec = Decoder::with_max_frame_size(512);
-		assert_eq!(dec.frame(&slice), Err(Error::TooLarge(512)));
+		assert!(matches!(dec.frame(&slice), Err(Error::TooLarge(512))));
 	}
 
 	#[test]

@@ -7,9 +7,8 @@
 
 export * as Loc from "@moq/loc";
 export * as Cmaf from "./cmaf";
-export { Consumer, type ConsumerProps } from "./consumer";
+export { Consumer, type ConsumerProps, type Read } from "./consumer";
 export type { Format } from "./format";
 export * as Legacy from "./legacy";
-export * as Timeline from "./timeline";
 export { type TrackInfoOptions, trackInfo } from "./track";
 export * from "./types";

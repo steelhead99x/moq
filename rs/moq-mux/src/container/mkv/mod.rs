@@ -19,6 +19,14 @@ mod import_test;
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+	/// Container display metadata has no valid catalog aspect ratio.
+	#[error("invalid display aspect: {0}")]
+	InvalidAspect(&'static str),
+
+	/// A subtitle cue cannot be represented with valid text and timing.
+	#[error("invalid subtitle: {0}")]
+	InvalidSubtitle(&'static str),
+
 	#[error("unsupported EBML DocType: {0}")]
 	UnsupportedDocType(String),
 
@@ -36,6 +44,10 @@ pub enum Error {
 
 	#[error("timestamp overflow")]
 	TimestampOverflow,
+
+	/// A Tracks element arrived after `finish()`, so the tracks it declares could never finish.
+	#[error("Tracks after finish")]
+	TracksAfterFinish,
 
 	#[error("TrackEntry missing TrackNumber")]
 	MissingTrackNumber,
@@ -64,11 +76,12 @@ pub enum Error {
 	#[error("invalid AV1CodecConfigurationRecord")]
 	InvalidAv1c,
 
+	/// A `Colour` element value has no catalog representation.
+	#[error("invalid Colour {0}")]
+	InvalidColour(&'static str),
+
 	#[error("MKV track layout changed after header was emitted: track '{0}' added")]
 	HeaderAddedTrack(String),
-
-	#[error("MKV track layout changed after header was emitted: track '{0}' removed")]
-	HeaderRemovedTrack(String),
 
 	#[error("MKV export does not support CMAF {kind} track '{name}'")]
 	UnsupportedCmafTrack { kind: String, name: String },
@@ -116,17 +129,37 @@ pub enum Error {
 	MatroskaParse,
 
 	#[error("matroska write error: {0}")]
-	MatroskaWrite(std::sync::Arc<webm_iterable::errors::TagWriterError>),
+	MatroskaWrite(String),
 
 	/// Building the Opus codec-private OpusHead for an audio track failed.
 	#[error(transparent)]
 	Opus(#[from] crate::codec::opus::Error),
 }
 
+// Flattened to its message so webm-iterable stays out of this crate's public API. The chain
+// matters here: `TagWriterError::WriteError` displays only "Error writing to destination." and
+// keeps the `io::Error` saying whether the disk filled or the pipe broke in `source()`.
 impl From<webm_iterable::errors::TagWriterError> for Error {
 	fn from(err: webm_iterable::errors::TagWriterError) -> Self {
-		Error::MatroskaWrite(std::sync::Arc::new(err))
+		Error::MatroskaWrite(crate::error::message(err))
 	}
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod error_tests {
+	use super::*;
+
+	/// `TagWriterError::WriteError` displays only "Error writing to destination.", so the
+	/// `io::Error` naming the actual failure has to come through the source chain or an export
+	/// failure is undiagnosable.
+	#[test]
+	fn matroska_write_keeps_the_io_cause() {
+		let source = std::io::Error::new(std::io::ErrorKind::StorageFull, "no space left on device");
+		let err = Error::from(webm_iterable::errors::TagWriterError::WriteError { source });
+
+		let message = err.to_string();
+		assert!(message.contains("no space left on device"), "{message}");
+	}
+}

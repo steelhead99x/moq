@@ -4,6 +4,7 @@
 //! and returns an SDP answer. The request path becomes the broadcast name on
 //! the upstream publish origin.
 
+#[cfg(feature = "server")]
 use axum::{
 	Router,
 	body::Bytes,
@@ -18,26 +19,36 @@ use crate::{Error, Result, ingest::IngestSink, sdp, server::Server, session};
 
 pub use crate::server::Response;
 
-/// Build the WHIP axum router.
-pub fn router(server: Server) -> Router {
-	Router::new()
-		.route("/{*path}", post(handle).delete(crate::server::delete))
-		.with_state(server)
+#[cfg(feature = "server")]
+#[derive(Clone)]
+struct RouterState {
+	server: Server,
+	publisher: moq_net::origin::Producer,
 }
 
+/// Build the WHIP axum router. Only with the `server` feature.
+#[cfg(feature = "server")]
+pub fn router(server: Server, publisher: moq_net::origin::Producer) -> Router {
+	Router::new()
+		.route("/{*path}", post(handle).delete(delete))
+		.with_state(RouterState { server, publisher })
+}
+
+#[cfg(feature = "server")]
 async fn handle(
-	State(server): State<Server>,
+	State(state): State<RouterState>,
 	Path(path): Path<String>,
 	OriginalUri(uri): OriginalUri,
 	headers: HeaderMap,
 	body: Bytes,
 ) -> HttpResponse {
-	match accept_offer(&server, &path, &headers, body).await {
+	match accept_offer(&state.server, &state.publisher, &path, &headers, body).await {
 		Ok(response) => {
 			let Response {
 				resource_id,
 				answer,
 				session,
+				..
 			} = response;
 			let mut response_headers = HeaderMap::new();
 			response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/sdp"));
@@ -58,12 +69,24 @@ async fn handle(
 
 /// Router glue: enforce the WHIP `Content-Type` then hand the raw offer to
 /// [`accept`], using the request path as the (unauthenticated) broadcast name.
-async fn accept_offer(server: &Server, path: &str, headers: &HeaderMap, body: Bytes) -> Result<Response> {
+#[cfg(feature = "server")]
+async fn accept_offer(
+	server: &Server,
+	publisher: &moq_net::origin::Producer,
+	path: &str,
+	headers: &HeaderMap,
+	body: Bytes,
+) -> Result<Response> {
 	if !is_sdp(headers) {
 		return Err(Error::InvalidSdp("expected Content-Type: application/sdp".into()));
 	}
 	let offer = std::str::from_utf8(&body).map_err(|err| Error::InvalidSdp(err.to_string()))?;
-	accept(server, server.publisher(), path, offer).await
+	accept(server, publisher, path, offer).await
+}
+
+#[cfg(feature = "server")]
+async fn delete(State(state): State<RouterState>, Path(path): Path<String>) -> StatusCode {
+	crate::server::delete(&state.server, &path)
 }
 
 /// Accept a WHIP SDP offer and publish the negotiated WebRTC media into
@@ -76,16 +99,17 @@ async fn accept_offer(server: &Server, path: &str, headers: &HeaderMap, body: By
 /// server's) lets the embedder publish through a *scoped* origin, so the publish
 /// scope is enforced by moq-net exactly as for a native session; the bundled
 /// [`router`] passes the server's own (unauthenticated) producer. It parses the
-/// offer, registers the broadcast (so a fast subscriber doesn't 404 in the gap
-/// before the first RTP packet), registers a media session on the shared mux,
-/// and returns the SDP answer plus an opaque `resource_id` for the WHIP
+/// offer, registers a media session on the shared mux, announces the
+/// broadcast under a fresh epoch once negotiation succeeds (so a fast subscriber
+/// doesn't 404 in the gap before the first RTP packet, and a reconnecting
+/// encoder replaces a stale session's broadcast at once), and returns the SDP answer plus an opaque `resource_id` for the WHIP
 /// `Location` header. The caller must run the returned [`Response`] to drive the
 /// RTP->MoQ session.
 ///
 /// `offer` is the raw SDP body; the caller is responsible for checking the
 /// `Content-Type: application/sdp` request header. Fails with
 /// [`Error::InvalidSdp`] on a malformed offer and surfaces
-/// [`moq_net::Error::Unauthorized`] (as [`Error::Other`]) if `broadcast` is
+/// [`moq_net::Error::Unauthorized`] if `broadcast` is
 /// outside `publisher`'s scope.
 pub async fn accept(
 	server: &Server,
@@ -94,16 +118,16 @@ pub async fn accept(
 	offer: &str,
 ) -> Result<Response> {
 	let offer = sdp::parse_offer(offer)?;
+	let broadcast = broadcast.as_path();
 
-	// Create the broadcast on the publish origin before negotiating, so a
-	// fast subscriber doesn't see a 404 in the gap between the SDP answer
-	// and the first RTP packet.
-	let producer = publisher
-		.create_broadcast(broadcast, moq_net::broadcast::Route::new().with_announce(true))
-		.map_err(|err| Error::Other(anyhow::anyhow!("failed to create broadcast: {err}")))?;
-
+	// Create the broadcast hidden up front, so an out-of-scope offer is refused before
+	// any mux work. It announces only once negotiation succeeds (below).
+	let producer = publisher.create_broadcast(&broadcast)?;
 	let handle = producer.clone();
-	let sink = Box::new(IngestSink::new(producer)?);
+	let config = moq_mux::catalog::Config::default()
+		.with_max_age(server.config().max_age)
+		.with_bandwidth(server.config().bandwidth.clone());
+	let sink = Box::new(IngestSink::new(producer, config)?);
 
 	// Register a session on the shared media mux: known ICE credentials (so the
 	// demux routes this peer's STUN by ufrag), an inbox to read datagrams from,
@@ -114,21 +138,37 @@ pub async fn accept(
 		.set_local_ice_credentials(creds)
 		.build(std::time::Instant::now());
 	for addr in mux.candidates() {
-		let cand = Candidate::host(*addr, "udp").map_err(str0m::RtcError::from)?;
+		let cand = Candidate::host(*addr, "udp").map_err(Error::rtc)?;
 		rtc.add_local_candidate(cand);
 	}
 
-	let answer = rtc.sdp_api().accept_offer(offer).map_err(Error::Rtc)?;
+	let answer = rtc.sdp_api().accept_offer(offer).map_err(Error::rtc)?;
+
+	// Announce only once negotiation succeeded, so a failed offer leaves a live
+	// session's broadcast alone, but before returning the answer, so a fast
+	// subscriber doesn't see a 404 in the gap before the first RTP packet. Each
+	// offer is its own publisher instance, so a reconnect replaces a stale
+	// session's broadcast instead of resuming into it.
+	let epoch = moq_net::Epoch::mint();
+	handle.announce(moq_net::origin::Route::default().with_epoch(epoch.clone()))?;
+
 	let resource_id = sdp::new_resource_id();
-	let session = session::Session::ingest(rtc, mux.socket(), mux.candidates().to_vec(), inbound, sink);
+	let socket = moq_ice::Socket {
+		udp: mux.socket(),
+		locals: mux.candidates().to_vec(),
+		inbound,
+	};
+	let session = session::Session::ingest(rtc, socket, sink)?;
 
 	// Register before returning so a DELETE that races the first packet still
 	// finds the session; Response::run unregisters itself when it ends.
 	let cancel = server.register_session(resource_id.clone());
+	tracing::info!(%broadcast, %epoch, "whip publish accepted");
 
 	Ok(Response {
 		resource_id: resource_id.clone(),
 		answer: sdp::render_answer(&answer),
+		wire: session.wire(),
 		session: crate::server::AcceptedSession {
 			server: server.clone(),
 			resource_id,
@@ -141,6 +181,7 @@ pub async fn accept(
 	})
 }
 
+#[cfg(feature = "server")]
 fn is_sdp(headers: &HeaderMap) -> bool {
 	headers
 		.get(header::CONTENT_TYPE)
@@ -149,11 +190,66 @@ fn is_sdp(headers: &HeaderMap) -> bool {
 		.unwrap_or(false)
 }
 
+#[cfg(feature = "server")]
 fn status_for(err: &Error) -> StatusCode {
 	match err {
 		Error::InvalidSdp(_) => StatusCode::BAD_REQUEST,
 		Error::UnsupportedCodec(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
 		Error::SessionNotFound => StatusCode::NOT_FOUND,
+		Error::Moq(moq_net::Error::Unauthorized) => StatusCode::UNAUTHORIZED,
 		_ => StatusCode::INTERNAL_SERVER_ERROR,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use str0m::{
+		format::Codec,
+		media::{Direction, MediaKind},
+	};
+
+	use super::*;
+
+	/// An encoder's offer to send one Opus track.
+	fn offer() -> String {
+		let mut rtc = session::rtc_with_codecs(&[Codec::Opus]);
+		let mut api = rtc.sdp_api();
+		api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+		let (offer, _pending) = api.apply().expect("an offer");
+		offer.to_sdp_string()
+	}
+
+	/// An encoder reconnecting to the same broadcast while its stale session is still
+	/// open restarts the broadcast at once: each offer is its own epoch, so a fresh
+	/// request reaches the reconnect, while the stale viewer stays on the old one until
+	/// it leaves.
+	#[tokio::test]
+	async fn a_reconnect_replaces_the_stale_session() {
+		let server = Server::new(crate::server::Config::default());
+		let origin = moq_tokio::origin::spawn();
+		let consumer = origin.consume();
+		let _stale_session = accept(&server, &origin, "live/cam0", &offer()).await.unwrap();
+		let stale = consumer.request_broadcast("live/cam0", None).await.unwrap();
+		let mut catalog = stale
+			.track(hang::Catalog::DEFAULT_NAME)
+			.unwrap()
+			.subscribe(None)
+			.await
+			.unwrap();
+
+		let _fresh_session = accept(&server, &origin, "live/cam0", &offer()).await.unwrap();
+		// The session binds a real UDP socket, so this runs on the wall clock.
+		let stale_viewer = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+			loop {
+				match catalog.recv_group().await {
+					Ok(Some(_)) => continue,
+					other => return other.map(|_| ()),
+				}
+			}
+		})
+		.await;
+		assert!(stale_viewer.is_err(), "the stale viewer ended: {stale_viewer:?}");
+		let fresh = consumer.request_broadcast("live/cam0", None).await.unwrap();
+		assert!(!fresh.is_clone(&stale), "viewers reach the reconnected session");
 	}
 }

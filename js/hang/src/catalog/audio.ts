@@ -1,9 +1,9 @@
 import * as z from "@zod/mini";
+import { compareName, compareNumber } from "./compare";
 import { ContainerSchema } from "./container";
 import { hexSchema } from "./hex";
 import { u53Schema } from "./integers";
 import { RelativeBroadcastSchema } from "./path";
-import { TimelineSchema } from "./timeline";
 
 // Backwards compatibility: old track schema
 const TrackSchema = z.object({
@@ -19,6 +19,12 @@ export const AudioConfigSchema = z.object({
 	// relative to the broadcast that served this catalog (e.g. "./source").
 	// If unset, the track lives in the same broadcast as the catalog.
 	broadcast: z.optional(RelativeBroadcastSchema),
+	// The track's name in its broadcast, when it differs from this entry's ID (its key in the
+	// catalog). Absent means the ID is the track name. Resolve it with `track`.
+	track: z.optional(z.string()),
+
+	// Human-readable rendition name for track pickers.
+	label: z.optional(z.string()),
 
 	// Registered WebCodecs codec string, or Hang's "pcm" extension for
 	// interleaved little-endian IEEE-754 binary32 samples.
@@ -38,20 +44,44 @@ export const AudioConfigSchema = z.object({
 	// The number of channels in the audio
 	numberOfChannels: u53Schema,
 
-	// The bitrate of the audio in bits per second
+	// The maximum bitrate of the audio in bits per second.
 	// TODO: Support up to Number.MAX_SAFE_INTEGER
 	bitrate: z.optional(u53Schema),
 
-	// The maximum jitter before the next frame is emitted in milliseconds.
-	// The player's jitter buffer should be larger than this value.
+	// Whether this rendition may be selected. When false, no frames are coming and a consumer
+	// must not select it. Default: true, so publishers only write it when false.
+	enabled: z.optional(z.boolean()),
+
+	// The maximum delay between a frame being ready and the publisher flushing it, in whole
+	// milliseconds rounded up. The player's jitter buffer should be larger than this value.
 	// If not provided, the player should assume each frame is flushed immediately.
 	//
+	// This is measured at the publisher (encoder latency, packet packing, reordering),
+	// never on the network a consumer sees. It only ever grows over the life of a stream.
+	//
 	// NOTE: The audio "frame" duration depends on the codec, sample rate, etc.
-	// ex: AAC often uses 1024 samples per frame, so at 44100Hz, this would be 1024/44100 = 23ms
-	jitter: z.optional(u53Schema),
+	// ex: AAC often uses 1024 samples per frame, so at 44100Hz, this would be 1024/44100 = 24ms
+	jitter: z.optional(
+		z.pipe(
+			u53Schema,
+			z.transform((value) => (value === 0 ? undefined : value)),
+		),
+	),
 
-	// The companion timeline track indexing this rendition's groups, if the publisher offers one.
-	timeline: z.optional(TimelineSchema),
+	// After a non-continuous join, decode from the group start, present at start plus warmup,
+	// and join that many milliseconds earlier.
+	warmup: z.optional(u53Schema),
+
+	// How far this rendition's frames reach the transport behind the broadcast's earliest
+	// rendition, in whole milliseconds rounded up. A player holds `delay + jitter` for it and never
+	// subtracts one rendition's `delay` from another's. Absent on the earliest rendition. It only
+	// ever grows over the life of a stream.
+	delay: z.optional(
+		z.pipe(
+			u53Schema,
+			z.transform((value) => (value === 0 ? undefined : value)),
+		),
+	),
 });
 
 /** Schema for the catalog audio section: a map of track name to rendition config. */
@@ -77,3 +107,15 @@ export const AudioSchema = z.union([
 export type Audio = z.infer<typeof AudioSchema>;
 /** Decoder config for a single audio rendition. */
 export type AudioConfig = z.infer<typeof AudioConfigSchema>;
+
+/** Rank audio best first: enabled, then bitrate, sample rate, channels, and name. */
+export function ranked(renditions: Record<string, AudioConfig>): [string, AudioConfig][] {
+	return Object.entries(renditions).sort(
+		(left, right) =>
+			compareNumber(Number(left[1].enabled !== false), Number(right[1].enabled !== false)) ||
+			compareNumber(left[1].bitrate, right[1].bitrate) ||
+			compareNumber(left[1].sampleRate, right[1].sampleRate) ||
+			compareNumber(left[1].numberOfChannels, right[1].numberOfChannels) ||
+			compareName(left[0], right[0]),
+	);
+}

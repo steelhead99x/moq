@@ -1,0 +1,66 @@
+name: Video
+
+# Runs the @moq/video renderer in headless Chromium, which `just check` cannot:
+# the WebGPU path, a lost device, and the Canvas2D fallback only exist in a real
+# browser. SwiftShader stands in for the GPU, so no GPU runner is needed.
+#
+# Narrow trigger, like wasm.yml: the renderer, the harness, and the two files that
+# wire the renderer into `<moq-publish>` (which the harness drives). `@moq/watch`
+# wires it the same way but needs a relay to drive, so its regressions surface
+# nightly instead.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * *"
+  pull_request:
+    # Main PRs skip it; the schedule above runs it on main. `edited` catches a
+    # main PR retargeted to release. `closed` is here only so merging/closing a
+    # PR cancels its in-flight run via the concurrency group below; the job
+    # itself is skipped on close.
+    branches: [release]
+    types: [opened, synchronize, reopened, edited, closed]
+    paths:
+      - "js/video/**"
+      - "js/publish/src/preview.ts"
+      - "js/publish/src/element.ts"
+      - "test/video/**"
+      - "test/justfile"
+      - "package.json"
+      - "bun.lock"
+      - "flake.nix"
+      - "flake.lock"
+      - ".github/workflows/video.yml"
+
+concurrency:
+  group: video-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  video:
+    name: Video
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/nix
+
+      # Playwright's Chromium isn't in the nix devShell. Install it plus its apt
+      # runtime libs (`--with-deps` needs the host package manager); the recipe's
+      # own `playwright install` then no-ops.
+      - name: Playwright Chromium
+        run: nix develop --command bash -c "bun install --frozen-lockfile && bunx playwright install --with-deps chromium"
+        shell: bash -leo pipefail {0}
+
+      - name: Video
+        run: nix develop --command just test video
+        shell: bash -leo pipefail {0}

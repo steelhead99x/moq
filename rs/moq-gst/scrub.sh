@@ -4,7 +4,7 @@
 # the user's system GStreamer instead of the nix copy it was linked
 # against. Used by build.sh on the tarball / .deb / .rpm release path;
 # `nix build .#moq-gst` does not run this, so the flake output stays
-# usable inside `nix shell` / cachix.
+# usable inside `nix shell` / the binary cache.
 #
 # Usage:
 #   scrub.sh <path-to-libgstmoq.so|.dylib>
@@ -40,7 +40,7 @@ scrub_macos() {
     # Framework path covers the official .pkg installer, and /usr/lib lets
     # dyld resolve system libs (libiconv, libc++) via the dyld_shared_cache at
     # @rpath substitution time.
-    "$SCRIPT_DIR/../scripts/scrub-macho.sh" "$dylib" \
+    "$SCRIPT_DIR/../../sh/rs/scrub-macho.sh" "$dylib" \
         /opt/homebrew/lib \
         /Library/Frameworks/GStreamer.framework/Libraries \
         /usr/lib

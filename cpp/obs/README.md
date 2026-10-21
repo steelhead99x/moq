@@ -3,7 +3,8 @@
 An OBS Studio plugin for publishing to and subscribing from MoQ relays.
 
 It loads into a stock OBS Studio install (no OBS source build required) and links
-`libmoq`, built from the in-tree [`rs/libmoq`](../../rs/libmoq) crate.
+the moq C++ package, built from the in-tree [`cpp/moq`](../moq) over
+[`rs/moq-ffi`](../../rs/moq-ffi).
 
 ## Features
 
@@ -29,3 +30,8 @@ just obs build
 
 Licensed under GPL-2.0-or-later (see [LICENSE](LICENSE)), separate from the rest of the
 repository, because it links OBS.
+
+Release dry runs use `just obs package --target TARGET --moq-archive FILE` to
+link the matching local C++ release archive. Tag builds use
+`--moq-release VERSION` to download the published archive. The two inputs are
+mutually exclusive; neither changes the plugin version in `VERSION`.

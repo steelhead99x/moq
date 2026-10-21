@@ -26,37 +26,35 @@ use crate::container::Frame;
 /// [`catalog::Reserved`](crate::catalog::Reserved) it reserves its rendition from, and feed it
 /// frames a [`Split`](super::Split) produced via [`decode`](Self::decode). The
 /// catalog rendition fills in lazily once the config is known.
-pub struct Import<E: CatalogExt = ()> {
-	track: crate::container::Producer<crate::catalog::hang::Container>,
-	rendition: crate::catalog::VideoTrack<E>,
+pub struct Import {
+	track: crate::container::Producer<crate::catalog::hang::Container, hang::catalog::VideoConfig>,
 	catalog: crate::codec::video::Catalog,
 	last_seq: Option<Bytes>,
 }
 
-impl<E: CatalogExt> Import<E> {
+impl Import {
 	/// Publish on an existing track producer, seeding the rendition from `hint` (pass
 	/// [`VideoHint::default`](crate::catalog::VideoHint) for none).
 	///
 	/// A hint carrying a codec publishes the catalog rendition up front (the sequence header still
 	/// refines it in band on the first keyframe).
-	pub fn new(
+	pub fn new<E: CatalogExt>(
 		track: moq_net::track::Producer,
 		reserved: crate::catalog::Reserved<E>,
 		hint: crate::catalog::VideoHint,
 	) -> crate::Result<Self> {
-		let rendition = reserved.video(track.name());
 		// The hint names the container; the writer is built from that same value so the wire
 		// cannot disagree with what the rendition advertises.
-		let wire = crate::catalog::hang::Container::try_from(&hint.container)?;
-		let catalog = crate::codec::video::Catalog::new(&reserved, track.name(), hint)?;
+		let wire = crate::catalog::hang::Container::try_from(&hint)?;
+		let catalog = crate::codec::video::Catalog::new(hint);
+		let track = reserved.video(track, wire, None)?;
 		let mut import = Self {
-			track: reserved.producer().media_producer(track, wire)?,
-			rendition,
+			track,
 			catalog,
 			last_seq: None,
 		};
 		if let Some(config) = import.catalog.initial_config() {
-			import.apply_config(config);
+			import.apply_config(config)?;
 		}
 		Ok(import)
 	}
@@ -77,18 +75,22 @@ impl<E: CatalogExt> Import<E> {
 		// fixed 4-byte header is read here, so don't gate on a larger size or a short
 		// out-of-band record falls through to raw-OBU scanning and leaves the config unset.
 		if data.len() >= 4 && data[0] == 0x81 {
-			self.init_from_av1c(data);
+			self.init_from_av1c(data)?;
 			return Ok(());
 		}
 
-		// Raw OBUs: resolve the config from any sequence header.
+		// Raw OBUs: resolve the config from any sequence header. A new one starts a coded sequence,
+		// so the last one's HDR metadata is dropped before the config publishes.
 		if let Some(seq) = find_sequence_header(data) {
+			if self.last_seq.as_ref() != Some(&seq) {
+				self.catalog.hdr(&mut self.track, Default::default(), true)?;
+			}
 			self.configure_from_seq(&seq)?;
 		}
 		Ok(())
 	}
 
-	fn init_from_av1c(&mut self, data: &[u8]) {
+	fn init_from_av1c(&mut self, data: &[u8]) -> crate::Result<()> {
 		let seq_profile = (data[1] >> 5) & 0x07;
 		let seq_level_idx = data[1] & 0x1F;
 		let tier = ((data[2] >> 7) & 0x01) == 1;
@@ -96,7 +98,7 @@ impl<E: CatalogExt> Import<E> {
 		let twelve_bit = ((data[2] >> 5) & 0x01) == 1;
 
 		// Resolution is unknown from av1C; it's filled when the first sequence header arrives.
-		let config = hang::catalog::VideoConfig::new(hang::catalog::AV1 {
+		let mut config = hang::catalog::VideoConfig::new(hang::catalog::AV1 {
 			profile: seq_profile,
 			level: seq_level_idx,
 			tier: if tier { 'H' } else { 'M' },
@@ -110,10 +112,16 @@ impl<E: CatalogExt> Import<E> {
 			matrix_coefficients: 1,
 			full_range: false,
 		});
-		self.apply_config(config);
+		// configOBUs follow the four header bytes; samples need not repeat what they carry. A new
+		// record starts a new coded sequence, whose HDR metadata is what its configOBUs carry.
+		config.color = color(&data[4..]);
+		let hdr = find_hdr(&Bytes::copy_from_slice(&data[4..]));
+		self.catalog.hdr(&mut self.track, hdr, true)?;
+		self.apply_config(config)?;
+		Ok(())
 	}
 
-	fn init(&mut self, seq_header: &SequenceHeaderObu) {
+	fn init(&mut self, seq_header: &SequenceHeaderObu) -> crate::Result<()> {
 		let mut config = hang::catalog::VideoConfig::new(hang::catalog::AV1 {
 			profile: seq_header.seq_profile,
 			level: seq_header
@@ -143,12 +151,14 @@ impl<E: CatalogExt> Import<E> {
 		});
 		config.coded_width = Some(seq_header.max_frame_width as u32);
 		config.coded_height = Some(seq_header.max_frame_height as u32);
-		self.apply_config(config);
+		config.color = sequence_color(seq_header);
+		self.apply_config(config)?;
+		Ok(())
 	}
 
 	/// Minimal config when sequence-header parsing fails, so the stream can still
 	/// flow (the catalog just won't carry full codec info).
-	fn init_minimal(&mut self) {
+	fn init_minimal(&mut self) -> crate::Result<()> {
 		let config = hang::catalog::VideoConfig::new(hang::catalog::AV1 {
 			profile: 0,
 			level: 0,
@@ -163,15 +173,16 @@ impl<E: CatalogExt> Import<E> {
 			matrix_coefficients: 2,      // Unspecified
 			full_range: false,
 		});
-		self.apply_config(config);
+		self.apply_config(config)?;
+		Ok(())
 	}
 
 	/// Apply a resolved config, updating the catalog rendition in place.
 	///
 	/// A changed config just re-mirrors the rendition; there are no fixed tracks
 	/// to reject a reconfiguration.
-	fn apply_config(&mut self, config: hang::catalog::VideoConfig) {
-		self.catalog.publish(&mut self.rendition, config);
+	fn apply_config(&mut self, config: hang::catalog::VideoConfig) -> crate::Result<()> {
+		self.catalog.publish(&mut self.track, config)
 	}
 
 	/// Resolve the config from a sequence-header OBU, falling back to a minimal
@@ -183,10 +194,10 @@ impl<E: CatalogExt> Import<E> {
 		self.last_seq = Some(seq_obu.clone());
 
 		match parse_sequence_header(seq_obu)? {
-			Some(seq_header) => self.init(&seq_header),
+			Some(seq_header) => self.init(&seq_header)?,
 			None if !self.catalog.configured() => {
 				tracing::debug!("sequence header parse failed, using minimal config");
-				self.init_minimal();
+				self.init_minimal()?;
 			}
 			None => {}
 		}
@@ -198,10 +209,14 @@ impl<E: CatalogExt> Import<E> {
 		self.track.track().demand()
 	}
 
+	/// Record a locally encoded frame's transport handoff for catalog jitter measurement.
+	pub fn flush(&mut self, timestamp: moq_net::Timestamp, now: moq_clock::Instant) -> crate::Result<()> {
+		self.track.flush(timestamp, now)
+	}
+
 	/// Finish the track, flushing the current group.
 	pub fn finish(&mut self) -> Result<()> {
 		self.track.finish()?;
-		self.estimate();
 		Ok(())
 	}
 
@@ -213,21 +228,20 @@ impl<E: CatalogExt> Import<E> {
 
 	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
 	/// the fields its config didn't supply.
-	fn estimate(&mut self) {
-		self.rendition.estimate(self.track.estimate());
-	}
-
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> Result<()> {
 		self.track.cut(end)?;
-		self.estimate();
 		Ok(())
+	}
+
+	/// Mark a timeline break and restart measurement without lowering advertised values.
+	pub fn discontinuity(&mut self) -> crate::Result<()> {
+		self.track.discontinuity()
 	}
 
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
 		self.track.seek(sequence)?;
-		self.estimate();
 		Ok(())
 	}
 
@@ -235,10 +249,18 @@ impl<E: CatalogExt> Import<E> {
 	/// keyframe's inline sequence header and refining the catalog jitter.
 	fn write_frames(&mut self, frames: impl IntoIterator<Item = Frame>) -> Result<()> {
 		for frame in frames {
-			if frame.keyframe
-				&& let Some(seq) = find_sequence_header(&frame.payload)
-			{
-				self.configure_from_seq(&seq)?;
+			if frame.keyframe {
+				let seq = find_sequence_header(&frame.payload);
+				// A new sequence header starts a coded sequence whose HDR metadata replaces the last
+				// one's. It goes first, so a keyframe that also configures publishes once.
+				// The first header after an av1C is the record's own sequence, which sync samples repeat.
+				let sequence = seq
+					.as_ref()
+					.is_some_and(|seq| self.last_seq.as_ref().is_some_and(|last| last != seq));
+				self.catalog.hdr(&mut self.track, find_hdr(&frame.payload), sequence)?;
+				if let Some(seq) = seq {
+					self.configure_from_seq(&seq)?;
+				}
 			}
 
 			// A keyframe we couldn't configure (no sequence header) is undecodable.
@@ -250,8 +272,6 @@ impl<E: CatalogExt> Import<E> {
 			// MissingKeyframe, which a caller joining mid-stream skips.
 			self.track.write(frame)?;
 		}
-
-		self.estimate();
 		Ok(())
 	}
 
@@ -275,6 +295,27 @@ fn parse_sequence_header(obu: &[u8]) -> Result<Option<SequenceHeaderObu>> {
 	Ok(SequenceHeaderObu::parse(header, &mut reader).ok())
 }
 
+/// The colour a sequence header's `color_config` signals; its range is always explicit.
+fn sequence_color(seq_header: &SequenceHeaderObu) -> Option<hang::catalog::Color> {
+	let color = &seq_header.color_config;
+	crate::codec::color::cicp(
+		color.color_primaries,
+		color.transfer_characteristics,
+		color.matrix_coefficients,
+		Some(color.full_color_range),
+	)
+}
+
+/// The colour a run of OBUs signals, such as av1C's `configOBUs`: the first parseable sequence
+/// header's, plus the static HDR metadata OBUs that the AV1 ISOBMFF binding places after it.
+pub(crate) fn color(obus: &[u8]) -> Option<hang::catalog::Color> {
+	let mut color = find_sequence_header(obus)
+		.and_then(|seq| parse_sequence_header(&seq).ok().flatten())
+		.and_then(|seq| sequence_color(&seq));
+	find_hdr(&Bytes::copy_from_slice(obus)).apply(&mut color);
+	color
+}
+
 /// Read encoded dimensions from the first parseable sequence header in a frame.
 pub(crate) fn dimensions(payload: &[u8]) -> Result<Option<(u32, u32)>> {
 	let Some(sequence) = find_sequence_header(payload) else {
@@ -289,6 +330,28 @@ pub(crate) fn dimensions(payload: &[u8]) -> Result<Option<(u32, u32)>> {
 	)))
 }
 
+/// The HDR metadata a temporal unit's metadata OBUs carry.
+fn find_hdr(payload: &Bytes) -> crate::codec::color::Hdr {
+	let mut hdr = crate::codec::color::Hdr::default();
+	let mut scan = |obu: &[u8]| {
+		let mut reader = obu;
+		if let Ok(header) = ObuHeader::parse(&mut reader)
+			&& header.obu_type == ObuType::Metadata
+		{
+			hdr.update(crate::codec::color::av1_metadata(reader));
+		}
+	};
+	let mut buf = payload.clone();
+	let mut obus = ObuIterator::new(&mut buf);
+	while let Some(Ok(obu)) = obus.next() {
+		scan(&obu);
+	}
+	if let Ok(Some(obu)) = obus.flush() {
+		scan(&obu);
+	}
+	hdr
+}
+
 /// Find the first sequence-header OBU in a payload, if any.
 fn find_sequence_header(payload: &[u8]) -> Option<Bytes> {
 	let mut buf = Bytes::copy_from_slice(payload);
@@ -299,4 +362,116 @@ fn find_sequence_header(payload: &[u8]) -> Option<Bytes> {
 		}
 	}
 	obus.flush().ok().flatten().filter(|obu| is_sequence_header(obu))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A metadata OBU (type 5, with a size field) carrying `payload`.
+	fn metadata_obu(payload: &[u8]) -> Vec<u8> {
+		let mut obu = vec![(5 << 3) | 0x02, payload.len() as u8];
+		obu.extend_from_slice(payload);
+		obu
+	}
+
+	/// HDR10 metadata OBUs: a 1000-nit BT.2020 mastering display, then MaxCLL 1000 and MaxFALL 400.
+	fn hdr10_obus() -> Vec<u8> {
+		let mut mdcv = vec![2];
+		for v in [46_399u16, 19_136, 11_141, 52_232, 8_585, 3_014, 20_493, 21_561] {
+			mdcv.extend_from_slice(&v.to_be_bytes());
+		}
+		mdcv.extend_from_slice(&(1000u32 << 8).to_be_bytes());
+		mdcv.extend_from_slice(&82u32.to_be_bytes());
+		let mut obus = metadata_obu(&mdcv);
+		obus.extend(metadata_obu(&[1, 0x03, 0xE8, 0x01, 0x90]));
+		obus
+	}
+
+	/// An av1C's configOBUs may carry the static HDR metadata alone; it is not dropped.
+	#[test]
+	fn config_obus_carry_hdr_metadata() {
+		let color = color(&hdr10_obus()).expect("HDR metadata");
+		assert_eq!(color.mastering.map(|m| m.max_luminance), Some(1000.0));
+		assert_eq!(color.content_light, crate::codec::color::test::hdr10().content_light);
+		assert_eq!(color.primaries, None);
+	}
+
+	/// A track initialized from an av1C publishes the colour its configOBUs carry, since the
+	/// samples need not repeat it.
+	#[tokio::test(start_paused = true)]
+	async fn av1c_initialize_publishes_config_obu_color() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let track = broadcast
+			.create_track("video", hang::container::track_info(hang::catalog::PRIORITY.video))
+			.unwrap();
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+
+		let mut av1c = vec![0x81, 0x08, 0x0c, 0x00];
+		av1c.extend(hdr10_obus());
+		import.initialize(&av1c).unwrap();
+
+		let color = catalog.snapshot().video.renditions["video"]
+			.color
+			.clone()
+			.expect("colour");
+		assert_eq!(color.content_light, crate::codec::color::test::hdr10().content_light);
+		assert!(color.mastering.is_some());
+
+		// The first sync sample repeats a sequence header but not the metadata OBUs.
+		let sequence = av1_sequence_header();
+		let pts = moq_net::Timestamp::from_micros(0).unwrap();
+		let mut split = super::super::Split::new();
+		let mut frames = split.decode(&sequence, pts).unwrap();
+		frames.extend(split.flush(pts).unwrap());
+		import.decode(frames).unwrap();
+		let color = catalog.snapshot().video.renditions["video"]
+			.color
+			.clone()
+			.expect("colour");
+		assert!(
+			color.mastering.is_some(),
+			"the av1C's HDR metadata survives the first sync sample"
+		);
+	}
+
+	/// Seeding with raw OBUs whose sequence header is new starts a new coded sequence, dropping the
+	/// HDR metadata the last one carried.
+	#[tokio::test(start_paused = true)]
+	async fn a_new_raw_sequence_drops_stale_hdr_metadata() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let track = broadcast
+			.create_track("video", hang::container::track_info(hang::catalog::PRIORITY.video))
+			.unwrap();
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+		let mut av1c = vec![0x81, 0x08, 0x0c, 0x00];
+		av1c.extend(hdr10_obus());
+		import.initialize(&av1c).unwrap();
+		let color = || catalog.snapshot().video.renditions["video"].color.clone().unwrap();
+		assert!(color().mastering.is_some());
+
+		import.initialize(&av1_sequence_header()).unwrap();
+		assert_eq!((color().mastering, color().content_light), (None, None));
+	}
+
+	/// A temporal unit of a temporal delimiter, the sequence header from `av1.mp4`'s av1C, and a frame.
+	fn av1_sequence_header() -> Vec<u8> {
+		let init = include_bytes!("../../container/fmp4/test_data/av1.mp4");
+		let mut cursor = std::io::Cursor::new(&init[..]);
+		let moov = loop {
+			match <mp4_atom::Any as mp4_atom::Decode>::decode(&mut cursor).unwrap() {
+				mp4_atom::Any::Moov(moov) => break moov,
+				_ => continue,
+			}
+		};
+		let mp4_atom::Codec::Av01(av01) = &moov.trak[0].mdia.minf.stbl.stsd.codecs[0] else {
+			panic!("expected av01");
+		};
+		let mut tu = vec![0x12, 0x00];
+		tu.extend_from_slice(&av01.av1c.config_obus);
+		tu.extend_from_slice(&[0x32, 0x01, 0x10]);
+		tu
+	}
 }

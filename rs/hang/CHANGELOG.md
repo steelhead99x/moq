@@ -7,6 +7,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- [**breaking**] Declare a fixed nominal duration on each archive timeline and remove the shared duration bound.
+
+## [0.21.11](https://github.com/moq-dev/moq/compare/hang-v0.21.10...hang-v0.21.11) - 2026-10-05
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.21.10](https://github.com/moq-dev/moq/compare/hang-v0.21.9...hang-v0.21.10) - 2026-10-03
+
+### Fixed
+
+- *(auth,hang)* out-of-range auth durations and catalog walls no longer panic ([#4600](https://github.com/moq-dev/moq/pull/4600))
+
+## [0.21.9](https://github.com/moq-dev/moq/compare/hang-v0.21.8...hang-v0.21.9) - 2026-09-30
+
+### Other
+
+- updated the following local packages: kio, moq-net, moq-json
+
+## [0.21.8](https://github.com/moq-dev/moq/compare/hang-v0.21.7...hang-v0.21.8) - 2026-09-27
+
+### Added
+
+- *(mux)* detect delay and jitter on JSON and binary tracks ([#4270](https://github.com/moq-dev/moq/pull/4270))
+
+### Fixed
+
+- *(egress)* single-rendition egress serves the best rendition ([#4293](https://github.com/moq-dev/moq/pull/4293))
+
+## [0.21.7](https://github.com/moq-dev/moq/compare/hang-v0.21.6...hang-v0.21.7) - 2026-09-26
+
+### Added
+
+- *(moq-mux)* catalog delay measures cross-rendition encoder lateness ([#4170](https://github.com/moq-dev/moq/pull/4170))
+
+## [0.21.6](https://github.com/moq-dev/moq/compare/hang-v0.21.5...hang-v0.21.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.21.5](https://github.com/moq-dev/moq/compare/hang-v0.21.4...hang-v0.21.5) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.21.4](https://github.com/moq-dev/moq/compare/hang-v0.21.3...hang-v0.21.4) - 2026-09-25
+
+### Added
+
+- *(mux)* measure encoder flush jitter per rendition ([#3940](https://github.com/moq-dev/moq/pull/3940))
+
+## [0.21.3](https://github.com/moq-dev/moq/compare/hang-v0.21.2...hang-v0.21.3) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.21.2](https://github.com/moq-dev/moq/compare/hang-v0.21.1...hang-v0.21.2) - 2026-09-24
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.21.1](https://github.com/moq-dev/moq/compare/hang-v0.21.0...hang-v0.21.1) - 2026-09-23
+
+### Other
+
+- updated the following local packages: moq-tokio
+
+## [0.21.0](https://github.com/moq-dev/moq/compare/hang-v0.20.13...hang-v0.21.0) - 2026-09-23
+
+### Added
+
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(hang)* [**breaking**] unify catalog APIs ([#3813](https://github.com/moq-dev/moq/pull/3813))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- *(net)* [**breaking**] announce prefixes on every wire; consumers read paths ([#3770](https://github.com/moq-dev/moq/pull/3770))
+- *(hang)* [**breaking**] one continuous broadcast clock at the catalog root ([#3675](https://github.com/moq-dev/moq/pull/3675))
+
+### Fixed
+
+- *(hang)* refuse a malformed text catalog section in JS too
+
+### Other
+
+- *(net)* [**breaking**] name path roles without new types ([#3826](https://github.com/moq-dev/moq/pull/3826))
+- *(quic)* [**breaking**] keep only the noq backend ([#3811](https://github.com/moq-dev/moq/pull/3811))
+- Merge origin/main into dev
+- Merge remote-tracking branch 'origin/main' into merge-main-into-dev-20260914
+
+### Changed
+
+- [**breaking**] Replace the catalog root `timeline` entry with `archive`. The
+  flattened timeline fields stay;
+  optional `replay`, `store`, and `version` advertise a durable recording.
+- [**breaking**] Replace the archive timeline `wall` field with a root `clock`
+  section (`{wall, timescale}`). Wall time is one fixed broadcast mapping: PTS zero in the
+  clock timescale since the moq epoch, with every track and the archive index converting
+  into it. Zero timescales, explicit null timescales, and wall values past the JSON-safe integer
+  range are refused.
+
+### Added
+
+- Human-readable labels for audio and video renditions.
+- Shared `catalog::stalled::Detector` for publishers to set the per-rendition `stalled` catalog flag.
+
+## [0.20.13](https://github.com/moq-dev/moq/compare/hang-v0.20.12...hang-v0.20.13) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.20.12](https://github.com/moq-dev/moq/compare/hang-v0.20.11...hang-v0.20.12) - 2026-09-13
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.20.11](https://github.com/moq-dev/moq/compare/hang-v0.20.10...hang-v0.20.11) - 2026-09-09
+
+### Other
+
+- updated the following local packages: moq-net
+
 ## [0.20.10](https://github.com/moq-dev/moq/compare/hang-v0.20.9...hang-v0.20.10) - 2026-09-02
 
 ### Other

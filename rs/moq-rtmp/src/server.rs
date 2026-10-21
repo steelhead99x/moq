@@ -13,12 +13,14 @@
 //!   down to the player) or [`Play::reject`]. This is the egress path: a player
 //!   (VLC, ffplay, mpv) pulls `rtmp://host/<app>/<key>` and we stream it back.
 //!
-//! This mirrors `moq-native`'s `Server` / `Request`, so the gateway stays
+//! This mirrors `moq-tokio`'s `Server` / `Request`, so the gateway stays
 //! unopinionated about auth: the embedder (e.g. a relay verifying the stream key
 //! as a JWT) owns that policy.
 //!
 //! RTMPS (RTMP over TLS): [`Server::with_tls`] makes the listener terminate TLS
-//! before the RTMP handshake, so `rtmps://` clients work with no other change.
+//! before the RTMP handshake for any client that opens with a ClientHello, so
+//! `rtmps://` and `rtmp://` clients share one port with no other change.
+//! [`Server::with_plaintext`] can refuse the plaintext ones.
 //! If you'd rather own the transport (custom TLS, a non-TCP socket, a test
 //! pipe), accept the connection and complete any handshake yourself, then hand
 //! the established stream to [`accept_stream`]; everything here is generic over
@@ -31,8 +33,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::rml::amf0::Amf0Value;
 use crate::rml::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use crate::rml::rml_amf0::Amf0Value;
 use crate::rml::sessions::{
 	FourCcSupport, ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
 };
@@ -40,10 +42,11 @@ use crate::rml::time::RtmpTimestamp;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use hang::catalog::{AudioCodec, VideoCodec};
+use hang::catalog::{AudioCodec, AudioCodecKind, VideoCodecKind, VideoConfig};
 use moq_mux::catalog::{CatalogFormat, Stream as CatalogStream};
 use moq_mux::container::flv::{Export as FlvExport, Import as FlvImport};
-use moq_net::{broadcast, origin};
+use moq_mux::select;
+use moq_net::origin;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -175,7 +178,7 @@ pub enum Conn {
 	/// A plaintext TCP connection (`rtmp://`).
 	Plain(TcpStream),
 
-	/// A TLS connection (`rtmps://`), established by [`Server::with_tls`]. Boxed
+	/// A TLS connection (`rtmps://`), sniffed and terminated by [`Server::with_tls`]. Boxed
 	/// because a `TlsStream` is large relative to a bare `TcpStream`.
 	#[cfg(feature = "tls")]
 	Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
@@ -225,17 +228,20 @@ const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// An RTMP server that yields each connection's pending request as a [`Request`].
 ///
-/// Build it with [`bind`](Self::bind), optionally enable RTMPS with
-/// [`with_tls`](Self::with_tls), then loop on [`accept`](Self::accept). The
+/// Build it with [`bind`](Self::bind), optionally enable RTMPS with `with_tls`
+/// (the `tls` feature), then loop on [`accept`](Self::accept). The
 /// handshake and the connect exchange happen inside `accept`, so a [`Request`] is
 /// only produced once a client actually wants to publish or play.
 pub struct Server {
 	listener: TcpListener,
 
-	/// When set, each accepted connection is TLS-terminated (RTMPS) before the
-	/// RTMP handshake.
+	/// When set, each accepted connection that opens with a ClientHello is
+	/// TLS-terminated (RTMPS) before the RTMP handshake.
 	#[cfg(feature = "tls")]
 	tls: Option<tokio_rustls::TlsAcceptor>,
+
+	/// Whether a connection that is not TLS is served as plaintext RTMP.
+	plaintext: bool,
 
 	/// In-flight handshakes; each resolves to a ready [`Request`], or `None` if
 	/// the connection closed or errored before issuing a publish or play.
@@ -249,7 +255,7 @@ pub struct Server {
 	/// While set, `accept` stops asking the listener until this instant. In-flight handshakes keep
 	/// being polled meanwhile: a connection that already got through must not wait out a backoff
 	/// earned by a different one.
-	accept_retry: Option<tokio::time::Instant>,
+	accept_retry: Option<moq_clock::Instant>,
 }
 
 impl Server {
@@ -261,20 +267,48 @@ impl Server {
 			listener,
 			#[cfg(feature = "tls")]
 			tls: None,
+			plaintext: true,
 			pending: FuturesUnordered::new(),
 			accept_delay: ACCEPT_RETRY_MIN,
 			accept_retry: None,
 		})
 	}
 
-	/// Terminate TLS on every accepted connection, turning this into an RTMPS
-	/// listener (`rtmps://`). Pass a `rustls::ServerConfig` (e.g. from
-	/// `moq_native::tls::Server::server_config` with an empty ALPN list), or
-	/// `None` to leave it plaintext.
+	/// Serve RTMPS (`rtmps://`) alongside plaintext RTMP on this one port: a
+	/// connection that opens with a TLS ClientHello is TLS-terminated, any other is
+	/// served as plaintext unless [`with_plaintext`](Self::with_plaintext) refuses it.
+	/// Pass a `rustls::ServerConfig` (e.g. from
+	/// `moq_tokio::tls::Listen::server_config` with an empty ALPN list), or
+	/// `None` to serve plaintext only.
 	#[cfg(feature = "tls")]
 	pub fn with_tls(mut self, tls: impl Into<Option<std::sync::Arc<rustls::ServerConfig>>>) -> Self {
 		self.tls = tls.into().map(tokio_rustls::TlsAcceptor::from);
 		self
+	}
+
+	/// Whether to accept plaintext `rtmp://` (the default). Pass `false` to refuse it and
+	/// serve `rtmps://` only, so stream keys never cross the network unencrypted: a
+	/// client that does not open with a TLS ClientHello is dropped at its first byte.
+	/// That needs `with_tls`, or [`accept`](Self::accept) refuses to run.
+	pub fn with_plaintext(mut self, allow: bool) -> Self {
+		self.plaintext = allow;
+		self
+	}
+
+	/// Refuse a server that would accept no connection at all: plaintext turned off with
+	/// no TLS to serve instead.
+	pub(crate) fn check(&self) -> Result<()> {
+		#[cfg(feature = "tls")]
+		let tls = self.tls.is_some();
+		#[cfg(not(feature = "tls"))]
+		let tls = false;
+
+		if !self.plaintext && !tls {
+			return Err(crate::Error::Session(
+				"plaintext RTMP is refused but no TLS config is set, so no client could connect".to_string(),
+			));
+		}
+		Ok(())
 	}
 
 	/// The local address the listener is bound to.
@@ -287,8 +321,14 @@ impl Server {
 	/// New connections are accepted and handshaked concurrently; this returns the
 	/// next one to reach its `publish` or `play` command. Connections that close or
 	/// error before either are dropped without surfacing here. Returns `None` only
-	/// if the listener itself stops (it currently never does).
+	/// if the listener itself stops (it currently never does) or the server refuses
+	/// plaintext without TLS, which is logged as an error.
 	pub async fn accept(&mut self) -> Option<Request<Conn>> {
+		if let Err(err) = self.check() {
+			tracing::error!(%err, "RTMP server misconfigured; not accepting connections");
+			return None;
+		}
+
 		loop {
 			// Copied out so the timer arm below doesn't borrow `self` alongside the other two.
 			let retry = self.accept_retry;
@@ -311,20 +351,24 @@ impl Server {
 						self.accept_delay = ACCEPT_RETRY_MIN;
 						configure_socket(&stream, peer);
 						#[cfg(feature = "tls")]
-						let tls = self.tls.clone();
+						let (tls, plaintext) = (self.tls.clone(), self.plaintext);
 						self.pending.push(Box::pin(async move {
 							// The TLS handshake (if any) and the RTMP handshake share one
 							// budget, so a client that stalls either is dropped.
-							let outcome = tokio::time::timeout(REQUEST_TIMEOUT, async move {
+							let outcome = moq_clock::timeout(REQUEST_TIMEOUT, async move {
 								#[cfg(feature = "tls")]
 								let conn = match tls {
-									Some(acceptor) => Conn::Tls(Box::new(
+									Some(acceptor) if starts_tls(&stream).await? => Conn::Tls(Box::new(
 										acceptor
 											.accept(stream)
 											.await
 											.map_err(|e| anyhow::anyhow!("rtmps tls handshake: {e}"))?,
 									)),
-									None => Conn::Plain(stream),
+									_ if !plaintext => {
+										tracing::warn!(%peer, "refusing plaintext RTMP: this listener requires TLS (rtmps://)");
+										return Ok(None);
+									}
+									_ => Conn::Plain(stream),
 								};
 								#[cfg(not(feature = "tls"))]
 								let conn = Conn::Plain(stream);
@@ -358,7 +402,7 @@ impl Server {
 						tracing::warn!(%err, "failed to accept RTMP connection; continuing");
 						let wait = self.accept_delay.mul_f64(0.5 + rand::rng().random::<f64>() / 2.0);
 						self.accept_delay = (self.accept_delay * 2).min(ACCEPT_RETRY_MAX);
-						self.accept_retry = Some(tokio::time::Instant::now() + wait);
+						self.accept_retry = Some(moq_clock::Instant::now() + wait);
 					}
 				},
 			}
@@ -366,13 +410,28 @@ impl Server {
 	}
 }
 
+/// The first byte of a TLS record carrying a ClientHello. RTMP's C0 is `0x03` (or `0x06`
+/// for the legacy encrypted variant), so one byte tells the two apart.
+#[cfg(feature = "tls")]
+const TLS_HANDSHAKE_RECORD: u8 = 0x16;
+
+/// Whether the client opened with a TLS ClientHello, peeked without consuming it.
+#[cfg(feature = "tls")]
+async fn starts_tls(stream: &TcpStream) -> io::Result<bool> {
+	let mut first = [0u8; 1];
+	if stream.peek(&mut first).await? == 0 {
+		return Err(io::ErrorKind::UnexpectedEof.into());
+	}
+	Ok(first[0] == TLS_HANDSHAKE_RECORD)
+}
+
 /// Sleep until `at`, or park forever when there is nothing to wait for.
 ///
 /// The `select!` arm that uses this is guarded on `at` being set; the pending branch keeps the arm
 /// well-formed rather than leaving the macro with a `None` to unwrap.
-async fn sleep_until(at: Option<tokio::time::Instant>) {
+async fn sleep_until(at: Option<moq_clock::Instant>) {
 	match at {
-		Some(at) => tokio::time::sleep_until(at).await,
+		Some(at) => moq_clock::sleep_until(at).await,
 		None => std::future::pending().await,
 	}
 }
@@ -412,7 +471,7 @@ pub fn configure_socket(stream: &TcpStream, peer: SocketAddr) {
 ///
 /// Returns `Ok(None)` if the client disconnects before issuing `publish` or
 /// `play`. Unlike [`Server`], this applies no timeout: wrap the call in
-/// [`tokio::time::timeout`] to bound how long a connected-but-idle client can
+/// [`moq_clock::timeout`] to bound how long a connected-but-idle client can
 /// hold the task.
 pub async fn accept_stream<S: Stream>(stream: S, peer: SocketAddr) -> Result<Option<Request<S>>> {
 	Ok(accept_until_request(stream, peer).await?)
@@ -453,6 +512,14 @@ impl<S: Stream> Request<S> {
 		}
 	}
 
+	/// The URL the client dialed, as its `connect` reported it in `tcUrl`.
+	pub fn tc_url(&self) -> Option<&str> {
+		match self {
+			Request::Publish(r) => r.tc_url(),
+			Request::Play(r) => r.tc_url(),
+		}
+	}
+
 	/// The remote peer address.
 	pub fn peer(&self) -> SocketAddr {
 		match self {
@@ -482,7 +549,14 @@ pub struct Publish<S = Conn> {
 	work: VecDeque<ServerSessionResult>,
 	app: String,
 	stream_key: String,
+	tc_url: Option<String>,
 	peer: SocketAddr,
+	/// Retention declared on the media tracks this publish mints, or `None` for hang's
+	/// own default. Override with [`with_max_age`](Self::with_max_age).
+	max_age: Option<Duration>,
+	/// Connection allocator each passthrough track claims its peak-hold bitrate on.
+	/// Override with [`with_bandwidth`](Self::with_bandwidth).
+	bandwidth: moq_net::bandwidth::Allocator,
 }
 
 impl<S: Stream> Publish<S> {
@@ -494,14 +568,44 @@ impl<S: Stream> Publish<S> {
 	/// The RTMP stream key (the final component of `rtmp://host/<app>/<key>`).
 	///
 	/// Conventionally a publish secret; an embedder can treat it as a token (e.g.
-	/// a moq-token JWT) to authenticate the publish.
+	/// a moq-auth JWT) to authenticate the publish.
 	pub fn stream_key(&self) -> &str {
 		&self.stream_key
+	}
+
+	/// The URL the client dialed (`rtmp://host/<app>`), as its `connect` reported
+	/// it in `tcUrl`, or `None` when it sent none. The only place a plaintext RTMP
+	/// session carries the hostname it was addressed to; RTMPS has the SNI too.
+	pub fn tc_url(&self) -> Option<&str> {
+		self.tc_url.as_deref()
 	}
 
 	/// The remote peer address.
 	pub fn peer(&self) -> SocketAddr {
 		self.peer
+	}
+
+	/// Set how long relays keep a non-latest group of this publish's media tracks
+	/// fetchable. `None` keeps hang's own default.
+	///
+	/// A retention budget, not a delivery one: it never makes a subscriber play further
+	/// behind live, it caps how far back a FETCH can still reach. The default suits a
+	/// segmented egress (HLS/DASH) reading the broadcast downstream, which may only
+	/// advertise segments that are still fetchable. Lower it when nothing reads history
+	/// and the memory matters.
+	pub fn with_max_age(mut self, max_age: Option<Duration>) -> Self {
+		self.max_age = max_age;
+		self
+	}
+
+	/// Claim each ingested track's peak-hold catalog bitrate on `bandwidth`.
+	///
+	/// A passthrough import has no configured ceiling, so it reserves the measured
+	/// maximum instead. A co-resident encoder then targets what is left of the
+	/// uplink. Unlimited (the default) claims nothing a sender can follow.
+	pub fn with_bandwidth(mut self, bandwidth: moq_net::bandwidth::Allocator) -> Self {
+		self.bandwidth = bandwidth;
+		self
 	}
 
 	/// Accept the publish: announce a broadcast at `path` in `origin` and pump the
@@ -516,7 +620,10 @@ impl<S: Stream> Publish<S> {
 		// Reserve the broadcast path before telling the client the publish succeeded:
 		// if the origin refuses `path`, reject cleanly instead of accepting and then
 		// dropping the connection a moment later.
-		let mut publisher = match Publisher::new(origin, path.as_str()) {
+		let config = moq_mux::catalog::Config::default()
+			.with_max_age(self.max_age)
+			.with_bandwidth(self.bandwidth);
+		let mut publisher = match Publisher::new(origin, path.as_str(), config) {
 			Ok(publisher) => publisher,
 			Err(err) => {
 				tracing::warn!(peer = %self.peer, %path, %err, "rejecting RTMP publish: broadcast unavailable");
@@ -539,7 +646,7 @@ impl<S: Stream> Publish<S> {
 			.map_err(|e| anyhow::anyhow!("rtmp accept publish: {e:?}"))?;
 		self.work.extend(results);
 
-		tracing::info!(peer = %self.peer, %path, "rtmp publish accepted");
+		tracing::info!(peer = %self.peer, %path, epoch = %publisher.epoch, "rtmp publish accepted");
 
 		let result = pump(
 			&mut self.stream,
@@ -604,10 +711,11 @@ pub struct Play<S = Conn> {
 	work: VecDeque<ServerSessionResult>,
 	app: String,
 	stream_key: String,
+	tc_url: Option<String>,
 	peer: SocketAddr,
 	/// How long the FLV muxer waits for a stalled group before skipping to a newer
-	/// one. Defaults to [`DEFAULT_LATENCY`](crate::DEFAULT_LATENCY); override with
-	/// [`with_latency`](Self::with_latency).
+	/// one. Defaults to [`DEFAULT_MAX_DELAY`](crate::DEFAULT_MAX_DELAY); override with
+	/// [`with_max_delay`](Self::with_max_delay).
 	latency: Duration,
 	/// Enhanced-RTMP capabilities advertised by the player in its connect object.
 	capabilities: ClientCapabilities,
@@ -627,17 +735,21 @@ impl<S: Stream> Play<S> {
 		&self.stream_key
 	}
 
+	/// The URL the client dialed, as its `connect` reported it in `tcUrl`; see
+	/// [`Publish::tc_url`].
+	pub fn tc_url(&self) -> Option<&str> {
+		self.tc_url.as_deref()
+	}
+
 	/// The remote peer address.
 	pub fn peer(&self) -> SocketAddr {
 		self.peer
 	}
 
-	/// Set how long the FLV muxer waits for a stalled group before skipping to a
-	/// newer one (the moq-level frame-drop latency). Defaults to
-	/// [`DEFAULT_LATENCY`](crate::DEFAULT_LATENCY). RTMP is unpaced (tags go out as
-	/// fast as the socket accepts them), so this bounds buffering, not the wire
-	/// rate. Pass [`Duration::ZERO`] to drop stale groups aggressively.
-	pub fn with_latency(mut self, latency: Duration) -> Self {
+	/// Set the FLV release delay and stalled-group budget.
+	/// Defaults to [`DEFAULT_MAX_DELAY`](crate::DEFAULT_MAX_DELAY); zero releases
+	/// available frames immediately without deadline drops.
+	pub fn with_max_delay(mut self, latency: Duration) -> Self {
 		self.latency = latency;
 		self
 	}
@@ -661,9 +773,9 @@ impl<S: Stream> Play<S> {
 				tracing::debug!(peer = %self.peer, %path, "viewer disconnected before play started");
 				return Ok(());
 			}
-			broadcast = tokio::time::timeout(PLAY_RESOLVE_TIMEOUT, origin.announced_broadcast(&path)) => {
-				match broadcast {
-					Ok(broadcast) => broadcast,
+			resolved = moq_clock::timeout(PLAY_RESOLVE_TIMEOUT, origin.routed_broadcast(&path)) => {
+				match resolved {
+					Ok(resolved) => resolved,
 					Err(_) => {
 						tracing::debug!(peer = %self.peer, %path, "play broadcast resolve timed out");
 						return self.reject("stream not found").await;
@@ -671,14 +783,14 @@ impl<S: Stream> Play<S> {
 				}
 			}
 		};
-		let Some(broadcast) = broadcast else {
+		let Ok(broadcast) = broadcast else {
 			tracing::debug!(peer = %self.peer, %path, "play broadcast unavailable");
 			return self.reject("stream not found").await;
 		};
 
 		// Resolve the catalog and reject the play up front if the client can't handle its
 		// codecs, before telling the viewer playback started.
-		let mut catalog = moq_mux::catalog::Consumer::new(&broadcast, CatalogFormat::default())
+		let mut check = moq_mux::catalog::Consumer::new(&broadcast, CatalogFormat::default())
 			.await
 			.map_err(|e| anyhow::anyhow!("init catalog check: {e}"))?;
 		let catalog = tokio::select! {
@@ -688,7 +800,7 @@ impl<S: Stream> Play<S> {
 				tracing::debug!(peer = %self.peer, %path, "viewer disconnected before play started");
 				return Ok(());
 			}
-			catalog = tokio::time::timeout(PLAY_RESOLVE_TIMEOUT, CatalogStream::next(&mut catalog)) => {
+			catalog = moq_clock::timeout(PLAY_RESOLVE_TIMEOUT, CatalogStream::next(&mut check)) => {
 				match catalog {
 					Ok(Ok(Some(catalog))) => catalog,
 					Ok(Ok(None)) => {
@@ -703,17 +815,27 @@ impl<S: Stream> Play<S> {
 				}
 			}
 		};
-		if let Err(reason) = check_play_capabilities(&catalog, &self.capabilities) {
-			tracing::debug!(peer = %self.peer, %path, %reason, "rejecting RTMP play: unsupported client capabilities");
-			return self.reject(&reason).await;
-		}
+		drop(check);
+		let select = match play_selection(&catalog, &self.capabilities) {
+			Ok(select) => select,
+			Err(reason) => {
+				tracing::debug!(peer = %self.peer, %path, %reason, "rejecting RTMP play: unsupported client capabilities");
+				return self.reject(&reason).await;
+			}
+		};
 
-		// The export re-resolves the broadcast (and any sibling broadcast a rendition's
-		// catalog `broadcast` field references) through the origin.
-		let mut export = FlvExport::new(moq_mux::Source::new(origin.consume(), path.as_str()))
+		// The capability check consumed its snapshot, so the export follows a fresh
+		// subscription narrowed to what the client can play. It reads the broadcast the
+		// check resolved, so a publisher that reconnected since then doesn't split the
+		// catalog from its media.
+		let source = moq_mux::Source::new(origin.clone(), broadcast);
+		let stream = source
+			.catalog::<()>(CatalogFormat::default())
 			.await
 			.map_err(|e| anyhow::anyhow!("init FLV export: {e}"))?
-			.with_latency(self.latency)
+			.select(select);
+		let mut export = FlvExport::new(source, stream)
+			.with_delay(self.latency)
 			.with_multitrack(self.capabilities.multitrack);
 
 		// Resolve the catalog and codec headers before Play.Start, too. Otherwise a
@@ -726,7 +848,7 @@ impl<S: Stream> Play<S> {
 				tracing::debug!(peer = %self.peer, %path, "viewer disconnected before play started");
 				return Ok(());
 			}
-			chunk = tokio::time::timeout(PLAY_RESOLVE_TIMEOUT, export.next()) => {
+			chunk = moq_clock::timeout(PLAY_RESOLVE_TIMEOUT, export.next()) => {
 				match chunk {
 					Ok(Ok(Some(chunk))) => chunk,
 					Ok(Ok(None)) => {
@@ -795,46 +917,138 @@ impl<S: Stream> Play<S> {
 	}
 }
 
-fn check_play_capabilities(
+/// Narrow a play to what the client can decode, or refuse it.
+///
+/// A multitrack client receives every enabled rendition, so it must play them all. A
+/// single-track client receives the best enabled rendition of each kind it can play.
+fn play_selection(
 	catalog: &moq_mux::catalog::hang::Catalog,
 	capabilities: &ClientCapabilities,
-) -> std::result::Result<(), String> {
-	let limit = if capabilities.multitrack { usize::MAX } else { 1 };
-
-	for config in catalog.video.renditions.values().take(limit) {
-		let Some(fourcc) = video_fourcc(&config.codec, capabilities.multitrack) else {
-			continue;
-		};
-		if !capabilities.supports_video(&fourcc) {
-			return Err(format!(
+) -> std::result::Result<select::Broadcast, String> {
+	let video_playable = |config: &VideoConfig| plays_video(capabilities, config.codec.kind());
+	let video_refused = if capabilities.multitrack {
+		catalog
+			.video
+			.enabled()
+			.map(|(_, config)| config)
+			.find(|config| !video_playable(config))
+	} else if catalog.video.renditions.values().any(video_playable) {
+		None
+	} else {
+		catalog.video.ranked().next().map(|(_, config)| config)
+	};
+	if let Some(config) = video_refused {
+		return Err(match video_fourcc(config.codec.kind(), capabilities.multitrack) {
+			Some(fourcc) => format!(
 				"client did not advertise required RTMP FourCC {}",
 				fourcc_label(&fourcc)
-			));
-		}
+			),
+			None => format!("RTMP can't carry video codec {}", config.codec),
+		});
 	}
 
-	for config in catalog.audio.renditions.values().take(limit) {
-		let Some(fourcc) = audio_fourcc(&config.codec, capabilities.multitrack) else {
-			continue;
-		};
-		if !capabilities.supports_audio(&fourcc) {
-			return Err(format!(
+	let audio_playable = |config: &hang::catalog::AudioConfig| plays_audio(capabilities, &config.codec);
+	let audio_refused = if capabilities.multitrack {
+		catalog
+			.audio
+			.enabled()
+			.map(|(_, config)| config)
+			.find(|config| !audio_playable(config))
+	} else if catalog.audio.renditions.values().any(audio_playable) {
+		None
+	} else {
+		catalog.audio.ranked().next().map(|(_, config)| config)
+	};
+	if let Some(config) = audio_refused {
+		return Err(match audio_fourcc(&config.codec, capabilities.multitrack) {
+			Some(fourcc) => format!(
 				"client did not advertise required RTMP FourCC {}",
 				fourcc_label(&fourcc)
-			));
-		}
+			),
+			None => format!("RTMP can't carry audio codec {}", config.codec),
+		});
 	}
 
-	Ok(())
+	let mut video = select::Video::default();
+	let mut any_video = false;
+	for kind in [
+		VideoCodecKind::H264,
+		VideoCodecKind::H265,
+		VideoCodecKind::AV1,
+		VideoCodecKind::VP9,
+	] {
+		if plays_video(capabilities, kind) {
+			video = video.codec(kind);
+			any_video = true;
+		}
+	}
+	// An empty codec list would select every codec, so a client that plays none gets no video.
+	let mut select = select::Broadcast::default();
+	if any_video {
+		select = select.video(video);
+	}
+
+	let mut audio = select::Audio::default();
+	let mut any_audio = false;
+	for kind in playable_audio_kinds(capabilities) {
+		audio = audio.codec(kind);
+		any_audio = true;
+	}
+	// Same as video: an empty list would keep codecs the client never advertised.
+	if any_audio {
+		select = select.audio(audio);
+	}
+	Ok(select)
 }
 
-fn video_fourcc(codec: &VideoCodec, multitrack: bool) -> Option<[u8; 4]> {
-	match codec {
-		VideoCodec::H264(_) if multitrack => Some(*b"avc1"),
-		VideoCodec::H265(_) => Some(*b"hvc1"),
-		VideoCodec::AV1(_) => Some(*b"av01"),
-		VideoCodec::VP9(_) => Some(*b"vp09"),
-		VideoCodec::H264(_) | VideoCodec::VP8 | VideoCodec::Unknown(_) => None,
+/// Whether a client with `capabilities` can play `codec` over FLV.
+fn plays_audio(capabilities: &ClientCapabilities, codec: &AudioCodec) -> bool {
+	match audio_fourcc(codec, capabilities.multitrack) {
+		Some(fourcc) => capabilities.supports_audio(&fourcc),
+		// Every client plays AAC and MP3 by their legacy CodecIDs; nothing else goes without a FourCC.
+		None => matches!(codec, AudioCodec::AAC(_) | AudioCodec::Mp3),
+	}
+}
+
+/// Codec families this client can play.
+///
+/// AAC and MP3 need no FourCC on a single-track client.
+fn playable_audio_kinds(capabilities: &ClientCapabilities) -> Vec<AudioCodecKind> {
+	let samples = [
+		AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
+		AudioCodec::Mp3,
+		AudioCodec::Opus,
+		AudioCodec::Ac3,
+		AudioCodec::Ec3,
+	];
+	let mut kinds = Vec::new();
+	for codec in samples {
+		if plays_audio(capabilities, &codec) {
+			let kind = codec.kind();
+			if !kinds.contains(&kind) {
+				kinds.push(kind);
+			}
+		}
+	}
+	kinds
+}
+
+/// Whether a client with `capabilities` can play `kind` over FLV.
+fn plays_video(capabilities: &ClientCapabilities, kind: VideoCodecKind) -> bool {
+	match video_fourcc(kind, capabilities.multitrack) {
+		Some(fourcc) => capabilities.supports_video(&fourcc),
+		// Every client plays H.264 by its legacy CodecID; nothing else goes without a FourCC.
+		None => kind == VideoCodecKind::H264,
+	}
+}
+
+/// The enhanced-RTMP FourCC a client must advertise to play `kind`, if any.
+fn video_fourcc(kind: VideoCodecKind, multitrack: bool) -> Option<[u8; 4]> {
+	match kind {
+		VideoCodecKind::H264 if multitrack => Some(*b"avc1"),
+		VideoCodecKind::H265 => Some(*b"hvc1"),
+		VideoCodecKind::AV1 => Some(*b"av01"),
+		VideoCodecKind::VP9 => Some(*b"vp09"),
 		_ => None,
 	}
 }
@@ -873,6 +1087,7 @@ async fn accept_until_request<S: Stream>(mut stream: S, peer: SocketAddr) -> any
 	}
 
 	let mut client_capabilities = ClientCapabilities::default();
+	let mut tc_url = None;
 
 	let mut buffer = [0u8; READ_BUFFER];
 	loop {
@@ -886,14 +1101,17 @@ async fn accept_until_request<S: Stream>(mut stream: S, peer: SocketAddr) -> any
 					ServerSessionEvent::ConnectionRequested {
 						request_id,
 						app_name,
+						tc_url: dialed,
 						caps_ex,
 						video_fourccs,
 						audio_fourccs,
 					} => {
 						client_capabilities = ClientCapabilities::new(caps_ex, video_fourccs, audio_fourccs);
+						tc_url = dialed;
 						tracing::debug!(
 							%peer,
 							%app_name,
+							tc_url = tc_url.as_deref().unwrap_or(""),
 							caps_ex,
 							client_multitrack = client_capabilities.multitrack,
 							client_video_fourccs = client_capabilities.video.fourccs.len(),
@@ -922,7 +1140,10 @@ async fn accept_until_request<S: Stream>(mut stream: S, peer: SocketAddr) -> any
 							work,
 							app: app_name,
 							stream_key,
+							tc_url,
 							peer,
+							max_age: None,
+							bandwidth: moq_net::bandwidth::Allocator::unlimited(),
 						})));
 					}
 					// The client wants to play: hand control back to the caller.
@@ -941,8 +1162,9 @@ async fn accept_until_request<S: Stream>(mut stream: S, peer: SocketAddr) -> any
 							work,
 							app: app_name,
 							stream_key,
+							tc_url,
 							peer,
-							latency: crate::DEFAULT_LATENCY,
+							latency: crate::DEFAULT_MAX_DELAY,
 							capabilities: client_capabilities.clone(),
 						})));
 					}
@@ -974,7 +1196,7 @@ async fn pump<S: Stream>(
 	peer: SocketAddr,
 ) -> anyhow::Result<()> {
 	let mut buffer = [0u8; READ_BUFFER];
-	let mut media_deadline = tokio::time::Instant::now() + PUBLISH_IDLE_TIMEOUT;
+	let mut media_deadline = moq_clock::Instant::now() + PUBLISH_IDLE_TIMEOUT;
 	loop {
 		let mut finished = false;
 		while let Some(result) = work.pop_front() {
@@ -987,21 +1209,22 @@ async fn pump<S: Stream>(
 					// consumes whole tags atomically, so one bad frame doesn't desync
 					// the stream, and tearing down a live publish over it would be worse.
 					ServerSessionEvent::AudioDataReceived { data, timestamp, .. } => {
-						media_deadline = tokio::time::Instant::now() + PUBLISH_IDLE_TIMEOUT;
+						media_deadline = moq_clock::Instant::now() + PUBLISH_IDLE_TIMEOUT;
 						if let Err(err) = publisher.push(flv::TAG_AUDIO, timestamp.value, &data) {
 							tracing::warn!(%peer, %err, "dropping RTMP audio frame that failed to demux");
 						}
 					}
 					ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
-						media_deadline = tokio::time::Instant::now() + PUBLISH_IDLE_TIMEOUT;
+						media_deadline = moq_clock::Instant::now() + PUBLISH_IDLE_TIMEOUT;
 						if let Err(err) = publisher.push(flv::TAG_VIDEO, timestamp.value, &data) {
 							tracing::warn!(%peer, %err, "dropping RTMP video frame that failed to demux");
 						}
 					}
 					ServerSessionEvent::PublishStreamFinished { .. } => finished = true,
 					// onMetaData and other script data: the FLV importer reads codec
-					// config from the sequence headers, so metadata isn't forwarded.
-					ServerSessionEvent::StreamMetadataChanged { .. } => {}
+					// config from the sequence headers, so script data isn't forwarded.
+					ServerSessionEvent::StreamMetadataChanged { .. }
+					| ServerSessionEvent::UnhandleableAmf0Data { .. } => publisher.metadata.record(),
 					other => tracing::trace!(%peer, ?other, "ignoring RTMP event"),
 				},
 				ServerSessionResult::UnhandleableMessageReceived(_) => {
@@ -1015,7 +1238,7 @@ async fn pump<S: Stream>(
 
 		let n = tokio::select! {
 			res = stream.read(&mut buffer) => res?,
-			_ = tokio::time::sleep_until(media_deadline) => {
+			_ = moq_clock::sleep_until(media_deadline) => {
 				anyhow::bail!("peer {peer} sent no RTMP media for {:?}", PUBLISH_IDLE_TIMEOUT);
 			}
 		};
@@ -1040,11 +1263,11 @@ async fn pump<S: Stream>(
 /// pings, `deleteStream`) so a long playback stays healthy. The read and write
 /// halves run independently, so media keeps flowing regardless of when the viewer
 /// next sends anything.
-async fn play_pump<S: Stream>(
+async fn play_pump<S: Stream, C: CatalogStream>(
 	stream: &mut S,
 	session: &mut ServerSession,
 	work: &mut VecDeque<ServerSessionResult>,
-	export: &mut FlvExport,
+	export: &mut FlvExport<C>,
 	mut tags: flv::TagReader,
 	stream_id: u32,
 	peer: SocketAddr,
@@ -1220,20 +1443,25 @@ async fn run_handshake<S: Stream>(stream: &mut S, peer: SocketAddr) -> anyhow::R
 /// An active publish: the moq-mux FLV importer, which owns the origin-created
 /// [`BroadcastProducer`](moq_net::broadcast::Producer) it publishes into.
 /// Either [`Self::finish`] or dropping it closes the broadcast and unannounces
-/// the path, the former without the dropped-without-finish warning.
+/// the path.
 struct Publisher {
 	importer: FlvImport,
-	// A clone of the importer's producer, so a deliberate end can finish() the
-	// broadcast (prompt unannounce) even though the importer owns it.
+	metadata: crate::metadata::Dropped,
+	// A clone of the importer's producer, so an end can close the broadcast
+	// (prompt unannounce) even though the importer owns it.
 	broadcast: moq_net::broadcast::Producer,
+	// This connection's publisher instance, so an encoder reconnecting under the
+	// same key replaces this broadcast at once instead of resuming into it.
+	epoch: moq_net::Epoch,
 }
 
 impl Publisher {
-	/// Open a broadcast at `path` and prime the importer with the FLV file
-	/// header, so subsequent tags decode against an initialized demuxer.
-	fn new(origin: &origin::Producer, path: &str) -> anyhow::Result<Self> {
-		let mut broadcast = origin.create_broadcast(path, broadcast::Route::new().with_announce(true))?;
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast)?;
+	/// Open a broadcast at `path` under a fresh epoch and prime the importer with
+	/// the FLV file header, so subsequent tags decode against an initialized demuxer.
+	fn new(origin: &origin::Producer, path: &str, config: moq_mux::catalog::Config) -> anyhow::Result<Self> {
+		let epoch = moq_net::Epoch::mint();
+		let mut broadcast = origin.publish(path, moq_net::origin::Route::default().with_epoch(epoch.clone()))?;
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, config)?;
 		let handle = broadcast.clone();
 		let mut importer = FlvImport::new(broadcast, catalog.reserve());
 
@@ -1242,7 +1470,9 @@ impl Publisher {
 
 		Ok(Self {
 			importer,
+			metadata: crate::metadata::Dropped::new(path),
 			broadcast: handle,
+			epoch,
 		})
 	}
 
@@ -1262,7 +1492,7 @@ impl Publisher {
 	/// the broadcast so the origin unannounces it immediately.
 	fn finish(&mut self) -> anyhow::Result<()> {
 		self.importer.finish()?;
-		self.broadcast.finish();
+		self.broadcast.close();
 		Ok(())
 	}
 
@@ -1270,15 +1500,69 @@ impl Publisher {
 	/// (the client disconnected, a protocol error) rather than a generic
 	/// `Error::Dropped` from the importer being dropped.
 	///
-	/// Consumes the publisher: the broadcast is done.
+	/// Consumes the publisher and closes the broadcast.
 	fn abort(self, err: moq_net::Error) {
 		self.importer.abort(err);
+		self.broadcast.close();
 	}
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
 	use super::*;
+	#[tokio::test(start_paused = true)]
+	#[tracing_test::traced_test]
+	async fn publish_metadata_drops_warn_once() {
+		let (mut stream, _peer) = tokio::io::duplex(1024);
+		let (mut session, _) = ServerSession::new(ServerSessionConfig::new()).unwrap();
+		let origin = moq_tokio::origin::spawn();
+		let mut publisher = Publisher::new(&origin, "metadata", Default::default()).unwrap();
+		let mut work = VecDeque::from([ServerSessionResult::RaisedEvent(
+			ServerSessionEvent::StreamMetadataChanged {
+				app_name: "live".into(),
+				stream_key: "metadata".into(),
+				metadata: crate::rml::sessions::StreamMetadata::new(),
+			},
+		)]);
+		// A custom script message goes through the session's own parser.
+		work.extend(session.handle_input(&crate::metadata::cue_point_packet()).unwrap());
+		work.push_back(ServerSessionResult::RaisedEvent(
+			ServerSessionEvent::PublishStreamFinished {
+				app_name: "live".into(),
+				stream_key: "metadata".into(),
+			},
+		));
+		pump(
+			&mut stream,
+			&mut session,
+			&mut work,
+			&mut publisher,
+			"127.0.0.1:1935".parse().unwrap(),
+		)
+		.await
+		.unwrap();
+		assert_eq!(publisher.metadata.count, 2);
+		publisher.finish().unwrap();
+		drop(publisher);
+		logs_assert(|lines| {
+			let warnings = lines
+				.iter()
+				.filter(|line| line.contains("discarding RTMP stream metadata"))
+				.count();
+			let summary = lines.iter().any(|line| {
+				line.contains("RTMP metadata discard summary")
+					&& line.contains("path=metadata")
+					&& line.contains("count=2")
+			});
+			if warnings == 1 && summary {
+				Ok(())
+			} else {
+				Err(format!("warnings={warnings}, summary={summary}"))
+			}
+		});
+	}
+
 	use crate::rml::sessions::{
 		ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
 	};
@@ -1559,9 +1843,33 @@ mod tests {
 		}
 	}
 
-	/// End-to-end play: publish a real broadcast into an origin (via the FLV
-	/// importer, so it carries a catalog + frames), then drive an RTMP play client
-	/// and assert it receives the muxed AVC sequence header and keyframe back.
+	/// The retention a publish declares has to reach the media tracks the FLV importer
+	/// mints, not stop at the catalog producer it was set on.
+	#[tokio::test]
+	async fn publisher_declares_the_configured_retention() {
+		let mut vseq = vec![0x17, 0x00, 0x00, 0x00, 0x00];
+		vseq.extend_from_slice(&[0x01, 0x42, 0xc0, 0x1f, 0xff, 0xe1, 0x00, 0x04, 0x67, 0x42, 0xc0, 0x1f]);
+		vseq.extend_from_slice(&[0x01, 0x00, 0x04, 0x68, 0xce, 0x3c, 0x80]);
+
+		let origin = moq_tokio::origin::spawn();
+		let mut publisher = Publisher::new(
+			&origin,
+			"live/cam0",
+			moq_mux::catalog::Config::default().with_max_age(Duration::from_secs(3)),
+		)
+		.unwrap();
+		publisher.push(flv::TAG_VIDEO, 0, &vseq).unwrap();
+
+		let consumer = origin.consume();
+		consumer.routed("live/cam0").await.unwrap();
+		let broadcast = consumer.request_broadcast("live/cam0", None).await.unwrap();
+		let info = broadcast.track("0.flv-v").unwrap().query().await.unwrap();
+		assert_eq!(info.max_age, Some(Duration::from_secs(3)));
+	}
+
+	/// End-to-end play: publish a real broadcast into an origin (via the FLV importer, so it
+	/// carries a catalog + frames), then drive an RTMP play client and assert it receives the
+	/// muxed AVC sequence header and keyframe back.
 	#[tokio::test]
 	async fn play_streams_broadcast_to_client() {
 		// An AVC sequence-header tag body: keyframe + AVC CodecID, AVCPacketType 0,
@@ -1580,11 +1888,10 @@ mod tests {
 		vframe.extend_from_slice(&[0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0x00]);
 
 		// Publish the broadcast at `live/cam0` by feeding synthetic FLV to the importer.
-		let origin = moq_net::Origin::random().produce();
-		let mut broadcast = origin
-			.create_broadcast("live/cam0", broadcast::Route::new().with_announce(true))
-			.unwrap();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let origin = moq_tokio::origin::spawn();
+		let mut broadcast = origin.create_broadcast("live/cam0").unwrap();
+		broadcast.announce(Default::default()).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let mut importer = FlvImport::new(broadcast, catalog.reserve());
 		importer.decode(&flv::file_header()).unwrap();
 		importer.decode(&flv::tag(flv::TAG_VIDEO, 0, &vseq)).unwrap();
@@ -1629,11 +1936,10 @@ mod tests {
 	async fn play_enhanced_codec_rejects_legacy_client() {
 		const VP9_KEYFRAME_320X240: &[u8] = &[0x82, 0x49, 0x83, 0x42, 0x20, 0x13, 0xf0, 0x0e, 0xf0, 0x00];
 
-		let origin = moq_net::Origin::random().produce();
-		let mut broadcast = origin
-			.create_broadcast("live/cam0", broadcast::Route::new().with_announce(true))
-			.unwrap();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let origin = moq_tokio::origin::spawn();
+		let mut broadcast = origin.create_broadcast("live/cam0").unwrap();
+		broadcast.announce(Default::default()).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let mut importer = FlvImport::new(broadcast, catalog.reserve());
 		importer.decode(&flv::file_header()).unwrap();
 
@@ -1665,6 +1971,161 @@ mod tests {
 		server_task.await.unwrap();
 	}
 
+	/// A single-track client gets the best rendition it can decode, whatever the
+	/// names; a multitrack client must decode every rendition.
+	#[test]
+	fn play_selection_picks_the_best_playable_rendition() {
+		fn rendition(codec: impl Into<hang::catalog::VideoCodec>, height: u32) -> VideoConfig {
+			let mut config = VideoConfig::new(codec);
+			config.coded_width = Some(height * 16 / 9);
+			config.coded_height = Some(height);
+			config
+		}
+		let h264 = hang::catalog::H264 {
+			profile: 0x42,
+			constraints: 0,
+			level: 0x1e,
+			inline: false,
+		};
+
+		let mut catalog = moq_mux::catalog::hang::Catalog::default();
+		// Name order would pick the lowest rendition.
+		catalog
+			.video
+			.renditions
+			.insert("a".to_string(), rendition(h264.clone(), 360));
+		catalog.video.renditions.insert(
+			"b".to_string(),
+			rendition(
+				hang::catalog::H265 {
+					in_band: false,
+					profile_space: 0,
+					profile_idc: 1,
+					profile_compatibility_flags: [0x60, 0, 0, 0],
+					tier_flag: false,
+					level_idc: 120,
+					constraint_flags: [0x90, 0, 0, 0, 0, 0],
+				},
+				1080,
+			),
+		);
+		catalog.video.renditions.insert("c".to_string(), rendition(h264, 720));
+
+		fn best(catalog: &moq_mux::catalog::hang::Catalog, capabilities: &ClientCapabilities) -> Option<String> {
+			let select = play_selection(catalog, capabilities).unwrap();
+			let mut catalog = catalog.clone();
+			select.retain(&mut catalog);
+			catalog.video.ranked().next().map(|(name, _)| name.clone())
+		}
+
+		let legacy = ClientCapabilities::default();
+		assert_eq!(best(&catalog, &legacy).as_deref(), Some("c"));
+
+		let hevc = FourCcSupport {
+			any: false,
+			fourccs: vec![*b"hvc1"],
+		};
+		let enhanced = ClientCapabilities::new(0, hevc.clone(), FourCcSupport::default());
+		assert_eq!(best(&catalog, &enhanced).as_deref(), Some("b"));
+
+		// Multitrack carries every rendition, so one the client can't decode refuses the play.
+		let multitrack = ClientCapabilities::new(CAPS_EX_MULTITRACK, hevc.clone(), FourCcSupport::default());
+		assert!(play_selection(&catalog, &multitrack).is_err());
+
+		// A disabled rendition is never selected, so a single-track client gets the best enabled
+		// one, and a multitrack client that can't decode it still plays the rest.
+		catalog.video.renditions.get_mut("c").unwrap().enabled = false;
+		assert_eq!(best(&catalog, &legacy).as_deref(), Some("a"));
+		let avc = FourCcSupport {
+			any: false,
+			fourccs: vec![*b"avc1"],
+		};
+		let h264_only = ClientCapabilities::new(CAPS_EX_MULTITRACK, avc, FourCcSupport::default());
+		assert!(
+			play_selection(&catalog, &h264_only).is_err(),
+			"b is enabled and is H.265"
+		);
+		catalog.video.renditions.get_mut("b").unwrap().enabled = false;
+		assert!(play_selection(&catalog, &h264_only).is_ok());
+		assert_eq!(best(&catalog, &h264_only).as_deref(), Some("a"));
+	}
+
+	/// A single-track client gets the best audio rendition it can play, not the first by name.
+	/// A multitrack client must still play every rendition.
+	#[test]
+	fn play_selection_picks_the_best_playable_audio() {
+		fn audio(codec: AudioCodec, bitrate: u64) -> hang::catalog::AudioConfig {
+			let mut config = hang::catalog::AudioConfig::new(codec, 48_000, 2);
+			config.bitrate = Some(bitrate);
+			config
+		}
+
+		let mut catalog = moq_mux::catalog::hang::Catalog::default();
+		// Name order would check Opus first and refuse a legacy client that can play the AAC.
+		catalog
+			.audio
+			.renditions
+			.insert("a".to_string(), audio(AudioCodec::Opus, 128_000));
+		catalog.audio.renditions.insert(
+			"b".to_string(),
+			audio(AudioCodec::AAC(hang::catalog::AAC { profile: 2 }), 64_000),
+		);
+
+		let legacy = ClientCapabilities::default();
+		let select = play_selection(&catalog, &legacy).expect("aac is playable");
+		let mut kept = catalog.clone();
+		select.retain(&mut kept);
+		assert_eq!(
+			kept.audio.renditions.keys().map(String::as_str).collect::<Vec<_>>(),
+			["b"]
+		);
+
+		// Nothing the client can play: cite the best rendition, not the first name.
+		let mut unsupported = moq_mux::catalog::hang::Catalog::default();
+		unsupported
+			.audio
+			.renditions
+			.insert("a".to_string(), audio(AudioCodec::Opus, 32_000));
+		unsupported
+			.audio
+			.renditions
+			.insert("b".to_string(), audio(AudioCodec::Ac3, 128_000));
+		let err = play_selection(&unsupported, &legacy).expect_err("no playable audio");
+		assert!(err.contains("ac-3"), "{err}");
+
+		// An advertised enhanced codec is kept, but not a sibling codec the client never
+		// advertised, even at a higher bitrate: an AC-3 decoder can't play E-AC-3.
+		let mut ac3 = moq_mux::catalog::hang::Catalog::default();
+		ac3.audio
+			.renditions
+			.insert("a".to_string(), audio(AudioCodec::Ac3, 128_000));
+		ac3.audio
+			.renditions
+			.insert("b".to_string(), audio(AudioCodec::Ec3, 256_000));
+		let support = FourCcSupport {
+			any: false,
+			fourccs: vec![*b"ac-3"],
+		};
+		let select = play_selection(&ac3, &ClientCapabilities::new(0, FourCcSupport::default(), support)).unwrap();
+		let mut kept = ac3.clone();
+		select.retain(&mut kept);
+		assert_eq!(
+			kept.audio.renditions.keys().map(String::as_str).collect::<Vec<_>>(),
+			["a"]
+		);
+
+		// Multitrack still requires every rendition.
+		let multitrack = ClientCapabilities::new(
+			CAPS_EX_MULTITRACK,
+			FourCcSupport::default(),
+			FourCcSupport {
+				any: false,
+				fourccs: vec![*b"Opus"],
+			},
+		);
+		assert!(play_selection(&catalog, &multitrack).is_err());
+	}
+
 	#[test]
 	fn play_capability_check_uses_per_kind_decode_support() {
 		let mut catalog = moq_mux::catalog::hang::Catalog::default();
@@ -1682,7 +2143,7 @@ mod tests {
 			fourccs: vec![*b"vp09"],
 		};
 		assert!(
-			check_play_capabilities(
+			play_selection(
 				&catalog,
 				&ClientCapabilities::new(0, video_support, FourCcSupport::default())
 			)
@@ -1694,7 +2155,7 @@ mod tests {
 			fourccs: vec![*b"vp09"],
 		};
 		assert!(
-			check_play_capabilities(
+			play_selection(
 				&catalog,
 				&ClientCapabilities::new(0, FourCcSupport::default(), audio_support)
 			)
@@ -1706,7 +2167,7 @@ mod tests {
 			fourccs: Vec::new(),
 		};
 		assert!(
-			check_play_capabilities(
+			play_selection(
 				&catalog,
 				&ClientCapabilities::new(0, wildcard, FourCcSupport::default())
 			)
@@ -1752,11 +2213,10 @@ mod tests {
 		let nalu = |b: u8| vec![0, 0, 0, 0, 0, 5, 0x65, b, 0x84, 0x21, 0x00];
 		let frames = multitrack_body(CODED_FRAMES, &[(0, nalu(0x88)), (1, nalu(0x99))]);
 
-		let origin = moq_net::Origin::random().produce();
-		let mut broadcast = origin
-			.create_broadcast("live/cam0", broadcast::Route::new().with_announce(true))
-			.unwrap();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let origin = moq_tokio::origin::spawn();
+		let mut broadcast = origin.create_broadcast("live/cam0").unwrap();
+		broadcast.announce(Default::default()).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let mut importer = FlvImport::new(broadcast, catalog.reserve());
 		importer.decode(&flv::file_header()).unwrap();
 		importer.decode(&flv::tag(flv::TAG_VIDEO, 0, &seq)).unwrap();
@@ -1814,7 +2274,7 @@ mod tests {
 		let mut server = Server::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
 		let addr = server.local_addr().unwrap();
 
-		let origin = moq_net::Origin::random().produce();
+		let origin = moq_tokio::origin::spawn();
 		let consumer = origin.consume();
 
 		let stream = TcpStream::connect(addr).await.unwrap();
@@ -1872,6 +2332,71 @@ mod tests {
 		};
 		publish.reject("test rejection").await.unwrap();
 		client.abort();
+	}
+
+	/// An encoder reconnecting under the same key while its stale connection is still
+	/// open restarts the broadcast at once: each connection is its own epoch, so a
+	/// fresh request reaches the reconnect, while the stale viewer stays on the old one
+	/// until it leaves.
+	#[tokio::test]
+	async fn a_reconnect_replaces_the_stale_publish() {
+		let mut server = Server::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+		let addr = server.local_addr().unwrap();
+		let origin = moq_tokio::origin::spawn();
+		let consumer = origin.consume();
+		let server_task = tokio::spawn(async move {
+			while let Some(request) = server.accept().await {
+				let Request::Publish(publish) = request else {
+					panic!("expected a publish request");
+				};
+				let origin = origin.clone();
+				tokio::spawn(async move { publish.accept(&origin, "live/cam0").await });
+			}
+		});
+
+		let stale_client = tokio::spawn(async move {
+			run_client(TcpStream::connect(addr).await.unwrap(), ClientMode::Publish).await;
+		});
+		tokio::time::timeout(Duration::from_secs(5), consumer.routed("live/cam0"))
+			.await
+			.expect("stale publish timed out")
+			.unwrap();
+		let stale = consumer.request_broadcast("live/cam0", None).await.unwrap();
+		let mut catalog = stale
+			.track(hang::Catalog::DEFAULT_NAME)
+			.unwrap()
+			.subscribe(None)
+			.await
+			.unwrap();
+
+		let mut announced = consumer.announced();
+		let fresh_client = tokio::spawn(async move {
+			run_client(TcpStream::connect(addr).await.unwrap(), ClientMode::Publish).await;
+		});
+		tokio::time::timeout(Duration::from_secs(5), async {
+			while !matches!(announced.next().await, Some(moq_net::announce::Event::Restart(_))) {}
+		})
+		.await
+		.expect("the reconnect restarts the broadcast");
+
+		let stale_viewer = tokio::time::timeout(Duration::from_millis(200), async {
+			loop {
+				match catalog.recv_group().await {
+					Ok(Some(_)) => continue,
+					other => return other.map(|_| ()),
+				}
+			}
+		})
+		.await;
+		assert!(stale_viewer.is_err(), "the stale viewer ended: {stale_viewer:?}");
+		assert!(!stale_client.is_finished(), "the stale connection is still open");
+
+		let fresh = consumer.request_broadcast("live/cam0", None).await.unwrap();
+		assert!(!fresh.is_clone(&stale), "viewers reach the reconnected publish");
+
+		stale_client.abort();
+		fresh_client.abort();
+		server_task.abort();
 	}
 
 	/// The connect `_result` should advertise the enhanced-RTMP codecs we ingest
@@ -2015,19 +2540,17 @@ mod tests {
 		client.abort();
 	}
 
-	/// The same publish flow, but over TLS: prove [`Server::with_tls`] terminates
-	/// RTMPS and yields an identical [`Request`]. Gated on `tls` (RTMPS support);
-	/// the cert is generated by the `moq-native` dev-dependency.
+	/// A throwaway self-signed server config for `localhost` plus a client connector that
+	/// trusts anything. The cert is generated by the `moq-tokio` dev-dependency.
 	#[cfg(feature = "tls")]
-	#[tokio::test]
-	async fn rtmps_accept_yields_publish_request() {
+	fn tls_fixture() -> (std::sync::Arc<rustls::ServerConfig>, tokio_rustls::TlsConnector) {
 		use std::sync::Arc;
 
 		use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 		use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 		use rustls::{DigitallySignedStruct, SignatureScheme};
 
-		// Accept any server cert: the test uses a throwaway self-signed cert.
+		// Accept any server cert: the tests use a throwaway self-signed cert.
 		#[derive(Debug)]
 		struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
 
@@ -2068,26 +2591,28 @@ mod tests {
 
 		let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
 
-		// Server: a self-signed cert for `localhost`, fronting the RTMP listener.
-		let mut tls = moq_native::tls::Server::default();
+		let mut tls = moq_tokio::tls::Listen::default();
 		tls.generate = vec!["localhost".to_string()];
 		let server_config = tls.server_config(vec![]).expect("build RTMPS server config");
 
-		let mut server = Server::bind("127.0.0.1:0".parse().unwrap())
-			.await
+		let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
+			.with_safe_default_protocol_versions()
 			.unwrap()
-			.with_tls(server_config);
-		let addr = server.local_addr().unwrap();
+			.dangerous()
+			.with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
+			.with_no_client_auth();
 
-		// Client: TLS-connect (no verify), then run the ordinary RTMP client.
+		(server_config, tokio_rustls::TlsConnector::from(Arc::new(client_config)))
+	}
+
+	/// Publish over TLS: prove the server terminates RTMPS and yields an identical
+	/// [`Request`].
+	#[cfg(feature = "tls")]
+	async fn rtmps_publish(server: &mut Server, connector: tokio_rustls::TlsConnector) {
+		use rustls::pki_types::ServerName;
+
+		let addr = server.local_addr().unwrap();
 		let client = tokio::spawn(async move {
-			let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
-				.with_safe_default_protocol_versions()
-				.unwrap()
-				.dangerous()
-				.with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
-				.with_no_client_auth();
-			let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
 			let tcp = TcpStream::connect(addr).await.unwrap();
 			let server_name = ServerName::try_from("localhost").unwrap();
 			let stream = connector.connect(server_name, tcp).await.unwrap();
@@ -2107,5 +2632,84 @@ mod tests {
 		};
 		publish.reject("test rejection").await.unwrap();
 		client.abort();
+	}
+
+	/// By default a server with TLS terminates RTMPS and still serves a plaintext client on the
+	/// same port. Gated on `tls` (RTMPS support).
+	#[cfg(feature = "tls")]
+	#[tokio::test]
+	async fn rtmps_and_rtmp_share_one_port() {
+		let (server_config, connector) = tls_fixture();
+
+		let mut server = Server::bind("127.0.0.1:0".parse().unwrap())
+			.await
+			.unwrap()
+			.with_tls(server_config);
+		let addr = server.local_addr().unwrap();
+
+		rtmps_publish(&mut server, connector).await;
+
+		let plain = tokio::spawn(async move {
+			let stream = TcpStream::connect(addr).await.unwrap();
+			run_client(stream, ClientMode::Play).await;
+		});
+		let request = tokio::time::timeout(Duration::from_secs(5), server.accept())
+			.await
+			.expect("plaintext accept timed out")
+			.expect("server yielded a plaintext request");
+		let Request::Play(play) = request else {
+			panic!("expected a play request");
+		};
+		play.reject("test rejection").await.unwrap();
+		plain.abort();
+	}
+
+	/// With plaintext turned off, a server refuses a plaintext client at its first byte,
+	/// without waiting for the request timeout, and keeps serving RTMPS afterwards.
+	#[cfg(feature = "tls")]
+	#[tokio::test]
+	async fn rtmps_required_refuses_plaintext() {
+		let (server_config, connector) = tls_fixture();
+
+		let mut server = Server::bind("127.0.0.1:0".parse().unwrap())
+			.await
+			.unwrap()
+			.with_tls(server_config)
+			.with_plaintext(false);
+		let addr = server.local_addr().unwrap();
+
+		// The connection is handled inside `accept`, so drive it while the plaintext client
+		// opens with an RTMP C0.
+		let plain = tokio::spawn(async move {
+			let mut stream = TcpStream::connect(addr).await.unwrap();
+			stream.write_all(&[0x03]).await.unwrap();
+			// A refusal closes the socket: EOF, or a reset when unread bytes were pending.
+			// A served client would instead be sent the handshake S0/S1.
+			let mut buf = [0u8; 1];
+			matches!(stream.read(&mut buf).await, Ok(0) | Err(_))
+		});
+
+		// The refusal comes well inside REQUEST_TIMEOUT, so a client that stayed open
+		// (a bug) fails the outer timeout rather than passing quietly.
+		let refused = tokio::select! {
+			refused = tokio::time::timeout(Duration::from_secs(5), plain) => refused,
+			request = server.accept() => panic!("plaintext client yielded a request: {}", request.is_some()),
+		};
+		assert!(refused.expect("plaintext client was not refused").unwrap());
+
+		rtmps_publish(&mut server, connector).await;
+	}
+
+	/// Refusing plaintext with no TLS to serve instead would listen for nothing, so the
+	/// server refuses to run rather than dropping every client.
+	#[tokio::test]
+	async fn plaintext_off_without_tls_is_refused() {
+		let mut server = Server::bind("127.0.0.1:0".parse().unwrap())
+			.await
+			.unwrap()
+			.with_plaintext(false);
+
+		assert!(server.check().is_err());
+		assert!(server.accept().await.is_none());
 	}
 }

@@ -1,5 +1,6 @@
 //! The track-free half of window consumption: frame payloads in, window events out.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use serde::de::DeserializeOwned;
@@ -102,6 +103,9 @@ pub struct Decoder<T> {
 
 	/// Events produced by the frames decoded so far, oldest first.
 	events: VecDeque<Queued<T>>,
+
+	/// Reused key buffers for refusing a frame that repeats a key.
+	check: RefCell<crate::strict::Scratch>,
 }
 
 impl<T> Decoder<T> {
@@ -113,6 +117,7 @@ impl<T> Decoder<T> {
 			len: 0,
 			delivered: None,
 			events: VecDeque::new(),
+			check: RefCell::default(),
 		}
 	}
 
@@ -159,37 +164,43 @@ impl<T: DeserializeOwned> Decoder<T> {
 			false => None,
 		};
 		let bytes = inflated.as_deref().unwrap_or(payload);
+		crate::strict::check(bytes, &self.check)?;
 
 		if !group.positioned {
-			let header: Header<T> = serde_path_to_error::deserialize(&mut serde_json::Deserializer::from_slice(bytes))
-				.map_err(|err| Error::Json(err.to_string()))?;
-			self.apply_header(header.offset, header.records)?;
+			let header: Header<T> = parse(bytes)?;
+			self.apply_header(header.offset, header.start.unwrap_or(header.offset), header.records)?;
 			group.positioned = true;
 			return Ok(());
 		}
 
-		match serde_path_to_error::deserialize(&mut serde_json::Deserializer::from_slice(bytes))
-			.map_err(|err| Error::Json(err.to_string()))?
-		{
+		match parse(bytes)? {
 			Op::Push(record) => self.apply_push(record),
 			Op::Pop(count) => self.apply_pop(count),
 		}
 	}
 
-	/// The window is exactly these records. Report what this reader missed, then what is new.
-	fn apply_header(&mut self, offset: u64, records: Vec<T>) -> Result<()> {
+	/// Apply a logical window range and its decodable suffix.
+	fn apply_header(&mut self, offset: u64, start: u64, records: Vec<T>) -> Result<()> {
 		if offset > MAX_INDEX {
 			return Err(Error::Json("window offset exceeds the safe integer range".into()));
 		}
+		if start < offset {
+			return Err(Error::Json("window checkpoint starts before its offset".into()));
+		}
 		let len = u64::try_from(records.len()).map_err(|_| Error::Json("window length exceeds u64".into()))?;
-		let end = offset
+		let end = start
 			.checked_add(len)
 			.filter(|end| *end <= MAX_INDEX)
 			.ok_or_else(|| Error::Json("window range exceeds the safe integer range".into()))?;
 
 		let delivered = match self.delivered {
 			// First position: adopt the publisher's offset rather than skipping all of history.
-			None => offset,
+			None => {
+				if offset < start {
+					self.events.push_back(Queued::Event(Event::Skip(offset..start)));
+				}
+				offset
+			}
 			Some(delivered) => {
 				if offset < self.front || end < delivered {
 					return Err(Error::Json("window header moved backwards".into()));
@@ -202,7 +213,7 @@ impl<T: DeserializeOwned> Decoder<T> {
 				if !popped.is_empty() {
 					self.events.push_back(Queued::Event(Event::Pop(popped)));
 				}
-				let skipped = delivered..offset;
+				let skipped = delivered..start;
 				if !skipped.is_empty() {
 					self.events.push_back(Queued::Event(Event::Skip(skipped)));
 				}
@@ -211,7 +222,7 @@ impl<T: DeserializeOwned> Decoder<T> {
 		};
 
 		// Keep the unseen tail as one batch and materialize each push only when the caller asks for it.
-		let skip = usize::try_from(delivered.saturating_sub(offset))
+		let skip = usize::try_from(delivered.saturating_sub(start))
 			.map_err(|_| Error::Json("window length exceeds usize".into()))?;
 		let mut records = records.into_iter();
 		if skip > 0 {
@@ -219,7 +230,7 @@ impl<T: DeserializeOwned> Decoder<T> {
 		}
 		if !records.as_slice().is_empty() {
 			self.events.push_back(Queued::Push {
-				index: offset + skip as u64,
+				index: start + skip as u64,
 				records,
 			});
 		}
@@ -282,6 +293,16 @@ impl<T: DeserializeOwned> Decoder<T> {
 
 		Ok(())
 	}
+}
+
+/// Deserialize one whole frame, naming the JSON path of any failure.
+fn parse<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+	// Tracking the path allocates for every key walked, which dwarfed the decode itself, so it only
+	// runs again to explain a failure. Trailing data has no path, so it keeps the plain error.
+	serde_json::from_slice(bytes).map_err(|err| {
+		let tracked = serde_path_to_error::deserialize::<_, T>(&mut serde_json::Deserializer::from_slice(bytes));
+		Error::Json(tracked.err().map_or_else(|| err.to_string(), |err| err.to_string()))
+	})
 }
 
 impl<T> Group<'_, T> {

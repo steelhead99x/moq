@@ -7,23 +7,27 @@ description: Build, test, and debug the MoQ repository
 
 The repository uses [Just](https://github.com/casey/just) as its command
 runner. Run commands inside the Nix dev shell (`nix develop`) so your tools
-match CI.
+match CI. `just check` and `just fix` refuse to run outside it; set
+`MOQ_ALLOW_HOST=1` to use the host toolchain anyway.
 
 | Command | Purpose |
 | --- | --- |
 | `just` | Start the local relay, test publisher, and web demo. |
 | `just --list` | List every recipe. |
 | `just fix` | Format and lint the packages this branch changed. |
-| `just check` | Compile and lint the same scope. This is what CI runs. |
-| `just test` | Run tests for the same scope. |
-| `just fix-all`, `just check-all`, `just test all` | The same, over every package. |
+| `just check` | Compile, lint, and test the same scope. |
+| `just ci` | Run the merge queue's gate locally, strictly. PRs into `main` get no other CI, so run it before every push. |
+| `just gate` | `just ci` over every package, as nightly and release PRs run it. |
+| `just fix --all`, `just check --all` | The same, over every package. |
 | `just pub bbb <url>` | Publish Big Buck Bunny (also `tos`, `clock`, `gst`, `hls`). |
 | `just sub gst bbb <url>` | Play a broadcast through GStreamer. |
 | `just relay` | Run a local relay on its own. |
 | `just boy` | Run the [MoQ Boy](/bin/demo) demo. |
 
 Recipes default to the local relay at `http://localhost:4443`. Pass
-`https://cdn.moq.dev/anon` to use the public relay instead.
+`https://cdn.moq.dev/anon` to use the public relay instead. `just pub bbb`
+publishes the original 720p video plus a pre-encoded 360p rendition, so the
+player can switch between them without encoding while publishing.
 
 ## Debugging
 
@@ -39,12 +43,12 @@ fetch groups with `curl`, which is the quickest way to see what a relay holds.
 ## Windows
 
 Nix isn't available on Windows, so `setup.bat` installs the toolchain with
-winget: Git, Rust, Bun, Node, just, CMake, and the Visual Studio Build Tools.
+winget: Git, Rust, Bun, Node, just, CMake, FFmpeg, and the Visual Studio Build Tools.
 Run it from an Administrator terminal on a fresh machine, and re-run it after
 reopening the terminal if it reports tools missing from `PATH`.
 
 Run `just` recipes from **Git Bash**, not PowerShell or `cmd`: they need
-`bash` and `cygpath`. Only one `just dev` can run at a time on Windows, because
+`bash`. Only one `just dev` can run at a time on Windows, because
 the free-port probe needs `lsof`. If a rebuild fails with "Access is denied",
 a previous relay is still running:
 
@@ -58,8 +62,11 @@ taskkill /IM moq.exe /F
 ```bash
 just fix
 just check
-just test
 ```
+
+These diff the branch against its upstream (or `origin/main`) and run only the
+modules the diff reaches. The map from paths to modules lives in
+`sh/dispatch.sh`.
 
 See [CONTRIBUTING.md](https://github.com/moq-dev/moq/blob/main/CONTRIBUTING.md)
 for branch targeting, commit messages, and reviews, and [Agent setup](/setup/agent)

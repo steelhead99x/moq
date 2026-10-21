@@ -2,10 +2,12 @@ package dev.moq.ffi
 
 import kotlinx.coroutines.test.runTest
 import uniffi.moq.MoqClient
+import uniffi.moq.MoqClientConfig
 import uniffi.moq.MoqException
-import uniffi.moq.MoqOriginOptions
+import uniffi.moq.MoqOriginConfig
 import uniffi.moq.MoqOriginProducer
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 
 /**
@@ -16,7 +18,7 @@ import kotlin.test.assertFailsWith
 class BindingsSmokeTest {
     @Test
     fun `client constructs and connect fails fast on a bad url`() = runTest {
-        MoqClient().use { client ->
+        MoqClient(MoqClientConfig()).use { client ->
             client.cancel()
             assertFailsWith<MoqException> {
                 client.connect("https://localhost:0/test")
@@ -25,8 +27,14 @@ class BindingsSmokeTest {
     }
 
     @Test
+    fun `an exception prints the Rust error message`() {
+        assertEquals("closed", MoqException.Closed().toString())
+        assertEquals("transport: reset", MoqException.Transport("reset").toString())
+    }
+
+    @Test
     fun `origin producer constructs and consumes`() = runTest {
-        MoqOriginProducer(MoqOriginOptions()).use { origin ->
+        MoqOriginProducer(MoqOriginConfig()).use { origin ->
             origin.consume().use { /* lifecycle smoke */ }
         }
     }

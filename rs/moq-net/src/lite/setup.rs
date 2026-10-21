@@ -1,4 +1,4 @@
-//! The lite-05 SETUP message: each endpoint advertises its capabilities once, as
+//! The lite-05+ SETUP message: each endpoint advertises its capabilities once, as
 //! the sole message on a unidirectional Setup Stream, then closes it.
 
 use crate::coding::*;
@@ -13,8 +13,10 @@ const PARAM_PATH: u64 = 0x2;
 const PARAM_ROLE: u64 = 0x3;
 /// Setup Parameter id for the link cost the dialer assigns to this connection.
 const PARAM_COST: u64 = 0x4;
-/// Setup Parameter id for the endpoint's origin (hop) id.
-const PARAM_ORIGIN: u64 = 0x5;
+/// Setup Parameter id for the endpoint's Hop ID.
+const PARAM_HOP: u64 = 0x5;
+/// Setup Parameter id offering the `ietf` extension (draft-lcurley-moq-ietf): "IETF" in ASCII.
+const PARAM_IETF: u64 = 0x4945_5446;
 
 /// The cost of crossing a link that neither end priced.
 ///
@@ -54,8 +56,8 @@ impl ProbeLevel {
 	/// Both metrics are sampled rather than declared, so this only works for a
 	/// transport whose figures exist by the time the session starts. QUIC and TCP
 	/// both qualify: their RTT comes from the handshake, which has already happened.
-	pub fn detect<S: web_transport_trait::Session>(session: &S) -> Self {
-		use web_transport_trait::Stats as _;
+	pub fn detect<S: crate::transport::poll::Session>(session: &S) -> Self {
+		use crate::transport::Stats as _;
 		let stats = session.stats();
 		match stats.estimated_send_rate().is_some() || stats.rtt().is_some() {
 			true => Self::Report,
@@ -163,8 +165,8 @@ pub struct Setup {
 	/// qmux over TCP/TLS, unix sockets), with `?` and the URI query appended when
 	/// there is one. Sent only by the client; a server never sends one and a relay
 	/// never forwards it. `None` on URI-carrying bindings, where it would be a
-	/// protocol violation. An empty path means the same thing as `None`; both are
-	/// on the wire so a client need not special-case the root.
+	/// protocol violation. On an in-band binding an empty path selects the root, like `None`;
+	/// a URI binding forbids even an empty Path parameter.
 	pub path: Option<String>,
 	/// The single direction the client intends to use, or `None` for a bidirectional
 	/// session. `None` is sent as the absence of the parameter, which is also how a
@@ -176,23 +178,78 @@ pub struct Setup {
 	/// Directional: it prices the sender's own egress, so both ends declare their own
 	/// and the two need not match. `None` means the default cost of 1.
 	pub cost: Option<u64>,
-	/// This endpoint's origin (hop) id, the identity it stamps onto forwarded
-	/// announcements. The peer uses it to serve this endpoint's subscriptions from
-	/// a route that does not flow through it (the same split horizon the announce
-	/// filter applies). `None` when the endpoint has no meaningful identity (a
+	/// This endpoint's Hop ID, the identity forwarded announcements name it by.
+	/// The peer uses it to serve this endpoint's subscriptions from a route that
+	/// does not flow through it (the same split horizon the announce filter
+	/// applies). `None` when the endpoint has no meaningful identity (a
 	/// leaf that never forwards); a wire value of 0 decodes as `None`.
-	pub origin: Option<crate::Origin>,
+	pub hop: Option<crate::Hop>,
+	/// Whether this endpoint offers the `ietf` extension (lite-07+). Negotiated only when
+	/// both endpoints offer it.
+	pub ietf: bool,
 }
 
 impl Message for Setup {
-	fn decode_msg<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+	const MAX_SIZE: usize = crate::setup::MAX_SETUP_SIZE;
+
+	fn decode_msg(r: &mut Decoder<'_>, version: Version) -> Result<Self, DecodeError> {
+		ReceivedSetup::decode_msg(r, version).map(|received| received.setup)
+	}
+
+	fn encode_msg(&self, w: &mut Encoder<'_>, version: Version) -> Result<(), EncodeError> {
+		if !version.has_setup_stream() {
+			return Err(EncodeError::Version);
+		}
+
+		let mut params = Parameters::default();
+		// None is the wire default, so omit it to keep the message empty when nothing is set.
+		if self.probe != ProbeLevel::None {
+			params.set_varint(PARAM_PROBE, self.probe.to_code(), version)?;
+		}
+		if let Some(path) = &self.path {
+			params.set_bytes(PARAM_PATH, path.as_bytes().to_vec());
+		}
+		// Bidirectional is the wire default (absence of the parameter), so only a
+		// directional role is encoded.
+		if let Some(role) = self.role {
+			params.set_varint(PARAM_ROLE, role.to_code(), version)?;
+		}
+		if let Some(cost) = self.cost {
+			params.set_varint(PARAM_COST, cost, version)?;
+		}
+		if let Some(hop) = self.hop {
+			params.set_varint(PARAM_HOP, hop.id(), version)?;
+		}
+		if self.ietf {
+			// The framing it changes is unpublished, so a published version cannot offer it.
+			if !version.has_ietf() {
+				return Err(EncodeError::Version);
+			}
+			params.set_bytes(PARAM_IETF, Vec::new());
+		}
+
+		params.encode(w, version)
+	}
+}
+
+/// Raw presence is needed even when an unknown Role decodes as bidirectional.
+#[derive(Debug)]
+pub(super) struct ReceivedSetup {
+	pub setup: Setup,
+	role_present: bool,
+}
+
+impl Message for ReceivedSetup {
+	const MAX_SIZE: usize = Setup::MAX_SIZE;
+
+	fn decode_msg(r: &mut Decoder<'_>, version: Version) -> Result<Self, DecodeError> {
 		if !version.has_setup_stream() {
 			return Err(DecodeError::Version);
 		}
 
 		let params = Parameters::decode(r, version)?;
 		let probe = params
-			.get_varint(PARAM_PROBE)?
+			.get_varint(PARAM_PROBE, version)?
 			.map(ProbeLevel::from_code)
 			.unwrap_or_default();
 		let path = match params.get_bytes(PARAM_PATH) {
@@ -203,49 +260,38 @@ impl Message for Setup {
 			),
 			None => None,
 		};
-		let role = params.get_varint(PARAM_ROLE)?.and_then(Role::from_code);
-		let cost = params.get_varint(PARAM_COST)?;
+		let role_code = params.get_varint(PARAM_ROLE, version)?;
+		let role = role_code.and_then(Role::from_code);
+		let cost = params.get_varint(PARAM_COST, version)?;
 		// 0 is legal on the wire but carries no identity (it can't be excluded),
 		// so it decodes as "not declared" rather than an error.
-		let origin = params
-			.get_varint(PARAM_ORIGIN)?
-			.and_then(|id| crate::Origin::new(id).ok());
+		let hop = params
+			.get_varint(PARAM_HOP, version)?
+			.and_then(|id| crate::Hop::new(id).ok());
+		// An older version does not know the parameter, so it ignores it like any other.
+		let ietf = match params.get_bytes(PARAM_IETF) {
+			Some(value) if version.has_ietf() => match value.is_empty() {
+				true => true,
+				false => return Err(DecodeError::InvalidValue),
+			},
+			_ => false,
+		};
 
 		Ok(Self {
-			probe,
-			path,
-			role,
-			cost,
-			origin,
+			role_present: role_code.is_some(),
+			setup: Setup {
+				probe,
+				path,
+				role,
+				cost,
+				hop,
+				ietf,
+			},
 		})
 	}
 
-	fn encode_msg<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
-		if !version.has_setup_stream() {
-			return Err(EncodeError::Version);
-		}
-
-		let mut params = Parameters::default();
-		// None is the wire default, so omit it to keep the message empty when nothing is set.
-		if self.probe != ProbeLevel::None {
-			params.set_varint(PARAM_PROBE, self.probe.to_code());
-		}
-		if let Some(path) = &self.path {
-			params.set_bytes(PARAM_PATH, path.as_bytes().to_vec());
-		}
-		// Bidirectional is the wire default (absence of the parameter), so only a
-		// directional role is encoded.
-		if let Some(role) = self.role {
-			params.set_varint(PARAM_ROLE, role.to_code());
-		}
-		if let Some(cost) = self.cost {
-			params.set_varint(PARAM_COST, cost);
-		}
-		if let Some(origin) = self.origin {
-			params.set_varint(PARAM_ORIGIN, origin.id());
-		}
-
-		params.encode(w, version)
+	fn encode_msg(&self, w: &mut Encoder<'_>, version: Version) -> Result<(), EncodeError> {
+		self.setup.encode_msg(w, version)
 	}
 }
 
@@ -254,49 +300,114 @@ impl Message for Setup {
 /// Streams whose encoding depends on a negotiated capability (e.g. the PROBE
 /// stream) wait on this before deciding what to do. Cheap to clone: every handle
 /// shares the same slot.
-#[derive(Clone, Default)]
-pub(crate) struct PeerSetup(kio::Shared<Option<Setup>>);
+#[derive(Clone)]
+pub(crate) struct PeerSetup(kio::Shared<PeerSetupState>);
+
+struct PeerSetupState {
+	client: bool,
+	binding: crate::transport::Binding,
+	/// Whether our own SETUP offers the `ietf` extension.
+	ietf: bool,
+	seen: bool,
+	setup: Option<Setup>,
+}
 
 impl PeerSetup {
+	pub fn new(client: bool, binding: crate::transport::Binding) -> Self {
+		Self(kio::Shared::new(PeerSetupState {
+			client,
+			binding,
+			ietf: false,
+			seen: false,
+			setup: None,
+		}))
+	}
+
+	pub(super) fn receive(&self, received: ReceivedSetup) -> Result<(), crate::Error> {
+		let mut state = self.0.lock();
+		if ((state.client || state.binding == crate::transport::Binding::Uri) && received.setup.path.is_some())
+			|| (state.client && received.role_present)
+		{
+			return Err(crate::Error::ProtocolViolation);
+		}
+		state.seen = true;
+		state.setup = Some(received.setup);
+		Ok(())
+	}
+
+	/// Note whether our own SETUP offers the `ietf` extension, before any stream depends on it.
+	pub fn offer_ietf(self, ietf: bool) -> Self {
+		self.0.lock().ietf = ietf;
+		self
+	}
+
+	/// Poll whether the `ietf` extension is negotiated: both SETUPs offer it.
+	///
+	/// Resolves at once when we did not offer it, and otherwise once the peer's SETUP arrives.
+	pub fn poll_ietf(&self, waiter: &kio::Waiter) -> std::task::Poll<bool> {
+		if !self.0.lock().ietf {
+			return std::task::Poll::Ready(false);
+		}
+		self.poll_get(waiter, |setup| setup.ietf)
+	}
+
+	/// Whether the `ietf` extension is negotiated, or `None` before the peer's SETUP arrives.
+	pub fn ietf(&self) -> Option<bool> {
+		let state = self.0.lock();
+		match state.ietf {
+			false => Some(false),
+			true => state.setup.as_ref().map(|setup| setup.ietf),
+		}
+	}
+
 	/// Record the peer's SETUP.
 	pub fn set(&self, setup: Setup) {
-		*self.0.lock() = Some(setup);
+		let mut state = self.0.lock();
+		state.seen = true;
+		state.setup = Some(setup);
 	}
 
-	/// Await the peer's advertised probe level, blocking until its SETUP arrives.
-	pub async fn probe_level(&self) -> ProbeLevel {
-		self.wait(|setup| setup.probe).await
+	/// Claim the Setup Stream before decoding its body, refusing any second stream.
+	pub fn claim(&self) -> Result<(), crate::Error> {
+		let mut state = self.0.lock();
+		if state.seen {
+			return Err(crate::Error::ProtocolViolation);
+		}
+		state.seen = true;
+		Ok(())
 	}
 
-	/// Await the link cost the peer (the dialing side) declared in its SETUP.
+	/// Poll for the peer's advertised probe level, waiting until its SETUP arrives.
+	pub fn poll_probe_level(&self, waiter: &kio::Waiter) -> std::task::Poll<ProbeLevel> {
+		self.poll_get(waiter, |setup| setup.probe)
+	}
+
+	/// Poll for the link cost the peer (the dialing side) declared in its SETUP.
 	/// `None` when it declared none, meaning the default cost of 1.
-	pub async fn cost(&self) -> Option<u64> {
-		self.wait(|setup| setup.cost).await
+	pub fn poll_cost(&self, waiter: &kio::Waiter) -> std::task::Poll<Option<u64>> {
+		self.poll_get(waiter, |setup| setup.cost)
 	}
 
-	/// Await the origin (hop) id the peer declared in its SETUP. `None` when it
-	/// declared none: a leaf with no identity worth excluding.
-	pub async fn origin(&self) -> Option<crate::Origin> {
-		self.wait(|setup| setup.origin).await
+	/// Poll for the [`Hop`](crate::Hop) id the peer declared in its SETUP `Hop`
+	/// parameter. `None` when it declared none: a leaf with no identity worth excluding.
+	pub fn poll_hop(&self, waiter: &kio::Waiter) -> std::task::Poll<Option<crate::Hop>> {
+		self.poll_get(waiter, |setup| setup.hop)
 	}
 
-	/// Await the peer's SETUP and read a field out of it.
+	/// Poll for a field of the peer's SETUP.
 	///
 	/// The peer MUST send exactly one SETUP, so this resolves once that stream is read.
-	/// Waits forever if it never does; the caller is a session task, cancelled when the
-	/// driver drops.
-	async fn wait<T>(&self, f: impl FnOnce(&Setup) -> T) -> T {
-		let slot = self
-			.0
-			.wait(|setup| {
-				if setup.is_some() {
-					std::task::Poll::Ready(())
-				} else {
-					std::task::Poll::Pending
-				}
-			})
-			.await;
-		f(slot.as_ref().expect("waited for Some"))
+	/// Pends forever if it never does; the caller is session state, dropped with the
+	/// driver.
+	fn poll_get<T>(&self, waiter: &kio::Waiter, f: impl FnOnce(&Setup) -> T) -> std::task::Poll<T> {
+		let slot = std::task::ready!(self.0.poll(waiter, |setup| {
+			if setup.setup.is_some() {
+				std::task::Poll::Ready(())
+			} else {
+				std::task::Poll::Pending
+			}
+		}));
+		std::task::Poll::Ready(f(slot.setup.as_ref().expect("waited for Some")))
 	}
 }
 
@@ -305,10 +416,11 @@ mod tests {
 	use super::*;
 
 	fn round_trip(msg: &Setup) -> Setup {
-		let mut buf = bytes::BytesMut::new();
-		msg.encode(&mut buf, Version::Lite05).unwrap();
+		let mut buf = Vec::new();
+		msg.encode(&mut Encoder::new(&mut buf, Version::Lite05.into()), Version::Lite05)
+			.unwrap();
 		let mut slice = &buf[..];
-		let got = Setup::decode(&mut slice, Version::Lite05).unwrap();
+		let got = crate::coding::decode_buf(&mut slice, Version::Lite05, Setup::decode).unwrap();
 		assert!(bytes::Buf::remaining(&slice) == 0, "trailing bytes after decode");
 		got
 	}
@@ -323,6 +435,7 @@ mod tests {
 	/// draft makes such a publisher reset any Probe Stream a subscriber opens. It
 	/// must advertise `None` so the subscriber never opens one.
 	#[test]
+	#[cfg(feature = "async")]
 	fn detect_reports_nothing_without_stats() {
 		use crate::lite::test_transport::{SinkSession, SinkStats};
 		let session = SinkSession::new(Default::default()).with_stats(SinkStats::default());
@@ -332,6 +445,7 @@ mod tests {
 	/// Either metric alone is enough to report, since the two PROBE fields are
 	/// independent on the wire.
 	#[test]
+	#[cfg(feature = "async")]
 	fn detect_reports_with_either_metric() {
 		use crate::lite::test_transport::{SinkSession, SinkStats};
 
@@ -368,6 +482,78 @@ mod tests {
 		}
 	}
 
+	/// Parameter values follow the session's varint codec, not a fixed one: a value that
+	/// takes the two-byte QUIC form on lite-06 fits one leading-ones byte on lite-07.
+	#[test]
+	fn parameter_values_use_the_version_codec() {
+		let msg = Setup {
+			cost: Some(100),
+			..Default::default()
+		};
+		for (version, wire) in [
+			(Version::Lite06, &[0x05, 0x01, 0x04, 0x02, 0x40, 0x64][..]),
+			(Version::Lite07, &[0x04, 0x01, 0x04, 0x01, 0x64][..]),
+		] {
+			let buf = msg.encode_bytes(version).unwrap();
+			assert_eq!(buf, wire, "{version}");
+			assert_eq!(
+				Setup::decode_slice(&buf, version).unwrap(),
+				(msg.clone(), buf.len()),
+				"{version}"
+			);
+		}
+	}
+
+	/// The `ietf` offer is an empty parameter that only a version with the extension sends,
+	/// and an older one ignores like any unknown parameter.
+	#[test]
+	fn ietf_offer_is_lite07_only() {
+		let msg = Setup {
+			ietf: true,
+			..Default::default()
+		};
+		let buf = msg.encode_bytes(Version::Lite07).unwrap();
+		assert_eq!(Setup::decode_slice(&buf, Version::Lite07).unwrap().0, msg);
+		assert!(msg.encode_bytes(Version::Lite06).is_err());
+
+		// Length, one parameter, its 8-byte QUIC varint ID, and an empty value.
+		let older = [0x0a, 0x01, 0xc0, 0, 0, 0, 0x49, 0x45, 0x54, 0x46, 0x00];
+		assert_eq!(
+			Setup::decode_slice(&older, Version::Lite06).unwrap().0,
+			Setup::default()
+		);
+
+		// A value it does not define is refused.
+		let mut valued = buf.to_vec();
+		assert_eq!(valued.pop(), Some(0), "the offer ends in its empty value");
+		valued.extend([1, 7]);
+		valued[0] += 1;
+		assert!(Setup::decode_slice(&valued, Version::Lite07).is_err());
+	}
+
+	/// Never emit a SETUP our own receiver would refuse.
+	#[test]
+	fn encode_enforces_the_setup_limit() {
+		// Count, id, and a 4-byte length varint precede the path.
+		let at_limit = crate::setup::MAX_SETUP_SIZE - 6;
+		let msg = Setup {
+			path: Some("a".repeat(at_limit)),
+			..Default::default()
+		};
+		assert_eq!(round_trip(&msg), msg);
+
+		let msg = Setup {
+			path: Some("a".repeat(at_limit + 1)),
+			..Default::default()
+		};
+		let mut buf = Vec::new();
+		assert!(matches!(
+			msg.encode(&mut Encoder::new(&mut buf, Version::Lite05.into()), Version::Lite05),
+			Err(EncodeError::TooLarge)
+		));
+		assert!(buf.is_empty());
+	}
+
 	#[test]
 	fn path_round_trip() {
 		let msg = Setup {
@@ -379,9 +565,9 @@ mod tests {
 	}
 
 	#[test]
-	fn origin_round_trip() {
+	fn hop_round_trip() {
 		let msg = Setup {
-			origin: Some(crate::Origin::new(42).unwrap()),
+			hop: Some(crate::Hop::new(42).unwrap()),
 			..Default::default()
 		};
 		assert_eq!(round_trip(&msg), msg);
@@ -390,21 +576,25 @@ mod tests {
 	// A declared id of 0 carries no identity (it cannot be excluded), so it
 	// decodes as absent rather than erroring.
 	#[test]
-	fn origin_zero_decodes_as_none() {
+	fn hop_zero_decodes_as_none() {
 		use crate::coding::Encode;
 
 		let version = Version::Lite05;
 		let mut params = Parameters::default();
-		params.set_varint(super::PARAM_ORIGIN, 0);
-		let mut body = bytes::BytesMut::new();
-		params.encode(&mut body, version).unwrap();
+		params.set_varint(super::PARAM_HOP, 0, version).unwrap();
+		let mut body = Vec::new();
+		params
+			.encode(&mut Encoder::new(&mut body, version.into()), version)
+			.unwrap();
 		// Frame the body with the Message Length prefix `Setup::decode` expects.
-		let mut buf = bytes::BytesMut::new();
-		(body.len() as u64).encode(&mut buf, version).unwrap();
+		let mut buf = Vec::new();
+		Encoder::new(&mut buf, version.into())
+			.varint(body.len() as u64)
+			.unwrap();
 		buf.extend_from_slice(&body);
 		let mut slice = &buf[..];
-		let got = Setup::decode(&mut slice, version).unwrap();
-		assert_eq!(got.origin, None);
+		let got = crate::coding::decode_buf(&mut slice, version, Setup::decode).unwrap();
+		assert_eq!(got.hop, None);
 	}
 
 	#[test]
@@ -435,16 +625,20 @@ mod tests {
 		// Frame a SETUP message carrying an unknown probe level (99) by hand: the
 		// parameters body, prefixed with its length (the lite Message size prefix).
 		let mut params = Parameters::default();
-		params.set_varint(PARAM_PROBE, 99);
+		params.set_varint(PARAM_PROBE, 99, Version::Lite05).unwrap();
 		let mut body = Vec::new();
-		params.encode(&mut body, Version::Lite05).unwrap();
+		params
+			.encode(&mut Encoder::new(&mut body, Version::Lite05.into()), Version::Lite05)
+			.unwrap();
 
-		let mut buf = bytes::BytesMut::new();
-		body.len().encode(&mut buf, Version::Lite05).unwrap();
+		let mut buf = Vec::new();
+		Encoder::new(&mut buf, Version::Lite05.into())
+			.varint(body.len() as u64)
+			.unwrap();
 		buf.extend_from_slice(&body);
 
 		let mut slice = &buf[..];
-		let got = Setup::decode(&mut slice, Version::Lite05).unwrap();
+		let got = crate::coding::decode_buf(&mut slice, Version::Lite05, Setup::decode).unwrap();
 		assert_eq!(got.probe, ProbeLevel::Increase);
 	}
 
@@ -465,16 +659,20 @@ mod tests {
 		// server. The draft mandates this fallback.
 		for code in [0u64, 9, 250] {
 			let mut params = Parameters::default();
-			params.set_varint(PARAM_ROLE, code);
+			params.set_varint(PARAM_ROLE, code, Version::Lite05).unwrap();
 			let mut body = Vec::new();
-			params.encode(&mut body, Version::Lite05).unwrap();
+			params
+				.encode(&mut Encoder::new(&mut body, Version::Lite05.into()), Version::Lite05)
+				.unwrap();
 
-			let mut buf = bytes::BytesMut::new();
-			body.len().encode(&mut buf, Version::Lite05).unwrap();
+			let mut buf = Vec::new();
+			Encoder::new(&mut buf, Version::Lite05.into())
+				.varint(body.len() as u64)
+				.unwrap();
 			buf.extend_from_slice(&body);
 
 			let mut slice = &buf[..];
-			let got = Setup::decode(&mut slice, Version::Lite05).unwrap();
+			let got = crate::coding::decode_buf(&mut slice, Version::Lite05, Setup::decode).unwrap();
 			assert_eq!(got.role, None, "role code {code} should decode as bidirectional");
 		}
 	}
@@ -482,9 +680,9 @@ mod tests {
 	#[test]
 	fn rejects_before_lite05() {
 		let msg = Setup::default();
-		let mut buf = bytes::BytesMut::new();
+		let mut buf = Vec::new();
 		assert!(matches!(
-			msg.encode(&mut buf, Version::Lite04),
+			msg.encode(&mut Encoder::new(&mut buf, Version::Lite04.into()), Version::Lite04),
 			Err(EncodeError::Version)
 		));
 	}
@@ -497,15 +695,19 @@ mod tests {
 		params.set_bytes(0xbeef, b"whatever".to_vec());
 
 		let mut body = Vec::new();
-		params.encode(&mut body, Version::Lite05).unwrap();
+		params
+			.encode(&mut Encoder::new(&mut body, Version::Lite05.into()), Version::Lite05)
+			.unwrap();
 
 		// Wrap with the message size prefix the Message impl expects.
-		let mut buf = bytes::BytesMut::new();
-		body.len().encode(&mut buf, Version::Lite05).unwrap();
+		let mut buf = Vec::new();
+		Encoder::new(&mut buf, Version::Lite05.into())
+			.varint(body.len() as u64)
+			.unwrap();
 		buf.extend_from_slice(&body);
 
 		let mut slice = &buf[..];
-		let got = Setup::decode(&mut slice, Version::Lite05).unwrap();
+		let got = crate::coding::decode_buf(&mut slice, Version::Lite05, Setup::decode).unwrap();
 		assert_eq!(got.path.as_deref(), Some("/foo"));
 	}
 }

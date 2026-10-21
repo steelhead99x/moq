@@ -13,9 +13,10 @@
 //! clone-able handles, bounded or unbounded, with separate wake lists for the
 //! push and pop sides.
 //!
-//! [`Fan`] hands out a [`Waker`](std::task::Waker) that wakes a whole [`WaiterList`], for
-//! driving a foreign future that keeps a single waker on behalf of everyone parked on it.
-//! It either owns the list or, via [`Fan::project`], wakes one already inside a [`Lock`].
+//! [`coop`] bounds the passes a loop makes per poll, so one that always finds
+//! work ready still yields.
+
+#![warn(missing_docs)]
 
 use std::{
 	fmt,
@@ -28,20 +29,16 @@ mod lock;
 mod sync;
 mod waiter;
 
+pub mod coop;
+
 mod consumer;
-mod pollable;
+mod pending;
 mod producer;
 mod queue;
 mod send;
 mod shared;
+mod task;
 mod weak;
-
-#[cfg(feature = "time")]
-pub mod time;
-
-#[cfg(feature = "tokio")]
-#[doc(hidden)]
-pub mod tokio;
 
 #[cfg(all(test, loom))]
 mod loom;
@@ -49,14 +46,59 @@ mod loom;
 mod tests;
 
 pub use consumer::Consumer;
-pub use lock::{Lock, LockGuard, WeakLock};
-pub use pollable::{Pending, Pollable};
-pub use producer::{Mut, Producer, Ref};
+pub use lock::{Lock, LockGuard};
+pub use pending::Pending;
+pub use producer::{Mut, Producer, Ref, Unused};
 pub use queue::{PushError, Queue};
 pub use send::MaybeSend;
 pub use shared::Shared;
-pub use waiter::{Fan, Hold, Park, Waiter, WaiterList, wait};
+pub use task::{Task, Tasks};
+pub use waiter::{Park, Waiter, WaiterList, wait};
 pub use weak::{ConsumerWeak, ProducerWeak, Weak};
+
+/// Bytes an `Arc<T>` allocation occupies: `T` behind two reference counts, padded to
+/// `T`'s alignment and rounded up to the whole layout's.
+///
+/// The `const` equivalent of `Layout::extend` followed by `pad_to_align`, neither of
+/// which is `const`. `arc_heap_matches_layout` holds it to those.
+const fn arc_heap<T>() -> usize {
+	let counts = 2 * size_of::<usize>();
+	let align = align_of::<T>();
+	let layout = if align > align_of::<usize>() {
+		align
+	} else {
+		align_of::<usize>()
+	};
+	(counts.next_multiple_of(align) + size_of::<T>()).next_multiple_of(layout)
+}
+
+#[cfg(test)]
+mod heap {
+	use std::alloc::Layout;
+
+	use super::*;
+
+	/// [`arc_heap`] hand-rolls what `Layout` does, because `Layout` isn't `const`. Hold
+	/// it to the real thing, including a `T` aligned past the reference counts.
+	#[test]
+	fn arc_heap_matches_layout() {
+		#[repr(align(64))]
+		struct Overaligned;
+
+		fn layout<T>() -> usize {
+			Layout::new::<[usize; 2]>()
+				.extend(Layout::new::<T>())
+				.unwrap()
+				.0
+				.pad_to_align()
+				.size()
+		}
+
+		assert_eq!(arc_heap::<u8>(), layout::<u8>());
+		assert_eq!(arc_heap::<Overaligned>(), layout::<Overaligned>());
+		assert_eq!(arc_heap::<sync::Mutex<State<()>>>(), layout::<sync::Mutex<State<()>>>());
+	}
+}
 
 /// The channel closed before the awaited condition held.
 ///

@@ -1,10 +1,114 @@
-set fallback
+set working-directory := '..'
 
-# actionlint is skipped when absent locally; the root `_tools` preflight makes
-# it a hard requirement under MOQ_STRICT, so CI can't skip it.
+# Build and test the persistent NixOS runner VM on x86_64 Linux.
+runner-vm:
+    nix build --no-link .#checks.x86_64-linux.github-runner-vm .#checks.x86_64-linux.github-runner-vm-image .#checks.x86_64-linux.github-runner-vm-config --print-build-logs
 
-# Lint GitHub Actions workflows.
+# Lint GitHub Actions workflows, their alert coverage, and that every step runs a recipe.
 check:
-    @if command -v actionlint >/dev/null 2>&1; then actionlint; fi
-    {{ source_directory() }}/scripts/alert.sh check-coverage
-    @if command -v rustc >/dev/null 2>&1; then {{ source_directory() }}/scripts/package-binary.test.sh; fi
+    actionlint
+    sh/gh/alert.sh check-coverage
+    bun test sh/gh/alert.test.ts
+    bun sh/gh/check-runs.ts
+    python3 bench/relay.test.py
+
+# Tests of repository tooling; nightly, not on every pull request.
+test:
+    python3 sh/coverage.test.py
+    python3 sh/size/report.test.py
+    python3 sh/size/release.test.py
+    python3 sh/size/nightly.test.py
+    python3 bench/compare.test.py
+    python3 bench/summary.test.py
+    python3 bench/profile.test.py
+    python3 bench/ffi.test.py
+    python3 sh/gh/gst-formula.test.py
+    python3 sh/changed.test.py
+    python3 sh/dispatch-query.test.py
+    python3 sh/dispatch-query.test.py --bench
+    bun test sh/gh/setup.test.ts
+    bun sh/gh/queue.test.ts
+    python3 sh/gh/install-formula.test.py
+    sh/gh/release.test.sh
+    python3 sh/gh/ffi.test.py
+    bun test sh/gh/ffi.test.ts sh/gh/cpp.test.ts
+    python3 sh/rs/package-rename.test.py
+    python3 sh/dart/build.test.py
+    python3 sh/rs/select.test.py
+    python3 sh/js/workspace.test.py
+    python3 sh/js/audit.test.py
+    python3 sh/rs/test-lints.test.py
+    python3 sh/rs/model-markers.test.py
+    python3 sh/gh/nightly.test.py
+    python3 sh/gh/bench-report.test.py
+    python3 sh/gh/ts-paths.test.py
+    sh/go/publish-wrapper.test.sh
+    bash .claude/hooks/direnv.test.sh
+    python3 sh/rs/uring.test.py
+
+# Release workflow helpers, e.g. `just gh release parse-version moq-cli`.
+[positional-arguments]
+release *args:
+    sh/gh/release.sh "$@"
+
+# Post a failed run to Discord, or check cron and publishing alert coverage.
+[positional-arguments]
+alert *args:
+    sh/gh/alert.sh "$@"
+
+# Render a Homebrew formula template for a release.
+[positional-arguments]
+formula *args:
+    sh/gh/render-formula.sh "$@"
+
+# Copy a rendered formula into a Homebrew tap checkout, migrating renamed formulae.
+[positional-arguments]
+install-formula *args:
+    python3 sh/gh/install-formula.py "$@"
+
+# Trigger the apt-repo and rpm-repo workflows for a release tag.
+[positional-arguments]
+trigger-repo-publish *args:
+    sh/gh/trigger-repo-publish.sh "$@"
+
+# Measure a workflow run's release uploads, the minimal FFI build, and bundled first-load JS entries.
+size-collect output run="":
+    sh/size/collect.sh '{{ output }}' '{{ run }}'
+
+# Compare a size report with its retained nightly history.
+[positional-arguments]
+size-report *args:
+    python3 sh/size/report.py "$@"
+
+# Collect and compare nightly shipping sizes through the existing alert path.
+size-nightly output run:
+    sh/size/nightly.sh '{{ output }}' '{{ run }}'
+
+# Install the rendered GStreamer formula against the current macOS tarball.
+[positional-arguments]
+gst-formula *args:
+    python3 sh/gh/gst-formula.py "$@"
+
+# Run related Nightly benchmarks in one build environment, reporting every failure.
+nightly group:
+    sh/gh/nightly.sh {{ quote(group) }}
+
+# Measure selected Criterion targets through the existing benchmark lifecycle.
+[positional-arguments]
+criterion *args:
+    bench/run.sh --criterion "$@"
+
+# Convert, validate, and stage nightly benchmark history.
+[positional-arguments]
+benchmark-report *args:
+    python3 sh/gh/bench-report.py "$@"
+
+# Select shared native artifacts or check an upstream FFI publisher.
+[positional-arguments]
+ffi *args:
+    python3 sh/gh/ffi.py "$@"
+
+# Prepare the shared history branch or publish its regression table.
+[positional-arguments]
+benchmark-publish *args:
+    sh/gh/bench-publish.sh "$@"

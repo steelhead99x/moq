@@ -1,7 +1,5 @@
 use crate::{Path, coding::*};
 
-use super::Version;
-
 fn to_tuple(namespace: &Path) -> Vec<String> {
 	let path = namespace.as_str();
 	if path.is_empty() {
@@ -49,7 +47,7 @@ fn from_tuple(parts: &[String]) -> Path<'static> {
 }
 
 /// Helper function to encode namespace as tuple of strings
-pub fn encode_namespace<W: bytes::BufMut>(w: &mut W, namespace: &Path, version: Version) -> Result<(), EncodeError> {
+pub fn encode_namespace(w: &mut Encoder<'_>, namespace: &Path) -> Result<(), EncodeError> {
 	let parts = to_tuple(namespace);
 
 	// The IETF draft limits namespaces to 32 parts.
@@ -57,63 +55,145 @@ pub fn encode_namespace<W: bytes::BufMut>(w: &mut W, namespace: &Path, version: 
 		return Err(BoundsExceeded.into());
 	}
 
-	(parts.len() as u64).encode(w, version)?;
+	w.varint(parts.len() as u64)?;
 	for part in parts {
-		part.encode(w, version)?;
+		w.string(&part)?;
 	}
 	Ok(())
 }
 
-/// Helper function to decode namespace from tuple of strings
-pub fn decode_namespace<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Path<'static>, DecodeError> {
-	let count = u64::decode(r, version)?;
+/// The most bytes a Track Namespace, or a whole Full Track Name, may hold on the wire.
+const MAX_BYTES: usize = 4096;
+
+/// Decode a namespace tuple, along with the sum of its field lengths.
+///
+/// Every limit here closes the session as a PROTOCOL_VIOLATION (draft-21 section 8.7):
+/// more than 32 fields, an empty field, or more than 4096 bytes.
+fn decode_fields(r: &mut Decoder<'_>) -> Result<(Path<'static>, usize), DecodeError> {
+	let count = r.varint()?;
 
 	if count == 0 {
-		return Ok(Path::from(String::new()));
+		return Ok((Path::from(String::new()), 0));
 	}
 
-	// The IETF draft limits namespaces to 32 parts.
 	if count > Path::MAX_PARTS as u64 {
 		return Err(DecodeError::BoundsExceeded);
 	}
 
 	let count = count as usize;
 	let mut parts = Vec::with_capacity(count);
+	let mut size = 0;
 	for _ in 0..count {
-		let part = String::decode(r, version)?;
+		let part = r.string()?;
+		if part.is_empty() {
+			return Err(DecodeError::InvalidValue);
+		}
+		size += part.len();
+		if size > MAX_BYTES {
+			return Err(DecodeError::BoundsExceeded);
+		}
 		parts.push(part);
 	}
 
-	Ok(from_tuple(&parts))
+	Ok((from_tuple(&parts), size))
+}
+
+/// Decode a Track Namespace.
+pub fn decode_namespace(r: &mut Decoder<'_>) -> Result<Path<'static>, DecodeError> {
+	Ok(decode_fields(r)?.0)
+}
+
+/// Decode a Full Track Name: a Track Namespace, then a Track Name, at most 4096 bytes together.
+pub fn decode_track(r: &mut Decoder<'_>) -> Result<(Path<'static>, String), DecodeError> {
+	let (namespace, size) = decode_fields(r)?;
+	let name = r.string()?;
+	if size + name.len() > MAX_BYTES {
+		return Err(DecodeError::BoundsExceeded);
+	}
+	Ok((namespace, name))
+}
+
+/// Session namespaces belong to the transport, and none of our extensions defines one.
+pub(super) fn refusal(namespace: &Path, version: super::Version) -> Option<super::RequestError<'static>> {
+	if matches!(
+		version,
+		super::Version::Draft14
+			| super::Version::Draft15
+			| super::Version::Draft16
+			| super::Version::Draft17
+			| super::Version::Draft18
+			| super::Version::Draft19
+			| super::Version::Draft20
+	) {
+		return None;
+	}
+	// Reserved literals contain no escapes. Comparing the first escaped field keeps
+	// a slash within a field and an empty first field from becoming a reserved name.
+	if !matches!(namespace.as_str().split('/').next(), Some("." | ".session")) {
+		return None;
+	}
+	Some(super::RequestError {
+		request_id: None,
+		error_code: super::error::request::to_code(
+			&crate::Error::NotFound,
+			super::error::request::Kind::Subscribe,
+			version,
+		),
+		reason_phrase: "reserved namespace does not exist".into(),
+		retry_interval: 0,
+	})
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use bytes::BytesMut;
+
+	#[test]
+	fn reserved_namespaces_keep_exact_tuple_fields_and_draft_boundaries() {
+		for (fields, reserved) in [
+			(vec!["."], true),
+			(vec![".", "child"], true),
+			(vec![".session"], true),
+			(vec![".session", "extension"], true),
+			(vec![".session/extension"], false),
+			(vec!["", ".session"], false),
+			(vec![".application"], false),
+			(vec![".sessionish"], false),
+		] {
+			let parts: Vec<_> = fields.iter().map(|field| (*field).to_owned()).collect();
+			let path = from_tuple(&parts);
+			for version in [super::super::Version::Draft21, super::super::Version::Draft22] {
+				assert_eq!(refusal(&path, version).is_some(), reserved, "{version}: {fields:?}");
+			}
+			assert!(refusal(&path, super::super::Version::Draft20).is_none());
+		}
+	}
+	use crate::coding::Form;
+
+	const FORM: Form = Form::LeadingOnes { seven: false };
 
 	fn encode_ns(path: &str) -> Vec<u8> {
 		encode_path(&Path::from(path.to_string()))
 	}
 
 	fn encode_path(path: &Path<'_>) -> Vec<u8> {
-		let mut buf = BytesMut::new();
-		encode_namespace(&mut buf, path, Version::Draft17).unwrap();
-		buf.to_vec()
+		let mut buf = Vec::new();
+		encode_namespace(&mut Encoder::new(&mut buf, FORM), path).unwrap();
+		buf
 	}
 
 	fn decode_ns(bytes: &[u8]) -> Path<'static> {
-		let mut buf = bytes::Bytes::from(bytes.to_vec());
-		decode_namespace(&mut buf, Version::Draft17).unwrap()
+		decode_namespace(&mut Decoder::new(bytes, FORM)).unwrap()
 	}
 
 	fn encode_tuple(parts: &[&str]) -> Vec<u8> {
-		let mut buf = BytesMut::new();
-		(parts.len() as u64).encode(&mut buf, Version::Draft17).unwrap();
+		let mut buf = Vec::new();
+		let mut w = Encoder::new(&mut buf, FORM);
+		w.varint(parts.len() as u64).unwrap();
 		for part in parts {
-			(*part).encode(&mut buf, Version::Draft17).unwrap();
+			w.string(part).unwrap();
 		}
-		buf.to_vec()
+		buf
 	}
 
 	#[test]
@@ -178,5 +258,25 @@ mod tests {
 		let decoded = decode_ns(&tuple);
 		assert_eq!(decoded.as_str(), r"\/foo/bar\//\/baz\/");
 		assert_eq!(encode_path(&decoded), tuple);
+	}
+
+	/// Draft-21 section 8.7: every field holds a byte, and a namespace or a whole Full Track
+	/// Name holds at most 4096.
+	#[test]
+	fn names_are_bounded() {
+		let decode_track_slice = |bytes: &[u8]| decode_track(&mut Decoder::new(bytes, FORM));
+
+		assert!(decode_namespace(&mut Decoder::new(&encode_tuple(&["a", "", "b"]), FORM)).is_err());
+
+		let field = "n".repeat(4096);
+		assert!(decode_namespace(&mut Decoder::new(&encode_tuple(&[&field]), FORM)).is_ok());
+		let field = "n".repeat(4097);
+		assert!(decode_namespace(&mut Decoder::new(&encode_tuple(&[&field]), FORM)).is_err());
+
+		for (namespace, name, ok) in [(4095, 1, true), (4096, 1, false), (2048, 2049, false)] {
+			let mut bytes = encode_tuple(&[&"n".repeat(namespace)]);
+			Encoder::new(&mut bytes, FORM).string(&"x".repeat(name)).unwrap();
+			assert_eq!(decode_track_slice(&bytes).is_ok(), ok, "{namespace} + {name}");
+		}
 	}
 }

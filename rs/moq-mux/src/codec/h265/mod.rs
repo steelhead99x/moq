@@ -10,6 +10,7 @@
 mod export;
 mod import;
 mod split;
+mod sps;
 
 pub use export::*;
 pub use import::*;
@@ -17,6 +18,7 @@ pub use split::*;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use scuffle_h265::{NALUnitType, SpsNALUnit};
+use sps::Sps;
 
 /// Wrap one hvc1 (length-prefixed NALU) access unit as a single
 /// [`Frame`](crate::container::Frame), with the keyframe flag set when it
@@ -197,22 +199,125 @@ impl Hvcc {
 pub(crate) fn config_from_hvcc(hvcc: &[u8]) -> Result<hang::catalog::VideoConfig> {
 	let params = Hvcc::parse(hvcc)?;
 	let sps_nal = params.sps.first().ok_or(Error::MissingSps)?;
-	let sps = SpsNALUnit::parse(&mut &sps_nal[..]).map_err(|_| Error::SpsParse)?;
-	let profile = &sps.rbsp.profile_tier_level.general_profile;
-
-	let mut config = hang::catalog::VideoConfig::new(hang::catalog::H265 {
-		in_band: false,
-		profile_space: profile.profile_space,
-		profile_idc: profile.profile_idc,
-		profile_compatibility_flags: profile.profile_compatibility_flag.bits().to_be_bytes(),
-		tier_flag: profile.tier_flag,
-		level_idc: profile.level_idc.ok_or(Error::MissingLevelIdc)?,
-		constraint_flags: pack_constraint_flags(profile),
-	});
-	config.coded_width = Some(sps.rbsp.cropped_width() as u32);
-	config.coded_height = Some(sps.rbsp.cropped_height() as u32);
+	let mut config = config_from_sps(sps_nal, false)?;
 	config.description = Some(Bytes::copy_from_slice(hvcc));
 	Ok(config)
+}
+
+/// Copy the frame rate, display aspect, and colour from a decoded hvcC's first SPS.
+///
+/// An hev1 record may list no SPS, leaving them unset.
+pub(crate) fn apply_hvcc_sps(hvcc: &mp4_atom::Hvcc, config: &mut hang::catalog::VideoConfig) -> Result<()> {
+	let Some(sps) = hvcc
+		.arrays
+		.iter()
+		.filter(|array| array.nal_unit_type == NALUnitType::SpsNut.0)
+		.flat_map(|array| &array.nalus)
+		.next()
+	else {
+		return Ok(());
+	};
+	let metadata = config_from_sps(sps, false)?;
+	config.framerate = metadata.framerate;
+	config.display_aspect_width = metadata.display_aspect_width;
+	config.display_aspect_height = metadata.display_aspect_height;
+	config.color = metadata.color;
+	Ok(())
+}
+
+/// Resolve either sample framing from the same SPS dimensions and VUI metadata.
+pub(crate) fn config_from_sps(sps_nal: &[u8], in_band: bool) -> Result<hang::catalog::VideoConfig> {
+	let sps = Sps::parse(sps_nal)?;
+	let color = sps.color();
+	let Sps { head, full } = sps;
+	let mut config = hang::catalog::VideoConfig::new(hang::catalog::H265 {
+		in_band,
+		profile_space: head.profile_space,
+		profile_idc: head.profile_idc,
+		profile_compatibility_flags: head.profile_compatibility_flags,
+		tier_flag: head.tier_flag,
+		level_idc: head.level_idc,
+		constraint_flags: head.constraint_flags,
+	});
+	config.coded_width = Some(head.width);
+	config.coded_height = Some(head.height);
+	config.framerate = full
+		.as_ref()
+		.and_then(sps_period)
+		.map(|(units, scale)| scale as f64 / units as f64);
+	let sample_aspect = full
+		.as_ref()
+		.and_then(|sps| sps.vui_parameters.as_ref())
+		.and_then(|vui| match vui.aspect_ratio_info {
+			scuffle_h265::AspectRatioInfo::ExtendedSar { sar_width, sar_height } => {
+				Some((u32::from(sar_width), u32::from(sar_height)))
+			}
+			scuffle_h265::AspectRatioInfo::Predefined(idc) => crate::codec::video::sample_aspect(idc.0),
+		});
+	let display_aspect =
+		sample_aspect.and_then(|sample| crate::codec::video::display_aspect(head.width, head.height, sample));
+	config.display_aspect_width = display_aspect.map(|(width, _)| width);
+	config.display_aspect_height = display_aspect.map(|(_, height)| height);
+	config.color = color;
+	Ok(config)
+}
+
+/// The reordering an SPS NAL unit declares for its highest sub-layer: `sps_max_num_reorder_pics`,
+/// and the picture period when the VUI's HRD parameters fix the picture rate within the CVS
+/// (ITU-T H.265 E.3.2).
+///
+/// `None` when the SPS fails to parse.
+pub(crate) fn sps_reorder(nal: &[u8]) -> Option<crate::codec::video::Reorder> {
+	let sps = SpsNALUnit::parse(&mut &nal[..]).ok()?;
+	let highest = sps.rbsp.sps_max_sub_layers_minus1 as usize;
+	let reorder = &sps.rbsp.sub_layer_ordering_info.sps_max_num_reorder_pics;
+	let depth = *reorder.get(highest).or(reorder.last())?;
+	Some(crate::codec::video::Reorder {
+		depth: u32::try_from(depth).ok()?,
+		period: sps_period(&sps.rbsp),
+	})
+}
+
+/// The HRD an SPS NAL unit's VUI declares at its highest sub-layer, when it carries one: the
+/// NAL HRD's last schedule, or the VCL HRD's when that is all there is.
+pub(crate) fn sps_hrd(nal: &[u8]) -> Option<crate::codec::video::Hrd> {
+	let sps = SpsNALUnit::parse(&mut &nal[..]).ok()?;
+	let highest = sps.rbsp.sps_max_sub_layers_minus1 as usize;
+	let hrd = sps
+		.rbsp
+		.vui_parameters
+		.as_ref()?
+		.vui_timing_info
+		.as_ref()?
+		.hrd_parameters
+		.as_ref()?;
+	let layer = hrd.sub_layers.get(highest).or(hrd.sub_layers.last())?;
+	// The NAL HRD's schedules come first when both are present.
+	let schedules = usize::try_from(layer.cpb_cnt_minus1).ok()? + 1;
+	let last = layer.sub_layer_parameters.get(..schedules)?.last()?;
+	let bit_rate_scale = u32::from(hrd.common_inf.bit_rate_scale?);
+	let cpb_size_scale = u32::from(hrd.common_inf.cpb_size_scale?);
+	Some(crate::codec::video::Hrd {
+		bit_rate: (u64::from(last.bit_rate_value_minus1) + 1) << (6 + bit_rate_scale),
+		cpb_size: (u64::from(last.cpb_size_value_minus1) + 1) << (4 + cpb_size_scale),
+	})
+}
+
+/// One picture's duration at the highest sub-layer as `(units, scale)`, when the VUI's HRD
+/// parameters fix the picture rate within the CVS (ITU-T H.265 E.3.2). Without that the VUI tick
+/// only bounds the rate from above.
+pub(crate) fn sps_period(sps: &scuffle_h265::SpsRbsp) -> Option<(u64, u64)> {
+	let highest = sps.sps_max_sub_layers_minus1 as usize;
+	let timing = sps.vui_parameters.as_ref()?.vui_timing_info.as_ref()?;
+	let sub_layers = &timing.hrd_parameters.as_ref()?.sub_layers;
+	let elemental = sub_layers
+		.get(highest)
+		.or(sub_layers.last())?
+		.elemental_duration_in_tc_minus1?;
+	let units = elemental
+		.checked_add(1)?
+		.checked_mul(u64::from(timing.num_units_in_tick.get()))?;
+	Some((units, u64::from(timing.time_scale.get())))
 }
 
 /// Annex-B → length-prefixed transmuxer; the H.265 analogue of
@@ -377,12 +482,8 @@ pub(crate) fn build_hvcc(vps_nals: &[Bytes], sps_nals: &[Bytes], pps_nals: &[Byt
 		}
 	}
 
-	let sps = SpsNALUnit::parse(&mut &first_sps[..]).map_err(|_| Error::SpsParse)?;
-	let profile = &sps.rbsp.profile_tier_level.general_profile;
-	let level_idc = profile.level_idc.ok_or(Error::MissingLevelIdc)?;
-	let constraint_flags = pack_constraint_flags(profile);
-	let compat = profile.profile_compatibility_flag.bits().to_be_bytes();
-	let num_temporal_layers = sps.rbsp.sps_max_sub_layers_minus1 + 1;
+	let sps = Sps::parse(first_sps)?.head;
+	let num_temporal_layers = sps.max_sub_layers_minus1 + 1;
 
 	let params_len: usize = vps_nals
 		.iter()
@@ -392,17 +493,17 @@ pub(crate) fn build_hvcc(vps_nals: &[Bytes], sps_nals: &[Bytes], pps_nals: &[Byt
 		.sum();
 	let mut out = BytesMut::with_capacity(23 + 3 * 3 + params_len);
 	out.put_u8(1); // configurationVersion
-	out.put_u8(((profile.profile_space & 0x3) << 6) | ((profile.tier_flag as u8) << 5) | (profile.profile_idc & 0x1f));
-	out.put_slice(&compat);
-	out.put_slice(&constraint_flags);
-	out.put_u8(level_idc);
+	out.put_u8(((sps.profile_space & 0x3) << 6) | ((sps.tier_flag as u8) << 5) | (sps.profile_idc & 0x1f));
+	out.put_slice(&sps.profile_compatibility_flags);
+	out.put_slice(&sps.constraint_flags);
+	out.put_u8(sps.level_idc);
 	out.put_u16(0xf000); // min_spatial_segmentation_idc unknown
 	out.put_u8(0xfc); // parallelismType mixed
-	out.put_u8(0xfc | (sps.rbsp.chroma_format_idc & 0x3));
-	out.put_u8(0xf8 | (sps.rbsp.bit_depth_luma_minus8 & 0x7));
-	out.put_u8(0xf8 | (sps.rbsp.bit_depth_chroma_minus8 & 0x7));
+	out.put_u8(0xfc | (sps.chroma_format_idc & 0x3));
+	out.put_u8(0xf8 | (sps.bit_depth_luma_minus8 & 0x7));
+	out.put_u8(0xf8 | (sps.bit_depth_chroma_minus8 & 0x7));
 	out.put_u16(0); // avgFrameRate unspecified
-	out.put_u8(((num_temporal_layers & 0x7) << 3) | ((sps.rbsp.sps_temporal_id_nesting_flag as u8) << 2) | 0x3);
+	out.put_u8(((num_temporal_layers & 0x7) << 3) | ((sps.temporal_id_nesting_flag as u8) << 2) | 0x3);
 	out.put_u8(3); // numOfArrays (VPS, SPS, PPS)
 
 	for (nal_type, nals) in [
@@ -419,6 +520,36 @@ pub(crate) fn build_hvcc(vps_nals: &[Bytes], sps_nals: &[Bytes], pps_nals: &[Byt
 	}
 
 	Ok(out.freeze())
+}
+
+/// An hvcC whose parameter sets will arrive in the samples, from a catalog codec
+/// string that already fixes the record.
+///
+/// Main and Main Still Picture are 8-bit 4:2:0. Main 10's depth is 8 or 10, and
+/// any other profile or profile space is not fixed by the codec string.
+pub(crate) fn catalog_hvcc(h265: &hang::catalog::H265) -> Option<Bytes> {
+	if !h265.in_band || h265.profile_space != 0 || !matches!(h265.profile_idc, 1 | 3) {
+		return None;
+	}
+
+	let mut out = BytesMut::with_capacity(23);
+	out.put_u8(1);
+	let profile = ((h265.profile_space & 0x3) << 6) | (u8::from(h265.tier_flag) << 5) | (h265.profile_idc & 0x1f);
+	out.put_u8(profile);
+	out.put_slice(&h265.profile_compatibility_flags);
+	out.put_slice(&h265.constraint_flags);
+	out.put_u8(h265.level_idc);
+	out.put_u16(0xf000); // min_spatial_segmentation_idc unknown
+	out.put_u8(0xfc); // parallelismType unknown
+	out.put_u8(0xfc | 1); // chroma_format_idc = 1 (4:2:0)
+	out.put_u8(0xf8); // bit_depth_luma_minus8 = 0
+	out.put_u8(0xf8); // bit_depth_chroma_minus8 = 0
+	out.put_u16(0); // avgFrameRate unspecified
+	// constantFrameRate 0, numTemporalLayers 0, temporalIdNested 0, lengthSizeMinusOne 3.
+	// temporalIdNested is ignored while numTemporalLayers is 0.
+	out.put_u8(0x03);
+	out.put_u8(0); // numOfArrays
+	Some(out.freeze())
 }
 
 /// Extract the parameter-set NALs (VPS, SPS, PPS in array order) and the NALU
@@ -461,8 +592,8 @@ pub(crate) fn pack_constraint_flags(profile: &scuffle_h265::Profile) -> [u8; 6] 
 	flags
 }
 
-/// Real parameter sets from a single-frame x265 encode (1280x720, Main profile),
-/// for tests that need an SPS that scuffle_h265 can actually parse.
+/// Real parameter sets, mostly from a single-frame x265 encode (1280x720, Main profile),
+/// for tests that need an SPS rather than hand-built bytes.
 #[cfg(test)]
 pub(crate) mod fixtures {
 	use bytes::Bytes;
@@ -477,6 +608,54 @@ pub(crate) mod fixtures {
 		0x02, 0x00, 0x00, 0x03, 0x00, 0x3c, 0x10,
 	];
 	pub(crate) const PPS: &[u8] = &[0x44, 0x01, 0xc1, 0x72, 0xb4, 0x62, 0x40];
+
+	/// SPS from a 64x64 Main 10 x265 encode with `colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc`.
+	pub(crate) const SPS_HDR10: &[u8] = &[
+		0x42, 0x01, 0x01, 0x02, 0x20, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x1e,
+		0xa0, 0x20, 0x81, 0x04, 0xd9, 0x65, 0x65, 0x4a, 0x4c, 0x2f, 0x01, 0x6a, 0x12, 0x20, 0x12, 0x08, 0x00, 0x00,
+		0x03, 0x00, 0x08, 0x00, 0x00, 0x03, 0x00, 0xc8, 0x40,
+	];
+	/// The same encode's `max-cll=1000,400` prefix SEI.
+	pub(crate) const SEI_CONTENT_LIGHT: &[u8] = &[0x4e, 0x01, 0x90, 0x04, 0x03, 0xe8, 0x01, 0x90, 0x80];
+	/// The same encode's `master-display` prefix SEI: a 1000-nit BT.2020 display with a D65 white point.
+	pub(crate) const SEI_MASTERING: &[u8] = &[
+		0x4e, 0x01, 0x89, 0x18, 0x21, 0x34, 0x9b, 0xaa, 0x19, 0x96, 0x08, 0xfc, 0x8a, 0x48, 0x39, 0x08, 0x3d, 0x13,
+		0x40, 0x42, 0x00, 0x98, 0x96, 0x80, 0x00, 0x00, 0x03, 0x00, 0x32, 0x80,
+	];
+	/// SPS from a 64x64, 25 fps x265 encode with `bframes=3:b-pyramid=1` and HRD signalling
+	/// (`sps_max_num_reorder_pics` 2).
+	pub(crate) const SPS_PYRAMID: &[u8] = &[
+		0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c,
+		0xa0, 0x20, 0x81, 0x05, 0x96, 0x56, 0x59, 0x24, 0xca, 0xf0, 0x16, 0x80, 0x80, 0x00, 0x00, 0x03, 0x00, 0x80,
+		0x00, 0x00, 0x0c, 0xb0, 0x0a, 0x48, 0x2f, 0x00, 0x07, 0xa1, 0x20, 0x00, 0xf4, 0x24, 0x40,
+	];
+
+	/// SPS from a Viewtron IP-PTZ-440 (1920x1080 Main@L5.0, 10 fps). Its VUI sets
+	/// `colour_description_present_flag` with `colour_primaries`, `transfer_characteristics`
+	/// and `matrix_coeffs` all 0 on a 4:2:0 stream. ITU-T H.265 E.3.1 forbids `matrix_coeffs`
+	/// 0 there, so scuffle_h265 refuses the SPS; libavcodec and GStreamer accept it.
+	pub(crate) const SPS_ZERO_COLOUR: &[u8] = &[
+		0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00,
+		0x96, 0xa0, 0x03, 0xc0, 0x80, 0x11, 0x07, 0xcb, 0x8a, 0xad, 0x3b, 0xa2, 0x4b, 0xb9, 0x08, 0x00, 0x00, 0x03,
+		0x00, 0x20, 0x05, 0x26, 0x5c, 0x00, 0x33, 0x7f, 0x98, 0x01,
+	];
+
+	/// SPS from a 1280x720, 60 fps hevc_nvenc encode (`p1`, `ull`), the desktop host's shape. Its VUI
+	/// sets `aspect_ratio_idc` 1: square samples.
+	pub(crate) const SPS_NVENC: &[u8] = &[
+		0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78,
+		0xa0, 0x02, 0x80, 0x80, 0x2e, 0x1f, 0x13, 0x96, 0x5d, 0x29, 0x08, 0x46, 0x45, 0xd5, 0x0c, 0x04, 0x04, 0x00,
+		0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf1, 0x80, 0x17, 0x79, 0x44, 0x00, 0x02, 0xdc, 0x6c, 0x00,
+		0x00, 0x2d, 0xc6, 0xc0, 0x40,
+	];
+
+	/// SPS from a 1440x1080 hevc_nvenc encode with 4:3 samples (`setsar=4/3`), shown 16:9.
+	pub(crate) const SPS_ANAMORPHIC: &[u8] = &[
+		0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78,
+		0xa0, 0x02, 0xd0, 0x80, 0x11, 0x07, 0xcb, 0x96, 0x5d, 0x29, 0x08, 0x46, 0x45, 0xd5, 0x0c, 0x38, 0x04, 0x00,
+		0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0x79, 0x80, 0x17, 0x79, 0x44, 0x00, 0x02, 0xdc, 0x6c, 0x00,
+		0x00, 0xf4, 0x24, 0x04,
+	];
 
 	/// An hvcC record built from the real parameter sets (4-byte NALU lengths).
 	pub(crate) fn hvcc() -> Bytes {
@@ -505,6 +684,14 @@ mod tests {
 
 	fn ts() -> moq_net::Timestamp {
 		moq_net::Timestamp::from_micros(0).unwrap()
+	}
+
+	#[test]
+	fn sps_reorder_reads_the_highest_sub_layer() {
+		let reorder = sps_reorder(fixtures::SPS_PYRAMID).unwrap();
+		assert_eq!(reorder.depth, 2);
+		assert_eq!(reorder.period, Some((1, 25)));
+		assert_eq!(sps_reorder(&fixtures::SPS[..8]), None);
 	}
 
 	/// hvc1: a length-prefixed access unit with an IDR slice wraps as one keyframe;
@@ -555,6 +742,26 @@ mod tests {
 
 	/// The real-SPS fixture resolves a full out-of-band config: dimensions from
 	/// the parsed SPS and the hvcC itself as the catalog `description`.
+	/// The hvcC's SPS signals the colour; a refused SPS signals none rather than failing.
+	#[test]
+	fn hvcc_config_reads_the_sps_colour() {
+		let hvcc = |sps: &'static [u8]| {
+			build_hvcc(
+				&[Bytes::from_static(fixtures::VPS)],
+				&[Bytes::from_static(sps)],
+				&[Bytes::from_static(fixtures::PPS)],
+			)
+			.unwrap()
+		};
+		let color = config_from_hvcc(&hvcc(fixtures::SPS_HDR10)).unwrap().color.unwrap();
+		assert_eq!(
+			(color.primaries, color.transfer, color.matrix, color.range),
+			(Some(9), Some(16), Some(9), Some(hang::catalog::Range::Limited))
+		);
+		assert_eq!(config_from_hvcc(&hvcc(fixtures::SPS)).unwrap().color, None);
+		assert_eq!(config_from_hvcc(&hvcc(fixtures::SPS_ZERO_COLOUR)).unwrap().color, None);
+	}
+
 	#[test]
 	fn config_from_hvcc_resolves_real_sps() {
 		let hvcc = fixtures::hvcc();
@@ -601,6 +808,45 @@ mod tests {
 		assert_eq!(params[2].as_ref(), pps);
 	}
 
+	/// hev1: an inline SPS whose VUI carries zeroed colour fields on 4:2:0 still configures the
+	/// rendition from the fields before the VUI.
+	#[test]
+	fn hev1_config_tolerates_zeroed_colour_description() {
+		let mut annexb = Vec::new();
+		for nal in [fixtures::VPS, fixtures::SPS_ZERO_COLOUR, fixtures::PPS] {
+			annexb.extend_from_slice(&[0, 0, 0, 1]);
+			annexb.extend_from_slice(nal);
+		}
+		let config = config(&annexb).expect("the SPS head is well-formed");
+		let hang::catalog::VideoCodec::H265(h265) = &config.codec else {
+			panic!("expected H.265 codec")
+		};
+		assert!(h265.in_band);
+		assert_eq!(h265.to_string(), "hev1.1.6.L150");
+		assert_eq!((config.coded_width, config.coded_height), (Some(1920), Some(1080)));
+	}
+
+	/// hvc1: the same SPS builds an hvcC and resolves an out-of-band config. The record header
+	/// matches, byte for byte, the one GStreamer's h265parse builds from this SPS.
+	#[test]
+	fn hvcc_tolerates_zeroed_colour_description() {
+		let hvcc = build_hvcc(
+			&[Bytes::from_static(fixtures::VPS)],
+			&[Bytes::from_static(fixtures::SPS_ZERO_COLOUR)],
+			&[Bytes::from_static(fixtures::PPS)],
+		)
+		.expect("the SPS head is well-formed");
+		assert_eq!(
+			&hvcc[..23],
+			&[
+				0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x96, 0xf0, 0x00, 0xfc, 0xfd,
+				0xf8, 0xf8, 0x00, 0x00, 0x0f, 0x03,
+			]
+		);
+		let config = config_from_hvcc(&hvcc).unwrap();
+		assert_eq!((config.coded_width, config.coded_height), (Some(1920), Some(1080)));
+	}
+
 	/// The SPS and catalog paths keep `profile_compatibility_flags` as raw
 	/// big-endian bytes, including across codec-string formatting and parsing.
 	#[test]
@@ -620,5 +866,49 @@ mod tests {
 
 		let parsed = hang::catalog::H265::from_str(&encoded).unwrap();
 		assert_eq!(parsed.profile_compatibility_flags, h265.profile_compatibility_flags);
+	}
+
+	fn hevc(profile_idc: u8, in_band: bool, profile_space: u8) -> hang::catalog::H265 {
+		hang::catalog::H265 {
+			in_band,
+			profile_space,
+			profile_idc,
+			profile_compatibility_flags: [0x60, 0, 0, 0],
+			tier_flag: false,
+			level_idc: 93,
+			constraint_flags: [0x90, 0, 0, 0, 0, 0],
+		}
+	}
+
+	fn decode_hvcc(bytes: &Bytes) -> mp4_atom::Hvcc {
+		use mp4_atom::Atom;
+		mp4_atom::Hvcc::decode_body(&mut std::io::Cursor::new(bytes.as_ref())).unwrap()
+	}
+
+	#[test]
+	fn catalog_hvcc_main_and_still_picture_round_trip() {
+		for profile_idc in [1, 3] {
+			let hvcc = decode_hvcc(&catalog_hvcc(&hevc(profile_idc, true, 0)).unwrap());
+			assert_eq!(hvcc.general_profile_idc, profile_idc);
+			assert_eq!(hvcc.general_profile_space, 0);
+			assert!(!hvcc.general_tier_flag);
+			assert_eq!(hvcc.general_profile_compatibility_flags, [0x60, 0, 0, 0]);
+			assert_eq!(hvcc.general_constraint_indicator_flags, [0x90, 0, 0, 0, 0, 0]);
+			assert_eq!(hvcc.general_level_idc, 93);
+			assert_eq!(hvcc.chroma_format_idc, 1);
+			assert_eq!(hvcc.bit_depth_luma_minus8, 0);
+			assert_eq!(hvcc.bit_depth_chroma_minus8, 0);
+			assert_eq!(hvcc.length_size_minus_one, 3);
+			assert_eq!(hvcc.num_temporal_layers, 0);
+			assert!(!hvcc.temporal_id_nested);
+			assert!(hvcc.arrays.is_empty());
+		}
+	}
+
+	#[test]
+	fn catalog_hvcc_refuses_profiles_the_string_cannot_describe() {
+		assert!(catalog_hvcc(&hevc(2, true, 0)).is_none(), "Main 10");
+		assert!(catalog_hvcc(&hevc(1, true, 1)).is_none(), "profile space");
+		assert!(catalog_hvcc(&hevc(1, false, 0)).is_none(), "out of band");
 	}
 }
