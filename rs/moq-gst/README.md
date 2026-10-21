@@ -8,7 +8,7 @@
 
 A [GStreamer](https://gstreamer.freedesktop.org/) plugin for [Media over QUIC](https://moq.dev), exposing `moqsink` (and friends) as native GStreamer elements.
 
-Uses [hang](https://github.com/moq-dev/moq/tree/main/rs/hang), [moq-mux](https://github.com/moq-dev/moq/tree/main/rs/moq-mux), and [moq-native](https://github.com/moq-dev/moq/tree/main/rs/moq-native) under the hood, so it can publish CMAF/fMP4 produced by any GStreamer pipeline directly to a MoQ relay.
+Uses [hang](https://github.com/moq-dev/moq/tree/main/rs/hang), [moq-mux](https://github.com/moq-dev/moq/tree/main/rs/moq-mux), and [moq-tokio](https://github.com/moq-dev/moq/tree/main/rs/moq-tokio) under the hood, so it can publish CMAF/fMP4 produced by any GStreamer pipeline directly to a MoQ relay.
 
 This crate is not published to crates.io. Pre-built binaries are attached to GitHub releases (see below) or you can build from source.
 
@@ -27,30 +27,30 @@ sudo apt update && sudo apt install gstreamer1.0-moq
 ### Fedora / RHEL / Rocky / AlmaLinux
 
 ```bash
-sudo dnf config-manager --add-repo https://rpm.moq.dev/moq.repo
+sudo curl -fsSL https://rpm.moq.dev/moq.repo -o /etc/yum.repos.d/moq.repo
 sudo dnf install gstreamer1-moq
 ```
 
 ### Nix (Linux or Apple Silicon macOS)
 
-The `moq-gst` flake output bundles the plugin with wrappers around `gst-inspect-1.0` / `gst-launch-1.0` that preload moq + the standard `gst-plugins-{base,good,bad}` set, so no `GST_PLUGIN_PATH` setup is needed.
+The `moq-gst` flake output bundles the plugin with wrappers around `gst-inspect-1.0` / `gst-launch-1.0` that preload moq + the standard `gst-plugins-{base,good,bad,ugly}` and `gst-libav` sets, so no `GST_PLUGIN_PATH` setup is needed.
 
 ```bash
-# Inspect: list moqsink + moqsrc. (Or one-shot: `nix run github:moq-dev/moq#moq-gst -- moq`.)
-nix shell github:moq-dev/moq#moq-gst --command gst-inspect-1.0 moq
+# Inspect: list moqsink + moqsrc. (Or one-shot: `nix run github:moq-dev/moq/release#moq-gst -- moq`.)
+nix shell github:moq-dev/moq/release#moq-gst --command gst-inspect-1.0 moq
 
 # Subscribe to the always-on public test broadcast and render to a window.
 # moqsrc emits one pad per rendition (video_0, audio_0, ...); link the one(s) you
 # want by name. A bare `moqsrc ! decodebin3 ! ...` only links the first pad offered,
 # which on a video+audio broadcast may be the audio pad (so a video sink shows nothing).
-nix shell github:moq-dev/moq#moq-gst --command gst-launch-1.0 -v -e \
+nix shell github:moq-dev/moq/release#moq-gst --command gst-launch-1.0 -v -e \
   moqsrc name=s url=https://cdn.moq.dev/demo broadcast=bbb.hang \
   s.video_0 ! queue ! decodebin3 ! videoconvert ! autovideosink \
   s.audio_0 ! queue ! decodebin3 ! audioconvert ! autoaudiosink
 
 # Publish your own broadcast on the public anon relay (then sub to it from anywhere).
 curl -fsSL https://vid.moq.dev/bbb.mp4 -o bbb.mp4
-nix shell github:moq-dev/moq#moq-gst --command gst-launch-1.0 -v -e \
+nix shell github:moq-dev/moq/release#moq-gst --command gst-launch-1.0 -v -e \
   multifilesrc location=bbb.mp4 loop=true ! parsebin name=parse \
     parse. ! queue ! identity sync=true ! mux.sink_0 \
     parse. ! queue ! identity sync=true ! mux.sink_1 \

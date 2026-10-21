@@ -1,8 +1,8 @@
 /**
  * Subscribe to a broadcast, decode it, and render it.
  *
- * The JS API: compose {@link Broadcast}, {@link Sync}, and the per-track `Video`/`Audio` pipelines
- * yourself. For a drop-in element, import `@moq/watch/element` instead.
+ * Use {@link Player} for a complete headless pipeline, or compose {@link Broadcast}, {@link Sync},
+ * and the per-track components yourself. For an element, import `@moq/watch/element` instead.
  *
  * @module
  */
@@ -11,9 +11,13 @@ export * as Hang from "@moq/hang";
 export type { BufferedRange, BufferedRanges } from "@moq/hang/container";
 export * as Net from "@moq/net";
 export * as Signals from "@moq/signals";
+export type { Arrival, Arrivals } from "./arrivals";
+export { assets } from "./assets";
 export * as Audio from "./audio";
 export * from "./broadcast";
+export * from "./player";
 export * from "./sync";
+export * as Text from "./text";
 export * as Video from "./video";
 
 // NOTE: element is not exported from this module

@@ -1,6 +1,10 @@
-import { Time } from "@moq/net";
+import { Micro, Milli, type Second } from "@moq/clock";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
-import type * as Video from "./video";
+import * as Video from "@moq/video";
+import type { Fanout } from "./fanout";
+import type * as Encoder from "./video";
+
+export type { Backend, RendererError } from "@moq/video";
 
 // What the canvas preview renders.
 // - `none`: nothing, an easy way to toggle the preview off without removing the element.
@@ -13,18 +17,22 @@ export type Mode = "none" | "source" | "encoded";
 export type RendererInput = {
 	// The canvas to draw into. Undefined renders nothing.
 	canvas: Getter<HTMLCanvasElement | undefined>;
-	// The captured frame to draw (owned by the capture pipeline; never closed here).
-	frame: Getter<VideoFrame | undefined>;
+	// The captured frames to draw. We subscribe for our own copies and close them.
+	frames: Getter<Fanout<VideoFrame> | undefined>;
 	// The display size, for sizing the canvas before the first frame.
 	display: Getter<{ width: number; height: number } | undefined>;
 	// Whether to mirror the video horizontally.
 	flip: Getter<boolean>;
+	// Clockwise rotation needed to display the video upright.
+	rotation: Getter<number>;
 	// The encoder to re-encode through in `encoded` mode. Falls back to the raw frame when unset.
-	encoder: Getter<Video.Encoder | undefined>;
+	encoder: Getter<Encoder.Encoder | undefined>;
 	// What to render. Defaults to `source`.
 	mode: Getter<Mode>;
 	// Whether to render at all. Defaults to true.
 	enabled: Getter<boolean>;
+	// Which graphics API draws the preview. See {@link Video.Backend}. Defaults to "auto".
+	backend: Getter<Video.Backend>;
 };
 
 /** Constructor options for the canvas preview: the frame source plus the encoder to mirror in `encoded` mode. */
@@ -34,41 +42,74 @@ export type RendererProps = Inputs<RendererInput>;
 export class Renderer {
 	readonly in: Readonlys<RendererInput>;
 
+	readonly out: Readonlys<{
+		// Why drawing stopped, or undefined while healthy. See {@link Video.RendererError}.
+		error: Getter<Video.RendererError | undefined>;
+	}>;
+
 	// Whether we've already warned about `encoded` mode without an encoder, so it fires at most once.
 	#warnedNoEncoder = false;
 
-	// The frame to draw. Just a pointer to a frame owned elsewhere (the capture pipeline or the
-	// transcoder), so we never close it ourselves.
-	#frame = new Signal<VideoFrame | undefined>(undefined);
+	// Where to read the frame from: our own latest capture, or the transcoder in `encoded` mode.
+	#source = new Signal<Getter<VideoFrame | undefined> | undefined>(undefined);
 
-	#ctx = new Signal<CanvasRenderingContext2D | undefined>(undefined);
+	// The newest captured frame, owned here: a preview draws one frame per paint, so anything older
+	// is thrown away rather than queued.
+	#latest = new Signal<VideoFrame | undefined>(undefined);
+
 	#signals = new Effect();
 
 	constructor(props?: RendererProps) {
 		this.in = {
 			canvas: getter(props?.canvas),
-			frame: getter(props?.frame),
+			frames: getter(props?.frames),
 			display: getter(props?.display),
 			flip: getter(props?.flip ?? false),
+			rotation: getter(props?.rotation ?? 0),
 			encoder: getter(props?.encoder),
 			mode: getter(props?.mode ?? "source"),
 			enabled: getter(props?.enabled ?? true),
+			backend: getter(props?.backend ?? "auto"),
 		};
 
-		this.#signals.run((effect) => {
-			const canvas = effect.get(this.in.canvas);
-			this.#ctx.set(canvas?.getContext("2d") ?? undefined);
+		this.#signals.run(this.#runSelect.bind(this));
+
+		// The renderer draws on the next animation frame. A replaced frame is closed a few microtasks
+		// before this computed moves on, which cancels that draw before it can touch the closed frame.
+		const frame = this.#signals.computed((effect) => {
+			const source = effect.get(this.#source);
+			return source ? effect.get(source) : undefined;
 		});
 
-		this.#signals.run(this.#runSelect.bind(this));
-		this.#signals.run(this.#runRender.bind(this));
+		const video = new Video.Renderer({
+			canvas: this.in.canvas,
+			frame,
+			// Size the canvas to the frame we're drawing so `encoded` mode shows the true transmitted
+			// resolution (which can be smaller than the capture). Fall back to the capture dimensions
+			// until the first frame arrives.
+			display: this.#signals.computed((effect) => {
+				const current = effect.get(frame);
+				const display = current
+					? { width: current.displayWidth, height: current.displayHeight }
+					: effect.get(this.in.display);
+				return display ? Video.rotateVideoDimensions(display, effect.get(this.in.rotation)) : undefined;
+			}),
+			presentation: this.#signals.computed((effect) => ({
+				flip: effect.get(this.in.flip),
+				rotation: effect.get(this.in.rotation),
+			})),
+			backend: this.in.backend,
+		});
+		this.#signals.cleanup(() => video.close());
+
+		this.out = readonlys({ error: video.out.error });
 	}
 
 	// Pick the frame source based on the mode, spinning up a transcoder for `encoded`.
 	#runSelect(effect: Effect): void {
 		const mode = effect.get(this.in.mode);
 		if (mode === "none" || !effect.get(this.in.enabled)) {
-			effect.set(this.#frame, undefined);
+			effect.set(this.#source, undefined);
 			return;
 		}
 
@@ -76,12 +117,12 @@ export class Renderer {
 			const encoder = effect.get(this.in.encoder);
 			if (encoder) {
 				const transcode = new Transcode({
-					source: this.in.frame,
+					source: this.in.frames,
 					config: encoder.out.resolved,
 					settings: encoder.config,
 				});
 				effect.cleanup(() => transcode.close());
-				effect.proxy(this.#frame, transcode.out.frame);
+				effect.set(this.#source, transcode.out.frame, undefined);
 				return;
 			}
 
@@ -92,41 +133,46 @@ export class Renderer {
 			}
 		}
 
-		effect.proxy(this.#frame, this.in.frame);
+		this.#pump(effect);
+		effect.set(this.#source, this.#latest, undefined);
 	}
 
-	#runRender(effect: Effect): void {
-		const ctx = effect.get(this.#ctx);
-		if (!ctx) return;
+	// Keep only the newest captured frame. A queue of 1 means a busy main thread drops frames at the
+	// fanout instead of drawing a backlog of stale ones.
+	#pump(effect: Effect): void {
+		const fanout = effect.get(this.in.frames);
+		if (!fanout) return;
 
-		const frame = effect.get(this.#frame);
-		const display = effect.get(this.in.display);
-		const flip = effect.get(this.in.flip);
+		const reader = fanout.subscribe(effect, 1).getReader();
+		effect.cleanup(() => {
+			reader.cancel().catch(() => {});
+		});
 
-		// Size the canvas to the frame we're drawing so `encoded` mode shows the true transmitted
-		// resolution (which can be smaller than the capture). Fall back to the capture dimensions
-		// until the first frame arrives.
-		const width = frame?.displayWidth ?? display?.width;
-		const height = frame?.displayHeight ?? display?.height;
+		effect.cleanup(() => {
+			this.#latest.update((prev) => {
+				prev?.close();
+				return undefined;
+			});
+		});
 
-		// Setting width/height clears the canvas, so only resize when the dimensions actually change.
-		if (width && height && (ctx.canvas.width !== width || ctx.canvas.height !== height)) {
-			ctx.canvas.width = width;
-			ctx.canvas.height = height;
-		}
+		// Not raced against teardown, which would drop a frame whose read had already resolved.
+		effect.spawn(async () => {
+			for (;;) {
+				const { value: frame } = await reader.read();
+				if (!frame) break;
 
-		ctx.fillStyle = "#000";
-		ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+				// The cleanup above already released the latest frame, so keep nothing past it.
+				if (effect.abort.aborted) {
+					frame.close();
+					break;
+				}
 
-		if (!frame) return;
-
-		ctx.save();
-		if (flip) {
-			ctx.scale(-1, 1);
-			ctx.translate(-ctx.canvas.width, 0);
-		}
-		ctx.drawImage(frame, 0, 0, ctx.canvas.width, ctx.canvas.height);
-		ctx.restore();
+				this.#latest.update((prev) => {
+					prev?.close();
+					return frame;
+				});
+			}
+		});
 	}
 
 	close(): void {
@@ -136,12 +182,12 @@ export class Renderer {
 
 // Signals the transcoder reads.
 export type TranscodeInput = {
-	// The captured frame to re-encode (owned by the capture pipeline; never closed here).
-	source: Getter<VideoFrame | undefined>;
+	// The captured frames to re-encode. We subscribe for our own copies and close them.
+	source: Getter<Fanout<VideoFrame> | undefined>;
 	// The resolved WebCodecs config to mirror.
 	config: Getter<VideoEncoderConfig | undefined>;
 	// The rendition's encoder settings, read for keyframe cadence so the preview's GOP matches the wire.
-	settings: Getter<Video.Config | undefined>;
+	settings: Getter<Encoder.Config | undefined>;
 };
 
 /** Constructor options for {@link Transcode}. */
@@ -214,23 +260,44 @@ export class Transcode {
 		decoder.configure({ codec: config.codec, optimizeForLatency: true });
 
 		// Re-key on the same cadence as the real encoder so the decoder can start and recover.
-		let lastKeyframe: Time.Micro | undefined;
+		let lastKeyframe: Micro | undefined;
 
 		effect.run((inner) => {
-			const frame = inner.get(this.in.source);
-			if (!frame) return;
-			if (encoder.state !== "configured") return;
+			const fanout = inner.get(this.in.source);
+			if (!fanout) return;
 
-			// Mirror Encoder.serve: default to a 2s GOP unless the rendition overrides it.
-			const settings = inner.get(this.in.settings);
-			const interval = settings?.keyframeInterval ?? Time.Milli.fromSecond(2 as Time.Second);
+			// Only the newest matters: this feeds a preview, not the wire.
+			const reader = fanout.subscribe(inner, 1).getReader();
+			inner.cleanup(() => {
+				reader.cancel().catch(() => {});
+			});
 
-			const timestamp = frame.timestamp as Time.Micro;
-			const keyFrame = lastKeyframe === undefined || lastKeyframe + Time.Micro.fromMilli(interval) <= timestamp;
-			if (keyFrame) lastKeyframe = timestamp;
+			// Not raced against teardown, which would drop a frame whose read had already resolved.
+			inner.spawn(async () => {
+				for (;;) {
+					const { value: frame } = await reader.read();
+					if (!frame) break;
 
-			// The capture pipeline owns and closes the frame, so we just read it here.
-			encoder.encode(frame, { keyFrame });
+					// Ours now, so close it once the encoder has taken what it needs.
+					try {
+						if (inner.abort.aborted) break;
+						if (encoder.state !== "configured") continue;
+
+						// Mirror Encoder.serve: default to a 2s GOP unless the rendition overrides it.
+						const settings = this.in.settings.peek();
+						const interval = settings?.keyframeInterval ?? Milli.fromSecond(2 as Second);
+
+						const timestamp = frame.timestamp as Micro;
+						const keyFrame =
+							lastKeyframe === undefined || lastKeyframe + Micro.fromMilli(interval) <= timestamp;
+						if (keyFrame) lastKeyframe = timestamp;
+
+						encoder.encode(frame, { keyFrame });
+					} finally {
+						frame.close();
+					}
+				}
+			});
 		});
 
 		effect.cleanup(() => {

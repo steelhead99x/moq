@@ -1,18 +1,155 @@
 import 'dart:convert';
+import 'dart:io' show Platform;
+import 'dart:typed_data';
 
+import 'package:moq/audio.dart' as moq_audio;
+import 'package:moq/media.dart' as moq_media;
+import 'package:moq/flate.dart' as moq_flate;
+import 'package:moq/json.dart' as moq_json;
 import 'package:moq/moq.dart';
+import 'package:moq/video.dart' as moq_video;
 import 'package:test/test.dart';
 
 const timeout = Duration(seconds: 10);
 
+/// The next announce event.
+Future<AnnounceEvent> nextRoute(AnnounceConsumer announced) async {
+  final event = await announced.next().timeout(timeout);
+  if (event == null) throw StateError('announce stream ended');
+  return event;
+}
+
 void main() {
+  test('container timebase belongs to one broadcast', () {
+    final owner = BroadcastProducer();
+    final other = BroadcastProducer();
+    final timebase = moq_media.Timebase(broadcast: owner);
+    expect(
+      () => moq_media.ContainerProducer(
+        broadcast: other,
+        init: moq_media.ContainerInit(
+          format: moq_media.ContainerFormat.fmp4,
+          data: Uint8List(0),
+          timebase: timebase,
+        ),
+      ),
+      throwsA(isA<CodecMoqException>()),
+    );
+    owner.close();
+    expect(
+      () => moq_media.Timebase(broadcast: owner),
+      throwsA(isA<ClosedMoqException>()),
+    );
+    other.close();
+  });
+
+  test('diagnostic errors expose their named reason', () {
+    final error = TransportMoqException('reset');
+    expect(error.reason, 'reset');
+  });
+
+  test('catalog handle closes with its broadcast', () {
+    final broadcast = BroadcastProducer();
+    final catalog = moq_media.CatalogProducer(broadcast: broadcast);
+    catalog.setSection(name: 'app', json: '{"value":42}');
+    catalog.now();
+    broadcast.close();
+    expect(
+      () => catalog.removeSection(name: 'app'),
+      throwsA(isA<ClosedMoqException>()),
+    );
+    expect(() => catalog.now(), throwsA(isA<ClosedMoqException>()));
+  });
+
+  for (final timestamp in <int?>[null, 123456]) {
+    for (final mode in ['snapshot', 'stream']) {
+      test('flate $mode preserves timestamp $timestamp', () async {
+        final broadcast = BroadcastProducer();
+        final info = timestamp == null ? null : TrackInfo(timescale: 1000000);
+        final track = broadcast.publishTrack(name: 'data', info: info);
+        final consumer = track.consume(subscription: null);
+        final payload = utf8.encode('payload');
+        if (mode == 'snapshot') {
+          final producer = moq_flate.SnapshotProducer(
+            broadcast: broadcast,
+            track: track,
+            config: moq_flate.Config(),
+          );
+          producer.update(payload: payload, timestampUs: timestamp);
+          producer.finish();
+        } else {
+          final producer = moq_flate.StreamProducer(
+            broadcast: broadcast,
+            track: track,
+            config: moq_flate.Config(),
+          );
+          producer.append(payload: payload, timestampUs: timestamp);
+          producer.finish();
+        }
+        final frame = await consumer.readFrame().timeout(timeout);
+        expect(frame?.payload, payload);
+        expect(frame?.timestampUs, timestamp);
+        broadcast.close();
+      });
+    }
+  }
+
+  test('raw writes without timestamps stay untimed', () async {
+    final broadcast = BroadcastProducer();
+    final track = broadcast.publishTrack(name: 'untimed', info: null);
+    final consumer = track.consume(subscription: null);
+    track.writeFrame(frame: Frame(payload: utf8.encode('payload')));
+    final frame = await consumer.readFrame().timeout(timeout);
+    expect(frame?.timestampUs, isNull);
+    expect(consumer.info().timescale, isNull);
+    track.finish();
+    broadcast.close();
+  });
+
+  test(
+    'an ascending subscription reads a cached backlog oldest first',
+    () async {
+      final broadcast = BroadcastProducer();
+      final track = broadcast.publishTrack(
+        name: 'backlog',
+        info: TrackInfo(timescale: 1000000),
+      );
+      for (var ms = 0; ms < 3; ms++) {
+        final group = track.appendGroup();
+        group.writeFrame(
+          frame: Frame(payload: utf8.encode('x'), timestampUs: ms * 1000),
+        );
+        group.finish();
+      }
+
+      final consumer = track.consume(
+        subscription: Subscription(
+          maxDelayUs: 10000000,
+          ranges: [Range(start: RelativeMoqAnchor(2))],
+          order: Order.ascending,
+        ),
+      );
+      final sequences = <int>[];
+      for (var i = 0; i < 3; i++) {
+        final group = await consumer.recvGroup().timeout(timeout);
+        sequences.add(group!.sequence());
+      }
+      expect(sequences, [0, 1, 2]);
+      broadcast.close();
+    },
+  );
+
   test('connects, announces, subscribes, and delivers a frame', () async {
-    final relay = MoqOriginProducer(options: MoqOriginOptions());
-    final server = MoqServer();
-    server.setBind(addr: '127.0.0.1:0');
-    server.setTlsGenerate(hostnames: ['localhost']);
-    server.setPublish(origin: relay);
-    server.setConsume(origin: relay);
+    final relay = MoqOriginProducer(config: MoqOriginConfig());
+    final server = MoqServer(
+      config: MoqServerConfig(
+        bind: '127.0.0.1:0',
+        tls: MoqServerTls(generate: ['localhost']),
+        quic: MoqQuicConfig(),
+        publish: relay,
+        consume: relay,
+      ),
+    );
     final address = await server.listen().timeout(timeout);
 
     final accepted = () async {
@@ -23,27 +160,39 @@ void main() {
 
     final client = await Moq.connect(
       'https://$address',
-      tlsVerify: false,
-      bind: '127.0.0.1:0',
+      options: const ConnectOptions(tlsVerify: false, bind: '127.0.0.1:0'),
     ).timeout(timeout);
     final serverSession = await accepted;
+    expect(client.bandwidth(), isA<MoqBandwidth>());
 
-    final announcement = client.announcements().first;
+    final announcement = client.announced().updates().firstWhere(
+      (event) => event is AnnounceEventStart,
+    );
     final broadcast = relay.createBroadcast(path: 'live');
-    final track = broadcast.publishTrack(name: 'events', info: null);
-    final announced = await announcement.timeout(timeout);
-    expect(announced.path(), 'live');
+    final track = broadcast.publishTrack(
+      name: 'events',
+      info: TrackInfo(timescale: 1000000),
+    );
+    broadcast.announce(route: MoqRoute());
+    final announced =
+        (await announcement.timeout(timeout) as AnnounceEventStart).announce;
+    expect(announced.prefix, 'live');
 
-    final consumer = await announced
-        .broadcast()
+    final requested = await client
+        .requestBroadcast(announced.prefix)
+        .timeout(timeout);
+    final consumer = await requested
         .subscribeTrack(name: 'events', subscription: null)
         .timeout(timeout);
-    await track.used().timeout(timeout);
 
+    // Routed subscriptions pull their source lazily when the consumer is first read.
     final nextGroup = consumer.nextGroup();
+    final demand = track.demand();
+    while (await demand.wantedChanged().timeout(timeout) == null) {}
+
     final producer = track.appendGroup();
     producer.writeFrame(
-      frame: MoqFrame(payload: utf8.encode('dart round trip')),
+      frame: MoqFrame(payload: utf8.encode('dart round trip'), timestampUs: 0),
     );
     producer.finish();
 
@@ -52,8 +201,434 @@ void main() {
     expect(frame, isNotNull);
     expect(utf8.decode(frame!.payload), 'dart round trip');
 
-    client.close();
+    await client.close();
     serverSession.cancel(code: 0);
     server.cancel();
+  });
+
+  test('Server.listen serves a broadcast to a connected client', () async {
+    final server = await Server.listen(
+      options: const ListenOptions(
+        bind: '127.0.0.1:0',
+        tlsGenerate: ['localhost'],
+      ),
+    ).timeout(timeout);
+    expect(server.certFingerprints(), isNotEmpty);
+
+    final accepted = () async {
+      final request = await server.requests().first.timeout(timeout);
+      return request.accept().timeout(timeout);
+    }();
+
+    // A one-shot QUIC-only dial with explicit pacing: every knob reaches the
+    // FFI client, and QUIC alone still connects.
+    final client = await Moq.connect(
+      'https://${server.localAddr}',
+      options: ConnectOptions(
+        tlsVerify: false,
+        tlsHostName: 'localhost',
+        bind: '127.0.0.1:0',
+        versions: versions(),
+        timeout: Duration(seconds: 5),
+        race: Duration.zero,
+        resolutionDelay: Duration.zero,
+        idleTimeout: Duration(seconds: 5),
+        keepAlive: Duration.zero,
+        gso: false,
+        mtuDiscovery: true,
+        congestionControl: CongestionControl.loss,
+        keylog: false,
+        reconnect: false,
+        backoff: Backoff(initialUs: 1000, maxUs: 2000, timeoutUs: 3000),
+        websocketEnabled: false,
+        websocketDelay: Duration.zero,
+      ),
+    ).timeout(timeout);
+    final serverSession = await accepted;
+
+    final announcement = client.announced().updates().firstWhere(
+      (event) => event is AnnounceEventStart,
+    );
+    final broadcast = server.createBroadcast('live');
+    final track = broadcast.publishTrack(name: 'events', info: null);
+    broadcast.announce(route: MoqRoute());
+    final announced =
+        (await announcement.timeout(timeout) as AnnounceEventStart).announce;
+    expect(announced.prefix, 'live');
+
+    await client.close();
+    serverSession.cancel(code: 0);
+    track.finish();
+    broadcast.close();
+    broadcast.close(); // a second close is a no-op
+    server.close();
+  });
+
+  test('a negative websocket delay is refused before dialing', () {
+    expect(
+      Moq.connect(
+        'https://localhost',
+        options: const ConnectOptions(
+          websocketDelay: Duration(microseconds: -1),
+        ),
+      ),
+      throwsArgumentError,
+    );
+  });
+
+  test('an invalid config fails before dialing', () {
+    expect(
+      Moq.connect(
+        'https://localhost',
+        options: const ConnectOptions(versions: ['moq-lite-99']),
+      ),
+      throwsA(isA<ConfigMoqException>()),
+    );
+  });
+
+  test(
+    'keylog without SSLKEYLOGFILE fails the listen',
+    () {
+      expect(
+        Server.listen(
+          options: const ListenOptions(
+            bind: '127.0.0.1:0',
+            tlsGenerate: ['localhost'],
+            keylog: true,
+          ),
+        ),
+        throwsA(isA<ConfigMoqException>()),
+      );
+    },
+    // dart:io cannot unset a variable, so a run that inherits one skips.
+    skip: (Platform.environment['SSLKEYLOGFILE'] ?? '').isNotEmpty
+        ? 'SSLKEYLOGFILE is set'
+        : false,
+  );
+
+  test('closing a server releases its port', () async {
+    final first = await Server.listen(
+      options: const ListenOptions(
+        bind: '127.0.0.1:0',
+        tlsGenerate: ['localhost'],
+      ),
+    ).timeout(timeout);
+    final addr = first.localAddr;
+    first.close();
+
+    // No retry: close() released the listening socket before returning.
+    final second = await Server.listen(
+      options: ListenOptions(bind: addr, tlsGenerate: ['localhost']),
+    ).timeout(timeout);
+    expect(second.localAddr, addr);
+    second.close();
+  });
+
+  test('microsecond fields read back as Durations', () {
+    final backoff = Backoff(initialUs: 1000, maxUs: 2000, timeoutUs: 3000);
+    expect(backoff.initial, const Duration(milliseconds: 1));
+    expect(backoff.max, const Duration(milliseconds: 2));
+    expect(backoff.timeout, const Duration(milliseconds: 3));
+
+    expect(ConnectionStats().rtt, isNull);
+    expect(
+      ConnectionStats(rttUs: 1500).rtt,
+      const Duration(microseconds: 1500),
+    );
+    expect(
+      Frame(payload: Uint8List(0), timestampUs: 20000).timestamp,
+      const Duration(milliseconds: 20),
+    );
+    expect(
+      moq_video.Frame(timestampUs: 33333, data: Uint8List(0)).timestamp,
+      const Duration(microseconds: 33333),
+    );
+    expect(moq_video.DecoderOutput().maxDelay, isNull);
+    expect(
+      moq_audio.EncoderOutput(codec: moq_audio.Codec.opus()).frameDuration,
+      Duration.zero,
+    );
+    expect(
+      moq_audio.DecoderOutput(
+        format: moq_audio.SampleFormat.f32,
+        maxDelayUs: 500,
+      ).maxDelay,
+      const Duration(microseconds: 500),
+    );
+  });
+
+  test('a broadcast is reachable only while announced', () async {
+    final origin = MoqOriginProducer(config: MoqOriginConfig());
+    final broadcast = origin.createBroadcast(path: 'live');
+    broadcast.publishTrack(name: 'events', info: null);
+    final consumer = origin.consume();
+    await expectLater(
+      consumer.requestBroadcast(path: 'live').timeout(timeout),
+      throwsA(anything),
+    );
+
+    broadcast.announce(route: MoqRoute());
+    final announced = consumer.announced(config: MoqAnnounceConfig());
+    final first = await nextRoute(announced);
+    expect(first, isA<AnnounceEventStart>());
+    expect((first as AnnounceEventStart).announce.prefix, 'live');
+
+    broadcast.unannounce();
+    final retracted = await nextRoute(announced);
+    expect(retracted, isA<AnnounceEventEnd>());
+    expect((retracted as AnnounceEventEnd).announce.prefix, 'live');
+    await expectLater(
+      consumer.requestBroadcast(path: 'live').timeout(timeout),
+      throwsA(anything),
+    );
+
+    broadcast.announce(route: MoqRoute());
+    expect(await nextRoute(announced), isA<AnnounceEventStart>());
+    await consumer.requestBroadcast(path: 'live').timeout(timeout);
+    announced.cancel();
+    announced.dispose();
+  });
+
+  test('a new epoch restarts announce consumers', () async {
+    final origin = MoqOriginProducer(config: MoqOriginConfig());
+    final announced = origin.consume().announced(config: MoqAnnounceConfig());
+    final broadcast = origin.createBroadcast(path: 'epoch');
+
+    final first = mintEpoch();
+    expect(
+      epochTime('018bcfe5-6800-7000-8000-000000000000'),
+      DateTime.utc(2023, 11, 14, 22, 13, 20),
+    );
+    broadcast.announce(route: MoqRoute(epoch: first));
+    final start = await nextRoute(announced) as AnnounceEventStart;
+    expect(start.announce.route.epoch, first);
+
+    final second = mintEpoch();
+    broadcast.announce(route: MoqRoute(epoch: second));
+    final restart = await nextRoute(announced) as AnnounceEventRestart;
+    expect(restart.announce.route.epoch, second);
+
+    expect(() => epochTime('not-an-epoch'), throwsA(isA<MoqException>()));
+    announced.cancel();
+    announced.dispose();
+  });
+
+  test('announced pattern reports captures', () async {
+    final origin = MoqOriginProducer(config: MoqOriginConfig());
+    final announced = origin.consume().announced(
+      config: MoqAnnounceConfig(prefix: 'room', filter: '*/chat'),
+    );
+    final broadcast = origin.createBroadcast(path: 'room/alice/chat');
+    broadcast.announce(route: MoqRoute());
+
+    final update = await nextRoute(announced) as AnnounceEventStart;
+    expect(update.announce.prefix, 'room/alice/chat');
+    expect(update.announce.captures, ['alice']);
+  });
+
+  test('dynamic serves a request under a prefix', () async {
+    final origin = MoqOriginProducer(config: MoqOriginConfig());
+    final dynamic = origin.dynamic_(prefix: 'live', route: MoqRoute());
+    final pending = origin.consume().requestBroadcast(path: 'live/cam');
+    final request = await dynamic.requestedBroadcast().timeout(timeout);
+    expect(request.path(), 'live/cam');
+    final served = MoqBroadcastProducer();
+    request.accept(broadcast: served);
+    await pending.timeout(timeout);
+    dynamic.cancel();
+    dynamic.dispose();
+    served.dispose();
+  });
+
+  test('JSON tracks take over a raw track', () async {
+    final broadcast = MoqBroadcastProducer();
+    final producer = moq_json.SnapshotProducer(
+      broadcast: broadcast,
+      track: broadcast.publishTrack(
+        name: 'status',
+        info: MoqTrackInfo(timescale: 1000000),
+      ),
+      config: moq_json.SnapshotConfig(),
+    );
+    final track = await broadcast
+        .consume()
+        .subscribeTrack(name: 'status', subscription: null)
+        .timeout(timeout);
+    final consumer = moq_json.SnapshotConsumer(
+      track: track,
+      config: moq_json.SnapshotConfig(),
+    );
+
+    for (var n = 1; n <= 4; n++) {
+      producer.update(value: jsonEncode({'n': n}), timestampUs: n * 1000);
+    }
+
+    // next() yields every state in order; latest() skips the buffered third.
+    moq_json.Value? value = await consumer.next().timeout(timeout);
+    expect(jsonDecode(value!.value), {'n': 1});
+    expect(value.timestampUs, 1000);
+    value = await consumer.next().timeout(timeout);
+    expect(jsonDecode(value!.value), {'n': 2});
+    value = await consumer.latest().timeout(timeout);
+    expect(jsonDecode(value!.value), {'n': 4});
+    expect(value.timestampUs, 4000);
+
+    consumer.cancel();
+    producer.finish();
+    broadcast.close();
+  });
+
+  test('decoded video frame owns its picture', () async {
+    final broadcast = BroadcastProducer();
+    final video = moq_video.Producer(
+      catalog: moq_media.CatalogProducer(broadcast: broadcast),
+      input: moq_video.EncoderInput(
+        format: moq_video.PixelFormat.rgba,
+        width: 320,
+        height: 240,
+        framerate: 30,
+      ),
+      // Software so the encode is deterministic everywhere.
+      output: moq_video.EncoderOutput(
+        codec: moq_video.Codec.h264,
+        track: 'camera',
+        kind: moq_video.SoftwareEncoder(),
+      ),
+    );
+
+    // Seed the track so a subscriber joining below lands on encoded media.
+    final rgba = Uint8List(320 * 240 * 4)..fillRange(0, 320 * 240 * 4, 0x80);
+    video.cut();
+    for (var i = 0; i < 10; i++) {
+      video.write(
+        frame: moq_video.Frame(timestampUs: i * 33333, data: rgba),
+      );
+    }
+
+    final consumer = broadcast.consume();
+    final catalogs = await moq_media.CatalogConsumer.subscribe(
+      broadcast: consumer,
+    ).timeout(timeout);
+    final catalog = await catalogs.next().timeout(timeout);
+    final decoder = await moq_video.Consumer.subscribe(
+      broadcast: consumer,
+      id: 'camera',
+      catalogVideo: catalog!.video['camera']!,
+      output: moq_video.DecoderOutput(),
+    ).timeout(timeout);
+
+    // Keep the encoder fed so the decoder sees frames after it joined.
+    for (var i = 10; i < 40; i++) {
+      video.write(
+        frame: moq_video.Frame(timestampUs: i * 33333, data: rgba),
+      );
+    }
+
+    final frame = await decoder.next().timeout(timeout);
+    // The frame outlives its consumer's cancellation.
+    decoder.cancel();
+    final pixels = frame!.width() * frame.height();
+    expect(
+      frame.pixels(format: moq_video.PixelFormat.i420).length,
+      pixels * 3 ~/ 2,
+    );
+    final packed = frame.pixels(format: moq_video.PixelFormat.rgba);
+    expect(packed.length, pixels * 4);
+    for (var i = 3; i < packed.length; i += 4) {
+      expect(packed[i], 0xFF);
+    }
+    expect(frame.surface(), isNull);
+    frame.dispose();
+
+    video.finish();
+    catalogs.cancel();
+    broadcast.close();
+  });
+
+  // A fixed playout delay is reported back as is, and an estimated one moves as frames are read.
+  test('audio consumer reports its playout delay', () async {
+    final broadcast = BroadcastProducer();
+    final audio = moq_audio.Producer(
+      catalog: moq_media.CatalogProducer(broadcast: broadcast),
+      input: moq_audio.EncoderInput(
+        format: moq_audio.SampleFormat.f32,
+        sampleRate: 48000,
+        channels: 1,
+      ),
+      output: moq_audio.EncoderOutput(
+        codec: moq_audio.Codec.opus(),
+        track: 'mic',
+      ),
+    );
+
+    final consumer = broadcast.consume();
+    final catalogs = await moq_media.CatalogConsumer.subscribe(
+      broadcast: consumer,
+    ).timeout(timeout);
+    final rendition = (await catalogs.next().timeout(timeout))!.audio['mic']!;
+
+    final fixedOutput = moq_audio.DecoderOutput(
+      format: moq_audio.SampleFormat.f32,
+      delayUs: 80000,
+    );
+    expect(fixedOutput.delay, const Duration(milliseconds: 80));
+    final fixed = await moq_audio.Consumer.subscribe(
+      broadcast: consumer,
+      id: 'mic',
+      catalogAudio: rendition,
+      output: fixedOutput,
+    ).timeout(timeout);
+    final estimated = await moq_audio.Consumer.subscribe(
+      broadcast: consumer,
+      id: 'mic',
+      catalogAudio: rendition,
+      output: moq_audio.DecoderOutput(format: moq_audio.SampleFormat.f32),
+    ).timeout(timeout);
+    expect(fixed.delay, const Duration(milliseconds: 80));
+    final initial = estimated.delay;
+
+    // Two 20 ms Opus frames of silence at 48 kHz mono.
+    for (var i = 0; i < 2; i++) {
+      audio.write(
+        frame: moq_audio.Frame(
+          timestampUs: i * 20000,
+          data: Uint8List(960 * 4),
+        ),
+      );
+    }
+    expect(await fixed.next().timeout(timeout), isNotNull);
+    expect(await estimated.next().timeout(timeout), isNotNull);
+
+    expect(fixed.delay, const Duration(milliseconds: 80));
+    expect(estimated.delay, isNot(initial));
+
+    fixed.cancel();
+    estimated.cancel();
+    audio.finish();
+    catalogs.cancel();
+    broadcast.close();
+  });
+
+  test('audio producer encodes opus', () {
+    final broadcast = BroadcastProducer();
+    final producer = moq_audio.Producer(
+      catalog: moq_media.CatalogProducer(broadcast: broadcast),
+      input: moq_audio.EncoderInput(
+        format: moq_audio.SampleFormat.f32,
+        sampleRate: 48000,
+        channels: 1,
+      ),
+      output: moq_audio.EncoderOutput(
+        codec: moq_audio.Codec.opus(),
+        track: 'mic',
+        preset: moq_audio.Preset.lowLatency,
+      ),
+    );
+    producer.write(
+      frame: moq_audio.Frame(timestampUs: 0, data: Uint8List(960 * 4)),
+    );
+    expect(producer.demand().name(), 'mic');
+    producer.finish();
+    broadcast.close();
   });
 }

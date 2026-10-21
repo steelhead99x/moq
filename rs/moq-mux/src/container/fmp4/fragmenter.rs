@@ -165,6 +165,11 @@ impl Fragmenter {
 			track_id: self.track_id,
 			timescale: self.timescale,
 			sequence_number: self.sequence,
+			kind: if self.is_video {
+				super::Kind::Video
+			} else {
+				super::Kind::Audio
+			},
 		};
 		let ticks = frame
 			.duration
@@ -180,13 +185,12 @@ impl Fragmenter {
 
 		Ok(Fragment {
 			data,
-			init: false,
 			// Audio has no keyframes, so every audio fragment is independent; video is
 			// independent only at a GOP boundary. Matches what the exporter advertises.
 			independent: !self.is_video || frame.keyframe,
 			// Describe the exact duration written into trun, including its timescale
 			// quantization, so playlist metadata and media advance by the same amount.
-			duration: f64::from(ticks) / self.timescale.as_u64() as f64,
+			duration: Duration::from_secs_f64(f64::from(ticks) / self.timescale.as_u64() as f64),
 		})
 	}
 
@@ -298,7 +302,12 @@ mod tests {
 		);
 
 		for (fragment, expected) in fragments.iter().zip(&input) {
-			let decoded = super::super::decode(fragment.data.clone(), timescale).unwrap();
+			let decoded = super::super::decode(
+				fragment.data.clone(),
+				None,
+				super::super::Track::new(timescale, crate::container::fmp4::Kind::Video),
+			)
+			.unwrap();
 			assert_eq!(decoded.len(), 1);
 			assert_eq!(decoded[0].timestamp, expected.timestamp, "pts survives the reorder");
 		}
@@ -524,7 +533,6 @@ mod tests {
 		}
 		fragments.extend(fragmenter.flush().unwrap());
 
-		assert!(!fragments.iter().any(|f| f.init), "these are media fragments");
 		assert_eq!(
 			fragments.iter().map(|f| f.independent).collect::<Vec<_>>(),
 			vec![true, false, false],
@@ -532,7 +540,7 @@ mod tests {
 		);
 
 		// 1500/30000 and 1000/30000: the trun durations, not the 0.05 gap for all three.
-		let durations: Vec<_> = fragments.iter().map(|f| (f.duration * 1e6).round() as u64).collect();
+		let durations: Vec<_> = fragments.iter().map(|f| f.duration.as_micros() as u64).collect();
 		assert_eq!(durations, vec![50_000, 50_000, 33_333], "microseconds");
 	}
 
@@ -555,12 +563,12 @@ mod tests {
 			};
 			let fragment = one(fragmenter.push(frame).unwrap());
 			assert!(fragment.independent, "audio fragments are always independent");
-			assert!((fragment.duration - 0.02).abs() < 1e-9, "the 20 ms TOC duration");
+			assert_eq!(fragment.duration, Duration::from_millis(20), "the 20 ms TOC duration");
 		}
 	}
 
 	// A keyframe may open a new group, and a group boundary is never a duration: the publisher
-	// may have paused across it (the 2405 second sample of moq-dev/moq.pro#814). The pending
+	// may have paused across it (which once produced a 2405 second sample). The pending
 	// frame takes the catalog cadence, and the new group re-anchors the decode timeline at its
 	// keyframe's presentation time rather than pretending the stream was continuous.
 	#[test]

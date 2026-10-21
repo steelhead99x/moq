@@ -1,3 +1,5 @@
+#![cfg(feature = "async")]
+
 //! wasm32 model-layer tests.
 //!
 //! moq-net's model layer (Origin/Broadcast/Track/Group/Frame) is transport-
@@ -5,8 +7,8 @@
 //! WebTransport session. This covers both directions (produce + consume) plus
 //! the wasm timestamp clock that the producer path depends on.
 //!
-//! Run (bypassing `wasm-pack test`, which builds the crate's native-only lib
-//! unit tests too. They use `tokio::spawn` and don't compile on wasm):
+//! Run (bypassing `wasm-pack test`, which also builds the crate's native-only
+//! lib unit tests):
 //!
 //! ```sh
 //! CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
@@ -25,7 +27,7 @@ use moq_net::{Broadcast, Timestamp, Track};
 use wasm_bindgen_test::*;
 
 /// The producer timestamp clock works on wasm: `Timestamp::now()` (which flows
-/// through the web_async clock) returns a non-decreasing local time.
+/// through the kio clock) returns a non-decreasing local time.
 /// On the old code this panicked (`std::time` has no clock on wasm32).
 #[wasm_bindgen_test]
 fn timescale_now_is_sane_and_monotonic() {
@@ -39,7 +41,7 @@ fn timescale_now_is_sane_and_monotonic() {
 
 /// Bidirectional model round-trip in-process on wasm: produce a track + frame,
 /// then consume it back. Exercises the produce path (which stamps groups via the
-/// wasm `web_async::time` clock) and the consume path together.
+/// wasm model clock) and the consume path together.
 #[wasm_bindgen_test]
 async fn produce_consume_frame_roundtrip() {
 	let mut broadcast = Broadcast::new().produce();

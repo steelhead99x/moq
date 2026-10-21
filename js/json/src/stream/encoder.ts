@@ -1,13 +1,20 @@
 import { Encoder as Flate } from "@moq/flate";
+import { Group, Error as NetError } from "@moq/net";
+import type * as z from "@zod/mini";
 
-/** Options shared by an {@link Encoder} and the {@link Producer} that wraps one. */
-export interface ProducerConfig {
+import { type Compression, isDeflate } from "../compression.ts";
+import { Desync } from "../error.ts";
+
+/** Options for an {@link Encoder}. */
+export interface Config<T = unknown> {
+	/** Validate each record before publishing and after decoding. */
+	schema?: z.ZodMiniType<T>;
 	/**
 	 * Compress the group as one sync-flushed `deflate-raw` stream, so each record reuses the earlier
 	 * ones as context and shrinks sharply. A {@link Decoder} reading the frames must set the same
-	 * flag. Defaults to `false`.
+	 * {@link compression}. Defaults to `"none"`.
 	 */
-	compression?: boolean;
+	compression?: Compression;
 }
 
 /**
@@ -46,6 +53,7 @@ export interface Pending {
  * starts a cold window that the new group's decoder can follow.
  */
 export class Encoder<T> {
+	#schema?: Config<T>["schema"];
 	#compress: boolean;
 	// The DEFLATE window for the whole log, present while compressing.
 	#flate?: Flate;
@@ -58,9 +66,14 @@ export class Encoder<T> {
 	// Bumped for each record handed out, so a commit that arrives after the encoder has moved on can
 	// tell that it is acknowledging a record that is no longer the outstanding one.
 	#generation = 0;
+	// Frames and payload bytes committed to the current group, checked against the group budget
+	// before each record is encoded. Replaced on reset, so a commit that lands after one charges the
+	// old group rather than the new.
+	#budget = { frames: 0, bytes: 0 };
 
-	constructor(config: ProducerConfig = {}) {
-		this.#compress = config.compression ?? false;
+	constructor(config: Config<T> = {}) {
+		this.#schema = config.schema;
+		this.#compress = isDeflate(config.compression);
 		this.#flate = this.#compress ? new Flate() : undefined;
 	}
 
@@ -74,6 +87,7 @@ export class Encoder<T> {
 		this.#flate = this.#compress ? new Flate() : undefined;
 		this.#desynced = false;
 		this.#pending = false;
+		this.#budget = { frames: 0, bytes: 0 };
 	}
 
 	/**
@@ -82,16 +96,21 @@ export class Encoder<T> {
 	 * The record comes back as a {@link Pending} the caller writes and then commits. Throws if a
 	 * previous compressed record was left uncommitted, since every frame after it would be
 	 * undecodable.
+	 *
+	 * Throws `GroupTooLarge` if the record might not fit in what is left of the group's budget
+	 * (`MAX_GROUP_CACHE_BYTES` and `MAX_GROUP_FRAMES`), counting every record committed since the
+	 * last {@link reset}. The refused record leaves the encoder untouched.
 	 */
 	encode(value: T): Pending {
 		// An uncompressed record carries no shared state, so losing one leaves a gap in the log rather
 		// than an undecodable stream, and encoding continues.
 		if (this.#pending && this.#compress) this.#desynced = true;
 		if (this.#desynced) {
-			throw new Error("compression desynchronized: a record was encoded but never written");
+			throw new Desync();
 		}
 
-		const text = JSON.stringify(value);
+		const valid = this.#schema ? this.#schema.parse(value) : value;
+		const text = JSON.stringify(valid);
 		if (text === undefined) {
 			// `JSON.stringify` yields undefined for a top-level undefined, function, or symbol, which
 			// would otherwise frame as empty bytes and fail on the consumer instead of here.
@@ -99,14 +118,32 @@ export class Encoder<T> {
 		}
 
 		const bytes = new TextEncoder().encode(text);
+
+		// Check before compressing: encoding advances the window, so a record refused afterwards
+		// would leave the encoder ahead of every reader. The worst case is checked rather than the
+		// actual size for the same reason. The budget is also below `@moq/flate`'s per-frame decode
+		// cap, so any record that fits is one every consumer can inflate.
+		const budget = this.#budget;
+		const bound = this.#compress ? Flate.bound(bytes.byteLength) : bytes.byteLength;
+		if (budget.frames >= Group.MAX_GROUP_FRAMES || budget.bytes + bound > Group.MAX_GROUP_CACHE_BYTES) {
+			throw new NetError.GroupTooLarge();
+		}
+
 		const payload = this.#flate ? this.#flate.frame(bytes) : bytes;
 
 		this.#pending = true;
 		const generation = ++this.#generation;
+		let charged = false;
 
 		return {
 			payload,
 			commit: () => {
+				// The record landed once, however often it is acknowledged.
+				if (!charged) {
+					charged = true;
+					budget.frames++;
+					budget.bytes += payload.byteLength;
+				}
 				// A caller that starts the next encode before this record settles has already made the
 				// encoder account for it. Acknowledging it now would clear the flag belonging to the newer
 				// record, so a later loss of that one would go unnoticed.

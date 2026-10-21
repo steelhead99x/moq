@@ -1,6 +1,6 @@
+use super::MAX_AGE;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use derive_more::Debug;
-use moq_net::VarInt;
 
 use crate::Error;
 
@@ -8,31 +8,18 @@ pub use moq_net::{Timescale, Timestamp};
 
 /// Canonical timescale for the hang legacy wire format: microseconds.
 ///
-/// The legacy container's on-wire timestamp is a single VarInt with no scale tag,
+/// The legacy container's on-wire timestamp is a single varint with no scale tag,
 /// so encoders normalize to this scale and decoders attach it.
 pub const TIMESCALE: Timescale = Timescale::MICRO;
-
-/// How long a media track asks its publisher (and, through TRACK_INFO, every relay) to keep a
-/// non-latest group fetchable.
-///
-/// Media is the one thing on a broadcast that is read as HISTORY rather than followed at the live
-/// edge: a segmented egress (HLS/DASH) may only advertise segments a FETCH can still reach, and a
-/// standard player starts several target durations behind live. `moq_net`'s conservative default
-/// is sized for a live-edge follower and leaves such a player addressing groups that are already
-/// gone.
-///
-/// Declared per track rather than by raising that default, so the tracks that do NOT index history
-/// keep the cheap default: the catalog is snapshot mode and the timeline is a single never-rolled
-/// group, and in both the useful value is the live edge, which is retained unconditionally.
-const LATENCY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Track properties for creating a track that carries [`Frame`]s, via
 /// [`create_track`](moq_net::broadcast::Producer::create_track) or
 /// [`accept`](moq_net::track::Request::accept).
 ///
-/// Pins the track's timescale to [`TIMESCALE`]. `moq_net::track::Info::default()` is milliseconds,
-/// which would quantize the net-level frame timestamps that moq-lite-05 and later delta-encode on
-/// the wire, even though the container prefix stays at microseconds. Chain
+/// Pins the track's timescale to [`TIMESCALE`], since `moq_net::track::Info::default()` is
+/// untimed and refuses timestamped frames. Microseconds match the container prefix, so the
+/// net-level frame timestamps that moq-lite-05 and later delta-encode on the wire aren't
+/// quantized. Chain
 /// [`with_timescale`](moq_net::track::Info::with_timescale) for a container that carries the
 /// source's own scale instead (CMAF and Matroska both do).
 ///
@@ -40,12 +27,21 @@ const LATENCY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 /// which is why every media track should start here rather than at `Info::default()`. It is a
 /// retention budget and a CEILING on what a subscriber may ask to wait for, so it never makes
 /// anyone play further behind live: a subscriber's own
-/// [`Subscription::latency_max`](moq_net::track::Subscription::latency_max) still defaults to zero
-/// (skip the moment a newer group arrives).
-pub fn track_info() -> moq_net::track::Info {
+/// [`Subscription::max_delay`](moq_net::track::Subscription::max_delay) defaults to
+/// [`std::time::Duration::ZERO`](std::time::Duration::ZERO) (skip the moment a newer group arrives).
+///
+/// `priority` is the publisher's tie-break priority, and should come from
+/// [`PRIORITY`](crate::catalog::PRIORITY) so every publisher orders its kinds the
+/// same way (`PRIORITY.video` for a video track, and so on). It's a parameter
+/// rather than a default because there is no correct value for "some media
+/// track": leaving it at zero is what puts audio and video in one undifferentiated
+/// tier, both on the wire and in
+/// [`bandwidth::Allocator`](moq_net::bandwidth::Allocator).
+pub fn track_info(priority: u8) -> moq_net::track::Info {
 	moq_net::track::Info::default()
 		.with_timescale(TIMESCALE)
-		.with_latency_max(LATENCY_MAX)
+		.with_max_age(MAX_AGE)
+		.with_priority(priority)
 }
 
 /// A media frame with a timestamp and codec-specific payload.
@@ -71,7 +67,7 @@ pub struct Frame {
 }
 
 impl Frame {
-	/// Encode the frame: VarInt timestamp prefix followed by the raw codec payload.
+	/// Encode the frame: varint timestamp prefix followed by the raw codec payload.
 	///
 	/// The timestamp is normalized to [`TIMESCALE`] (microseconds) so peers using a
 	/// different source scale (e.g. nanoseconds from MKV) can decode without knowing
@@ -82,12 +78,12 @@ impl Frame {
 		Ok(())
 	}
 
-	/// Decode a frame from raw bytes (VarInt timestamp prefix + payload).
+	/// Decode a frame from raw bytes (varint timestamp prefix + payload).
 	///
 	/// Attaches [`TIMESCALE`] (microseconds) to the decoded timestamp, matching what
 	/// [`Self::encode`] writes. Inverse of [`Self::encode`].
 	pub fn decode(mut buf: impl Buf) -> Result<Self, Error> {
-		let value: u64 = VarInt::decode_quic(&mut buf).map_err(moq_net::Error::from)?.into();
+		let value: u64 = moq_net::varint::decode_quic(&mut buf).map_err(moq_net::Error::from)?;
 		let timestamp = Timestamp::new(value, TIMESCALE)?;
 		let payload = buf.copy_to_bytes(buf.remaining());
 
@@ -111,7 +107,7 @@ impl Frame {
 		// simply don't put it on the wire.
 		let info = moq_net::frame::Info {
 			size,
-			timestamp: self.timestamp,
+			timestamp: Some(self.timestamp),
 		};
 		let mut chunked = group.create_frame(info)?;
 		chunked.write(header)?;
@@ -121,11 +117,10 @@ impl Frame {
 		Ok(())
 	}
 
-	/// Write the VarInt timestamp prefix, normalized to [`TIMESCALE`].
+	/// Write the varint timestamp prefix, normalized to [`TIMESCALE`].
 	fn encode_header(&self, buf: &mut impl BufMut) -> Result<(), Error> {
 		let timestamp = self.timestamp.convert(TIMESCALE)?;
-		let value = VarInt::try_from(timestamp.value()).map_err(moq_net::Error::from)?;
-		value.encode_quic(buf).map_err(moq_net::Error::from)?;
+		moq_net::varint::encode_quic(timestamp.value(), buf).map_err(moq_net::Error::from)?;
 
 		Ok(())
 	}
@@ -165,33 +160,39 @@ mod test {
 		assert_eq!(decoded.timestamp, Timestamp::from_micros(1_234_567).expect("timestamp"));
 	}
 
+	/// Publishers stamp the kind's priority, which is what keeps audio ahead of video
+	/// both on the wire and in `bandwidth::Allocator`. It is a parameter precisely so
+	/// this can't silently fall back to the undifferentiated default.
+	#[test]
+	fn track_info_carries_the_publisher_priority() {
+		use crate::catalog::PRIORITY;
+
+		assert_eq!(track_info(PRIORITY.video).priority, PRIORITY.video);
+		assert_eq!(track_info(PRIORITY.audio).priority, PRIORITY.audio);
+	}
+
 	#[test]
 	fn track_info_uses_container_timescale() {
-		assert_eq!(track_info().timescale, TIMESCALE);
+		assert_eq!(track_info(crate::catalog::PRIORITY.video).timescale, Some(TIMESCALE));
 	}
 
 	#[test]
 	fn media_tracks_declare_their_retention() {
 		// A media track is read as history (a segmented egress FETCHes segments a playlist
-		// advertised), so it declares a retention rather than inheriting the live-edge default.
-		assert_eq!(track_info().latency_max, LATENCY_MAX);
-		assert!(LATENCY_MAX > moq_net::track::DEFAULT_LATENCY_MAX);
+		// advertised), so it declares a finite retention window.
+		assert_eq!(track_info(crate::catalog::PRIORITY.video).max_age, Some(MAX_AGE));
 
 		// Retimescaling for a container that carries the source's own scale keeps it, since that
 		// is the shape that would otherwise reach for `Info::default()` and lose the retention.
-		let at = track_info().with_timescale(Timescale::MILLI);
-		assert_eq!(at.timescale, Timescale::MILLI);
-		assert_eq!(at.latency_max, LATENCY_MAX);
+		let at = track_info(crate::catalog::PRIORITY.video).with_timescale(Timescale::MILLI);
+		assert_eq!(at.timescale, Some(Timescale::MILLI));
+		assert_eq!(at.max_age, Some(MAX_AGE));
 	}
 
 	#[test]
 	fn non_media_tracks_keep_the_default_retention() {
-		// The catalog is snapshot mode and the timeline is a single never-rolled group: in both
-		// the useful value is the live edge, which is retained unconditionally, so neither pays
-		// for history it never serves.
-		assert_eq!(
-			crate::Catalog::default_track_info().latency_max,
-			moq_net::track::DEFAULT_LATENCY_MAX
-		);
+		// Catalog and timeline metadata impose no publisher age limit; local cache policy
+		// still controls storage.
+		assert_eq!(crate::Catalog::default_track_info().max_age, None);
 	}
 }

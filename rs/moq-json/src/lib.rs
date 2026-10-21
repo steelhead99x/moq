@@ -1,7 +1,7 @@
 //! JSON publishing over [`moq-net`](moq_net) tracks, in three modes:
 //!
-//! - [`snapshot`]: **lossy**. One JSON value updated over time; a consumer only gets the most
-//!   recent value. Intermediate updates are collapsed and older groups are dropped.
+//! - [`snapshot`]: **lossy**. One JSON value updated over time; `next` yields states inside the
+//!   drift budget, while `latest` skips to the newest state. Superseded groups may be lost.
 //! - [`stream`]: **lossless**. An ordered append-log of self-contained records; every record is
 //!   preserved and delivered in order, nothing is ever superseded.
 //! - [`window`]: **bounded**. An ordered run of records appended to the back and dropped from the
@@ -17,12 +17,33 @@
 //! when something else already owns the track, such as a `moq_mux::container::Producer` also
 //! managing a timeline and a catalog estimate.
 
+#![warn(missing_docs)]
+
 mod diff;
+mod merge;
 pub mod snapshot;
 pub mod stream;
+mod strict;
 pub mod window;
 
 pub use crate::diff::{Diff, diff};
+
+/// How a JSON track compresses its frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Compression {
+	/// Uncompressed JSON frames.
+	#[default]
+	None,
+
+	/// Group-scoped raw DEFLATE, sync-flushed at each frame boundary.
+	Deflate,
+}
+
+impl Compression {
+	pub(crate) const fn is_deflate(self) -> bool {
+		matches!(self, Self::Deflate)
+	}
+}
 
 /// Errors produced while publishing or consuming JSON.
 #[derive(thiserror::Error, Debug, Clone)]
@@ -57,6 +78,23 @@ pub enum Error {
 	/// calling [`stream::Encoder::reset`].
 	#[error("compression desynchronized: a frame was encoded but never written")]
 	Desync,
+
+	/// A [`stream`] track carried a second group, which a lossless log cannot do.
+	///
+	/// A stream is a single group by construction: a publisher that cannot write a record ends the
+	/// track rather than rolling. A second group therefore means the records that would have
+	/// completed the first one are gone, so the read fails instead of presenting the remainder as
+	/// a continuous log.
+	#[error("stream rolled to a second group")]
+	Rolled,
+
+	/// A decoded frame or reconstructed snapshot exceeded its configured byte budget.
+	#[error("decoded JSON exceeded {0} bytes")]
+	TooLarge(usize),
+
+	/// A decoded frame repeated a key within one JSON object, which parsers resolve differently.
+	#[error("duplicate JSON object key")]
+	DuplicateKey,
 }
 
 impl From<serde_json::Error> for Error {

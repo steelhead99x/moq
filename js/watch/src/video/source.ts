@@ -1,9 +1,8 @@
-import type * as Catalog from "@moq/hang/catalog";
+import * as Catalog from "@moq/hang/catalog";
 import type * as Moq from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
 import { supportCacheKey } from "./config";
-import { renditionJitter } from "./playhead";
 
 /**
  * A function that checks if a video configuration can be played.
@@ -43,6 +42,11 @@ export type SourceInput = {
 	// A function that checks if a video configuration can be played. Renditions that fail the
 	// probe are filtered out. Nothing is selected until one is provided.
 	supported: Getter<Supported | undefined>;
+
+	// The connection's PROBE estimates, used to auto-select a rendition when the target has no
+	// explicit bitrate. Usually wired from a `Connection`'s `probe`.
+	// Optional: without it auto-selection falls back to the rank order alone.
+	probe: Getter<Moq.Connection.Probe | undefined>;
 };
 
 type SourceOutput = {
@@ -55,9 +59,6 @@ type SourceOutput = {
 	// The name of the active rendition.
 	track: Signal<string | undefined>;
 	config: Signal<Catalog.VideoConfig | undefined>;
-
-	// The per-rendition jitter (ms) to add to the sync buffer. Wired into Sync by the parent.
-	jitter: Signal<Moq.Time.Milli | undefined>;
 };
 
 /**
@@ -184,44 +185,16 @@ function byBitrate(target: number): RenditionFilter {
 	};
 }
 
-/**
- * Pick the best rendition when no filters are active.
- * Prefers the largest resolution, falls back to highest bitrate,
- * then falls back to the first entry.
- */
-function bestRendition(entries: [string, Catalog.VideoConfig][]): string {
-	let best = entries[0];
-
-	for (const entry of entries) {
-		const [, config] = entry;
-		const [, bestConfig] = best;
-
-		const size = (config.codedWidth ?? 0) * (config.codedHeight ?? 0);
-		const bestSize = (bestConfig.codedWidth ?? 0) * (bestConfig.codedHeight ?? 0);
-
-		if (size !== bestSize) {
-			if (size > bestSize) best = entry;
-			continue;
-		}
-
-		if ((config.bitrate ?? 0) > (bestConfig.bitrate ?? 0)) {
-			best = entry;
-		}
-	}
-
-	return best[0];
+/** Return the renditions that may be selected: a disabled one has no frames coming. */
+function enabledRenditions(renditions: Record<string, Catalog.VideoConfig>): Record<string, Catalog.VideoConfig> {
+	return Object.fromEntries(Object.entries(renditions).filter(([, config]) => config.enabled !== false));
 }
 
-/** Return unstalled renditions, or the lowest bitrate or resolution when every option is stalled. */
-function selectableRenditions(renditions: Record<string, Catalog.VideoConfig>): Record<string, Catalog.VideoConfig> {
-	const active = Object.entries(renditions).filter(([, config]) => !config.stalled);
-	if (active.length > 0) return Object.fromEntries(active);
-
+/** Keep only the highest preference: a lower one is a fallback for players that can't decode it. */
+function preferredRenditions(renditions: Record<string, Catalog.VideoConfig>): Record<string, Catalog.VideoConfig> {
 	const entries = Object.entries(renditions);
-	if (entries.length === 0) return {};
-	const byRate = byBitrate(0)(entries);
-	const lowest = byRate.length === 1 ? byRate[0] : byDimensions(0, 0)(entries)[0];
-	return { [lowest]: renditions[lowest] };
+	const top = Math.max(...entries.map(([, config]) => config.preference ?? 0));
+	return Object.fromEntries(entries.filter(([, config]) => (config.preference ?? 0) === top));
 }
 
 /**
@@ -237,7 +210,6 @@ export class Source {
 		error: new Signal<SourceError | undefined>(undefined),
 		track: new Signal<string | undefined>(undefined),
 		config: new Signal<Catalog.VideoConfig | undefined>(undefined),
-		jitter: new Signal<Moq.Time.Milli | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -249,6 +221,7 @@ export class Source {
 			broadcast: getter(props?.broadcast),
 			target: getter(props?.target),
 			supported: getter(props?.supported),
+			probe: getter(props?.probe),
 		};
 
 		this.#signals.run(this.#runCatalog.bind(this));
@@ -288,11 +261,6 @@ export class Source {
 		effect.spawn(async () => {
 			const available: Record<string, Catalog.VideoConfig> = {};
 
-			// `supported` comes from the consumer, so we cannot assume it ever settles. A rerun
-			// waits for the tasks it spawned, so an unraced probe would hold the next run shut
-			// for good. Captured here so it stays this run's promise once we start awaiting.
-			const cancelled = effect.cancel.then(() => undefined);
-
 			for (const [name, config] of Object.entries(renditions)) {
 				const cacheKey = (supported as CacheableSupported)[supportCacheKey];
 				const key = cacheKey ? cacheKey(config) : JSON.stringify(config);
@@ -303,7 +271,9 @@ export class Source {
 				} else {
 					let failed = false;
 					try {
-						isSupported = await Promise.race([supported(config), cancelled]);
+						// `supported` comes from the consumer, so we cannot assume it ever settles. A
+						// rerun waits for the tasks it spawned, so an unraced probe would hold it shut.
+						isSupported = await effect.race(supported(config));
 					} catch (err) {
 						failed = true;
 						console.warn(
@@ -337,26 +307,22 @@ export class Source {
 	}
 
 	#runSelected(effect: Effect): void {
-		const available = selectableRenditions(effect.get(this.#out.available));
-		if (Object.keys(available).length === 0) return;
-
+		const available = enabledRenditions(effect.get(this.#out.available));
 		const target = effect.get(this.in.target);
 
-		// Manual selection by name skips all ABR logic.
 		if (target?.name && target.name in available) {
 			const config = available[target.name];
 			effect.set(this.#out.track, target.name);
 			effect.set(this.#out.config, config);
-			effect.set(this.#out.jitter, renditionJitter(config));
 			return;
 		}
+
+		if (Object.keys(available).length === 0) return;
 
 		// Auto-select: use recv bandwidth if no explicit bitrate target.
 		let effectiveTarget = target;
 		if (!target?.bitrate) {
-			const broadcast = effect.get(this.in.broadcast);
-			const connection = broadcast ? effect.get(broadcast.in.connection) : undefined;
-			const estimate = connection && effect.get(connection.probe).estimatedRecvRate;
+			const estimate = effect.get(this.in.probe)?.estimatedRecvRate;
 			if (estimate != null) {
 				// Apply a safety margin (80%) to avoid oscillation.
 				const safeBitrate = Math.round(estimate * 0.8);
@@ -364,14 +330,13 @@ export class Source {
 			}
 		}
 
-		const selected = this.#select(available, effectiveTarget);
+		const selected = this.#select(preferredRenditions(available), effectiveTarget);
 		if (!selected) return;
 
 		const config = available[selected];
 
 		effect.set(this.#out.track, selected);
 		effect.set(this.#out.config, config);
-		effect.set(this.#out.jitter, renditionJitter(config));
 	}
 
 	/**
@@ -399,9 +364,9 @@ export class Source {
 			filters.push(byBitrate(target.bitrate));
 		}
 
-		// With no filters, pick the best rendition by quality.
+		// No cap: the same rank as Rust's single-rendition egresses.
 		if (filters.length === 0) {
-			return bestRendition(entries);
+			return Catalog.Video.ranked(renditions)[0][0];
 		}
 
 		// Run each filter to get ranked preference lists.

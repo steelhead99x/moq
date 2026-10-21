@@ -5,7 +5,7 @@ authors = ["Luke Curley <kixelated@gmail.com>"]
 repository = "https://github.com/moq-dev/moq"
 license = "MIT OR Apache-2.0"
 
-version = "0.3.9"
+version = "0.5.8"
 edition = "2024"
 rust-version.workspace = true
 
@@ -14,7 +14,6 @@ categories = ["multimedia", "network-programming", "web-programming"]
 
 [dependencies]
 bytes = { workspace = true }
-json-patch = "4"
 kio = { workspace = true }
 moq-flate = { workspace = true }
 moq-net = { workspace = true }
@@ -26,7 +25,27 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+futures = { workspace = true }
+json-patch = "4"
+proptest = { workspace = true, features = ["handle-panics"] }
 
 [[bench]]
 name = "codec"
 harness = false
+
+[[bench]]
+name = "allocations"
+harness = false
+
+[[bench]]
+name = "table"
+harness = false
+
+[[bench]]
+name = "window"
+harness = false
+
+# Run the documented example's inline test in the normal nextest gate.
+[[example]]
+name = "teleop"
+test = true

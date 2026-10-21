@@ -7,6 +7,293 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `MoqAudioEncoderOutput::preset` takes a `MoqAudioPreset` (low latency, balanced, quality).
+- `MoqAudioEncoder::track_init` returns the init that publishes its packets, and
+  `MoqAudioEncoder::set_bitrate` retunes it live.
+- `MoqAudioDecoderOutput::delay_us` fixes the audio playout delay, and
+  `MoqAudioConsumer::delay_us()` reports it, fixed or estimated from arrivals.
+- `MoqAudio::jitter_us` carries the catalog's advertised jitter, which floors
+  the estimated audio playout delay.
+
+### Changed
+
+- Native audio and video producers move out of broadcast handles: construct
+  `MoqAudioProducer` / `MoqVideoProducer` from the broadcast's catalog, and
+  subscribe with `MoqAudioConsumer::subscribe` / `MoqVideoConsumer::subscribe`.
+  Codec-only `MoqAudioEncoder` / `MoqVideoEncoder` are available alongside them.
+- Audio frame duration defaults to the codec's own frame; video GOP mode is an enum.
+
+## [0.4.12](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.11...moq-ffi-v0.4.12) - 2026-10-06
+
+### Other
+
+- updated the following local packages: moq-tokio
+
+## [0.4.11](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.10...moq-ffi-v0.4.11) - 2026-10-05
+
+### Other
+
+- updated the following local packages: moq-net, moq-json, hang, moq-mux, moq-tokio, moq-audio, moq-video
+
+## [0.4.10](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.9...moq-ffi-v0.4.10) - 2026-10-03
+
+### Other
+
+- *(moxygen)* Moxygen compatibility ([#4253](https://github.com/moq-dev/moq/pull/4253))
+
+## [0.4.9](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.8...moq-ffi-v0.4.9) - 2026-09-30
+
+### Added
+
+- *(ffi)* Python, Go, and Dart print MoqError's Rust message ([#4433](https://github.com/moq-dev/moq/pull/4433))
+
+### Fixed
+
+- *(net)* an origin::Dynamic keeps its origin alive ([#4417](https://github.com/moq-dev/moq/pull/4417))
+
+## [0.4.8](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.7...moq-ffi-v0.4.8) - 2026-09-27
+
+### Added
+
+- *(kt)* end a broadcast with end() ([#4259](https://github.com/moq-dev/moq/pull/4259))
+
+### Other
+
+- fix stale agent rules, the moq-net hop range, and the ffi unannounce doc ([#4305](https://github.com/moq-dev/moq/pull/4305))
+- video resumes on a keyframe after discontinuity() ([#4285](https://github.com/moq-dev/moq/pull/4285))
+
+## [0.4.7](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.6...moq-ffi-v0.4.7) - 2026-09-26
+
+### Added
+
+- end a broadcast with close() in every language ([#4031](https://github.com/moq-dev/moq/pull/4031))
+- *(mux)* forward importer discontinuities through publishers ([#4239](https://github.com/moq-dev/moq/pull/4239))
+
+### Other
+
+- rename CLAUDE.md to AGENTS.md ([#4235](https://github.com/moq-dev/moq/pull/4235))
+
+## [0.4.6](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.5...moq-ffi-v0.4.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-video, moq-json, hang, moq-mux, moq-tokio, moq-audio
+
+## [0.4.5](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.4...moq-ffi-v0.4.5) - 2026-09-25
+
+### Added
+
+- *(ffi)* advertise JSON tracks in the catalog, add binary data tracks ([#4137](https://github.com/moq-dev/moq/pull/4137))
+
+### Fixed
+
+- *(ffi)* name the binary config conversion so moq-ffi compiles ([#4157](https://github.com/moq-dev/moq/pull/4157))
+
+## [0.4.4](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.3...moq-ffi-v0.4.4) - 2026-09-25
+
+### Added
+
+- *(ffi)* name the track an encoded audio or video publish writes ([#4097](https://github.com/moq-dev/moq/pull/4097))
+- *(mux)* measure encoder flush jitter per rendition ([#3940](https://github.com/moq-dev/moq/pull/3940))
+
+## [0.4.3](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.2...moq-ffi-v0.4.3) - 2026-09-25
+
+### Added
+
+- *(net)* hide dot-named broadcasts from discovery (moq-lite-07) ([#4060](https://github.com/moq-dev/moq/pull/4060))
+- *(ffi)* disable or delay the WebSocket fallback ([#3961](https://github.com/moq-dev/moq/pull/3961))
+
+### Fixed
+
+- *(net)* a broadcast exists only while announced ([#4021](https://github.com/moq-dev/moq/pull/4021))
+
+## [0.4.2](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.1...moq-ffi-v0.4.2) - 2026-09-24
+
+### Other
+
+- rename in-repo smoke test to interop ([#3963](https://github.com/moq-dev/moq/pull/3963))
+
+## [0.4.1](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.0...moq-ffi-v0.4.1) - 2026-09-23
+
+### Added
+
+- *(ffi)* add a TrackDemand handle and expose demand() on JSON producers ([#3949](https://github.com/moq-dev/moq/pull/3949))
+
+## [0.4.0](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.19...moq-ffi-v0.4.0) - 2026-09-23
+
+### Added
+
+- *(video)* fork v4l in-tree with checked-in V4L2 bindings ([#3867](https://github.com/moq-dev/moq/pull/3867))
+- *(moq-ffi)* the decode pixel format reaches every uniffi binding ([#3892](https://github.com/moq-dev/moq/pull/3892))
+- *(video)* [**breaking**] type the group configuration and make cut fallible ([#3876](https://github.com/moq-dev/moq/pull/3876))
+- preserve video capture timing ([#3849](https://github.com/moq-dev/moq/pull/3849))
+- *(ffi)* [**breaking**] scope announcement streams with patterns ([#3856](https://github.com/moq-dev/moq/pull/3856))
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(libmoq)* [**breaking**] finalize release API ([#3819](https://github.com/moq-dev/moq/pull/3819))
+- *(hang)* [**breaking**] unify catalog APIs ([#3813](https://github.com/moq-dev/moq/pull/3813))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- *(net)* [**breaking**] announce prefixes on every wire; consumers read paths ([#3770](https://github.com/moq-dev/moq/pull/3770))
+- *(net)* [**breaking**] fold the session placeholders into PROTOCOL_VIOLATION ([#3755](https://github.com/moq-dev/moq/pull/3755))
+- [**breaking**] name every rate estimate estimated_*_rate
+- *(net)* [**breaking**] register the four placeholder stream codes
+- *(net)* [**breaking**] rank anonymous hop chains last ([#3724](https://github.com/moq-dev/moq/pull/3724))
+- [**breaking**] borrow publisher finish so abort can still run ([#3714](https://github.com/moq-dev/moq/pull/3714))
+- *(net)* [**breaking**] one name per announce, request, and origin config concept ([#3725](https://github.com/moq-dev/moq/pull/3725))
+- *(json)* [**breaking**] Config means the same thing in json and binary ([#3718](https://github.com/moq-dev/moq/pull/3718))
+- *(ffi)* [**breaking**] drop MoqCancel; Go cancels through context.Context ([#3723](https://github.com/moq-dev/moq/pull/3723))
+- *(ffi)* [**breaking**] use microseconds and matching origin verbs
+- *(tokio)* [**breaking**] rename ConnectionStatsReader to connection::Monitor ([#3705](https://github.com/moq-dev/moq/pull/3705))
+- *(ffi)* [**breaking**] carry the route cold cost through MoqRoute ([#3669](https://github.com/moq-dev/moq/pull/3669))
+- *(ffi)* [**breaking**] replace MoqAudioCodec enum with opus() object ([#3671](https://github.com/moq-dev/moq/pull/3671))
+- *(net)* [**breaking**] make reader group and frame limits explicit ([#3647](https://github.com/moq-dev/moq/pull/3647))
+- *(net)* [**breaking**] advertise wildcard routes with Pattern events ([#3649](https://github.com/moq-dev/moq/pull/3649))
+- *(ffi)* [**breaking**] fail configuration setters that cannot apply ([#3642](https://github.com/moq-dev/moq/pull/3642))
+- *(ffi)* [**breaking**] preserve session and stream protocol error details ([#3615](https://github.com/moq-dev/moq/pull/3615))
+- *(ffi)* [**breaking**] align create_broadcast, announce, and dynamic across bindings ([#3577](https://github.com/moq-dev/moq/pull/3577))
+- *(ffi)* [**breaking**] follow the connection's bandwidth share ([#3622](https://github.com/moq-dev/moq/pull/3622))
+- *(moq-ffi)* expose the reconnect epoch and QUIC stream cap ([#3627](https://github.com/moq-dev/moq/pull/3627))
+- *(hang)* [**breaking**] empty frames close the previous frame's duration ([#3575](https://github.com/moq-dev/moq/pull/3575))
+
+### Fixed
+
+- *(net)* announce local broadcasts on origin cursors ([#3928](https://github.com/moq-dev/moq/pull/3928))
+- *(moq-ffi)* cancel waits for the listening socket to close ([#3914](https://github.com/moq-dev/moq/pull/3914))
+- *(ci)* repair nightly and meta-review failures ([#3799](https://github.com/moq-dev/moq/pull/3799))
+- *(ffi)* stop the runtime thread at Python exit so it never dies mid-callback ([#3766](https://github.com/moq-dev/moq/pull/3766))
+- *(ffi)* keep the first-frame cursor across empty groups and cancel ([#3641](https://github.com/moq-dev/moq/pull/3641))
+- *(json)* [**breaking**] fallible modify(), abort the track when a dropped edit fails ([#3644](https://github.com/moq-dev/moq/pull/3644))
+- *(ffi)* keep the lane guard alive for the whole read ([#3651](https://github.com/moq-dev/moq/pull/3651))
+- *(ffi)* let group and datagram reads progress independently ([#3645](https://github.com/moq-dev/moq/pull/3645))
+- *(moq-mux)* [**breaking**] make an fMP4 export fragment a group, on every track ([#3573](https://github.com/moq-dev/moq/pull/3573))
+
+### Other
+
+- *(moq-ffi)* move the bindgen CLI out of the library build ([#3908](https://github.com/moq-dev/moq/pull/3908))
+- *(net)* routed_broadcast waits on the watch alone ([#3901](https://github.com/moq-dev/moq/pull/3901))
+- *(rs)* read constant-size chunks with as_chunks ([#3899](https://github.com/moq-dev/moq/pull/3899))
+- *(video)* [**breaking**] separate decoder output from subscription policy ([#3875](https://github.com/moq-dev/moq/pull/3875))
+- *(audio)* [**breaking**] separate configuration contracts ([#3843](https://github.com/moq-dev/moq/pull/3843))
+- *(audio)* [**breaking**] expose demand without track authority ([#3842](https://github.com/moq-dev/moq/pull/3842))
+- Unify mux track and rendition ownership ([#3857](https://github.com/moq-dev/moq/pull/3857))
+- Make media backends optional ([#3839](https://github.com/moq-dev/moq/pull/3839))
+- *(video)* [**breaking**] type frame conversions ([#3846](https://github.com/moq-dev/moq/pull/3846))
+- *(mux)* [**breaking**] share media rate policy ([#3840](https://github.com/moq-dev/moq/pull/3840))
+- *(just)* consolidate full-suite actions ([#3823](https://github.com/moq-dev/moq/pull/3823))
+- *(net)* [**breaking**] name path roles without new types ([#3826](https://github.com/moq-dev/moq/pull/3826))
+- *(net)* [**breaking**] return the next deadline from driver polls ([#3828](https://github.com/moq-dev/moq/pull/3828))
+- *(net)* [**breaking**] drive time and cache cleanup explicitly ([#3825](https://github.com/moq-dev/moq/pull/3825))
+- *(net)* expose route cost fields ([#3802](https://github.com/moq-dev/moq/pull/3802))
+- *(tokio)* make API shapes type-safe ([#3816](https://github.com/moq-dev/moq/pull/3816))
+- Merge origin/main into dev
+- Merge remote-tracking branch 'origin/dev' into merge-main-into-dev-20260914
+- merge main into dev
+- merge main into dev
+
+### Removed
+
+- `MoqCancel` and the trailing `cancel` argument on blocking async methods. Bindings with
+  native async cancellation never needed it; Go now cancels through `context.Context` on
+  the generated call.
+
+### Added
+
+- `MoqError::Busy` when a configuration setter races an in-flight connect, listen, or accept.
+
+### Fixed
+
+- `TrackConsumer.read_frame` skips completed empty groups instead of returning
+  EOF, keeps a group across a cancelled read so its first frame is not lost,
+  and drops a group that errors so a later read can move on.
+
+### Changed
+
+- `MoqClient::set_tls_disable_verify(bool)` is `set_tls_verify(bool)`, so the
+  argument's polarity matches every ergonomic wrapper.
+- `MoqRequest::transport()` returns the closed `MoqTransport` enum instead of a string.
+- Bare-integer durations are microseconds: `max_age_us` on decoder outputs,
+  track info, and subscriptions; `MoqBackoff` is `initial_us` / `max_us` /
+  `timeout_us`. `MoqSession::publish()` / `consume()` match `set_publish` /
+  `set_consume`.
+- `MoqAnnounced` is `MoqAnnounceConsumer`, `MoqAnnouncement` is
+  `MoqAnnounceUpdate` with `prefix()` instead of `path()`; the returned covered
+  prefix is relative to the prefix passed to `announced`. `MoqBroadcastRequest::abort`
+  is `reject`, and `MoqOriginOptions` is `MoqOriginConfig`.
+
+- [**breaking**] `MoqTrackProducer::finish` and `MoqGroupProducer::finish` keep the handle open so a
+  later `abort` can still run. Broadcast, audio, video, and JSON producers still close on finish.
+- Client, server, and pending-request configuration setters now return `Result` and
+  apply or fail. They error with `Busy` while connect/listen/accept owns the handle
+  and `Cancelled` after `cancel()`. Server bind/TLS is captured at `listen()` and
+  those setters fail afterwards; request origin overrides fail with `AlreadyResponded`
+  after accept/reject. `cert_fingerprints()` uses `Busy` instead of `Bind` when the
+  server is in an accept/listen call.
+
+- `MoqError` is no longer a flat error. `Protocol` carries a `MoqProtocolError` record
+  (session or stream scope, the verbatim wire code, a known kind, and a message). Transport
+  failures are `Transport`; local failures without a protocol code are `Internal`. Associated
+  data on other variants is now visible to bindings instead of being flattened into the message.
+
+- `publish_container_stream` takes a `MoqContainerFormat` instead of a `MoqContainerInit`, which
+  carried leading bytes the stream importer discarded.
+
+- `publish_media`, `publish_media_on_track`, and `publish_media_stream` split by media kind:
+  `publish_audio`, `publish_video`, `publish_container`, `publish_audio_on_track`,
+  `publish_video_on_track`, `publish_video_stream`, and `publish_container_stream`. Each takes only
+  the fields its kind can honor, so a video hint on an audio track and a label on a container are no
+  longer expressible. There is no audio stream variant: audio has no frame boundaries to infer.
+- `MoqInit` splits into `MoqAudioInit`, `MoqVideoInit`, and `MoqContainerInit`, and the format is a
+  typed `MoqAudioFormat` / `MoqVideoFormat` / `MoqContainerFormat` rather than a string.
+- The raw encoder paths are `encode_audio` and `encode_video`, freeing `publish_audio` /
+  `publish_video` for the bring-your-own-encoder path. C already called these `_raw`.
+- `MoqAudioFormat` (the PCM sample layout) is now `MoqAudioSampleFormat`, matching the existing
+  `MoqVideoPixelFormat`.
+- A container gets its own `MoqContainerProducer` / `MoqContainerStreamProducer` rather than sharing
+  `MoqMediaProducer`. `write` takes no timestamp, since a container carries its own timing and the
+  shared type silently dropped it; and `name`/`used`/`unused` no longer have a container case to
+  fail on.
+
+### Added
+
+- `MoqErrorScope`, `MoqProtocolKind`, and `MoqProtocolError` so every binding can read a
+  peer's session or stream code without parsing a message.
+
+- Publish and consume human-readable audio and video rendition labels.
+
+### Changed
+
+- `publish_media` and `publish_media_stream` reject a `MoqInit` label or video hint on a container
+  format, and an audio format rejects a video hint, instead of silently dropping either.
+
+## [0.3.19](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.18...moq-ffi-v0.3.19) - 2026-09-17
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.3.18](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.17...moq-ffi-v0.3.18) - 2026-09-13
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.3.17](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.16...moq-ffi-v0.3.17) - 2026-09-09
+
+### Added
+
+- *(audio,video)* compile the device, render, and VAAPI code by default ([#3353](https://github.com/moq-dev/moq/pull/3353))
+
+### Fixed
+
+- *(rs)* compile the lib tests at --no-default-features ([#3397](https://github.com/moq-dev/moq/pull/3397))
+
+### Other
+
+- make the agent guides minimal and situational ([#3469](https://github.com/moq-dev/moq/pull/3469))
+- take every feature that needs a library or libclang at build time off the defaults ([#3464](https://github.com/moq-dev/moq/pull/3464))
+- *(deps)* bump the cargo group across 1 directory with 5 updates ([#3395](https://github.com/moq-dev/moq/pull/3395))
+
 ## [0.3.16](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.15...moq-ffi-v0.3.16) - 2026-09-02
 
 ### Added

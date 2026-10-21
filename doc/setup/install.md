@@ -1,43 +1,75 @@
 ---
 title: Install
-description: Install moq-relay, moq-cli, moq-token, and the plugins on Linux, macOS, and Windows
+description: Install moq-relay, moq, and the plugins on Linux, macOS, and Windows
 ---
 
 # Install
 
-Three binaries and two plugins ship prebuilt:
+Two binaries and two plugins ship prebuilt:
 
 | Package | Binary | What it does |
 | --- | --- | --- |
 | `moq-relay` | `moq-relay` | The [relay server](/bin/relay/) |
-| `moq-cli` | `moq` | The [media router](/bin/cli): publish, play, convert, gateways, and `moq token` |
-| `moq-token-cli` | `moq-token` | Standalone JWT tool; the same commands as `moq token` |
+| `moq` | `moq` | The [media router](/bin/cli): publish, play, convert, gateways, and `moq auth` |
 | GStreamer plugin | `moqsink`, `moqsrc` | [GStreamer](/bin/gstreamer) elements |
 | OBS plugin | | [OBS Studio](/bin/obs) output and source |
+
+Package names match the executables everywhere except crates.io, where the
+crate is `moq-cli`. The CLI was once packaged as `moq-cli`; that Docker image
+and flake output stop at 0.12.2, so switch to `moqdev/moq` and `#moq`.
+`moq auth` mints keys and tokens, so installing `moq` covers that too.
+
+## macOS and Linux
+
+The quickest way to install `moq`:
+
+```bash
+curl -fsSL https://moq.sh | sh
+```
+
+It installs the newest `moq` release into `~/.local/bin`, without sudo or Rust,
+on macOS (Apple Silicon) and Linux (x86\_64, aarch64, glibc 2.34+). It checks
+the download against the release's `SHA256SUMS` and never edits your shell
+profile; it prints the `PATH` line to add if needed. Run it again to upgrade.
+Pass options after `sh -s --`:
+
+```bash
+# A specific version, e.g. to pin or downgrade
+curl -fsSL https://moq.sh | sh -s -- --version 0.14.0
+
+# Another directory, required when HOME is unset
+curl -fsSL https://moq.sh | sh -s -- --dir ~/bin
+```
+
+It refuses to overwrite a `moq` that a package manager symlinked, so upgrade
+that one with its package manager. To uninstall, delete the binary:
+`rm ~/.local/bin/moq`. `moq-relay` and the plugins use the methods below.
 
 ## Any platform
 
 ```bash
 # crates.io (needs a Rust toolchain)
-cargo install moq-relay moq-cli moq-token-cli
+cargo install moq-relay moq-cli
 
 # Homebrew (macOS and Linux)
-brew install moq-dev/tap/moq-relay moq-dev/tap/moq-cli
+brew install moq-dev/tap/moq-relay moq-dev/tap/moq
 
-# Nix (pin a release tag to use the binary cache)
-nix run github:moq-dev/moq#moq-relay -- relay.toml
-nix run github:moq-dev/moq#moq-cli -- --help
+# Nix (`release` builds from source; a release tag such as moq-relay-v0.12.4 uses the binary cache)
+nix run github:moq-dev/moq/release#moq-relay -- relay.toml
+nix run github:moq-dev/moq/release#moq -- --help
 
-# Docker (linux/amd64 and linux/arm64)
+# Docker (linux/amd64 and linux/arm64). The image is scratch (the package
+# closure only) and has no shell.
 docker run -p 4443:4443/udp -p 4443:4443/tcp -v "$PWD/relay.toml:/app/relay.toml:ro" moqdev/moq-relay /app/relay.toml
-docker run -i moqdev/moq-cli --help
+docker run -i moqdev/moq --help
 ```
 
 Static binaries for Linux (x86\_64, aarch64), macOS (Apple Silicon), and Windows
 (x64) are attached to every
 [GitHub release](https://github.com/moq-dev/moq/releases). The Nix cache at
-`kixelated.cachix.org` only holds tagged releases, so an unpinned
-`github:moq-dev/moq` builds from source.
+`nix.moq.dev` only holds tagged releases, so the `release` branch builds from
+source. Nix asks before trusting it; `--accept-flake-config` says yes for one
+command.
 
 ## Debian and Ubuntu
 
@@ -48,7 +80,7 @@ is available on Debian 12+ and Ubuntu 24.04+.
 curl -fsSL https://apt.moq.dev/moq-keyring.gpg | sudo tee /usr/share/keyrings/moq-keyring.gpg > /dev/null
 echo "deb [signed-by=/usr/share/keyrings/moq-keyring.gpg] https://apt.moq.dev stable main" | sudo tee /etc/apt/sources.list.d/moq.list
 sudo apt update
-sudo apt install moq-relay moq-cli moq-token-cli gstreamer1.0-moq
+sudo apt install moq-relay moq gstreamer1.0-moq
 ```
 
 ## Fedora, RHEL, and openSUSE
@@ -56,8 +88,8 @@ sudo apt install moq-relay moq-cli moq-token-cli gstreamer1.0-moq
 Fedora 39+, RHEL 9, Rocky 9, AlmaLinux 9. On openSUSE use `zypper addrepo`.
 
 ```bash
-sudo dnf config-manager --add-repo https://rpm.moq.dev/moq.repo
-sudo dnf install moq-relay moq-cli moq-token-cli gstreamer1-moq
+sudo curl -fsSL https://rpm.moq.dev/moq.repo -o /etc/yum.repos.d/moq.repo
+sudo dnf install moq-relay moq gstreamer1-moq
 ```
 
 Both repositories are signed with the project key, served at
@@ -81,8 +113,7 @@ works without root, and config edits survive upgrades.
 
 ```powershell
 winget install moq-dev.moq-relay
-winget install moq-dev.moq-cli
-winget install moq-dev.moq-token-cli
+winget install moq-dev.moq
 ```
 
 The OBS plugin ships as a zip for Windows x64 and macOS arm64 on the

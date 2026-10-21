@@ -1,0 +1,160 @@
+/// Errors from encoding, decoding, or storing recording objects.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+	/// The backing object store failed.
+	#[error("object store: {0}")]
+	Store(String),
+
+	/// No object exists at this key.
+	#[error("not found: {0}")]
+	NotFound(String),
+
+	/// The recording format version is not the current one.
+	#[error("unknown version {0}")]
+	Version(u64),
+
+	/// A group ID, segment ID, or frame timestamp is outside 0 through 2^53 - 1.
+	#[error("{0} exceeds the recording id range")]
+	Id(u64),
+
+	/// `.info` timescale is not in 1 through 2^53 - 1.
+	#[error("timescale {0} is outside 1..=9007199254740991")]
+	Timescale(u64),
+
+	/// An existing `.info` has a different priority.
+	#[error("priority {existing} does not match {intended}")]
+	Priority {
+		/// The priority already recorded.
+		existing: u8,
+		/// The priority the caller wanted to record.
+		intended: u8,
+	},
+
+	/// An existing `.info` has a different timescale, `None` when untimed.
+	#[error("timescale {existing:?} does not match {intended:?}")]
+	TimescaleMismatch {
+		/// The timescale already recorded.
+		existing: Option<u64>,
+		/// The timescale the caller wanted to record.
+		intended: Option<u64>,
+	},
+
+	/// An existing `.info` was recorded from another publisher instance: the source
+	/// restarted, so the caller starts a new prefix.
+	#[error(
+		"source epoch {} does not match the recorded {}",
+		epoch_text(intended),
+		epoch_text(existing)
+	)]
+	EpochMismatch {
+		/// The epoch already recorded.
+		existing: Option<moq_net::Epoch>,
+		/// The epoch of the source being recorded now.
+		intended: Option<moq_net::Epoch>,
+	},
+
+	/// The object has no groups.
+	#[error("empty object")]
+	Empty,
+
+	/// Group sequences are not strictly ascending.
+	#[error("group sequences are not strictly ascending")]
+	Sequence,
+
+	/// An object's table does not hold exactly the frames its record names.
+	#[error("object does not match its record")]
+	Span,
+
+	/// The binary table is truncated, overlapping, gapped, or out of range.
+	#[error("malformed table")]
+	Table,
+
+	/// Arithmetic overflowed while encoding or decoding.
+	#[error("overflow")]
+	Overflow,
+
+	/// The track name is empty or its encoding is not canonical.
+	#[error("invalid track name")]
+	Track,
+
+	/// An object path is not a recording key.
+	#[error("invalid path: {0}")]
+	Path(String),
+
+	/// A backend returned a directory from the flat object listing API.
+	#[error("directory listing is unsupported: {0}")]
+	Directory(String),
+
+	/// A pagination continuation was passed to streaming list.
+	#[error("continuation query requires list_paginated")]
+	Pagination,
+
+	/// A create collided with different object bytes.
+	#[error("conflicting object: {0}")]
+	Conflict(String),
+
+	/// `.info` JSON is malformed.
+	#[error("json: {0}")]
+	Json(String),
+
+	/// Publishing the replayed archive failed.
+	#[error("moq: {0}")]
+	Moq(String),
+
+	/// The track was already enrolled, or is the recording's own timeline.
+	#[error("track already enrolled: {0}")]
+	Enrolled(String),
+
+	/// The track is untimed, so a DVR has no content time to measure its retention by.
+	#[error("untimed track: {0}")]
+	Untimed(String),
+
+	/// A frame's timestamp does not match its track: missing on a timed track, or present on an
+	/// untimed one.
+	#[error("frame timing does not match the track")]
+	Timing,
+
+	/// The source broadcast or one of its tracks failed.
+	#[error("source: {0}")]
+	Source(String),
+
+	/// The recording's timeline could not be recovered, segmented, or published.
+	#[error("timeline: {0}")]
+	Timeline(String),
+
+	/// The writer stopped accepting commands.
+	#[error("writer closed")]
+	Closed,
+}
+
+impl From<object_store::Error> for Error {
+	fn from(err: object_store::Error) -> Self {
+		match err {
+			object_store::Error::NotFound { path, .. } => Self::NotFound(path),
+			other => Self::Store(other.to_string()),
+		}
+	}
+}
+
+impl From<moq_net::Error> for Error {
+	fn from(err: moq_net::Error) -> Self {
+		Self::Moq(err.to_string())
+	}
+}
+
+impl From<serde_json::Error> for Error {
+	fn from(err: serde_json::Error) -> Self {
+		Self::Json(err.to_string())
+	}
+}
+
+/// A [`Result`](std::result::Result) using this crate's [`Error`].
+pub type Result<T> = std::result::Result<T, Error>;
+
+fn epoch_text(epoch: &Option<moq_net::Epoch>) -> String {
+	match epoch {
+		Some(epoch) => epoch.to_string(),
+		None => "none".to_string(),
+	}
+}

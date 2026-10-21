@@ -2,25 +2,28 @@ import * as Moq from "@moq/net";
 
 async function main() {
 	const url = new URL("https://cdn.moq.dev/anon");
-	const connection = await Moq.Connection.connect(url);
+	const origin = new Moq.Origin.Producer();
+	const connection = await Moq.Connection.connect({ url, consume: origin });
 
-	// Get the announced stream iterator
-	const announced = connection.announced();
+	// Own and close the origin announcement watch.
+	const announced = origin.announced();
+	const requests = new Map<Moq.Path.Valid, Moq.Origin.Requesting>();
 
 	// Discover broadcasts announced by the server
-	for (;;) {
-		const announcement = await announced.next();
-		if (!announcement) break;
+	for await (const announcement of announced) {
+		if (announcement.kind === "end" || requests.has(announcement.prefix)) continue;
+		console.log("New stream available:", announcement.prefix);
 
-		console.log("New stream available:", announcement.path);
-
-		// Subscribe to new streams
-		const _broadcast = connection.consume(announcement.path);
-
-		// Do something with the broadcast
+		// One request per path follows its publisher restarts until closed.
+		const request = origin.request(announcement.prefix, { announced: true });
+		request.active.subscribe((broadcast) => console.log(request.path, broadcast ? "live" : "offline"));
+		requests.set(announcement.prefix, request);
 	}
 
-	connection.close();
+	for (const request of requests.values()) request.close();
+	announced.close();
+	await connection.close();
+	origin.close();
 }
 
 main().catch(console.error);

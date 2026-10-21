@@ -1,21 +1,22 @@
 /**
- * The MoQ Cluster extension (draft-lcurley-moq-cluster-00).
+ * The MoQ Cluster extension (draft-lcurley-moq-cluster-01).
  *
  * moq-transport carries no routing information, so a peer cannot tell whether an
  * advertisement already passed through us. This extension adds it:
  *
- * - each endpoint declares its own Hop ID via the RELAY_HOPS Setup Option, which is also
- *   what negotiates the extension;
+ * - each endpoint declares its own Hop ID via the HOP_ID Setup Option, which is also what
+ *   negotiates the extension;
  * - every advertisement carries the HOP_PATH it traversed and the accumulated ROUTE_COST
- *   of that path, as Key-Value-Pair message parameters on PUBLISH_NAMESPACE and NAMESPACE.
+ *   of that path, as Key-Value-Pair message parameters on PUBLISH_NAMESPACE and NAMESPACE,
+ *   and a PUBLISH_NAMESPACE is repriced with the same parameters on a REQUEST_UPDATE.
  *
  * These are the semantics moq-lite carries natively on every announcement (see
  * `lite/announce.ts`); this module is the moq-transport binding, negotiated on draft-17+
  * only, where SETUP is a Key-Value-Pair block.
  *
- * We are a leaf, never a relay: the only path we can advertise is our own, so we stamp a
- * single-entry HOP_PATH and seed the cost at 0. What we get out of declaring is the other
- * direction. A relay that knows our Hop ID withholds the advertisements that already flowed
+ * A broadcast we produce carries a single-entry HOP_PATH and a cost of 0, and a route we
+ * forward carries its own hop chain and static cost with our id appended. What we get out of
+ * declaring is also the other direction. A relay that knows our Hop ID withholds the advertisements that already flowed
  * through us, so publishing a broadcast no longer announces it back to us, which is what
  * moq-lite has always done with its own hop chain.
  *
@@ -24,8 +25,7 @@
  */
 
 import { ProtocolViolation, reason } from "../error.ts";
-import { MAX_HOPS, type Origin, OriginSchema, UNKNOWN_ORIGIN } from "../origin.ts";
-import type { Reader } from "../stream.ts";
+import { type Hop, HopSchema, MAX_HOPS, UNKNOWN_HOP } from "../hop.ts";
 import * as Varint from "../varint.ts";
 import { Parameters, SetupOption, type SetupOptions } from "./parameters.ts";
 import { type IetfVersion, Version } from "./version.ts";
@@ -50,10 +50,10 @@ export function supported(version: IetfVersion): boolean {
  */
 export interface Hops {
 	/** Our own Hop ID, declared in SETUP and stamped onto every advertisement we send. */
-	self: Origin;
+	self: Hop;
 
 	/**
-	 * The peer's Hop ID, or `undefined` when it declared no RELAY_HOPS.
+	 * The peer's Hop ID, or `undefined` when it declared no HOP_ID.
 	 *
 	 * This is what decides whether advertisements carry the parameters at all, in both
 	 * directions: a peer that declared nothing has not read ours either, so sending it a
@@ -61,7 +61,7 @@ export interface Hops {
 	 * message. A peer that declared the reserved 0 negotiated the extension but withheld its
 	 * identity, so the parameters flow and there is simply nothing to exclude.
 	 */
-	peer?: Origin;
+	peer?: Hop;
 }
 
 /**
@@ -74,7 +74,7 @@ export interface Hops {
  */
 export interface Advert {
 	/** HOP_PATH: the path this advertisement traversed, publisher first, sender last. */
-	hops: Origin[];
+	hops: Hop[];
 
 	/** ROUTE_COST: the marginal cost of subscribing via this advertisement. Absent on the
 	 * wire means 0, so an endpoint that prices nothing sends nothing. */
@@ -82,22 +82,32 @@ export interface Advert {
 }
 
 /**
+ * The cluster parameters a REQUEST_UPDATE on a PUBLISH_NAMESPACE carries: only what
+ * changed, since an omitted parameter keeps its value.
+ *
+ * @internal
+ */
+export interface Update {
+	/** HOP_PATH, when the route changed. */
+	hops?: Hop[];
+
+	/** ROUTE_COST, when the cost changed. A cost that dropped to 0 arrives as an explicit
+	 * 0 here, unlike the advertisement itself where absent means 0. */
+	cost?: bigint;
+}
+
+/**
  * Read the peer's Hop ID out of its SETUP, or `undefined` when it did not negotiate.
  *
  * @internal
  */
-export function fromSetup(params: SetupOptions, version: IetfVersion): Origin | undefined {
+export function fromSetup(params: SetupOptions, version: IetfVersion): Hop | undefined {
 	if (!supported(version)) return undefined;
 
-	// RELAY_HOPS is odd, so its value is a length-prefixed byte string holding the sender's
-	// Hop ID as a single varint. 0 is legal: the peer speaks the extension but withholds
-	// its identity.
-	const value = params.getBytes(SetupOption.RelayHops);
+	// 0 is legal: the peer speaks the extension but withholds its identity.
+	const value = params.getVarint(SetupOption.HopId);
 	if (value === undefined) return undefined;
-
-	const [origin, rest] = Varint.decodeLeadingOnes(value);
-	if (rest.length !== 0) throw new Error("trailing bytes in RELAY_HOPS");
-	return OriginSchema.parse(origin);
+	return HopSchema.parse(value);
 }
 
 /**
@@ -105,9 +115,9 @@ export function fromSetup(params: SetupOptions, version: IetfVersion): Origin | 
  *
  * @internal
  */
-export function intoSetup(params: SetupOptions, self: Origin, version: IetfVersion) {
+export function intoSetup(params: SetupOptions, self: Hop, version: IetfVersion) {
 	if (!supported(version)) return;
-	params.setBytes(SetupOption.RelayHops, Varint.encodeLeadingOnes(self));
+	params.setVarint(SetupOption.HopId, self);
 }
 
 /**
@@ -145,8 +155,8 @@ export function advertise(ids: Hops | undefined): Advert | undefined {
  *
  * @internal
  */
-export function loops(advert: Advert, self: Origin): boolean {
-	return self !== UNKNOWN_ORIGIN && advert.hops.includes(self);
+export function loops(advert: Advert, self: Hop): boolean {
+	return self !== UNKNOWN_HOP && advert.hops.includes(self);
 }
 
 /**
@@ -155,20 +165,8 @@ export function loops(advert: Advert, self: Origin): boolean {
  * @internal
  */
 export function intoParams(advert: Advert): Parameters {
-	validate(advert.hops);
-
 	const params = new Parameters();
-
-	// The entries fill the value, so they are written with no count of their own and framed
-	// by the parameter's own length prefix.
-	const hops = advert.hops.map((hop) => Varint.encodeLeadingOnes(hop));
-	const value = new Uint8Array(hops.reduce((total, hop) => total + hop.length, 0));
-	let offset = 0;
-	for (const hop of hops) {
-		value.set(hop, offset);
-		offset += hop.length;
-	}
-	params.hopPath = value;
+	params.hopPath = encodeHops(advert.hops);
 
 	// Absent means 0, so a free path sends nothing.
 	if (advert.cost !== 0n) params.routeCost = advert.cost;
@@ -177,23 +175,31 @@ export function intoParams(advert: Advert): Parameters {
 }
 
 /**
- * Read the parameters a negotiated session puts on every advertisement.
- *
- * The parameter block is mandatory there, so a message that ends before it (the base form)
- * or one whose block does not parse is the peer's violation, same as a block that parses but
- * carries no HOP_PATH.
+ * Write a REQUEST_UPDATE's parameters: only what changed, and a cost of 0 explicitly,
+ * since an omitted parameter keeps its value.
  *
  * @internal
  */
-export async function decodeParams(r: Reader, version: IetfVersion): Promise<Advert> {
-	let params: Parameters;
-	try {
-		params = await Parameters.decode(r, version);
-	} catch (err) {
-		throw new ProtocolViolation(reason(err), { cause: err });
-	}
+export function updateIntoParams(update: Update): Parameters {
+	const params = new Parameters();
+	if (update.hops !== undefined) params.hopPath = encodeHops(update.hops);
+	if (update.cost !== undefined) params.routeCost = update.cost;
+	return params;
+}
 
-	return fromParams(params);
+/** Write a HOP_PATH value: the entries fill it with no count of their own, framed by the
+ * parameter's own length prefix. */
+function encodeHops(hops: Hop[]): Uint8Array {
+	validate(hops);
+
+	const encoded = hops.map((hop) => Varint.encodeLeadingOnes(hop));
+	const value = new Uint8Array(encoded.reduce((total, hop) => total + hop.length, 0));
+	let offset = 0;
+	for (const hop of encoded) {
+		value.set(hop, offset);
+		offset += hop.length;
+	}
+	return value;
 }
 
 /**
@@ -210,25 +216,53 @@ export function fromParams(params: Parameters): Advert {
 	try {
 		const value = params.hopPath;
 		if (value === undefined) throw new Error("advertisement is missing HOP_PATH");
-
-		const hops: Origin[] = [];
-		let rest = value;
-		while (rest.length > 0) {
-			// A short read here means the entries did not exactly fill the length.
-			const [hop, remain] = Varint.decodeLeadingOnes(rest);
-			hops.push(OriginSchema.parse(hop));
-			rest = remain;
-
-			// Bail before the buffer does: a hostile length would otherwise cost us one
-			// allocation per entry all the way to 64KB of parameter value.
-			if (hops.length > MAX_HOPS) throw new Error(`hop count exceeds maximum ${MAX_HOPS}`);
-		}
-
-		validate(hops);
-		return { hops, cost: params.routeCost ?? 0n };
+		return { hops: decodeHops(value), cost: params.routeCost ?? 0n };
 	} catch (err) {
 		throw new ProtocolViolation(reason(err), { cause: err });
 	}
+}
+
+/**
+ * Read a REQUEST_UPDATE's parameters: each is optional, and a malformed HOP_PATH is the
+ * same violation it is on an advertisement.
+ *
+ * @internal
+ */
+export function updateFromParams(params: Parameters): Update {
+	try {
+		const value = params.hopPath;
+		return { hops: value === undefined ? undefined : decodeHops(value), cost: params.routeCost };
+	} catch (err) {
+		throw new ProtocolViolation(reason(err), { cause: err });
+	}
+}
+
+/**
+ * The advertisement after `update` lands on `held`: an omitted parameter keeps its value.
+ *
+ * @internal
+ */
+export function apply(held: Advert, update: Update): Advert {
+	return { hops: update.hops ?? held.hops, cost: update.cost ?? held.cost };
+}
+
+/** Read a HOP_PATH value: bare varints filling the parameter, with no count of their own. */
+function decodeHops(value: Uint8Array): Hop[] {
+	const hops: Hop[] = [];
+	let rest = value;
+	while (rest.length > 0) {
+		// A short read here means the entries did not exactly fill the length.
+		const [hop, remain] = Varint.decodeLeadingOnes(rest);
+		hops.push(HopSchema.parse(hop));
+		rest = remain;
+
+		// Bail before the buffer does: a hostile length would otherwise cost us one
+		// allocation per entry all the way to 64KB of parameter value.
+		if (hops.length > MAX_HOPS) throw new Error(`hop count exceeds maximum ${MAX_HOPS}`);
+	}
+
+	validate(hops);
+	return hops;
 }
 
 /**
@@ -236,14 +270,14 @@ export function fromParams(params: Parameters): Advert {
  * than we accept, or a non-zero Hop ID appearing twice (a loop). Duplicate zeros are legal,
  * since 0 identifies nothing.
  */
-function validate(hops: Origin[]) {
+function validate(hops: Hop[]) {
 	if (hops.length === 0) throw new Error("hop path is empty");
 	if (hops.length > MAX_HOPS) throw new Error(`hop count ${hops.length} exceeds maximum ${MAX_HOPS}`);
 
 	// MAX_HOPS is 32, so the quadratic scan is cheaper than allocating a set.
 	for (let i = 0; i < hops.length; i++) {
 		const hop = hops[i];
-		if (hop === UNKNOWN_ORIGIN) continue;
+		if (hop === UNKNOWN_HOP) continue;
 		if (hops.indexOf(hop, i + 1) !== -1) throw new Error(`hop ${hop} appears twice in the hop path`);
 	}
 }

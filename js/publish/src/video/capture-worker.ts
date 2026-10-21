@@ -1,5 +1,5 @@
 // Reads camera frames off a native MediaStreamTrackProcessor, which Safari (18+) and Firefox expose
-// only inside a dedicated worker. Compiled and inlined as a blob URL by Vite (`?worker&inline`).
+// only inside a dedicated worker. Bundled by vite-plugin-worklet (`?worklet`).
 //
 // Frames are transferred back one at a time, each in response to a `pull`, so a busy main thread
 // drops frames at the capture source instead of queueing them (and their GPU memory) in the message
@@ -69,6 +69,7 @@ async function pull(): Promise<void> {
 	if (!reader) throw new Error("not started");
 
 	const { value } = await reader.read();
+	// biome-ignore lint/style/noRestrictedGlobals: a Unix-anchored stamp the main thread maps onto its clock.
 	const at = performance.timeOrigin + performance.now();
 
 	if (!value) {

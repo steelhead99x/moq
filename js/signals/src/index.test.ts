@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { Computed, Effect, Once, Signal } from "./index.ts";
+import { Manual, Milli, Nano, Second } from "@moq/clock";
+import { Computed, type Dispose, Effect, type GetPromise, Once, race, Signal } from "./index.ts";
 
 const NO_SUBSCRIPTION_WARNING = "Effect did not subscribe to any signals; it will never rerun.";
 
@@ -81,6 +82,17 @@ describe("Signal", () => {
 		await settle();
 		expect(seen).toEqual([{ a: 2 }]);
 		dispose();
+	});
+
+	test("any number of subscribers is legitimate", async () => {
+		const signal = new Signal(0);
+		let notified = 0;
+		const disposes = Array.from({ length: 1000 }, () => signal.subscribe(() => notified++));
+
+		signal.set(1);
+		await settle();
+		expect(notified).toBe(1000);
+		for (const dispose of disposes) dispose();
 	});
 });
 
@@ -275,6 +287,72 @@ describe("Effect", () => {
 		}
 	});
 
+	test("a spawn rejection after close still reports the failure", async () => {
+		const error = spyOn(console, "error").mockImplementation(() => {});
+		const effect = new Effect();
+		const gate = Promise.withResolvers<void>();
+
+		try {
+			effect.spawn(async () => {
+				await gate.promise;
+				throw new Error("boom");
+			});
+			effect.close();
+			gate.resolve();
+			await settle();
+
+			expect(error).toHaveBeenCalledWith("spawn error", expect.any(Error));
+		} finally {
+			error.mockRestore();
+		}
+	});
+
+	test("a spawn rejection while open is a spawn error", async () => {
+		const error = spyOn(console, "error").mockImplementation(() => {});
+		const effect = new Effect();
+
+		try {
+			effect.spawn(async () => {
+				throw new Error("boom");
+			});
+			await settle();
+
+			expect(error).toHaveBeenCalledWith("spawn error", expect.any(Error));
+		} finally {
+			effect.close();
+			error.mockRestore();
+		}
+	});
+
+	test("teardown runs last-in, first-out, nested effects included", async () => {
+		// Something registered later may depend on something registered earlier, such as a nested
+		// effect using its parent's connection, so it has to be released first.
+		const sig = new Signal(0);
+		const order: string[] = [];
+		const effect = new Effect((inner) => {
+			inner.get(sig);
+			inner.cleanup(() => order.push("first"));
+			inner.run((nested) => {
+				nested.cleanup(() => order.push("nested first"));
+				nested.cleanup(() => order.push("nested second"));
+			});
+			inner.cleanup(() => order.push("third"));
+		});
+
+		try {
+			await settle();
+			sig.set(1);
+			await settle();
+
+			expect(order).toEqual(["third", "nested second", "nested first", "first"]);
+			order.length = 0;
+		} finally {
+			effect.close();
+		}
+
+		expect(order).toEqual(["third", "nested second", "nested first", "first"]);
+	});
+
 	test("a cleanup registered during close still runs", async () => {
 		// Teardown that cascades still completes: `cleanup` appends onto the list close() is
 		// draining rather than dropping it on the floor.
@@ -338,17 +416,17 @@ describe("Effect", () => {
 	});
 
 	test("closing from a rerun cleanup runs each teardown once", async () => {
-		// `#run` and `close` share one drain, so a cleanup that closes the effect hands off at the
-		// cursor rather than starting a second pass over callbacks that already ran.
+		// `#run` and `close` share one drain, so a cleanup that closes the effect keeps popping the
+		// same list rather than starting a second pass over callbacks that already ran.
 		const sig = new Signal(0);
 		const ran: string[] = [];
 		const effect = new Effect((inner) => {
 			inner.get(sig);
+			inner.cleanup(() => ran.push("b"));
 			inner.cleanup(() => {
 				ran.push("a");
 				inner.close();
 			});
-			inner.cleanup(() => ran.push("b"));
 		});
 
 		try {
@@ -396,19 +474,18 @@ describe("Effect", () => {
 	});
 
 	test("cancelling a nested run during teardown does not skip the next cleanup", async () => {
-		// The disposer `run` hands back removes itself from the parent. Doing that by splicing
-		// shifts every later entry down, stepping the drain's cursor over a cleanup that has not
-		// run yet, so it never fires and leaks whatever it owned.
+		// The disposer `run` hands back removes itself from the parent while that list is being
+		// drained. The cleanup still pending below it must not be stepped over or leaked.
 		const sig = new Signal(0);
 		const ran: string[] = [];
 		const effect = new Effect((inner) => {
 			inner.get(sig);
+			inner.cleanup(() => ran.push("first"));
 			const dispose = inner.run(() => {});
 			inner.cleanup(() => {
-				ran.push("middle");
+				ran.push("last");
 				dispose();
 			});
-			inner.cleanup(() => ran.push("last"));
 		});
 
 		try {
@@ -416,7 +493,7 @@ describe("Effect", () => {
 			sig.set(1);
 			await settle();
 
-			expect(ran).toEqual(["middle", "last"]);
+			expect(ran).toEqual(["last", "first"]);
 		} finally {
 			effect.close();
 		}
@@ -476,16 +553,8 @@ describe("Effect", () => {
 		let lateAbort: boolean | undefined;
 		let immediate: boolean | undefined;
 
-		// Fire the 5s timer by hand instead of waiting five real seconds for it.
-		let elapsed5s: (() => void) | undefined;
-		const realSetTimeout = globalThis.setTimeout;
-		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
-			if (ms === 5000) {
-				elapsed5s = fn;
-				return 0 as unknown as ReturnType<typeof setTimeout>;
-			}
-			return realSetTimeout(fn, ms);
-		}) as typeof setTimeout);
+		const clock = new Manual();
+		const restore = clock.install();
 		const warn = spyOn(console, "warn").mockImplementation(() => {});
 
 		const effect = new Effect((e) => {
@@ -516,9 +585,7 @@ describe("Effect", () => {
 			expect(runs).toBe(1); // parked awaiting the task
 
 			// Five seconds pass. The warning fires, but the next run must stay shut.
-			expect(elapsed5s).toBeDefined();
-			elapsed5s?.();
-			await settle();
+			await clock.advanceAsync(Nano.fromSecond(Second(5)));
 			expect(runs).toBe(1);
 			expect(warn).toHaveBeenCalled();
 
@@ -534,7 +601,7 @@ describe("Effect", () => {
 			expect(runs).toBe(2);
 		} finally {
 			effect.close();
-			timer.mockRestore();
+			restore();
 			warn.mockRestore();
 		}
 	});
@@ -547,23 +614,8 @@ describe("Effect", () => {
 		const tick = new Signal(0);
 		const never = Promise.withResolvers<void>(); // deliberately never resolved
 
-		let elapsed5s: (() => void) | undefined;
-		let cleared = false;
-		const realSetTimeout = globalThis.setTimeout;
-		const realClearTimeout = globalThis.clearTimeout;
-		const TIMER = 987 as unknown as ReturnType<typeof setTimeout>;
-
-		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
-			if (ms === 5000) {
-				elapsed5s = fn;
-				return TIMER;
-			}
-			return realSetTimeout(fn, ms);
-		}) as typeof setTimeout);
-		const clear = spyOn(globalThis, "clearTimeout").mockImplementation(((id?: unknown) => {
-			if (id === TIMER) cleared = true;
-			else realClearTimeout(id as never);
-		}) as typeof clearTimeout);
+		const clock = new Manual();
+		const restore = clock.install();
 		const warn = spyOn(console, "warn").mockImplementation(() => {});
 
 		const effect = new Effect((e) => {
@@ -576,23 +628,18 @@ describe("Effect", () => {
 		try {
 			await settle();
 			tick.set(1);
-			await settle();
-			expect(elapsed5s).toBeDefined(); // parked on the task, timer armed
+			await settle(); // parked on the task, timer armed
 
 			effect.close();
 			await settle();
 
-			// The wait let go, so the diagnostic timer was disarmed on the way out.
-			expect(cleared).toBe(true);
-
-			// Even if the timer had already been queued, a closed effect must not be warned about.
-			elapsed5s?.();
+			// The wait let go, so five seconds later a closed effect is not warned about.
+			await clock.advanceAsync(Nano.fromSecond(Second(5)));
 			const warned = warn.mock.calls.some((call) => String(call[0]).includes("spawn is still running"));
 			expect(warned).toBe(false);
 		} finally {
 			effect.close();
-			timer.mockRestore();
-			clear.mockRestore();
+			restore();
 			warn.mockRestore();
 		}
 	});
@@ -692,10 +739,10 @@ describe("Effect", () => {
 		}
 	});
 
-	test("a spawn that outlived its run sees that run aborted and cancelled", async () => {
+	test("a spawn that outlived its run sees that run aborted", async () => {
 		// The scope a stale task reads has to be its own, not the incoming run's: an abort
-		// signal that never fires would scope its listeners to the next run, and a cancel
-		// promise that never resolves would park it forever.
+		// signal that never fires would scope its listeners to the next run, and a race that
+		// never settles would park it forever.
 		const tick = new Signal(0);
 		const target = new EventTarget();
 		let events = 0;
@@ -713,7 +760,7 @@ describe("Effect", () => {
 				await gate.promise;
 				aborted = e.abort.aborted;
 				e.event(target, "ping", () => events++);
-				await e.cancel;
+				await e.race();
 				cancelled = true;
 			});
 		});
@@ -803,6 +850,37 @@ describe("Effect", () => {
 		} finally {
 			effect.close();
 			warn.mockRestore();
+		}
+	});
+
+	test("timer, timeout, and interval run on the installed clock until cleanup", async () => {
+		const ms = (value: number) => Nano.fromMilli(Milli(value));
+		const clock = new Manual();
+		const restore = clock.install();
+		const fired: string[] = [];
+		const effect = new Effect();
+		try {
+			effect.timer(() => fired.push("timer"), ms(10));
+			effect.interval(() => fired.push("tick"), ms(4));
+			effect.timeout((child) => child.cleanup(() => fired.push("timeout")), ms(6));
+
+			await clock.advanceAsync(ms(3));
+			expect(fired).toEqual([]);
+			await clock.advanceAsync(ms(1));
+			expect(fired).toEqual(["tick"]);
+			await clock.advanceAsync(ms(2));
+			expect(fired).toEqual(["tick", "timeout"]);
+			await clock.advanceAsync(ms(2));
+			expect(fired).toEqual(["tick", "timeout", "tick"]);
+			await clock.advanceAsync(ms(2));
+			expect(fired).toEqual(["tick", "timeout", "tick", "timer"]);
+
+			effect.close();
+			await clock.advanceAsync(ms(20));
+			expect(fired).toEqual(["tick", "timeout", "tick", "timer"]);
+		} finally {
+			effect.close();
+			restore();
 		}
 	});
 });
@@ -1011,4 +1089,328 @@ describe("Once", () => {
 		await flush();
 		expect(seen).toEqual(["x"]);
 	});
+});
+
+// A GetPromise over a Once that counts the listeners currently attached to it.
+function counted<T>(once = new Once<T>()): GetPromise<T> & { listeners: number; once: Once<T> } {
+	const wrapper = {
+		once,
+		listeners: 0,
+		peek: () => once.peek(),
+		changed: ((fn?: (value: T | undefined) => void) =>
+			fn ? track(once.changed(fn)) : once.changed()) as GetPromise<T>["changed"],
+		subscribe: (fn: (value: T | undefined) => void) => track(once.subscribe(fn)),
+		// biome-ignore lint/suspicious/noThenProperty: mirrors Once.
+		then: once.then.bind(once) as GetPromise<T>["then"],
+	};
+	function track(dispose: Dispose): Dispose {
+		wrapper.listeners++;
+		let live = true;
+		return () => {
+			if (!live) return;
+			live = false;
+			wrapper.listeners--;
+			dispose();
+		};
+	}
+	return wrapper;
+}
+
+// A thenable that counts how many reactions were attached to it.
+function thenable<T>(): PromiseLike<T> & { reactions: number; resolve: (value: T) => void } {
+	const inner = Promise.withResolvers<T>();
+	return {
+		reactions: 0,
+		resolve: inner.resolve,
+		// biome-ignore lint/suspicious/noThenProperty: a counting thenable.
+		then(onFulfilled, onRejected) {
+			this.reactions++;
+			return inner.promise.then(onFulfilled, onRejected);
+		},
+	};
+}
+
+describe("race", () => {
+	test("settles with the first value to settle", async () => {
+		const slow = new Promise((resolve) => setTimeout(() => resolve("slow"), 20));
+		const fast = new Promise((resolve) => setTimeout(() => resolve("fast"), 1));
+		expect(await race([slow, fast])).toBe("fast");
+	});
+
+	test("rejects with the first rejection", async () => {
+		const pending = new Promise(() => {});
+		await expect(race([pending, Promise.reject(new Error("boom"))])).rejects.toThrow("boom");
+	});
+
+	test("an already settled Once wins at once", async () => {
+		const once = new Once<string>();
+		once.set("done");
+		expect(await race([Promise.resolve("promise"), once])).toBe("done");
+	});
+
+	test("a loser after an already settled winner is still observed", async () => {
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			const once = new Once<string>();
+			once.set("done");
+			let fail!: (err: Error) => void;
+			const later = new Promise<never>((_, reject) => (fail = reject));
+			expect(await race([once, later])).toBe("done");
+			fail(new Error("late"));
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+
+	test("resolves when a pending Once settles", async () => {
+		const once = new Once<number>();
+		const result = race([new Promise(() => {}), once]);
+		once.set(3);
+		expect(await result).toBe(3);
+	});
+
+	test("many races leave a pending Once without listeners", async () => {
+		const closed = counted<Error | null>();
+		for (let i = 0; i < 1000; i++) {
+			expect(await race([Promise.resolve(i), closed])).toBe(i);
+		}
+		expect(closed.listeners).toBe(0);
+	});
+
+	test("many races attach one reaction to a long-lived promise", async () => {
+		const closed = thenable<string>();
+		for (let i = 0; i < 1000; i++) {
+			expect(await race([Promise.resolve(i), closed])).toBe(i);
+		}
+		expect(closed.reactions).toBe(1);
+
+		closed.resolve("closed");
+		expect(await race([new Promise(() => {}), closed])).toBe("closed");
+		expect(closed.reactions).toBe(1);
+	});
+
+	test("many races against a long-lived promise leave it no listeners", async () => {
+		const closed = new Promise(() => {});
+		const add = spyOn(Set.prototype, "add");
+		let sets: Set<unknown>[];
+		try {
+			for (let i = 0; i < 1000; i++) await race([Promise.resolve(i), closed]);
+			sets = [...add.mock.contexts] as Set<unknown>[];
+		} finally {
+			add.mockRestore();
+		}
+
+		// `closed` is the last value each race listens to, so the last set added to is its listeners.
+		const listeners = sets.at(-1);
+		expect(sets.filter((set) => set === listeners).length).toBe(1000);
+		expect(sets.every((set) => set.size === 0)).toBe(true);
+	});
+});
+
+describe("effect.race", () => {
+	test("resolves with the value while the run is live", async () => {
+		const effect = new Effect();
+		expect(await effect.race(Promise.resolve(5))).toBe(5);
+		effect.close();
+	});
+
+	test("resolves undefined when the run is torn down", async () => {
+		const trigger = new Signal(0);
+		let result: Promise<unknown> | undefined;
+		const effect = new Effect((effect) => {
+			if (effect.get(trigger) === 0) result = effect.race(new Promise(() => {}));
+		});
+		await settle();
+		trigger.set(1);
+		expect(await result).toBeUndefined();
+		effect.close();
+	});
+
+	test("resolves undefined on close, and at once after it", async () => {
+		const effect = new Effect();
+		const result = effect.race(new Promise(() => {}));
+		effect.close();
+		expect(await result).toBeUndefined();
+		expect(await effect.race(Promise.resolve(1))).toBeUndefined();
+	});
+
+	test("many races leave neither teardown nor the value with a listener", async () => {
+		const added = spyOn(AbortSignal.prototype, "addEventListener");
+		const removed = spyOn(AbortSignal.prototype, "removeEventListener");
+		try {
+			const closed = counted<Error | null>();
+			const effect = new Effect();
+			for (let i = 0; i < 1000; i++) {
+				expect(await effect.race(Promise.resolve(i), closed)).toBe(i);
+			}
+			expect(closed.listeners).toBe(0);
+			expect(added.mock.calls.length).toBe(removed.mock.calls.length);
+
+			// A teardown that wins releases the value's listener too.
+			const pending = effect.race(closed);
+			expect(closed.listeners).toBe(1);
+			effect.close();
+			expect(await pending).toBeUndefined();
+			expect(closed.listeners).toBe(0);
+		} finally {
+			added.mockRestore();
+			removed.mockRestore();
+		}
+	});
+});
+
+describe("spawn retention", () => {
+	test("an effect that never reruns drops settled tasks", async () => {
+		const effect = new Effect();
+		const add = spyOn(Set.prototype, "add");
+		let sets: Set<unknown>[];
+		try {
+			for (let i = 0; i < 100; i++) effect.spawn(async () => {});
+			sets = [...add.mock.contexts] as Set<unknown>[];
+		} finally {
+			add.mockRestore();
+		}
+
+		// The effect's own task set, found by what spawn added to it.
+		const tasks = sets[0];
+		expect(sets.every((set) => set === tasks)).toBe(true);
+		expect(tasks?.size).toBe(100);
+
+		await settle();
+		expect(tasks?.size).toBe(0);
+		effect.close();
+	});
+
+	test("a rerun still waits for a pending task", async () => {
+		const trigger = new Signal(0);
+		const task = Promise.withResolvers<void>();
+		let runs = 0;
+		const effect = new Effect((effect) => {
+			runs++;
+			effect.get(trigger);
+			if (runs === 1) {
+				effect.spawn(async () => {});
+				effect.spawn(() => task.promise);
+			}
+		});
+		await settle();
+		trigger.set(1);
+		await settle();
+		expect(runs).toBe(1);
+
+		task.resolve();
+		await settle();
+		expect(runs).toBe(2);
+		effect.close();
+	});
+});
+
+describe("Signal.race", () => {
+	test("starts lazily, shares listeners, and restarts after the last subscriber leaves", async () => {
+		const first = counted<number>();
+		const second = counted<string>();
+		const pending = Signal.race(first, second);
+		expect(first.listeners).toBe(0);
+		expect(second.listeners).toBe(0);
+		const stop = pending.subscribe(() => {});
+		const cancel = pending.changed(() => {});
+		expect(first.listeners).toBe(1);
+		expect(second.listeners).toBe(1);
+		stop();
+		expect(first.listeners).toBe(1);
+		cancel();
+		cancel();
+		expect(first.listeners).toBe(0);
+		expect(second.listeners).toBe(0);
+
+		const result = race([pending]);
+		expect(first.listeners).toBe(1);
+		second.once.set("changed");
+		expect(await result).toBe("changed");
+		expect(await pending).toBe("changed");
+		expect(pending.peek()).toBe("changed");
+		expect(first.listeners).toBe(0);
+		expect(second.listeners).toBe(0);
+	});
+
+	test("direct await releases every source", async () => {
+		const first = counted<number>();
+		const second = counted<string>();
+		const pending = Signal.race(first, second);
+		const result = (async () => await pending)();
+		await flush();
+		first.once.set(7);
+		expect(await result).toBe(7);
+		expect(first.listeners).toBe(0);
+		expect(second.listeners).toBe(0);
+	});
+
+	test("a losing outer race releases every source", async () => {
+		const source = counted<number>();
+		for (let i = 0; i < 1000; i++) {
+			expect(await race([Signal.race(source), Promise.resolve(i)])).toBe(i);
+			expect(source.listeners).toBe(0);
+		}
+	});
+
+	test("effect teardown releases every source", async () => {
+		const effect = new Effect();
+		const source = counted<number>();
+		const pending = effect.race(Signal.race(source));
+		expect(source.listeners).toBe(1);
+		effect.close();
+		expect(await pending).toBeUndefined();
+		expect(source.listeners).toBe(0);
+	});
+
+	test("one losing subscriber leaves another subscriber's wait alive", async () => {
+		const source = counted<number>();
+		const pending = Signal.race(source);
+		const remaining = race([pending]);
+		expect(await race([pending, Promise.resolve("other")])).toBe("other");
+		expect(source.listeners).toBe(1);
+		source.once.set(9);
+		expect(await remaining).toBe(9);
+		expect(source.listeners).toBe(0);
+	});
+
+	test("an undefined change settles direct and nested waits, including later waits", async () => {
+		const source = new Signal<number | undefined>(1);
+		const pending = Signal.race(source);
+		const nested = race([pending]);
+		source.set(undefined);
+		expect(await nested).toBeUndefined();
+		expect(await pending).toBeUndefined();
+		expect(await race([pending, "later"])).toBeUndefined();
+	});
+
+	test("promise-valued changes retain fulfillment and rejection", async () => {
+		const source = new Signal<Promise<number>>(Promise.resolve(0));
+		const changed: GetPromise<number> = Signal.race(source);
+		const fulfilled = race([changed]);
+		source.set(Promise.resolve(1));
+		expect(await fulfilled).toBe(1);
+		expect(changed.peek()).toBe(1);
+		const rejected = race([Signal.race(source)]);
+		source.set(Promise.reject(new Error("failed")));
+		await expect(rejected).rejects.toThrow("failed");
+	});
+});
+
+test("await Signal.race subscribes before already queued microtasks run", async () => {
+	const source = new Signal(0);
+	queueMicrotask(() => source.set(1));
+	expect(await Signal.race(source)).toBe(1);
+});
+
+test("races from another package copy release their source listeners", async () => {
+	const module = "./index.ts?signal-race-copy";
+	const copy = (await import(module)) as typeof import("./index.ts");
+	const source = counted<number>();
+	expect(await race([copy.Signal.race(source), Promise.resolve("other")])).toBe("other");
+	expect(source.listeners).toBe(0);
 });

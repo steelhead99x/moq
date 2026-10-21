@@ -1,3 +1,4 @@
+import { Milli, Nano } from "@moq/clock";
 /**
  * The `<moq-publish-ui>` custom element: capture controls wrapped around a `<moq-publish>`.
  *
@@ -15,7 +16,7 @@ import type { Tab, UiState } from "./state";
 import styles from "./styles/index.css?inline";
 
 // How long the chrome lingers after the pointer stops moving while previewing.
-const HIDE_MS = 2800;
+const HIDE = Nano.fromMilli(Milli(2800));
 
 export default class MoqPublishUi extends HTMLElement {
 	#signals?: Effect;
@@ -99,7 +100,8 @@ export default class MoqPublishUi extends HTMLElement {
 		// last live preview's aspect ratio (defaults to 16:9) instead of snapping.
 		let lastAspect = 16 / 9;
 		effect.run((e) => {
-			const src = e.get(publish.capture.in.source);
+			const capture = e.get(publish.video.in.capture);
+			const src = capture ? e.get(capture.in.source) : undefined;
 			if (src) {
 				player.classList.remove("player--empty");
 				player.style.aspectRatio = "";
@@ -142,7 +144,7 @@ export default class MoqPublishUi extends HTMLElement {
 			e.get(activity);
 			state.chrome.set(true);
 			if (isPinned) return;
-			e.timer(() => state.chrome.set(false), HIDE_MS);
+			e.timer(() => state.chrome.set(false), HIDE);
 		});
 
 		effect.event(this, "pointerleave", () => {

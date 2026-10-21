@@ -49,14 +49,17 @@ impl VideoEncoder {
 
 		// Game Boy is 160x144; force the openh264 software encoder since hardware
 		// encoders can reject such tiny resolutions.
-		let mut config = moq_video::encode::Config::new(WIDTH, HEIGHT, FRAMERATE);
+		let mut config = moq_video::encode::Config::new(WIDTH, HEIGHT, moq_video::Rate::new(FRAMERATE, 1).unwrap());
 		config.kind = moq_video::encode::Kind::Software;
 
 		// Probed from a throwaway encoder, before the emulator has run a frame, so a
 		// viewer can discover (and unpause) a moq-boy that has published nothing.
 		let rendition = config.probe().await.expect("failed to probe the H.264 encoder");
+		let reserved = catalog
+			.reserve()
+			.with_timeline_hint(config.gop.duration(config.framerate));
 		let producer =
-			moq_video::encode::Producer::new(broadcast, catalog, rendition).expect("failed to create avc3 producer");
+			moq_video::encode::Producer::new(broadcast, reserved, rendition).expect("failed to create avc3 producer");
 		let demand = producer.demand();
 
 		let force_keyframe = Arc::new(AtomicBool::new(false));
@@ -85,7 +88,7 @@ impl VideoEncoder {
 		}
 	}
 
-	/// Publish an empty group marking a pause, so the PTS jump on resume reads as a break
+	/// Publish a marker group marking a pause, so the PTS jump on resume reads as a break
 	/// rather than one very long frame, and a viewer arriving mid-pause isn't served the
 	/// pre-pause group as if it were live.
 	///
@@ -146,9 +149,13 @@ fn encoder_thread(
 		// Asked for before the conversion below, which can fail: the encoder holds the
 		// request until a frame actually arrives, so dropping this frame delays the
 		// keyframe rather than losing it. A viewer needs a decodable starting point;
-		// otherwise the encoder's own GOP keys the stream.
-		if force_keyframe.swap(false, Ordering::AcqRel) {
-			enc.keyframe();
+		// otherwise the encoder's own GOP keys the stream. A refusal is terminal:
+		// only a backend that cannot cut at all gives one, and this never selects one.
+		if force_keyframe.swap(false, Ordering::AcqRel)
+			&& let Err(e) = enc.cut()
+		{
+			tracing::error!(error = %e, "H.264 encoder cannot cut a group; stopping encoder");
+			return;
 		}
 		let start = Instant::now();
 		let surface = match moq_video::Surface::rgba(&rgba, moq_video::Size::new(WIDTH, HEIGHT)) {

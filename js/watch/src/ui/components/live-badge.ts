@@ -8,12 +8,14 @@ type Variant = "live" | "loading" | "connecting" | "error";
 function deriveStatus(
 	url: URL | undefined,
 	connection: "connecting" | "connected" | "disconnected",
-	broadcast: "offline" | "loading" | "live",
+	broadcast: "offline" | "loading" | "live" | "error" | "unsupported",
 ): { variant: Variant; text: string } {
 	if (!url) return { variant: "error", text: "No URL" };
 	if (connection === "disconnected") return { variant: "error", text: "Disconnected" };
 	if (connection === "connecting") return { variant: "connecting", text: "Connecting" };
 	if (broadcast === "offline") return { variant: "error", text: "Offline" };
+	if (broadcast === "error") return { variant: "error", text: "Refused" };
+	if (broadcast === "unsupported") return { variant: "error", text: "Update player" };
 	if (broadcast === "loading") return { variant: "loading", text: "Loading" };
 	if (broadcast === "live") return { variant: "live", text: "Live" };
 	return { variant: "loading", text: "Connected" };
@@ -44,9 +46,10 @@ export function liveBadge(parent: Effect, watch: MoqWatch, state: UiState): HTML
 		const broadcast = effect.get(watch.broadcast.out.status);
 		const { variant, text: label } = deriveStatus(url, conn, broadcast);
 
-		// The center overlay already shows a prominent OFFLINE notice; don't
-		// duplicate it in the bar.
-		button.style.display = broadcast === "offline" ? "none" : "";
+		// The center overlay already explains an offline, refused, or unsupported broadcast;
+		// don't duplicate it in the bar.
+		button.style.display =
+			broadcast === "offline" || broadcast === "error" || broadcast === "unsupported" ? "none" : "";
 		button.dataset.variant = variant;
 		text.textContent = label.toUpperCase();
 	});
@@ -54,7 +57,7 @@ export function liveBadge(parent: Effect, watch: MoqWatch, state: UiState): HTML
 	parent.run((effect) => {
 		// Show the total added latency (jitter buffer + codec frame overhead),
 		// which is what the viewer actually experiences.
-		const total = effect.get(watch.sync.out.buffer);
+		const total = effect.get(watch.sync.out.delay);
 		latency.textContent = `+${formatMillis(total)} latency`;
 	});
 

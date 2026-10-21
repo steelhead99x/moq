@@ -1,22 +1,25 @@
 //! The consuming half: typed readers over one published stats broadcast.
 
-use moq_net::broadcast;
 use moq_net::stats::{Role, Tier};
+use moq_net::{AsPath, broadcast};
 
-use crate::{Result, SessionsFrame, TrafficFrame, sessions_track, traffic_track};
+use crate::{
+	PrefixFrame, PresenceFrame, Result, SessionsFrame, TotalsFrame, TrafficFrame, prefix_track, presence_track,
+	sessions_track, totals_track, traffic_track,
+};
 
-/// Configuration for a [`Consumer`]. Construct with [`ConsumerConfig::new`]
+/// Configuration for a [`Consumer`]. Construct with [`Config::new`]
 /// and chain the `with_*` setters.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
-pub struct ConsumerConfig {
+pub struct Config {
 	/// Read the compressed `.json.z` tracks instead of the plain `.json` ones.
 	/// Same data for a fraction of the bytes, but requires a producer that
 	/// publishes them. Defaults to `false`.
 	pub compression: bool,
 }
 
-impl ConsumerConfig {
+impl Config {
 	/// A config with default settings: the plain `.json` tracks.
 	pub fn new() -> Self {
 		Self::default()
@@ -32,43 +35,75 @@ impl ConsumerConfig {
 /// Reads one published stats broadcast (a `<prefix>/node/<node>` announce),
 /// yielding typed frames per track.
 ///
-/// Subscribe to the traffic and session tracks you care about with
-/// [`Self::traffic`] / [`Self::sessions`]; a track that the producer never
-/// created (e.g. a named tier that saw no traffic) fails to subscribe or ends
-/// immediately, so callers typically subscribe the tiers they know exist.
+/// Subscribe to the tracks you care about with [`Self::totals`],
+/// [`Self::traffic`], [`Self::sessions`], [`Self::presence`], and
+/// [`Self::prefix`]. A named tier's tracks are held open with an empty frame
+/// until the tier records, and a label's presence track and a prefix's track
+/// are produced only while subscribed.
 pub struct Consumer {
 	broadcast: broadcast::Consumer,
-	config: ConsumerConfig,
+	config: Config,
 }
 
 impl Consumer {
 	/// Wrap a stats broadcast. The broadcast is whatever the announce at a
 	/// stats path resolved to; parse the path with [`crate::parse_node_path`].
-	pub fn new(broadcast: broadcast::Consumer, config: ConsumerConfig) -> Self {
+	pub fn new(broadcast: broadcast::Consumer, config: Config) -> Self {
 		Self { broadcast, config }
+	}
+
+	/// Subscribe to the totals track, awaiting the subscription handshake.
+	pub async fn totals(&self) -> Result<Totals> {
+		let name = totals_track(self.config.compression);
+		Ok(Totals {
+			inner: self.subscribe(&name).await?,
+		})
 	}
 
 	/// Subscribe to the traffic track for `(tier, role)`, awaiting the
 	/// subscription handshake.
-	pub async fn traffic(&self, tier: &Tier, role: Role) -> Result<TrafficConsumer> {
+	pub async fn traffic(&self, tier: &Tier, role: Role) -> Result<Traffic> {
 		let name = traffic_track(tier, role, self.config.compression);
-		Ok(TrafficConsumer {
+		Ok(Traffic {
 			inner: self.subscribe(&name).await?,
 		})
 	}
 
 	/// Subscribe to the sessions track for `tier`, awaiting the subscription
 	/// handshake.
-	pub async fn sessions(&self, tier: &Tier) -> Result<SessionsConsumer> {
+	pub async fn sessions(&self, tier: &Tier) -> Result<Sessions> {
 		let name = sessions_track(tier, self.config.compression);
-		Ok(SessionsConsumer {
+		Ok(Sessions {
+			inner: self.subscribe(&name).await?,
+		})
+	}
+
+	/// Subscribe to the presence track for `label`, awaiting the
+	/// subscription handshake. Fails with
+	/// [`NotFound`](moq_net::Error::NotFound) for a label outside the group.
+	pub async fn presence(&self, label: impl AsPath) -> Result<Presence> {
+		let name = presence_track(label, self.config.compression);
+		Ok(Presence {
+			inner: self.subscribe(&name).await?,
+		})
+	}
+
+	/// Subscribe to the prefix track for broadcast prefix `path`, awaiting the
+	/// subscription handshake. Fails with
+	/// [`NotFound`](moq_net::Error::NotFound) for a prefix outside the group.
+	pub async fn prefix(&self, path: impl AsPath) -> Result<Prefix> {
+		let name = prefix_track(path, self.config.compression);
+		Ok(Prefix {
 			inner: self.subscribe(&name).await?,
 		})
 	}
 
 	async fn subscribe<T: serde::de::DeserializeOwned>(&self, name: &str) -> Result<moq_json::snapshot::Consumer<T>> {
 		let track = self.broadcast.track(name)?.subscribe(None).await?;
-		let config = moq_json::snapshot::ConsumerConfig::default().with_compression(self.config.compression);
+		let mut config = moq_json::snapshot::consumer::Config::default();
+		if self.config.compression {
+			config.compression = moq_json::Compression::Deflate;
+		}
 		Ok(moq_json::snapshot::Consumer::new(track, config))
 	}
 }
@@ -76,43 +111,111 @@ impl Consumer {
 /// A typed reader over one traffic track. Yields the latest [`TrafficFrame`];
 /// intermediate frames a slow reader missed are collapsed, which is safe
 /// because the counters are cumulative.
-pub struct TrafficConsumer {
+pub struct Traffic {
 	inner: moq_json::snapshot::Consumer<TrafficFrame>,
 }
 
-impl TrafficConsumer {
+impl Traffic {
 	/// The next frame, or `None` once the track ends (the producer went away).
 	pub async fn next(&mut self) -> Result<Option<TrafficFrame>> {
-		Ok(self.inner.next().await?)
+		Ok(self.inner.latest().await?.map(|value| value.value))
 	}
 }
 
-/// A typed reader over one sessions track; see [`TrafficConsumer`].
-pub struct SessionsConsumer {
+/// A typed reader over one sessions track; see [`Traffic`].
+pub struct Sessions {
 	inner: moq_json::snapshot::Consumer<SessionsFrame>,
 }
 
-impl SessionsConsumer {
+impl Sessions {
 	/// The next frame, or `None` once the track ends (the producer went away).
 	pub async fn next(&mut self) -> Result<Option<SessionsFrame>> {
-		Ok(self.inner.next().await?)
+		Ok(self.inner.latest().await?.map(|value| value.value))
+	}
+}
+
+/// A typed reader over the totals track; see [`Traffic`].
+pub struct Totals {
+	inner: moq_json::snapshot::Consumer<TotalsFrame>,
+}
+
+impl Totals {
+	/// The next frame, or `None` once the track ends (the producer went away).
+	pub async fn next(&mut self) -> Result<Option<TotalsFrame>> {
+		Ok(self.inner.latest().await?.map(|value| value.value))
+	}
+}
+
+/// A typed reader over one label's presence track; see [`Traffic`].
+pub struct Presence {
+	inner: moq_json::snapshot::Consumer<PresenceFrame>,
+}
+
+impl Presence {
+	/// The next frame, or `None` once the track ends (the producer went away
+	/// or its group unannounced).
+	pub async fn next(&mut self) -> Result<Option<PresenceFrame>> {
+		Ok(self.inner.latest().await?.map(|value| value.value))
+	}
+}
+
+/// A typed reader over one broadcast prefix's track; see [`Traffic`].
+pub struct Prefix {
+	inner: moq_json::snapshot::Consumer<PrefixFrame>,
+}
+
+impl Prefix {
+	/// The next frame, or `None` once the track ends (the producer went away
+	/// or its group unannounced). Fails with
+	/// [`FrameTooLarge`](moq_net::Error::FrameTooLarge) once the frame outgrows
+	/// the cache.
+	pub async fn next(&mut self) -> Result<Option<PrefixFrame>> {
+		Ok(self.inner.latest().await?.map(|value| value.value))
 	}
 }
 
 #[cfg(test)]
 mod tests {
+	/// A millisecond track: the frames written here carry timestamps.
+	fn timed() -> moq_net::track::Info {
+		moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI)
+	}
+
+	/// Build an origin producer, spawning its driver on the ambient runtime.
+	fn produce_origin() -> moq_net::origin::Producer {
+		let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::default());
+		if tokio::runtime::Handle::try_current().is_ok() {
+			tokio::spawn(moq_net::time::run(driver));
+		} else {
+			// A sync test: nothing polls the driver, and dropping it would tear
+			// the origin down, so leak it and rely on the synchronous half.
+			std::mem::forget(driver);
+		}
+		producer
+	}
+
+	/// The next route and whether it is active.
+	async fn next_update(announced: &mut moq_net::announce::Consumer) -> Option<(moq_net::announce::Announce, bool)> {
+		match announced.next().await? {
+			moq_net::announce::Event::Start(route)
+			| moq_net::announce::Event::Update(route)
+			| moq_net::announce::Event::Restart(route) => Some((route, true)),
+			moq_net::announce::Event::End(route) => Some((route, false)),
+		}
+	}
+
 	use std::time::Duration;
 
-	use moq_net::{Consume, Origin, PathOwned, Timestamp, announce, broadcast, origin, track};
+	use moq_net::{Consume, PathOwned, Timestamp, announce, broadcast, origin, track};
 
-	use crate::{Producer, ProducerConfig, Tier};
+	use crate::{Producer, Tier, produce};
 
 	use super::*;
 
 	fn test_producer() -> (Producer, origin::Producer) {
-		let origin = Origin::random().produce();
+		let origin = produce_origin();
 		let producer = Producer::new(
-			ProducerConfig::new()
+			produce::Config::new()
 				.with_origin(origin.clone())
 				.with_node(PathOwned::from("sjc")),
 		);
@@ -120,7 +223,7 @@ mod tests {
 	}
 
 	/// A tagged egress feed into a producer's registry, holding the handles needed
-	/// to write more traffic incrementally. Presence is recorded under `root`.
+	/// to write more traffic incrementally. Presence is recorded under `label`.
 	struct Feed {
 		track: track::Producer,
 		sub: track::Subscriber,
@@ -141,22 +244,19 @@ mod tests {
 		}
 	}
 
-	async fn feed(producer: &Producer, tier: Tier, root: &str, path: &str) -> Feed {
-		let ctx = producer.registry().tier(tier).session(root);
-		let feed_origin = Origin::random().produce();
+	async fn feed(producer: &Producer, tier: Tier, label: &str, path: &str) -> Feed {
+		let ctx = producer.registry().tier(tier).session(label);
+		let feed_origin = produce_origin();
 		let egress = feed_origin.consume().with_stats(ctx.clone());
 
 		let mut announced = egress.announced();
-		let mut source = feed_origin
-			.create_broadcast(path, broadcast::Route::announced())
-			.unwrap();
-		let track = source.create_track("video", None).unwrap();
+		let source = feed_origin.create_broadcast(path).unwrap();
+		source.announce(origin::Route::default()).unwrap();
+		let track = source.clone().create_track("video", timed()).unwrap();
 
-		tokio::time::sleep(Duration::from_millis(1)).await;
-		tokio::time::sleep(Duration::from_millis(1)).await;
-
-		let announce::Update { broadcast, .. } = announced.next().await.expect("announce");
-		let consumer = broadcast.expect("active");
+		let (_, active) = next_update(&mut announced).await.expect("announce");
+		assert!(active);
+		let consumer = egress.request_broadcast(path, None).await.expect("resolve");
 		let sub = consumer.track("video").unwrap().subscribe(None).await.unwrap();
 
 		Feed {
@@ -169,10 +269,15 @@ mod tests {
 	}
 
 	async fn announced(origin: &origin::Producer) -> moq_net::broadcast::Consumer {
-		let mut consumer = origin.consume().announced();
+		let mut consumer = origin.consume().with_hidden(true).announced();
 		tokio::time::advance(Duration::from_millis(1)).await;
-		let announce::Update { broadcast, .. } = consumer.next().await.expect("expected announce");
-		broadcast.expect("active")
+		let (update, active) = next_update(&mut consumer).await.expect("expected announce");
+		assert!(active);
+		origin
+			.consume()
+			.request_broadcast(moq_net::Path::new(update.prefix.as_str()), None)
+			.await
+			.expect("resolve")
 	}
 
 	async fn drive_tick() {
@@ -195,8 +300,8 @@ mod tests {
 		drive_tick().await;
 
 		let broadcast = announced(&origin).await;
-		let plain = Consumer::new(broadcast.consume(), ConsumerConfig::new());
-		let compressed = Consumer::new(broadcast.consume(), ConsumerConfig::new().with_compression(true));
+		let plain = Consumer::new(broadcast.consume(), Config::new());
+		let compressed = Consumer::new(broadcast.consume(), Config::new().with_compression(true));
 
 		let mut plain_traffic = plain.traffic(&tier, Role::Publisher).await.expect("subscribe plain");
 		let mut z_traffic = compressed
@@ -220,5 +325,29 @@ mod tests {
 		let mut sessions = compressed.sessions(&tier).await.expect("subscribe sessions");
 		let frame = sessions.next().await.expect("read").expect("frame");
 		assert_eq!(frame.get("acme").expect("root").active(), 1);
+
+		let mut totals = compressed.totals().await.expect("subscribe totals");
+		let frame = totals.next().await.expect("read").expect("frame");
+		let totals = frame.get("").expect("default tier");
+		assert_eq!(totals.publisher.bytes, 50);
+		assert_eq!(totals.sessions.active(), 1);
+
+		// A presence track is produced once requested, so drive a drain.
+		let mut presence = std::pin::pin!(compressed.presence("acme"));
+		assert!(futures::poll!(presence.as_mut()).is_pending());
+		drive_tick().await;
+		let mut presence = presence.await.expect("subscribe presence");
+		let frame = presence.next().await.expect("read").expect("frame");
+		assert_eq!(frame.get("").expect("default tier").active(), 1);
+
+		// So is a prefix track.
+		let mut prefix = std::pin::pin!(compressed.prefix("foo"));
+		assert!(futures::poll!(prefix.as_mut()).is_pending());
+		drive_tick().await;
+		let mut prefix = prefix.await.expect("subscribe prefix");
+		let frame = prefix.next().await.expect("read").expect("frame");
+		let tier = frame.get("").expect("default tier");
+		assert_eq!(tier.publisher.bytes, 50);
+		assert_eq!(tier.children["bar"].publisher.bytes, 50);
 	}
 }

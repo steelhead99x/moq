@@ -128,9 +128,13 @@ describe("Source error signal", () => {
 		source.close();
 	});
 
-	it("ignores escaping renditions before selecting a valid fallback", async () => {
-		const invalidVideo = { ...config("avc1.640028"), broadcast: "../../source" };
-		const validVideo = { ...config("avc1.640028"), broadcast: "./source" };
+	// The catalog goes as a whole rather than losing the one rendition, so a valid sibling
+	// is no rescue: the reference names content outside the consumer's authorized subtree,
+	// and selecting the fallback would leave a publisher bug to surface later as a track
+	// that never fills.
+	it("selects nothing when an escaping rendition rejects the catalog", async () => {
+		const invalidVideo = { ...config("avc1.640028"), broadcast: Path.normalizeRelative("../../source") };
+		const validVideo = { ...config("avc1.640028"), broadcast: Path.normalizeRelative("./source") };
 		const audioConfig = Catalog.AudioConfigSchema.parse({
 			codec: "opus",
 			container: { kind: "legacy" },
@@ -145,31 +149,73 @@ describe("Source error signal", () => {
 				video: { renditions: { invalid: invalidVideo, fallback: validVideo } },
 				audio: {
 					renditions: {
-						invalid: { ...audioConfig, broadcast: "../../source" },
-						fallback: { ...audioConfig, broadcast: "./source" },
+						invalid: { ...audioConfig, broadcast: Path.normalizeRelative("../../source") },
+						fallback: { ...audioConfig, broadcast: Path.normalizeRelative("./source") },
 					},
 				},
 			},
 		});
 		const source = new Source({ broadcast, supported: async () => true });
 
-		await settle();
-		expect(Object.keys(broadcast.out.catalog.peek()?.video?.renditions ?? {})).toEqual(["fallback"]);
-		expect(Object.keys(broadcast.out.catalog.peek()?.audio?.renditions ?? {})).toEqual(["fallback"]);
-		expect(Object.keys(source.out.available.peek())).toEqual(["fallback"]);
-		expect(source.out.track.peek()).toBe("fallback");
+		const error = console.error;
+		console.error = () => {};
+		try {
+			await settle();
+			expect(broadcast.out.catalog.peek()).toBeUndefined();
+			expect(Object.keys(source.out.available.peek())).toEqual([]);
+			expect(source.out.track.peek()).toBeUndefined();
+		} finally {
+			console.error = error;
+		}
 
 		source.close();
 		broadcast.close();
 	});
 });
 
-describe("Source stalled rendition selection", () => {
-	it("skips a stalled manual target while an unstalled rendition exists", async () => {
+describe("Source disabled rendition selection", () => {
+	it("moves to an enabled rendition when the selected one is disabled, and back", async () => {
+		const state = mutableBroadcast({
+			low: config("avc1.64001e", { bitrate: 1_000_000 }),
+			high: config("avc1.640028", { bitrate: 2_000_000 }),
+		});
+		const source = new Source({
+			broadcast: state.broadcast,
+			supported: async () => true,
+		});
+
+		await settle();
+		expect(source.out.track.peek()).toBe("high");
+
+		state.catalog.set({
+			video: {
+				renditions: {
+					low: config("avc1.64001e", { bitrate: 1_000_000 }),
+					high: config("avc1.640028", { bitrate: 2_000_000, enabled: false }),
+				},
+			},
+		});
+		await settle();
+		expect(source.out.track.peek()).toBe("low");
+
+		state.catalog.set({
+			video: {
+				renditions: {
+					low: config("avc1.64001e", { bitrate: 1_000_000 }),
+					high: config("avc1.640028", { bitrate: 2_000_000 }),
+				},
+			},
+		});
+		await settle();
+		expect(source.out.track.peek()).toBe("high");
+		source.close();
+	});
+
+	it("never selects a disabled manual target", async () => {
 		const source = new Source({
 			broadcast: mockBroadcast({
 				low: config("avc1.64001e", { bitrate: 1_000_000 }),
-				high: config("avc1.640028", { bitrate: 2_000_000, stalled: true }),
+				high: config("avc1.640028", { bitrate: 2_000_000, enabled: false }),
 			}),
 			target: { name: "high" },
 			supported: async () => true,
@@ -177,35 +223,35 @@ describe("Source stalled rendition selection", () => {
 
 		await settle();
 		expect(source.out.track.peek()).toBe("low");
-		expect(Object.keys(source.out.available.peek())).toEqual(["low", "high"]);
 		source.close();
 	});
 
-	it("selects the lowest rendition when every supported rendition is stalled", async () => {
+	it("selects nothing when every rendition is disabled", async () => {
 		const source = new Source({
 			broadcast: mockBroadcast({
+				high: config("avc1.640028", { bitrate: 2_000_000, enabled: false }),
+				low: config("avc1.64001e", { bitrate: 1_000_000, enabled: false }),
+			}),
+			supported: async () => true,
+		});
+
+		await settle();
+		expect(source.out.track.peek()).toBeUndefined();
+		expect(source.out.config.peek()).toBeUndefined();
+		source.close();
+	});
+
+	it("ignores a legacy stalled flag", async () => {
+		const source = new Source({
+			broadcast: mockBroadcast({
+				low: config("avc1.64001e", { bitrate: 1_000_000 }),
 				high: config("avc1.640028", { bitrate: 2_000_000, stalled: true }),
-				low: config("avc1.64001e", { bitrate: 1_000_000, stalled: true }),
 			}),
 			supported: async () => true,
 		});
 
 		await settle();
-		expect(source.out.track.peek()).toBe("low");
-		source.close();
-	});
-
-	it("uses coded dimensions when stalled renditions omit bitrate", async () => {
-		const source = new Source({
-			broadcast: mockBroadcast({
-				high: config("avc1.640028", { codedWidth: 1920, codedHeight: 1080, stalled: true }),
-				low: config("avc1.64001e", { codedWidth: 854, codedHeight: 480, stalled: true }),
-			}),
-			supported: async () => true,
-		});
-
-		await settle();
-		expect(source.out.track.peek()).toBe("low");
+		expect(source.out.track.peek()).toBe("high");
 		source.close();
 	});
 
@@ -230,7 +276,7 @@ describe("Source stalled rendition selection", () => {
 				renditions: {
 					high: config("avc1.640028", {
 						bitrate: 1_500_000,
-						stalled: true,
+						label: "Main camera",
 						codedWidth: 1280,
 						codedHeight: 720,
 					}),
@@ -241,7 +287,7 @@ describe("Source stalled rendition selection", () => {
 
 		expect(probes).toBe(1);
 		expect(Number(source.out.config.peek()?.bitrate)).toBe(1_500_000);
-		expect(source.out.config.peek()?.stalled).toBe(true);
+		expect(source.out.config.peek()?.label).toBe("Main camera");
 		source.close();
 	});
 
@@ -270,4 +316,141 @@ describe("Source stalled rendition selection", () => {
 			expect(source.out.available.peek()).toEqual({});
 			source.close();
 		}));
+});
+
+describe("Source rendition rank", () => {
+	it("breaks an exact tie by name, not catalog order", async () => {
+		const source = new Source({
+			broadcast: mockBroadcast({
+				e: config("avc1.640028", { codedWidth: 1280, codedHeight: 720, bitrate: 3_000_000 }),
+				d: config("avc1.64001e", { codedWidth: 1280, codedHeight: 720, bitrate: 3_000_000 }),
+			}),
+			supported: async () => true,
+		});
+
+		await settle();
+		expect(source.out.track.peek()).toBe("d");
+		source.close();
+	});
+
+	it("ranks a known zero bitrate above an unknown one", async () => {
+		const source = new Source({
+			broadcast: mockBroadcast({
+				unknown: config("avc1.640028", { codedWidth: 1280, codedHeight: 720 }),
+				zero: config("avc1.64001e", { codedWidth: 1280, codedHeight: 720, bitrate: 0 }),
+			}),
+			supported: async () => true,
+		});
+
+		await settle();
+		expect(source.out.track.peek()).toBe("zero");
+		source.close();
+	});
+
+	it("prefers a known picture over a higher bitrate with no size", async () => {
+		const source = new Source({
+			broadcast: mockBroadcast({
+				a: config("avc1.640028", { bitrate: 9_000_000 }),
+				b: config("avc1.64001e", { codedWidth: 640, codedHeight: 360, bitrate: 1_000_000 }),
+			}),
+			supported: async () => true,
+		});
+
+		await settle();
+		expect(source.out.track.peek()).toBe("b");
+		source.close();
+	});
+});
+
+describe("Source rendition preference", () => {
+	// An H.265 source beside its own H.264 compatibility transcode.
+	const renditions = () => ({
+		source: config("hvc1.1.6.L93.B0", { codedWidth: 1280, codedHeight: 720, bitrate: 2_000_000 }),
+		fallback: config("avc1.64001f", { codedWidth: 1280, codedHeight: 720, bitrate: 4_000_000, preference: -1 }),
+	});
+	const decodes = (prefix: string) => async (config: Catalog.VideoConfig) => !config.codec.startsWith(prefix);
+
+	it("selects a supported source over a lower preference with a higher bitrate", async () => {
+		const source = new Source({ broadcast: mockBroadcast(renditions()), supported: async () => true });
+
+		await settle();
+		expect(source.out.track.peek()).toBe("source");
+		source.close();
+	});
+
+	it("selects a supported source over a lower preference that fits the bitrate budget", async () => {
+		const source = new Source({
+			broadcast: mockBroadcast({
+				source: config("hvc1.1.6.L93.B0", { bitrate: 2_000_000 }),
+				fallback: config("avc1.64001f", { bitrate: 1_000_000, preference: -1 }),
+			}),
+			target: { bitrate: 1_500_000 },
+			supported: async () => true,
+		});
+
+		await settle();
+		expect(source.out.track.peek()).toBe("source");
+		source.close();
+	});
+
+	it("selects a lower preference when the source is unsupported", async () => {
+		const source = new Source({ broadcast: mockBroadcast(renditions()), supported: decodes("hvc1") });
+
+		await settle();
+		expect(source.out.track.peek()).toBe("fallback");
+		source.close();
+	});
+
+	it("resolves three tiers to the highest supported one", async () => {
+		const broadcast = mockBroadcast({
+			av1: config("av01.0.08M.08", { codedWidth: 1280, codedHeight: 720, preference: 1 }),
+			...renditions(),
+		});
+		const all = new Source({ broadcast, supported: async () => true });
+		const noAv1 = new Source({ broadcast, supported: decodes("av01") });
+
+		await settle();
+		expect(all.out.track.peek()).toBe("av1");
+		expect(noAv1.out.track.peek()).toBe("source");
+		all.close();
+		noAv1.close();
+	});
+
+	it("lets a manual target select a lower preference", async () => {
+		const source = new Source({
+			broadcast: mockBroadcast(renditions()),
+			target: { name: "fallback" },
+			supported: async () => true,
+		});
+
+		await settle();
+		expect(source.out.track.peek()).toBe("fallback");
+		source.close();
+	});
+
+	it("steps down a transcoded ladder that shares its source's preference", async () => {
+		const source = new Source({
+			broadcast: mockBroadcast({
+				video: config("hvc1.1.6.L93.B0", {
+					codedWidth: 1920,
+					codedHeight: 1080,
+					bitrate: 5_000_000,
+					preference: 1,
+				}),
+				"video/360p": config("avc1.64001e", {
+					codedWidth: 640,
+					codedHeight: 360,
+					bitrate: 600_000,
+					preference: 1,
+				}),
+				other: config("avc1.640028", { codedWidth: 1280, codedHeight: 720, bitrate: 900_000 }),
+			}),
+			target: { bitrate: 1_000_000 },
+			supported: async () => true,
+		});
+
+		await settle();
+		expect(source.out.track.peek()).toBe("video/360p");
+		source.close();
+	});
 });

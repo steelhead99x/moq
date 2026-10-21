@@ -14,17 +14,17 @@
 //
 // Local builds and CI resolve `moq-ffi` from the sibling project via the
 // dependency substitution below, so tests run against freshly-built bindings.
-// The published POM keeps the range (substitution only affects resolution).
+// release-kt-lib.yml publishes only once those bindings match a released tag.
 //
 // Publishing uses com.vanniktech.maven.publish; CI runs
 // `:moq:publishAndReleaseToMavenCentral`. Credentials come from env vars set by
 // release-kt-lib.yml (ORG_GRADLE_PROJECT_*). Signing is only wired up when a key
 // is present (see mavenPublishing below), so keyless local and fork-PR builds work.
 
-import com.android.build.gradle.LibraryExtension
+import com.android.build.api.dsl.LibraryExtension
 import com.vanniktech.maven.publish.JavadocJar
 import com.vanniktech.maven.publish.KotlinMultiplatform
-import com.vanniktech.maven.publish.SonatypeHost
+import org.gradle.api.publish.maven.tasks.GenerateMavenPom
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 // Plugin versions are pinned in the root build.gradle.kts (Kotlin, publish) and
@@ -41,9 +41,10 @@ plugins {
 
 version = providers.gradleProperty("moq.version").get()
 
-// Compatible-patch range for the bindings: any 0.3.x, never 0.4.0. Published
-// into the wrapper's POM so consumers float to the newest bindings patch.
-val MOQ_FFI_RANGE = "[0.3,0.4)"
+// Compatible-patch range for the bindings: 0.4.3 (the WebSocket fallback
+// setters) or newer, never 0.5.0. Published into the wrapper's POM so consumers
+// float to the newest bindings patch.
+val MOQ_FFI_RANGE = "[0.4.3,0.5)"
 
 val androidEnabled = providers.gradleProperty("android.enabled").orNull == "true"
 
@@ -68,24 +69,25 @@ kotlin {
         }
     }
 
-    @Suppress("UNUSED_VARIABLE")
     sourceSets {
-        val commonMain by getting {
+        // Gradle 9.6 deprecates the `by getting` / `by creating` delegates,
+        // and Kotlin DSL treats those as script compilation errors.
+        val commonMain = getByName("commonMain") {
             dependencies {
-                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
                 // api: the typed JSON helpers are inline+reified, so they
                 // resolve serializers at the consumer's call site.
-                api("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+                api("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
             }
         }
-        val commonTest by getting {
+        val commonTest = getByName("commonTest") {
             dependencies {
                 implementation(kotlin("test"))
-                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
             }
         }
 
-        val jvmAndAndroidMain by creating {
+        val jvmAndAndroidMain = create("jvmAndAndroidMain") {
             dependsOn(commonMain)
             dependencies {
                 // api: the wrapper re-exports the FFI types, so consumers get
@@ -95,22 +97,22 @@ kotlin {
                 }
             }
         }
-        val jvmAndAndroidTest by creating {
+        val jvmAndAndroidTest = create("jvmAndAndroidTest") {
             dependsOn(commonTest)
         }
 
-        val jvmMain by getting {
+        getByName("jvmMain") {
             dependsOn(jvmAndAndroidMain)
         }
-        val jvmTest by getting {
+        getByName("jvmTest") {
             dependsOn(jvmAndAndroidTest)
         }
 
         if (androidEnabled) {
-            val androidMain by getting {
+            getByName("androidMain") {
                 dependsOn(jvmAndAndroidMain)
             }
-            val androidUnitTest by getting {
+            getByName("androidUnitTest") {
                 dependsOn(jvmAndAndroidTest)
             }
         }
@@ -140,9 +142,9 @@ mavenPublishing {
     // Bundle the Dokka-generated KDoc HTML as the javadoc jar. Without this the
     // KMP default is an empty javadoc jar, so javadoc.io (which mirrors whatever
     // Maven Central holds) would serve a docless page.
-    configure(KotlinMultiplatform(javadocJar = JavadocJar.Dokka("dokkaHtml")))
+    configure(KotlinMultiplatform(javadocJar = JavadocJar.Dokka("dokkaGeneratePublicationHtml")))
 
-    publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
+    publishToMavenCentral(automaticRelease = true)
     // Only sign when a key is actually configured. signAllPublications() registers a
     // *required* sign task, so calling it unconditionally makes publishToMavenLocal
     // fail ("no configured signatory") on fork-PR dry-runs, which run without secrets.
@@ -173,5 +175,17 @@ mavenPublishing {
             connection.set("scm:git:https://github.com/moq-dev/moq.git")
             developerConnection.set("scm:git:ssh://git@github.com/moq-dev/moq.git")
         }
+    }
+}
+
+// The target POMs (moq-jvm, moq-android) name the substituted project's
+// version, which is never published. Kotlin rewrites those dependencies in its
+// own withXml, whose order against ours varies, so restore the range after the
+// POM is written.
+tasks.withType<GenerateMavenPom>().configureEach {
+    val range = MOQ_FFI_RANGE
+    val ffi = Regex("(<groupId>dev\\.moq</groupId>\\s*<artifactId>moq-ffi[^<]*</artifactId>\\s*<version>)[^<]*(</version>)")
+    doLast {
+        destination.writeText(ffi.replace(destination.readText()) { it.groupValues[1] + range + it.groupValues[2] })
     }
 }

@@ -5,20 +5,23 @@
  *
  * @module
  */
+import { Milli, Nano } from "@moq/clock";
 import { Effect, Signal } from "@moq/signals";
 import * as DOM from "@moq/signals/dom";
 import type MoqWatch from "../element";
 import { bufferingIndicator } from "./components/buffering-indicator";
 import { centerPlay } from "./components/center-play";
 import { controlBar } from "./components/control-bar";
+import { hiddenIndicator } from "./components/hidden-indicator";
 import { offlineIndicator } from "./components/offline-indicator";
+import { refusedIndicator } from "./components/refused-indicator";
 import { settingsPanel } from "./components/settings-panel";
 import { unsupportedIndicator } from "./components/unsupported-indicator";
 import type { Tab, UiState } from "./state";
 import styles from "./styles/index.css?inline";
 
 // How long the chrome lingers after the pointer stops moving (while playing).
-const HIDE_MS = 2800;
+const HIDE = Nano.fromMilli(Milli(2800));
 
 // Whether `el` is the element the browser has actually put fullscreen. Unlike
 // `document.fullscreenElement`, this is not retargeted to the shadow host. `matches` throws on a
@@ -86,13 +89,15 @@ export default class MoqWatchUi extends HTMLElement {
 		// The slotted <moq-watch> (canvas/video) sits at the base of the stack.
 		player.appendChild(DOM.create("slot"));
 
-		// Center affordances: play prompt + buffering spinner + offline / unsupported-codec notice.
+		// Center affordances: play prompt + buffering spinner + offline / refused / unsupported / hidden notices.
 		const center = DOM.create("div", { className: "center" });
 		center.append(
 			centerPlay(effect, watch),
 			bufferingIndicator(effect, watch),
 			offlineIndicator(effect, watch),
+			refusedIndicator(effect, watch),
 			unsupportedIndicator(effect, watch),
+			hiddenIndicator(effect, watch),
 		);
 
 		// Top scrim keeps the bottom bar legible and hosts ambient gradient.
@@ -196,7 +201,7 @@ export default class MoqWatchUi extends HTMLElement {
 			e.get(activity);
 			state.chrome.set(true);
 			if (isPinned) return;
-			e.timer(() => state.chrome.set(false), HIDE_MS);
+			e.timer(() => state.chrome.set(false), HIDE);
 		});
 
 		effect.event(this, "pointerleave", () => {

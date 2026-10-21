@@ -1,0 +1,63 @@
+name: Audio quality
+
+# Grades the recorded-trace replays of test/audio-quality against their exact
+# budgets, nightly on main and on every release PR that can move them. They
+# replay the player's container consumer and rings on a simulated clock, so
+# they are deterministic and take seconds, unlike the browser rows, which stay
+# in nightly.yml.
+on:
+  workflow_call:
+  pull_request:
+    # Main PRs skip it; nightly.yml runs it on main. `edited` catches a main PR
+    # retargeted to release.
+    branches: [release]
+    types: [opened, synchronize, reopened, edited]
+    paths:
+      - "js/watch/**"
+      # The container consumer decides what a replay delivers, waits for, and skips, on the
+      # groups, tracks, and signals underneath it.
+      - "js/hang/**"
+      - "js/net/**"
+      - "js/signals/**"
+      - "test/audio-quality/**"
+      - "test/lib/**"
+      - "test/justfile"
+      - ".github/workflows/audio-quality.yml"
+
+concurrency:
+  group: audio-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    name: Replay
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/nix
+
+      - name: Replay
+        run: nix develop --command just test audio-quality --replays --enforce
+        shell: bash -leo pipefail {0}
+        env:
+          # Somewhere upload-artifact can reach; the harness default is under $TMPDIR.
+          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
+
+      # The harness keeps a failing run's directory: every row's samples and summary.
+      - name: Keep the failing run
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: audio-quality-replay
+          path: ${{ runner.temp }}/moq-test-runs/
+          retention-days: 7
+          if-no-files-found: ignore

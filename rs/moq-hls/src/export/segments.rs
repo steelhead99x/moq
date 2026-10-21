@@ -1,84 +1,199 @@
-//! One rendition's segment timeline, as a `Producer`/[`Consumer`] pair.
+//! One rendition's view of the broadcast's segments, as a `Producer`/[`Consumer`] pair.
 //!
-//! The `Producer` is fed [`moq_mux::timeline::Entry`]s by a background task as the publisher
-//! indexes new groups; it keeps a bounded window of them. Two things read that window:
+//! Segments are derived from one reference rendition's timeline: each of its records is a
+//! segment, numbered by the record's sequence. The catalog watcher reads that timeline and fans
+//! each record out to every rendition as a row: the segment's number and timing, plus the
+//! reference record's frames. Each rendition resolves a row against its own timeline. Two things
+//! read the window:
 //!
-//! * the HTTP serve path, synchronously, to render a media playlist and look up a segment's
-//!   group span (nothing here touches media bytes on that path); and
-//! * a [`Consumer`] cursor, for a recorder that wants every finalized segment *with its media*,
-//!   in order, exactly once. `next()` waits for the next segment to finalize, FETCHes and
-//!   transmuxes its groups (via [`Rendition`]), and yields the CMAF bytes.
+//! * the HTTP serve path, synchronously, to render a media playlist and resolve a segment's
+//!   frames (nothing here touches media bytes on that path); and
+//! * a [`Consumer`] cursor, for a recorder that wants every segment *with its media*, in
+//!   order, exactly once. `next()` waits for the next resolved row, FETCHes and transmuxes its
+//!   frames (via [`Rendition`]), and yields the CMAF bytes.
+//!
+//! A segment is addressed by its reference's tag and its number (the `seg/{tag}.{segment}.m4s`
+//! URI); the number alone is its `EXT-X-MEDIA-SEQUENCE` and the recorder cursor's position. The
+//! same URI names the same span of content time on every rendition, on every edge, and after
+//! every reload. A new reference lists its records under its own tag, continuing past the last
+//! advertised number rather than reusing the old one's URIs.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use moq_mux::timeline::Entry;
+use sha2::{Digest, Sha256};
 
-use super::Rendition;
+use super::{Kind, Rendition};
 use crate::Result;
-
-/// Duration assumed for the live-edge segment of an ended timeline before any complete
-/// segment has revealed the real cadence.
-const DEFAULT_SEGMENT: Duration = Duration::from_secs(4);
 
 /// The producing side of a rendition's timeline window.
 ///
-/// A background task appends timeline records via [`push`](Self::push) and marks the stream
+/// The catalog watcher appends rows via [`push`](Self::push) and marks the stream
 /// [`end`](Self::end)ed. Cheap to share behind an `Arc`; the window state lives in a
 /// [`kio::Producer`] so a [`Consumer`] can await changes without a separate signal.
 pub(crate) struct Producer {
 	state: kio::Producer<State>,
-	/// The broadcast serving the media track. Seeded at construction for a rendition served by
-	/// the catalog's own broadcast, and otherwise set by the background task once it has resolved
-	/// the sibling broadcast the catalog rendition's `broadcast` reference names.
-	pub broadcast: OnceLock<moq_net::broadcast::Consumer>,
 }
 
 struct State {
-	/// Timeline records within the window, oldest first. Consecutive records bound a segment:
-	/// record `i` starts it, record `i + 1` supplies its duration, so the last record is the
-	/// live edge (its segment is still growing).
-	entries: VecDeque<Entry>,
-	/// Records evicted from the front of the window since subscribing; the playlist's
-	/// `EXT-X-MEDIA-SEQUENCE` base, so segment positions stay stable across reloads.
-	dropped: u64,
-	/// The timeline track ended: the broadcast is over and the last record is a full segment.
+	/// Rows within the window, oldest first. Every row is a complete segment.
+	rows: VecDeque<Row>,
+	/// The first listed segment, or the segment that would follow an empty trimmed window.
+	sequence: u64,
+	/// The newest discontinuity seen, retained when the playlist window becomes empty.
+	discontinuity: u64,
+	/// The timeline track ended: the broadcast is over (`EXT-X-ENDLIST`).
 	ended: bool,
+	/// Bumped whenever the window is cleared, so a latch on what it listed can tell it is stale.
+	resets: u64,
 }
 
-/// One playlist segment: a starting group and the media it covers.
+/// Numbers the broadcast's content timeline: the sequence bumps wherever the timeline breaks.
+///
+/// Held once by the timeline fanout rather than per rendition, so every rendition stamps a
+/// record with the same sequence even when one isn't listing rows (its sibling ended) or
+/// cleared its own window.
+#[derive(Default)]
+pub(crate) struct Discontinuities {
+	sequence: u64,
+	/// The end of the last stamped record.
+	last_end: Option<Duration>,
+	/// Records were skipped, so the next one can't continue the timeline.
+	broken: bool,
+}
+
+impl Discontinuities {
+	/// The sequence of a record spanning `pts..end`, bumped if it doesn't continue the last one.
+	pub fn stamp(&mut self, pts: Duration, end: Duration) -> u64 {
+		// Tolerate sub-millisecond drift from timescale rounding.
+		let jumped = self.last_end.is_some_and(|last| !continues(last, pts));
+		if self.broken || jumped {
+			self.sequence += 1;
+		}
+		self.broken = false;
+		self.last_end = Some(end);
+		self.sequence
+	}
+
+	/// Records were skipped (or a new run started): the next one starts a new discontinuity.
+	pub fn interrupt(&mut self) {
+		self.broken = true;
+	}
+}
+
+/// Whether two content boundaries coincide within the timeline's rounding tolerance.
+pub(crate) fn continues(end: Duration, pts: Duration) -> bool {
+	pts.saturating_sub(end).max(end.saturating_sub(pts)) <= Duration::from_millis(1)
+}
+
+/// The most segments a playlist window lists, however short they are.
+///
+/// A fresh subscriber to a `moq-mux` timeline is only promised this many recent records (the
+/// checkpoint each timeline group restates), so an edge that joined long ago must not list more
+/// source records than one joining now. The dense-timeline
+/// test fails if the two drift apart.
+pub(crate) const MAX_SEGMENTS: usize = 256;
+
+/// Whether a window of `len` rows, whose rows after the oldest span `rest`, should drop its
+/// oldest: it lists more than [`MAX_SEGMENTS`], or the rest still covers `window` and still
+/// holds a start (`keeps_start`, see [`starts`]). A GOP longer than the window keeps its sync
+/// row, so the window stretches to that one GOP, and stays startable.
+pub(crate) fn evicts(window: Duration, len: usize, rest: Duration, keeps_start: bool) -> bool {
+	len > MAX_SEGMENTS || (len >= 2 && rest >= window && keeps_start)
+}
+
+/// Whether a player can start at a `reference` record: audio starts anywhere, video only at a
+/// group start that is a sync point.
+pub(crate) fn starts(reference: &ReferenceKey, keyframe: bool, start: &hang::timeline::Position) -> bool {
+	reference.0 == Kind::Audio || (keyframe && start.frame == 0)
+}
+
+/// A reference's kind, rendition ID, and the track its timeline indexes. The track is part of it
+/// because it can change under one ID, and the new track's records are another numbering.
+pub(crate) type ReferenceKey = (Kind, String, String);
+
+/// The rendition a broadcast's segment boundaries come from.
+pub(crate) type Reference = Arc<ReferenceKey>;
+
+/// The URI tag naming `reference`'s segment numbering: a hash of its kind, ID and track, so every edge
+/// derives the same one and it never contains a URI separator.
+pub(crate) fn tag(reference: &ReferenceKey) -> String {
+	let (kind, id, track) = reference;
+	// A track named by its ID hashes as before, so edges on either side of an upgrade agree.
+	// An override uses a separator the ID form cannot produce after the kind, and length-prefixes
+	// the ID, so no pair of names can hash the bytes of another reference.
+	let digest = match id == track {
+		true => Sha256::digest(format!("{}/{id}", kind.as_str())),
+		false => Sha256::digest(format!("{}\0{}\0{id}{track}", kind.as_str(), id.len())),
+	};
+	// 32 bits: the tag only has to tell apart the references one broadcast ever switches between.
+	digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// One playlist segment: its number, timing, and the reference record's frames.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Row {
-	/// The first group of the segment (its URI: `seg/{group}.m4s`). The segment covers every
-	/// group up to (excluding) the next segment's `group`.
-	pub group: u64,
-	/// Presentation duration in seconds (the gap to the next timeline record).
-	pub duration: f64,
+	/// The reference timeline's record index, used to mirror exact window trims.
+	pub index: u64,
+	/// The reference record's sequence: its `EXT-X-MEDIA-SEQUENCE` and, with the reference's tag,
+	/// its URI (`seg/{tag}.{segment}.m4s`), shared across renditions.
+	pub segment: u64,
+	/// The DASH period start, the reference timestamp where its handoff landed; retained
+	/// even after the first row of the period is evicted.
+	pub period: moq_net::Timestamp,
+	/// The rendition the boundaries come from.
+	pub reference: Reference,
+	/// The reference record's frames, which the reference rendition serves as is.
+	pub frames: std::ops::Range<hang::timeline::Position>,
+	/// Whether the reference record's first frame is a sync point, where a player can start
+	/// decoding (the record's `keyframe` flag).
+	pub keyframe: bool,
+	/// Presentation duration.
+	pub duration: Duration,
 	/// The segment's starting presentation timestamp.
 	pub pts: moq_net::Timestamp,
+	/// The segment's ending presentation timestamp (`pts + duration`), for window eviction
+	/// and discontinuity detection.
+	pub end: Duration,
+	/// The broadcast's [`Discontinuities`] sequence for this record, shared by every rendition,
+	/// so renditions mark the same breaks however many segments each one skipped.
+	pub discontinuity: u64,
+}
+
+impl Row {
+	/// Whether the segment starts at a group start that is a sync point, so a player can begin
+	/// decoding with it.
+	pub fn starts_sync(&self) -> bool {
+		self.keyframe && self.frames.start.frame == 0
+	}
+
+	/// Whether a player can start at this segment (see [`starts`]).
+	pub fn starts(&self) -> bool {
+		starts(&self.reference, self.keyframe, &self.frames.start)
+	}
 }
 
 /// A consistent read of the window, for rendering one playlist (the serve path only).
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub(crate) struct Window {
-	/// The `EXT-X-MEDIA-SEQUENCE` of the first listed segment.
+	/// The `EXT-X-MEDIA-SEQUENCE` of the first listed segment: its source segment number, so
+	/// sequence numbers line up across renditions and edges.
 	pub sequence: u64,
-	/// Complete segments, oldest first.
+	/// The first listed discontinuity, or the newest seen when the window is empty.
+	pub discontinuity: u64,
+	/// Listed segments, oldest first.
 	pub segments: Vec<Row>,
 	/// Whether the timeline (and so the playlist) has ended.
 	pub ended: bool,
 }
 
-/// The next finalized segment a [`Consumer`] should emit, resolved from the window.
+/// The next segment a [`Consumer`] should emit, resolved from the window.
 enum Next {
-	/// A finalized segment is ready to fetch, along with the group that follows it in the
-	/// window (`None` if it's the last / ended-final record). The successor lets a cursor
-	/// notice a gap: if the next segment it emits isn't this successor, records were evicted
-	/// unseen in between.
-	Ready { row: Row, successor: Option<u64> },
+	/// A segment is ready to fetch.
+	Ready(Row),
 	/// No further segment will ever appear (the timeline ended).
 	Ended,
 	/// Nothing new yet; wait for the next window change.
@@ -86,155 +201,131 @@ enum Next {
 }
 
 impl State {
-	/// Snapshot the current window.
-	///
-	/// A segment needs the next record for its duration, so the live-edge record isn't
-	/// listed; once the timeline ends it becomes the final segment, whose duration is
-	/// estimated as the largest gap seen in the window (falling back to
-	/// [`DEFAULT_SEGMENT`] before any complete segment exists).
+	/// Snapshot the current window. Every row is a complete segment, so all are listed.
 	#[cfg_attr(not(feature = "server"), allow(dead_code))]
 	fn window(&self) -> Window {
-		let mut segments = Vec::with_capacity(self.entries.len());
-
-		for (entry, next) in self.entries.iter().zip(self.entries.iter().skip(1)) {
-			segments.push(row(entry, Some(next)));
-		}
-
-		// The final (open-ended) segment has no successor record to time it.
-		if self.ended
-			&& let Some(last) = self.entries.back()
-		{
-			segments.push(Row {
-				group: last.group,
-				duration: self.final_duration(),
-				pts: last.pts,
-			});
-		}
-
 		Window {
-			sequence: self.dropped,
-			segments,
+			sequence: self.sequence,
+			discontinuity: self.rows.front().map_or(self.discontinuity, |row| row.discontinuity),
+			segments: self.rows.iter().cloned().collect(),
 			ended: self.ended,
 		}
 	}
 
-	/// The duration to advertise for the final (open-ended) segment of an ended timeline, which
-	/// has no successor record to time it: the largest gap seen in the window, floored at
-	/// [`DEFAULT_SEGMENT`] before any complete segment has revealed the real cadence. Shared by
-	/// the serve path and the recording cursor so both time that segment identically.
-	fn final_duration(&self) -> f64 {
-		self.entries
-			.iter()
-			.zip(self.entries.iter().skip(1))
-			.map(|(entry, next)| {
-				Duration::from(next.pts)
-					.saturating_sub(Duration::from(entry.pts))
-					.as_secs_f64()
-			})
-			.fold(0.0f64, f64::max)
-			.max(DEFAULT_SEGMENT.as_secs_f64())
-	}
-
-	/// The first finalized segment starting past `after`, for a cursor.
+	/// The first segment past `after`, for a cursor.
 	///
-	/// A record is finalized once a later record bounds its duration, or the timeline has
-	/// ended (making the live-edge record the final segment). Segments evicted from the front
-	/// of the window before the cursor reached them are skipped: the cursor resumes at the
-	/// oldest record still in the window.
-	fn next_after(&self, after: Option<u64>) -> Next {
-		let mut iter = self.entries.iter().enumerate().filter(|(_, e)| match after {
-			Some(after) => e.group > after,
+	/// Rows are complete the moment they arrive. Segments evicted from the front of the
+	/// window before the cursor reached them are skipped: the cursor resumes at the oldest
+	/// row still in the window. A reset starts a new window, whose numbers may restart lower.
+	fn next_after(&self, after: Option<&(u64, u64)>) -> Next {
+		let next = self.rows.iter().find(|r| match after {
+			Some((resets, after)) => *resets != self.resets || r.segment > *after,
 			None => true,
 		});
-		let Some((index, entry)) = iter.next() else {
-			return if self.ended { Next::Ended } else { Next::Pending };
-		};
-		match self.entries.get(index + 1) {
-			// Bounded by the next record: finalized, and that record is its successor.
-			Some(next) => Next::Ready {
-				row: row(entry, Some(next)),
-				successor: Some(next.group),
-			},
-			// The live-edge record is only a segment once the timeline ended; nothing follows it,
-			// so it takes the same estimated duration the serve path advertises for it.
-			None if self.ended => Next::Ready {
-				row: Row {
-					group: entry.group,
-					duration: self.final_duration(),
-					pts: entry.pts,
-				},
-				successor: None,
-			},
+		match next {
+			Some(row) => Next::Ready(row.clone()),
+			None if self.ended => Next::Ended,
 			None => Next::Pending,
 		}
 	}
 }
 
 impl Producer {
-	/// An empty window. `broadcast` is the media broadcast when it is already known, i.e. for a
-	/// rendition served by the catalog's own broadcast; a sibling reference passes `None` and the
-	/// watcher fills it in once resolved.
-	pub fn new(broadcast: Option<moq_net::broadcast::Consumer>) -> Self {
+	/// An empty window.
+	pub fn new() -> Self {
 		Self {
 			state: kio::Producer::new(State {
-				entries: VecDeque::new(),
-				dropped: 0,
+				rows: VecDeque::new(),
+				sequence: 0,
+				discontinuity: 0,
 				ended: false,
+				resets: 0,
 			}),
-			broadcast: broadcast.map(OnceLock::from).unwrap_or_default(),
 		}
 	}
 
-	/// Append a timeline record, evicting the front of the window past `window`.
-	pub fn push(&self, entry: Entry, window: Duration) {
+	/// Append a row, evicting the front of the window past `window` (see [`evicts`]). With no
+	/// `window`, only source timeline pops remove rows. Returns the window's
+	/// [`resets`](Self::resets) after the push.
+	pub fn push(&self, row: Row, window: Option<Duration>) -> u64 {
 		let Ok(mut state) = self.state.write() else {
-			return;
+			return u64::MAX;
 		};
 
-		if let Some(back_pts) = state.entries.back().map(|e| e.pts) {
-			// A non-advancing record (a duplicate, or a stalled/mis-scaled source) would open a
-			// zero-duration segment and never trigger eviction; drop it so the prior segment just
-			// covers its groups too.
-			if entry.pts == back_pts {
-				return;
-			}
-			// A backward jump means the publisher restarted its timeline; the old window can't be
-			// stitched onto the new one, so start over (keeping the sequence monotonic).
-			if entry.pts < back_pts {
+		if let Some(back) = state.rows.back() {
+			// A backward jump in pts or segment number means the publisher restarted its timeline;
+			// the old window can't be stitched onto the new one, so start over.
+			if Duration::from(row.pts) < Duration::from(back.pts) || row.segment <= back.segment {
 				tracing::warn!("timeline jumped backwards; resetting the playlist window");
-				state.dropped += state.entries.len() as u64;
-				state.entries.clear();
+				state.rows.clear();
+				state.resets += 1;
 			}
 		}
+		if state.rows.is_empty() {
+			state.sequence = row.segment;
+		}
 
-		state.entries.push_back(entry);
+		state.discontinuity = row.discontinuity;
+		state.rows.push_back(row);
 
-		// Evict from the front while the *listed* segments (which start at the second entry
-		// once the first is dropped) still cover the window.
-		while state.entries.len() >= 3 {
-			let span =
-				Duration::from(state.entries.back().unwrap().pts).saturating_sub(Duration::from(state.entries[1].pts));
-			if span < window {
+		while let Some(window) = window {
+			let rest = match state.rows.get(1) {
+				Some(second) => state.rows.back().unwrap().end.saturating_sub(second.pts.into()),
+				None => Duration::ZERO,
+			};
+			let keeps_start = !state.rows[0].starts() || state.rows.iter().skip(1).any(Row::starts);
+			if !evicts(window, state.rows.len(), rest, keeps_start) {
 				break;
 			}
-			state.entries.pop_front();
-			state.dropped += 1;
+			state.rows.pop_front();
+		}
+		state.sequence = state.rows.front().unwrap().segment;
+		state.resets
+	}
+
+	/// Retire the prefix through segment `through`, so the playlist stays consecutive.
+	pub fn retire(&self, through: u64) {
+		if let Ok(mut state) = self.state.write() {
+			state.rows.retain(|row| row.segment > through);
+			state.sequence = state
+				.rows
+				.front()
+				.map_or_else(|| state.sequence.max(through.saturating_add(1)), |row| row.segment);
 		}
 	}
 
-	/// Mark the timeline ended (the broadcast finished cleanly): the live-edge record becomes
-	/// the final segment.
+	/// Clear every retained row after an unrecoverable gap in the source timeline.
+	pub fn clear(&self) {
+		if let Ok(mut state) = self.state.write() {
+			state.rows.clear();
+			state.resets += 1;
+		}
+	}
+
+	/// How many times the window was cleared: by [`clear`](Self::clear), or a timeline that
+	/// jumped backwards.
+	pub fn resets(&self) -> u64 {
+		self.state.read().resets
+	}
+
+	/// Mark the timeline ended (it finished, or failed): the playlist gets
+	/// `EXT-X-ENDLIST` and cursors end once drained.
 	pub fn end(&self) {
 		if let Ok(mut state) = self.state.write() {
 			state.ended = true;
 		}
 	}
 
-	/// Close the channel: no more records will arrive. A [`Consumer`] drains the segments it
+	/// Close the channel: no more rows will arrive. A [`Consumer`] drains the segments it
 	/// can still see and then ends; the serve path keeps reading the frozen window. Call after
-	/// [`end`](Self::end) on a clean finish, or on its own when the source is lost mid-stream.
+	/// [`end`](Self::end) when the timeline is over, or on its own when a rendition is retired.
 	pub fn close(&self) {
 		let _ = self.state.close();
+	}
+
+	/// The start of the oldest listed segment, without copying the window.
+	pub fn oldest(&self) -> Option<Duration> {
+		self.state.read().rows.front().map(|row| row.pts.into())
 	}
 
 	/// Snapshot the current window (serve path).
@@ -243,154 +334,193 @@ impl Producer {
 		self.state.read().window()
 	}
 
-	/// The groups covered by the segment starting at `group`, or `None` if it isn't in the
-	/// window. An open end means "until the track ends" (the final segment of an ended
-	/// timeline).
-	pub fn segment_groups(&self, group: u64) -> Option<(u64, Option<u64>)> {
+	/// The row of segment `segment` numbered by the reference tagged `tag`, or `None` if it isn't
+	/// in the window.
+	pub fn row(&self, tag: &str, segment: u64) -> Option<Row> {
 		let state = self.state.read();
-		let index = state.entries.iter().position(|e| e.group == group)?;
-		match state.entries.get(index + 1) {
-			Some(next) => Some((group, Some(next.group))),
-			None if state.ended => Some((group, None)),
-			None => None,
-		}
+		state
+			.rows
+			.iter()
+			.find(|r| r.segment == segment && self::tag(&r.reference) == tag)
+			.cloned()
 	}
 
-	/// The newest complete segment's starting group, used to bootstrap an init segment for
-	/// inline-parameter-set codecs.
-	pub fn latest_group(&self) -> Option<u64> {
+	/// The number of the segment whose `pts` is exactly `time` in the timeline's timescale
+	/// (DASH `$Time$` addressing), or `None` when no listed row starts there. Exact match is
+	/// safe because the rendered `S@t` and this lookup convert the same [`Row::pts`] the same
+	/// way.
+	#[cfg_attr(not(feature = "server"), allow(dead_code))]
+	pub fn segment_number_at(&self, tag: &str, time: u64, timescale: moq_net::Timescale) -> Option<u64> {
 		let state = self.state.read();
-		if state.ended {
-			return state.entries.back().map(|e| e.group);
-		}
-		// The back entry is the live edge; the one before it starts a complete segment.
-		state.entries.iter().rev().nth(1).map(|e| e.group)
+		state
+			.rows
+			.iter()
+			.find(|row| row.pts.as_scale(timescale) == time as u128 && self::tag(&row.reference) == tag)
+			.map(|row| row.segment)
 	}
 
-	/// Whether the playlist has anything to serve yet (at least one complete segment, or the
-	/// broadcast already ended).
+	/// The newest group of `reference` a row starts on a keyframe, used to bootstrap an init
+	/// segment for inline-parameter-set codecs.
+	pub fn latest_keyframe_group(&self, reference: &ReferenceKey) -> Option<u64> {
+		let state = self.state.read();
+		state
+			.rows
+			.iter()
+			.rev()
+			.filter(|row| *row.reference == *reference)
+			.find(|row| row.starts_sync())
+			.map(|row| row.frames.start.group)
+	}
+
+	/// Whether the playlist has anything to serve yet (at least one segment, or the broadcast
+	/// already ended).
 	#[cfg_attr(not(feature = "server"), allow(dead_code))]
 	pub fn is_playable(&self) -> bool {
 		let state = self.state.read();
-		state.ended || state.entries.len() >= 2
+		state.ended || !state.rows.is_empty()
 	}
 
 	/// Poll until [`is_playable`](Self::is_playable), for the serve path's long-poll.
 	#[cfg_attr(not(feature = "server"), allow(dead_code))]
 	pub fn poll_playable(&self, waiter: &kio::Waiter) -> Poll<()> {
 		let poll = self.state.poll_ref(waiter, |state| {
-			if state.ended || state.entries.len() >= 2 {
+			if state.ended || !state.rows.is_empty() {
 				Poll::Ready(())
 			} else {
 				Poll::Pending
 			}
 		});
 		match poll {
-			// Ready, or the channel closed (no more records will arrive): stop waiting either way.
+			// Ready, or the channel closed (no more rows will arrive): stop waiting either way.
 			Poll::Ready(_) => Poll::Ready(()),
 			Poll::Pending => Poll::Pending,
 		}
 	}
 
-	/// A cursor over finalized segments, starting from the oldest still in the window.
+	/// Poll `f` over the listed rows, waking on the next window change while it is pending, and
+	/// return the [`resets`](Self::resets) those rows belong to. A closed window stays pending: no
+	/// new row can make `f` ready.
+	pub fn poll_rows(&self, waiter: &kio::Waiter, mut f: impl FnMut(&VecDeque<Row>) -> Poll<()>) -> Poll<u64> {
+		match self
+			.state
+			.poll_ref(waiter, |state| f(&state.rows).map(|()| state.resets))
+		{
+			Poll::Ready(Ok(resets)) => Poll::Ready(resets),
+			_ => Poll::Pending,
+		}
+	}
+
+	/// A cursor over segments, starting from the oldest still in the window.
 	pub fn subscribe(&self, rendition: Arc<Rendition>) -> Consumer {
 		Consumer {
 			state: self.state.consume(),
 			rendition,
 			after: None,
-			expected: None,
-			gap: false,
+			feed: None,
 		}
 	}
 }
 
-/// A finalized segment with its transmuxed media, yielded by a [`Consumer`].
+/// A segment with its transmuxed media, yielded by a [`Consumer`].
 pub struct Segment {
-	/// The segment's starting group (also its `seg/{group}.m4s` URI stem).
-	pub group: u64,
+	/// The source segment number (its URI is `seg/{reference}.{segment}.m4s`), shared across renditions.
+	pub segment: u64,
 	/// The transmuxed CMAF fragment (`moof`+`mdat`), fetched on demand by [`Consumer::next`].
 	pub media: Bytes,
-	/// Presentation duration in seconds.
-	pub duration: f64,
+	/// Presentation duration.
+	pub duration: Duration,
 	/// Wall-clock start time, when the timeline advertises an anchor.
 	pub program_date_time: Option<SystemTime>,
-	/// The media timeline is broken before this segment: one or more finalized segments were
-	/// skipped (evicted from the window before they could be fetched) since the previous one.
-	/// A recorder marks an `EXT-X-DISCONTINUITY` here.
-	pub discontinuity: bool,
+	/// The absolute timeline discontinuity sequence within this broadcaster.
+	///
+	/// Use the first retained segment's value as `EXT-X-DISCONTINUITY-SEQUENCE`, then write
+	/// `current - previous` `EXT-X-DISCONTINUITY` tags before each later segment; a skipped
+	/// epoch makes that more than one. Cursors share this sequence regardless of when
+	/// they start or which segments they skip. Recreating the broadcaster starts a new
+	/// namespace: start a new recording or map it into a recording-wide sequence.
+	pub discontinuity: u64,
 }
 
-/// A cursor over one rendition's finalized segments, in timeline order.
+/// A cursor over one rendition's segments, in timeline order.
 ///
-/// Obtained from [`Rendition::segments`](super::Rendition::segments). Drives the same
-/// fetch-on-demand path the HTTP serve path uses, so it adds no standing traffic: each
-/// [`next`](Self::next) awaits the next segment to finalize, then FETCHes and transmuxes it.
+/// Obtained from [`Rendition::segments`](super::Rendition::segments). Each
+/// [`next`](Self::next) awaits the next segment, then FETCHes and transmuxes it through the
+/// path the HTTP serve path uses. The cursor also holds a live subscription to the media
+/// track, so each group reaches the cache as it is published and that FETCH is a hit. A
+/// cursor reads every group anyway, so this costs no extra traffic, and a source without
+/// FETCH (moq-lite before 05) can serve a group no other way.
 pub struct Consumer {
 	state: kio::Consumer<State>,
 	rendition: Arc<Rendition>,
-	/// The group of the last segment returned; the next call resumes strictly after it. Only
-	/// advanced once a segment is fetched or skipped, so a transient fetch error re-tries the
-	/// same segment on the next call instead of losing it.
-	after: Option<u64>,
-	/// The successor group recorded when the last segment was emitted. If the next segment
-	/// isn't it, records were evicted unseen in between (a gap).
-	expected: Option<u64>,
-	/// A gap opened since the last emitted segment (a skip); set on the next one's discontinuity.
-	gap: bool,
+	/// Last fetched or skipped segment, with its window reset epoch; errors leave it unchanged
+	/// so callers can retry.
+	after: Option<(u64, u64)>,
+	feed: Option<Feed>,
+}
+
+/// The live subscription a [`Consumer`] holds on its rendition's media track.
+struct Feed {
+	/// What it subscribed through: a re-issued sibling bind gets a fresh feed.
+	binding: Arc<moq_mux::Binding>,
+	state: FeedState,
+}
+
+enum FeedState {
+	/// Waiting for the binding to resolve the broadcast.
+	Binding,
+	Subscribing(moq_net::track::Subscribing),
+	Live(Box<moq_net::track::Subscriber>),
+	/// The track can't be subscribed; fetches fail on their own.
+	Failed,
 }
 
 impl Consumer {
 	/// The rendition's CMAF init segment, built once and cached; `None` until it can be built
-	/// (an inline-parameter-set codec needs the first complete segment first).
+	/// (an inline-parameter-set codec needs the first segment first).
 	pub async fn init(&self) -> Result<Option<Bytes>> {
 		self.rendition.init().await
 	}
 
-	/// The next finalized segment, with its media; `None` once the rendition ends.
+	/// The next segment, with its media; `None` once the rendition ends, including when its
+	/// timeline failed.
 	///
-	/// Waits for the next segment to finalize, then FETCHes and transmuxes its groups. A
-	/// segment whose groups already left the relay cache is skipped (this resumes at the next
-	/// one, flagging [`Segment::discontinuity`]) rather than surfaced as an error; a real
+	/// Waits for the next segment to resolve on this rendition, then FETCHes and transmuxes its
+	/// frames. A segment whose groups already left the relay cache (or that is a gap for this
+	/// rendition) is skipped, resuming at the next one, rather than surfaced as an error; a real
 	/// fetch/transmux failure is returned, leaving the cursor to retry it on the next call.
 	pub async fn next(&mut self) -> Result<Option<Segment>> {
 		loop {
-			let Some((row, successor)) = kio::wait(|waiter| self.poll_next(waiter)).await else {
+			let Some((row, resets)) = kio::wait(|waiter| self.poll_next(waiter)).await else {
 				return Ok(None);
 			};
-			// A gap opened if the segment we're about to emit isn't the successor the previous
-			// one recorded (records between them evicted unseen).
-			let gap = self.gap || self.expected.is_some_and(|expected| expected != row.group);
-
-			match self.rendition.segment(row.group).await? {
-				Some(media) => {
-					self.after = Some(row.group);
-					self.expected = successor;
-					self.gap = false;
-					return Ok(Some(Segment {
-						group: row.group,
-						media,
-						duration: row.duration,
-						program_date_time: self.rendition.wall_clock(row.pts),
-						discontinuity: gap,
-					}));
-				}
-				// Its groups aged out of the cache before we fetched them; skip to the next and
-				// carry the gap onto whichever segment we emit next.
-				None => {
-					self.after = Some(row.group);
-					self.expected = successor;
-					self.gap = true;
-				}
+			kio::wait(|waiter| self.rendition.poll_resolved(waiter, &row)).await;
+			// The rendition's timeline failed: it ends here, like its playlist.
+			if self.rendition.is_failed(&row) {
+				return Ok(None);
+			}
+			let media = self.rendition.fetch(&row).await?;
+			self.after = Some((resets, row.segment));
+			if let Some(media) = media {
+				return Ok(Some(Segment {
+					segment: row.segment,
+					media,
+					duration: row.duration,
+					program_date_time: self.rendition.wall_clock(row.pts),
+					discontinuity: row.discontinuity,
+				}));
 			}
 		}
 	}
 
-	fn poll_next(&self, waiter: &kio::Waiter) -> Poll<Option<(Row, Option<u64>)>> {
-		let poll = self.state.poll(waiter, |state| match state.next_after(self.after) {
-			Next::Ready { row, successor } => Poll::Ready(Some((row, successor))),
-			Next::Ended => Poll::Ready(None),
-			Next::Pending => Poll::Pending,
-		});
+	fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<Option<(Row, u64)>> {
+		self.poll_feed(waiter);
+		let poll = self
+			.state
+			.poll(waiter, |state| match state.next_after(self.after.as_ref()) {
+				Next::Ready(row) => Poll::Ready(Some((row, state.resets))),
+				Next::Ended => Poll::Ready(None),
+				Next::Pending => Poll::Pending,
+			});
 		match poll {
 			Poll::Ready(Ok(found)) => Poll::Ready(found),
 			// The producer closed without a clean end (broadcast dropped): no more segments.
@@ -398,16 +528,39 @@ impl Consumer {
 			Poll::Pending => Poll::Pending,
 		}
 	}
-}
 
-fn row(entry: &Entry, next: Option<&Entry>) -> Row {
-	let duration = next
-		.map(|next| Duration::from(next.pts).saturating_sub(Duration::from(entry.pts)))
-		.unwrap_or(DEFAULT_SEGMENT);
-	Row {
-		group: entry.group,
-		duration: duration.as_secs_f64(),
-		pts: entry.pts,
+	/// Hold a live subscription on the media track the rendition is bound to now.
+	fn poll_feed(&mut self, waiter: &kio::Waiter) {
+		// Also ends the window on an ended sibling, which nothing else may wake this cursor for.
+		let binding = self.rendition.poll_media(waiter);
+		let feed = match &mut self.feed {
+			Some(feed) if Arc::ptr_eq(&feed.binding, &binding) => feed,
+			feed => feed.insert(Feed {
+				binding,
+				state: FeedState::Binding,
+			}),
+		};
+		loop {
+			feed.state = match &mut feed.state {
+				FeedState::Binding => match self.rendition.poll_subscribe(&feed.binding, waiter) {
+					Poll::Ready(Some(subscribing)) => FeedState::Subscribing(subscribing),
+					Poll::Ready(None) => FeedState::Failed,
+					Poll::Pending => return,
+				},
+				FeedState::Subscribing(subscribing) => match subscribing.poll_ok(waiter) {
+					Poll::Ready(Ok(subscriber)) => FeedState::Live(Box::new(subscriber)),
+					Poll::Ready(Err(_)) => FeedState::Failed,
+					Poll::Pending => return,
+				},
+				FeedState::Live(subscriber) => {
+					// Drop each group as it arrives: the cache keeps it for the fetch, and a
+					// subscription that resumed across routes only pulls while it is read.
+					while let Poll::Ready(Ok(Some(_))) = subscriber.poll_recv_group(waiter) {}
+					return;
+				}
+				FeedState::Failed => return,
+			};
+		}
 	}
 }
 
@@ -415,193 +568,265 @@ fn row(entry: &Entry, next: Option<&Entry>) -> Row {
 mod tests {
 	use super::*;
 
-	fn entry(group: u64, pts_ms: u64) -> Entry {
-		Entry {
-			group,
-			pts: moq_net::Timestamp::from_millis(pts_ms).unwrap(),
-			ext: (),
+	fn row(segment: u64, group: u64, pts_ms: u64, duration_ms: u64) -> Row {
+		let pts = moq_net::Timestamp::from_millis(pts_ms).unwrap();
+		Row {
+			index: segment,
+			segment,
+			period: moq_net::Timestamp::ZERO,
+			reference: Arc::new((Kind::Video, "video".to_string(), "video".to_string())),
+			frames: hang::timeline::Position::group(group)..hang::timeline::Position::group(group + 1),
+			keyframe: true,
+			duration: Duration::from_millis(duration_ms),
+			pts,
+			end: Duration::from(pts) + Duration::from_millis(duration_ms),
+			discontinuity: 0,
 		}
 	}
 
 	#[test]
-	fn last_record_is_the_live_edge_until_ended() {
-		let live = Producer::new(None);
-		live.push(entry(0, 0), Duration::from_secs(30));
-		live.push(entry(1, 2_000), Duration::from_secs(30));
-		live.push(entry(2, 4_000), Duration::from_secs(30));
+	fn every_row_is_listed() {
+		let live = Producer::new();
+		live.push(row(0, 0, 0, 2_000), Some(Duration::from_secs(30)));
+		live.push(row(1, 1, 2_000, 2_000), Some(Duration::from_secs(30)));
 
 		let window = live.window();
 		assert_eq!(window.sequence, 0);
 		assert!(!window.ended);
-		assert_eq!(window.segments.len(), 2, "the live-edge record is not listed");
-		assert_eq!(window.segments[0].group, 0);
-		assert_eq!(window.segments[0].duration, 2.0);
-		assert_eq!(window.segments[1].group, 1);
+		assert_eq!(window.segments.len(), 2, "rows are complete segments; all are listed");
+		assert_eq!(window.segments[0].segment, 0);
+		assert_eq!(window.segments[0].duration, Duration::from_secs(2));
 
 		live.end();
-		let window = live.window();
-		assert!(window.ended);
-		assert_eq!(window.segments.len(), 3, "ending lists the final record");
-		assert_eq!(window.segments[2].duration, 4.0, "final duration falls back");
+		assert!(live.window().ended);
 	}
 
 	#[test]
 	fn window_evicts_and_advances_sequence() {
-		let live = Producer::new(None);
-		let window = Duration::from_secs(4);
+		let live = Producer::new();
+		let window = Some(Duration::from_secs(4));
 		for i in 0..6u64 {
-			live.push(entry(i, i * 2_000), window);
+			live.push(row(i, i, i * 2_000, 2_000), window);
 		}
 
 		let snapshot = live.window();
-		// Segments still cover >= 4s after eviction, and the sequence counts the drops.
+		// Segments still cover >= 4s after eviction, and the sequence is the first listed
+		// segment's aligned number.
 		assert!(snapshot.sequence > 0);
-		let span: f64 = snapshot.segments.iter().map(|s| s.duration).sum();
-		assert!(span >= 4.0);
-		assert_eq!(snapshot.segments.first().unwrap().group, snapshot.sequence);
+		let span: Duration = snapshot.segments.iter().map(|s| s.duration).sum();
+		assert!(span >= Duration::from_secs(4));
+		assert_eq!(snapshot.segments.first().unwrap().segment, snapshot.sequence);
 	}
 
 	#[test]
-	fn segment_groups_cover_record_gaps() {
-		let live = Producer::new(None);
-		let window = Duration::from_secs(30);
-		// An audio-style timeline: records skip groups (granularity throttling).
-		live.push(entry(0, 0), window);
-		live.push(entry(50, 1_000), window);
-		live.push(entry(100, 2_000), window);
+	fn retiring_a_prefix_advances_the_playlist_sequence() {
+		let live = Producer::new();
+		let window = Some(Duration::from_secs(30));
+		for i in 0..4u64 {
+			live.push(row(i, i, i * 2_000, 2_000), window);
+		}
 
-		assert_eq!(live.segment_groups(0), Some((0, Some(50))));
-		assert_eq!(live.segment_groups(50), Some((50, Some(100))));
-		// The live edge isn't a segment yet, and unknown groups miss.
-		assert_eq!(live.segment_groups(100), None);
-		assert_eq!(live.segment_groups(7), None);
+		live.retire(1);
+		let snapshot = live.window();
+		assert_eq!(snapshot.sequence, 2);
+		assert_eq!(
+			snapshot.segments.iter().map(|row| row.segment).collect::<Vec<_>>(),
+			vec![2, 3]
+		);
 
-		live.end();
-		assert_eq!(live.segment_groups(100), Some((100, None)));
+		live.retire(3);
+		let snapshot = live.window();
+		assert_eq!(snapshot.sequence, 4);
+		assert!(snapshot.segments.is_empty());
+	}
+
+	#[test]
+	fn a_skipped_source_range_clears_rows_before_the_next_segment() {
+		let live = Producer::new();
+		live.push(row(4, 4, 8_000, 2_000), Some(Duration::from_secs(10)));
+		live.clear();
+		live.push(row(10, 10, 20_000, 2_000), Some(Duration::from_secs(10)));
+
+		let snapshot = live.window();
+		assert_eq!(snapshot.sequence, 10);
+		assert_eq!(
+			snapshot.segments.iter().map(|row| row.segment).collect::<Vec<_>>(),
+			vec![10]
+		);
+	}
+
+	fn secs(s: u64) -> Duration {
+		Duration::from_secs(s)
+	}
+
+	#[test]
+	fn a_continuous_timeline_keeps_one_discontinuity() {
+		// A cursor that skips a record (uncached, or a gap for its rendition) must not mark the
+		// next one: a sibling that fetched it wouldn't, and players require renditions to agree.
+		let mut timeline = Discontinuities::default();
+		assert_eq!(timeline.stamp(secs(0), secs(2)), 0);
+		assert_eq!(timeline.stamp(secs(2), secs(4)), 0);
+		assert_eq!(timeline.stamp(secs(4), secs(6)), 0);
+	}
+
+	#[test]
+	fn a_content_time_jump_starts_a_new_discontinuity() {
+		let mut timeline = Discontinuities::default();
+		assert_eq!(timeline.stamp(secs(0), secs(2)), 0);
+		assert_eq!(timeline.stamp(secs(10), secs(12)), 1);
+		assert_eq!(timeline.stamp(secs(12), secs(14)), 1);
+	}
+
+	#[test]
+	fn skipped_records_start_a_new_discontinuity() {
+		let mut timeline = Discontinuities::default();
+		assert_eq!(timeline.stamp(secs(0), secs(2)), 0);
+		timeline.interrupt();
+		assert_eq!(
+			timeline.stamp(secs(2), secs(4)),
+			1,
+			"skipped records break the timeline even when the next one lines up"
+		);
+	}
+
+	#[test]
+	fn rows_and_the_keyframe_group() {
+		let live = Producer::new();
+		let window = Some(Duration::from_secs(30));
+		live.push(row(0, 0, 0, 1_000), window);
+		live.push(
+			Row {
+				keyframe: false,
+				..row(1, 1, 1_000, 1_000)
+			},
+			window,
+		);
+
+		let video = (Kind::Video, "video".to_string(), "video".to_string());
+		let tag = tag(&video);
+		assert_eq!(
+			live.row(&tag, 0).unwrap().frames,
+			hang::timeline::Position::group(0)..hang::timeline::Position::group(1)
+		);
+		assert_eq!(live.row(&tag, 7), None, "unknown segments miss");
+		assert_eq!(live.row("00000000", 0), None, "another reference's numbering misses");
+		assert_eq!(
+			live.latest_keyframe_group(&video),
+			Some(0),
+			"row 1 does not start on a keyframe"
+		);
+		assert_eq!(
+			live.latest_keyframe_group(&(Kind::Audio, "video".to_string(), "video".to_string())),
+			None
+		);
 	}
 
 	#[test]
 	fn backwards_jump_resets_the_window() {
-		let live = Producer::new(None);
-		let window = Duration::from_secs(30);
-		live.push(entry(0, 10_000), window);
-		live.push(entry(1, 12_000), window);
-		live.push(entry(2, 1_000), window); // restart
+		let live = Producer::new();
+		let window = Some(Duration::from_secs(30));
+		assert_eq!(live.push(row(0, 0, 10_000, 2_000), window), 0);
+		assert_eq!(live.push(row(1, 1, 12_000, 2_000), window), 0);
+		assert_eq!(live.push(row(2, 2, 1_000, 2_000), window), 1); // restart: pts rewound
 
 		let snapshot = live.window();
-		assert_eq!(snapshot.sequence, 2, "reset keeps the media sequence monotonic");
-		assert!(snapshot.segments.is_empty(), "only the live edge remains");
+		assert_eq!(snapshot.segments.len(), 1, "the window restarted at the new row");
+		assert_eq!(snapshot.segments[0].segment, 2);
+
+		// A segment number that rewinds (a restarted publisher) resets the same way.
+		assert_eq!(live.push(row(0, 0, 2_000, 2_000), window), 2);
+		assert_eq!(live.window().segments.len(), 1);
 	}
 
 	#[test]
-	fn non_advancing_record_is_skipped() {
-		let live = Producer::new(None);
-		let window = Duration::from_secs(30);
-		live.push(entry(0, 0), window);
-		live.push(entry(1, 2_000), window);
-		// A record whose pts equals the live edge would open a zero-duration segment; it's dropped
-		// so the prior segment just covers its groups.
-		live.push(entry(2, 2_000), window);
-		live.push(entry(3, 4_000), window);
+	fn next_after_walks_segments() {
+		let live = Producer::new();
+		let window = Some(Duration::from_secs(30));
+		live.push(row(0, 0, 0, 2_000), window);
+		live.push(row(1, 1, 2_000, 2_000), window);
 
-		live.end();
-		let window = live.window();
-		let durations: Vec<f64> = window.segments.iter().map(|s| s.duration).collect();
-		assert!(!durations.contains(&0.0), "no zero-duration segment: {durations:?}");
-		// Group 2 was absorbed into group 1's segment (still bounded by group 3's record).
-		assert_eq!(live.segment_groups(1), Some((1, Some(3))));
-		assert_eq!(live.segment_groups(2), None, "the skipped record is not a boundary");
-	}
-
-	// `end()` is what promotes the live-edge record into the final segment, and it is a no-op
-	// once the channel is closed. So anything retiring a rendition must NOT force-close a
-	// timeline that is about to end on its own, or that last segment is silently lost -- which
-	// is why `renditions::Producer::clear` drops its renditions rather than closing them.
-	#[test]
-	fn closing_before_end_loses_the_final_segment() {
-		let window = Duration::from_secs(30);
-
-		// The watcher's own order: end() then close() -- the live edge finalizes.
-		let clean = Producer::new(None);
-		clean.push(entry(0, 0), window);
-		clean.push(entry(1, 2_000), window);
-		clean.end();
-		clean.close();
-		assert!(
-			matches!(clean.state.read().next_after(Some(0)), Next::Ready { .. }),
-			"end() before close() finalizes the live edge"
-		);
-
-		// Reversed: a close() that races ahead of end() strands it forever.
-		let raced = Producer::new(None);
-		raced.push(entry(0, 0), window);
-		raced.push(entry(1, 2_000), window);
-		raced.close();
-		raced.end();
-		assert!(
-			matches!(raced.state.read().next_after(Some(0)), Next::Pending),
-			"end() is a no-op after close(), so the final segment never finalizes"
-		);
-	}
-
-	// The cursor and the serve path must time the final (open-ended) segment identically:
-	// estimated from the observed cadence, not a flat DEFAULT_SEGMENT.
-	#[test]
-	fn final_segment_duration_matches_the_serve_path() {
-		let live = Producer::new(None);
-		let window = Duration::from_secs(30);
-		// A 6s cadence, so the flat 4s DEFAULT_SEGMENT would be wrong for the last segment.
-		live.push(entry(0, 0), window);
-		live.push(entry(1, 6_000), window);
-		live.push(entry(2, 12_000), window);
-		live.end();
-
-		let served = live.window();
-		let last_served = served.segments.last().expect("a final segment");
-		assert_eq!(last_served.group, 2);
-		assert_eq!(last_served.duration, 6.0, "serve path estimates from the cadence");
-
-		let last_recorded = match live.state.read().next_after(Some(1)) {
-			Next::Ready { row, .. } => row,
-			_ => panic!("ending finalizes the live edge"),
+		let Next::Ready(first) = live.state.read().next_after(None) else {
+			panic!("expected a segment");
 		};
-		assert_eq!(last_recorded.group, 2);
-		assert_eq!(
-			last_recorded.duration, last_served.duration,
-			"the cursor times the final segment like the serve path"
-		);
-	}
-
-	#[test]
-	fn next_after_walks_finalized_segments() {
-		let live = Producer::new(None);
-		let window = Duration::from_secs(30);
-		live.push(entry(0, 0), window);
-		live.push(entry(1, 2_000), window);
-		live.push(entry(2, 4_000), window);
-
-		// Groups 0 and 1 are finalized; group 2 is the live edge.
-		let first = match live.state.read().next_after(None) {
-			Next::Ready { row, .. } => row,
-			_ => panic!("expected a finalized segment"),
+		assert_eq!(first.segment, 0);
+		let after = |segment| Some((0, segment));
+		let Next::Ready(second) = live.state.read().next_after(after(0).as_ref()) else {
+			panic!("expected a segment");
 		};
-		assert_eq!(first.group, 0);
-		let second = match live.state.read().next_after(Some(0)) {
-			Next::Ready { row, .. } => row,
-			_ => panic!("expected a finalized segment"),
-		};
-		assert_eq!(second.group, 1);
+		assert_eq!(second.segment, 1);
 		assert!(
-			matches!(live.state.read().next_after(Some(1)), Next::Pending),
-			"the live edge is not finalized while live"
+			matches!(live.state.read().next_after(after(1).as_ref()), Next::Pending),
+			"nothing further while live"
 		);
 
 		live.end();
-		let last = match live.state.read().next_after(Some(1)) {
-			Next::Ready { row, .. } => row,
-			_ => panic!("ending finalizes the live edge"),
+		assert!(matches!(live.state.read().next_after(after(1).as_ref()), Next::Ended));
+	}
+
+	/// A cleared window may restart its numbering lower, so a cursor past a higher number of the
+	/// old window still yields the new one's rows.
+	#[test]
+	fn a_new_reference_restarts_the_cursor() {
+		let live = Producer::new();
+		let window = Some(Duration::from_secs(30));
+		live.push(row(5, 5, 10_000, 2_000), window);
+		let Next::Ready(old) = live.state.read().next_after(None) else {
+			panic!("expected a segment");
 		};
-		assert_eq!(last.group, 2);
-		assert!(matches!(live.state.read().next_after(Some(2)), Next::Ended));
+
+		live.clear();
+		let switched = Row {
+			reference: Arc::new((Kind::Video, "other".to_string(), "other".to_string())),
+			..row(0, 0, 0, 2_000)
+		};
+		live.push(switched, window);
+		let after = Some((0, old.segment));
+		let Next::Ready(next) = live.state.read().next_after(after.as_ref()) else {
+			panic!("the new reference's first row follows");
+		};
+		assert_eq!(next.segment, 0);
+		assert_ne!(tag(&next.reference), tag(&old.reference), "its URLs carry another tag");
+	}
+
+	#[test]
+	fn a_handoff_continues_the_source_numbering_under_another_tag() {
+		let live = Producer::new();
+		let window = Some(Duration::from_secs(30));
+		let old = row(5, 5, 10_000, 2_000);
+		let old_reference = old.reference.clone();
+		live.push(old, window);
+		let switched = Row {
+			reference: Arc::new((Kind::Video, "other".into(), "other".into())),
+			period: moq_net::Timestamp::from_secs(12).unwrap(),
+			..row(6, 6, 12_000, 2_000)
+		};
+		live.push(switched, window);
+		assert_eq!(live.window().sequence, 5);
+		let Next::Ready(next) = live.state.read().next_after(Some(&(0, 5))) else {
+			panic!("the replacement's row follows");
+		};
+		assert_eq!(next.segment, 6);
+		assert_ne!(tag(&next.reference), tag(&old_reference));
+		assert!(matches!(live.state.read().next_after(Some(&(0, 6))), Next::Pending));
+		live.retire(5);
+		assert_eq!(live.window().sequence, 6);
+		assert!(live.row(&tag(&old_reference), 5).is_none());
+		live.retire(6);
+		assert!(live.window().segments.is_empty());
+		assert_eq!(live.window().sequence, 7);
+	}
+
+	#[test]
+	fn tag_encodings_never_collide() {
+		let key = |id: &str, track: &str| (Kind::Video, id.to_string(), track.to_string());
+		// The ID form and an override cannot share bytes, whatever the names contain.
+		assert_ne!(tag(&key("a\0b", "a\0b")), tag(&key("a", "b")));
+		// Nor can two overrides that split the same bytes differently.
+		assert_ne!(tag(&key("ab", "c")), tag(&key("a", "bc")));
+		// A track named by its ID keeps the tag it had before overrides existed.
+		assert_eq!(tag(&key("video", "video")), {
+			let digest = Sha256::digest("video/video");
+			digest[..4].iter().map(|b| format!("{b:02x}")).collect::<String>()
+		});
 	}
 }

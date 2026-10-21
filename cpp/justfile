@@ -1,0 +1,39 @@
+#!/usr/bin/env just --justfile
+#
+# The moq C++ package over rs/moq-ffi. Invoked from the repo root as `just cpp <recipe>` via
+# the `mod cpp` import. The OBS plugin has its own module, `just obs`.
+
+set working-directory := '.'
+
+default:
+    just check
+
+# Build the package, or check an archive, and run its installed consumers.
+[no-cd]
+[positional-arguments]
+check *args:
+    python3 {{ quote(justfile_directory() / "sh/cpp/ffi.test.py") }}
+    {{ quote(justfile_directory() / "sh/cpp/check.sh") }} "$@"
+
+# Run the in-process binding benchmark with the release library.
+bench:
+    bash ../sh/cpp/bench.sh
+
+# Runs in the caller's directory, so a relative `--output` means what it would
+# to the script itself.
+
+# Build and package the C++ package for release.
+[no-cd]
+[positional-arguments]
+package *args:
+    {{ quote(justfile_directory() / "cpp/moq/build.sh") }} "$@"
+
+# Remove the package builds.
+clean:
+    rm -rf moq/build
+
+# Stage, archive, fetch, or publish the pinned default-feature native input.
+[no-cd]
+[positional-arguments]
+ffi *args:
+    python3 {{ quote(justfile_directory() / "sh/cpp/ffi.py") }} "$@"

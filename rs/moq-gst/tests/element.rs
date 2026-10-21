@@ -552,11 +552,11 @@ fn a_pipeline_description_names_the_track() {
 fn a_pipeline_description_configures_quic_timeouts() {
 	init();
 	let sink = gst::parse::launch(
-		"moqsink url=https://127.0.0.1:1 broadcast=test quic-idle-timeout=15000 quic-keep-alive=3000",
+		"moqsink url=https://127.0.0.1:1 broadcast=test quic-idle-timeout=15000 quic-keep-alive=2000",
 	)
 	.expect("parse the description");
 	assert_eq!(sink.property::<u64>("quic-idle-timeout"), 15_000);
-	assert_eq!(sink.property::<u64>("quic-keep-alive"), 3_000);
+	assert_eq!(sink.property::<u64>("quic-keep-alive"), 2_000);
 }
 
 #[test]
@@ -569,6 +569,20 @@ fn a_pipeline_description_selects_loc() {
 	assert_eq!(
 		child_of(&sink, "sink_0").property::<gstmoq::MediaContainer>("container"),
 		gstmoq::MediaContainer::Loc
+	);
+}
+
+#[test]
+fn a_pipeline_description_marks_an_encoder_pad() {
+	init();
+	let sink = gst::parse::launch("moqsink name=publisher url=https://127.0.0.1:1 broadcast=test sink_0::encoder=true")
+		.expect("parse the description");
+	let _pad = sink.request_pad_simple("sink_0").expect("request sink_0");
+	assert!(child_of(&sink, "sink_0").property::<bool>("encoder"));
+	let _other = sink.request_pad_simple("sink_1").expect("request sink_1");
+	assert!(
+		!child_of(&sink, "sink_1").property::<bool>("encoder"),
+		"a pad is an import unless it says otherwise"
 	);
 }
 
@@ -1034,7 +1048,7 @@ fn a_pad_requested_from_the_eos_notify_is_refused() {
 }
 
 // A write that the producer rejects is the failure the property exists for. A frame past
-// MAX_GROUP_CACHE is the deterministic way to cause one: moq-net refuses it before reserving a group.
+// MAX_CACHE_BYTES is the deterministic way to cause one: moq-net refuses it before reserving a group.
 #[test]
 fn a_rejected_write_moves_the_pad_to_error() {
 	init();
@@ -1143,8 +1157,7 @@ fn replacing_the_session_from_eos_notify_discards_the_old_eos() {
 	assert!(pad.send_event(gst::event::Eos::new()));
 	assert!(restarted.load(Ordering::SeqCst));
 	assert!(
-		bus.timed_pop_filtered(gst::ClockTime::ZERO, &[gst::MessageType::Eos])
-			.is_none(),
+		bus.pop_filtered(&[gst::MessageType::Eos]).is_none(),
 		"the completed session posted EOS into its replacement"
 	);
 	let _ = sink.set_state(gst::State::Null);
@@ -1491,8 +1504,8 @@ fn connect_failure_retries_without_erroring() {
 	let msg = bus.timed_pop_filtered(gst::ClockTime::from_seconds(3), &[gst::MessageType::Error]);
 	let connected = sink.property::<bool>("connected");
 	let status = sink.property::<gstmoq::ConnectionStatus>("status");
-	let send_bitrate = sink.property::<u64>("estimated-send-bitrate");
-	let recv_bitrate = sink.property::<u64>("estimated-recv-bitrate");
+	let send_bitrate = sink.property::<u64>("estimated-send-rate");
+	let recv_bitrate = sink.property::<u64>("estimated-recv-rate");
 	let _ = pipeline.set_state(gst::State::Null);
 
 	assert!(

@@ -5,29 +5,21 @@ use std::marker::PhantomData;
 use bytes::Bytes;
 use serde::Serialize;
 
-use crate::{Error, Result};
+use crate::{Compression, Error, Result};
 
-/// Configuration for an [`Encoder`], and so for the [`Producer`](super::Producer) wrapping one.
+/// Codec options for an [`Encoder`], and so for the [`Producer`](super::Producer) wrapping one.
 ///
 /// Build from [`Default`] and override fields (the struct is `#[non_exhaustive]`, so new
 /// options stay additive).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
-pub struct ProducerConfig {
+pub struct Config {
 	/// Compress the group as one sync-flushed DEFLATE stream, so each record reuses the earlier
 	/// ones as context and shrinks sharply.
 	///
-	/// `false` (the default) emits plaintext JSON frames. A [`Decoder`](super::Decoder) reading them
-	/// must set [`ConsumerConfig::compression`](super::ConsumerConfig::compression) to match.
-	pub compression: bool,
-}
-
-impl ProducerConfig {
-	/// Set [`compression`](Self::compression) (a builder, since the struct is `#[non_exhaustive]`).
-	pub fn with_compression(mut self, compression: bool) -> Self {
-		self.compression = compression;
-		self
-	}
+	/// [`Compression::None`] (the default) emits plaintext JSON frames. A [`Decoder`](super::Decoder)
+	/// reading them must set the same [`compression`](Self::compression).
+	pub compression: Compression,
 }
 
 /// An encoded record the caller has not yet acknowledged writing.
@@ -59,6 +51,8 @@ impl<T> Pending<'_, T> {
 	/// Only call this once the write has actually succeeded.
 	pub fn commit(mut self) {
 		self.committed = true;
+		self.encoder.frames += 1;
+		self.encoder.bytes += self.payload.len() as u64;
 	}
 }
 
@@ -88,16 +82,23 @@ pub struct Encoder<T> {
 	/// consumer for the rest of the group, so encoding stops until the caller rolls a new one.
 	desynced: bool,
 
+	/// Frames and payload bytes committed to the current group, checked against moq-net's group
+	/// budget before each record is encoded.
+	frames: usize,
+	bytes: u64,
+
 	_marker: PhantomData<fn(T)>,
 }
 
 impl<T> Encoder<T> {
 	/// Create an encoder with a cold window.
-	pub fn new(config: ProducerConfig) -> Self {
+	pub fn new(config: Config) -> Self {
 		Self {
-			flate: config.compression.then(moq_flate::Encoder::new),
-			compression: config.compression,
+			flate: config.compression.is_deflate().then(moq_flate::Encoder::new),
+			compression: config.compression.is_deflate(),
 			desynced: false,
+			frames: 0,
+			bytes: 0,
 			_marker: PhantomData,
 		}
 	}
@@ -109,6 +110,8 @@ impl<T> Encoder<T> {
 	pub fn reset(&mut self) {
 		self.flate = self.compression.then(moq_flate::Encoder::new);
 		self.desynced = false;
+		self.frames = 0;
+		self.bytes = 0;
 	}
 
 	/// Mark the window as ahead of the consumer, after a record that was never written.
@@ -126,12 +129,34 @@ impl<T: Serialize> Encoder<T> {
 	/// The record comes back as a [`Pending`] the caller writes and then
 	/// [`commit`](Pending::commit)s. Errors with [`Error::Desync`] if a previous compressed record
 	/// was left uncommitted, since every frame after it would be undecodable.
+	///
+	/// Errors with [`moq_net::Error::GroupTooLarge`] if the record might not fit in what is left of
+	/// the group's budget ([`moq_net::group::MAX_CACHE_BYTES`] and
+	/// [`moq_net::group::MAX_GROUP_FRAMES`]), counting every record committed since the last
+	/// [`reset`](Self::reset). The refused record leaves the encoder untouched.
 	pub fn encode(&mut self, value: &T) -> Result<Pending<'_, T>> {
 		if self.desynced {
 			return Err(Error::Desync);
 		}
 
 		let bytes = serde_json::to_vec(value)?;
+
+		// Check before compressing: encoding advances the window, so a record refused afterwards
+		// would leave the encoder ahead of every reader. The worst case is checked rather than the
+		// actual size for the same reason. The budget is also below moq-flate's per-frame decode cap,
+		// so any record that fits is one every consumer can inflate.
+		let size = bytes.len() as u64;
+		let bound = if self.compression {
+			moq_flate::Encoder::bound(size)
+		} else {
+			size
+		};
+		if self.frames >= moq_net::group::MAX_GROUP_FRAMES
+			|| self.bytes.saturating_add(bound) > moq_net::group::MAX_CACHE_BYTES
+		{
+			return Err(moq_net::Error::GroupTooLarge.into());
+		}
+
 		let payload = match self.flate.as_mut() {
 			Some(flate) => flate.frame(&bytes),
 			None => Bytes::from(bytes),

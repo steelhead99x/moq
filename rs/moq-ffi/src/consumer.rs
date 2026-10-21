@@ -1,73 +1,109 @@
-use std::sync::Arc;
-
-use bytes::Buf;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::task::{Poll, ready};
 
 use crate::error::MoqError;
-use crate::ffi::Task;
+use crate::ffi::{Background, Guard, Task};
 use crate::media::*;
-use crate::origin::MoqRoute;
 use crate::producer::MoqTrackInfo;
 
-fn timestamp_us(timestamp: moq_net::Timestamp) -> Result<u64, MoqError> {
-	timestamp
-		.as_micros()
-		.try_into()
-		.map_err(|_| MoqError::TimeOverflow(moq_net::TimeOverflow))
+pub(crate) fn timestamp_us(timestamp: moq_net::Timestamp) -> Result<u64, MoqError> {
+	timestamp.as_micros().try_into().map_err(|_| MoqError::TimeOverflow)
 }
 
 fn raw_frame(frame: moq_net::frame::Frame) -> Result<MoqFrame, MoqError> {
-	let timestamp_us = timestamp_us(frame.timestamp)?;
+	let timestamp_us = frame.timestamp.map(timestamp_us).transpose()?;
 	Ok(MoqFrame {
 		payload: frame.payload.to_vec(),
 		timestamp_us,
 	})
 }
 
-fn media_frame(mut frame: moq_mux::container::Frame) -> Result<MoqMediaFrame, MoqError> {
-	let timestamp_us = timestamp_us(frame.timestamp)?;
-	let payload = frame.payload.copy_to_bytes(frame.payload.remaining()).to_vec();
-
-	Ok(MoqMediaFrame {
-		payload,
-		timestamp_us,
-		keyframe: frame.keyframe,
-	})
-}
-
-fn media_container(container: MoqContainer) -> Result<moq_mux::catalog::hang::Container, MoqError> {
-	let container: hang::catalog::Container = container.into();
-	(&container)
-		.try_into()
-		.map_err(|e| MoqError::Codec(format!("invalid container: {e}")))
-}
-
 /// Subscriber-side delivery preferences, mirroring [`moq_net::track::Subscription`].
 ///
 /// Construct with the fields you care about; the rest default to moq-net's defaults
-/// (priority 0, unordered, no staleness tolerance, full group range).
+/// (priority 0, no staleness tolerance, everything still fresh, newest first).
 #[derive(Clone, uniffi::Record)]
 pub struct MoqSubscription {
 	/// Delivery priority; higher values preempt lower ones under bandwidth contention.
 	#[uniffi(default = 0)]
 	pub priority: u8,
-	/// Whether groups are prioritized in sequence order. Groups may always arrive
-	/// out-of-order (or not at all) over the network. Defaults to `false`; the
-	/// aggregate is ordered only when every subscriber asks for it.
-	#[uniffi(default = false)]
-	pub ordered: bool,
-	/// Maximum age of a non-latest group before it is skipped, in milliseconds.
+	/// Maximum age of a non-latest group before it is skipped, in microseconds.
 	/// `0` skips immediately; a larger value tolerates that much reordering.
 	///
 	/// Enforced both by the publisher's cache (sent on the wire) and by any local
-	/// buffering, such as `subscribe_media`'s jitter buffer.
+	/// buffering, such as [`MoqMediaTrackConsumer`]'s jitter buffer. It caps every range.
 	#[uniffi(default = 0)]
-	pub latency_max_ms: u64,
-	/// First group to deliver, or null to start at the latest group.
+	pub max_delay_us: u64,
+	/// The spans of the track to deliver, or null for everything `max_delay_us` still
+	/// considers fresh. An empty list asks for nothing.
+	///
+	/// A request to the publisher, aggregated across every subscriber, and this
+	/// subscription's read filter: it reads only the groups its own ranges cover.
 	#[uniffi(default = None)]
-	pub group_start: Option<u64>,
-	/// Last group to deliver (inclusive), or null for no end.
+	pub ranges: Option<Vec<MoqRange>>,
+	/// Which pending group the publisher sends first, or null for newest first.
 	#[uniffi(default = None)]
-	pub group_end: Option<u64>,
+	pub order: Option<MoqOrder>,
+}
+
+/// A span of a track to deliver: from `start` up to `end`, or onward when `end` is null.
+///
+/// A relative start is the first frame of its group, and a relative end includes its whole
+/// group. An absolute end is exclusive.
+#[derive(Clone, Copy, uniffi::Record)]
+pub struct MoqRange {
+	/// Where delivery starts.
+	pub start: MoqAnchor,
+	/// Where delivery stops, or null to keep following the live edge.
+	#[uniffi(default = None)]
+	pub end: Option<MoqAnchor>,
+}
+
+/// Where one end of a [`MoqRange`] falls, mirroring [`moq_net::track::Anchor`].
+#[derive(Clone, Copy, uniffi::Enum)]
+pub enum MoqAnchor {
+	/// This exact group and frame.
+	Absolute { group: u64, frame: u64 },
+	/// The group this many before the latest, clamped to group 0: `0` is the latest group.
+	Relative { groups: u64 },
+}
+
+/// Which of a subscription's pending groups the publisher sends first, mirroring
+/// [`moq_net::track::Order`].
+#[derive(Clone, Copy, uniffi::Enum)]
+pub enum MoqOrder {
+	/// Oldest first, draining a backlog in sequence order.
+	Ascending,
+	/// Newest first, so congestion sheds the backlog rather than the live edge.
+	Descending,
+}
+
+impl From<MoqAnchor> for moq_net::track::Anchor {
+	fn from(anchor: MoqAnchor) -> Self {
+		match anchor {
+			MoqAnchor::Absolute { group, frame } => Self::Absolute(moq_net::track::Position { group, frame }),
+			MoqAnchor::Relative { groups } => Self::Relative(groups),
+		}
+	}
+}
+
+impl From<MoqRange> for moq_net::track::Range {
+	fn from(range: MoqRange) -> Self {
+		Self {
+			start: range.start.into(),
+			end: range.end.map(Into::into),
+		}
+	}
+}
+
+impl From<MoqOrder> for moq_net::track::Order {
+	fn from(order: MoqOrder) -> Self {
+		match order {
+			MoqOrder::Ascending => Self::Ascending,
+			MoqOrder::Descending => Self::Descending,
+		}
+	}
 }
 
 /// Options for fetching one past group by sequence.
@@ -76,111 +112,105 @@ pub struct MoqFetchGroupOptions {
 	/// Delivery priority for the fetch stream; higher values preempt lower ones.
 	#[uniffi(default = 0)]
 	pub priority: u8,
+	/// Maximum age behind the live edge in microseconds; null uses publisher retention alone.
+	#[uniffi(default = None)]
+	pub max_delay_us: Option<u64>,
 }
 
 impl From<MoqFetchGroupOptions> for moq_net::group::Fetch {
 	fn from(options: MoqFetchGroupOptions) -> Self {
-		moq_net::group::Fetch::default().with_priority(options.priority)
+		let fetch = moq_net::group::Fetch::default().with_priority(options.priority);
+		match options.max_delay_us {
+			Some(max_delay) => fetch.with_max_delay(std::time::Duration::from_micros(max_delay)),
+			None => fetch,
+		}
 	}
 }
 
 impl From<MoqSubscription> for moq_net::track::Subscription {
 	fn from(s: MoqSubscription) -> Self {
-		moq_net::track::Subscription::default()
+		let mut subscription = moq_net::track::Subscription::default()
 			.with_priority(s.priority)
-			.with_ordered(s.ordered)
-			.with_latency_max(std::time::Duration::from_millis(s.latency_max_ms))
-			.with_group_start(s.group_start)
-			.with_group_end(s.group_end)
+			.with_max_delay(std::time::Duration::from_micros(s.max_delay_us));
+		if let Some(ranges) = s.ranges {
+			subscription = subscription.with_ranges(ranges.into_iter().map(Into::into));
+		}
+		if let Some(order) = s.order {
+			subscription = subscription.with_order(order.into());
+		}
+		subscription
 	}
 }
 
 #[derive(Clone, uniffi::Object)]
 pub struct MoqBroadcastConsumer {
-	inner: moq_net::broadcast::Consumer,
+	pub(crate) inner: moq_net::broadcast::Consumer,
+	/// The origin this broadcast was resolved through, if any. A catalog rendition may name a
+	/// sibling broadcast, and only an origin can fetch one; a standalone broadcast (a local
+	/// producer's `consume`) has none, so such a rendition is unresolvable rather than wrong.
+	pub(crate) origin: Option<moq_net::origin::Consumer>,
+	pub(crate) driver: Background,
 }
 
 impl MoqBroadcastConsumer {
+	/// Wrap a standalone broadcast, with no origin to resolve cross-broadcast references against.
+	#[cfg(test)]
 	pub(crate) fn new(inner: moq_net::broadcast::Consumer) -> Self {
-		Self { inner }
+		Self {
+			inner,
+			origin: None,
+			driver: Background::default(),
+		}
 	}
 
-	/// Access the underlying `moq_net::broadcast::Consumer` for sibling
-	/// modules (e.g. `audio`) that need to subscribe a typed track.
+	/// Wrap a broadcast the origin handed out, so a rendition referencing a sibling broadcast
+	/// resolves through the same origin (which deduplicates the shared subscription).
+	///
+	/// `origin` must be the cursor that named `inner`: the broadcast's path is stamped per
+	/// cursor, and a reference resolves against that path, so an origin rooted elsewhere would
+	/// read a legal reference as escaping (or worse, resolve it to the wrong broadcast).
+	pub(crate) fn routed(
+		inner: moq_net::broadcast::Consumer,
+		origin: moq_net::origin::Consumer,
+		driver: Background,
+	) -> Self {
+		Self {
+			inner,
+			origin: Some(origin),
+			driver,
+		}
+	}
+
+	#[cfg(test)]
 	pub(crate) fn inner(&self) -> &moq_net::broadcast::Consumer {
 		&self.inner
 	}
-}
 
-/// A watch over a broadcast's route. Created by `MoqBroadcastConsumer::route_updates`.
-#[derive(uniffi::Object)]
-pub struct MoqRouteWatch {
-	task: Task<RouteWatch>,
-}
+	/// Resolve a catalog rendition's `broadcast` reference to the broadcast serving its track.
+	pub(crate) async fn resolve_inner(
+		&self,
+		reference: Option<&str>,
+	) -> Result<moq_net::broadcast::Consumer, MoqError> {
+		self.driver
+			.watch(async {
+				// Normalize before testing emptiness: this is a caller-supplied string, and one made only
+				// of slashes normalizes to the empty reference, which names this broadcast.
+				let reference = reference.map(moq_net::path::Relative::new);
 
-struct RouteWatch {
-	inner: moq_net::broadcast::Consumer,
-}
+				// An absent or empty reference names the catalog's own broadcast, which we already hold.
+				// Short-circuiting also keeps a standalone broadcast usable: the common case needs no origin.
+				let Some(reference) = reference.filter(|reference| !reference.is_empty()) else {
+					return Ok(self.inner.clone());
+				};
 
-impl RouteWatch {
-	async fn next(&mut self) -> Result<Option<MoqRoute>, MoqError> {
-		match self.inner.route_changed().await {
-			Ok(route) => Ok(Some(route.into())),
-			// A broadcast has no abort; Dropped (every producer gone) is its clean end.
-			Err(moq_net::Error::Dropped) => Ok(None),
-			Err(e) => Err(e.into()),
-		}
-	}
-}
+				let origin = self.origin.clone().ok_or_else(|| MoqError::UnresolvableBroadcast {
+					reason: reference.as_str().to_string(),
+				})?;
 
-#[uniffi::export]
-impl MoqRouteWatch {
-	/// Wait for the next route: the current one on the first call, then each change.
-	///
-	/// Returns `None` once the broadcast ends (every producer gone).
-	pub async fn next(&self) -> Result<Option<MoqRoute>, MoqError> {
-		self.task.run(|mut state| async move { state.next().await }).await
-	}
-
-	/// Cancel all current and future `next()` calls.
-	pub fn cancel(&self) {
-		self.task.cancel();
-	}
-}
-
-#[derive(uniffi::Object)]
-pub struct MoqCatalogConsumer {
-	task: Task<Catalog>,
-}
-
-struct Catalog {
-	// Consume with the untyped `Extra` extension so application sections survive into
-	// `MoqCatalog.sections` instead of being dropped.
-	inner: moq_mux::catalog::hang::Consumer<moq_mux::catalog::hang::Extra>,
-}
-
-impl Catalog {
-	async fn next(&mut self) -> Result<Option<MoqCatalog>, MoqError> {
-		match self.inner.next().await {
-			Ok(Some(catalog)) => Ok(Some(convert_catalog(&catalog))),
-			Ok(None) => Ok(None),
-			Err(e) => Err(e.into()),
-		}
-	}
-}
-
-#[derive(uniffi::Object)]
-pub struct MoqMediaConsumer {
-	task: Task<Media>,
-}
-
-struct Media {
-	inner: moq_mux::container::Consumer<moq_mux::catalog::hang::Container>,
-}
-
-impl Media {
-	async fn next(&mut self) -> Result<Option<MoqMediaFrame>, MoqError> {
-		self.inner.read().await?.map(media_frame).transpose()
+				let source = moq_mux::Source::new(origin, self.inner.clone());
+				Ok(source.resolve(Some(&reference)).await?)
+			})
+			.await
 	}
 }
 
@@ -188,48 +218,47 @@ impl Media {
 
 #[uniffi::export]
 impl MoqBroadcastConsumer {
-	/// The route the broadcast currently takes to reach this origin.
-	pub fn route(&self) -> MoqRoute {
-		self.inner.route().into()
-	}
-
-	/// Watch the broadcast's route for changes.
+	/// Resolve a catalog rendition's `broadcast` reference to the broadcast serving its track.
 	///
-	/// The returned watch yields the current route first, then every update
-	/// (e.g. an upstream failover), so a loop observes the full history from now.
-	pub fn route_updates(&self) -> Arc<MoqRouteWatch> {
-		Arc::new(MoqRouteWatch {
-			task: Task::new(RouteWatch {
-				inner: self.inner.clone(),
-			}),
-		})
-	}
-
-	/// Subscribe to the catalog for this broadcast.
-	pub async fn subscribe_catalog(&self) -> Result<Arc<MoqCatalogConsumer>, MoqError> {
-		let track = self
-			.inner
-			.track(hang::catalog::Catalog::DEFAULT_NAME)?
-			.subscribe(hang::catalog::Catalog::default_subscription())
-			.await?;
-		let consumer = moq_mux::catalog::hang::Consumer::from(track);
-		Ok(Arc::new(MoqCatalogConsumer {
-			task: Task::new(Catalog { inner: consumer }),
+	/// `reference` is [`MoqVideo::broadcast`] / [`MoqAudio::broadcast`]: absent or empty names
+	/// this broadcast, anything else names a sibling relative to it (e.g. `./source`). Call it on a
+	/// rendition that carries one before [`Self::subscribe_track`] or [`Self::fetch_group`], which
+	/// take a track name rather than a rendition. The rendition-based consumers
+	/// (`MoqMediaTrackConsumer::subscribe`, `MoqMediaGroupConsumer::fetch`,
+	/// `MoqVideoConsumer::subscribe`, `MoqAudioConsumer::subscribe`) resolve it themselves.
+	///
+	/// Errors if this broadcast came from a local producer rather than an origin, since a
+	/// standalone broadcast has no sibling to name, and reports a sibling that exists but is not
+	/// announced yet as unroutable rather than waiting for it (see
+	/// [`MoqOriginConsumer::request_broadcast`](crate::origin::MoqOriginConsumer::request_broadcast)).
+	pub async fn resolve(&self, reference: Option<String>) -> Result<Arc<MoqBroadcastConsumer>, MoqError> {
+		let broadcast = self.resolve_inner(reference.as_deref()).await?;
+		Ok(Arc::new(match self.origin.clone() {
+			Some(origin) => Self::routed(broadcast, origin, self.driver.clone()),
+			None => Self {
+				inner: broadcast,
+				origin: None,
+				driver: self.driver.clone(),
+			},
 		}))
 	}
 
 	/// Subscribe to a track by name, the same pattern as moq-boy's command/status tracks.
 	///
 	/// Frames are returned as plain byte payloads with no codec or container parsing.
-	/// `subscription` tunes delivery priority, group ordering priority, and group range; omit for defaults.
+	/// `subscription` tunes delivery priority, group range, and staleness; omit for defaults.
 	pub async fn subscribe_track(
 		&self,
 		name: String,
 		subscription: Option<MoqSubscription>,
 	) -> Result<Arc<MoqTrackConsumer>, MoqError> {
-		let subscription = subscription.map(moq_net::track::Subscription::from);
-		let track = self.inner.track(&name)?.subscribe(subscription).await?;
-		Ok(Arc::new(MoqTrackConsumer::new(track)))
+		self.driver
+			.watch(async {
+				let subscription = subscription.map(moq_net::track::Subscription::from);
+				let track = self.inner.track(&name)?.subscribe(subscription).await?;
+				Ok(Arc::new(MoqTrackConsumer::new(track, self.driver.clone())))
+			})
+			.await
 	}
 
 	/// Fetch one complete group by track name and group sequence.
@@ -243,62 +272,20 @@ impl MoqBroadcastConsumer {
 		sequence: u64,
 		options: Option<MoqFetchGroupOptions>,
 	) -> Result<Arc<MoqGroupConsumer>, MoqError> {
-		let options = options.map(moq_net::group::Fetch::from);
-		let track = self.inner.track(&name).map_err(map_fetch_error)?;
-		let group = track.fetch_group(sequence, options).await.map_err(map_fetch_error)?;
-		Ok(Arc::new(MoqGroupConsumer::new(group)))
-	}
-
-	/// Fetch one group and decode its track container into media frames.
-	///
-	/// Unlike [`Self::subscribe_media`], this does not create a live subscription or apply
-	/// latency-based group skipping. The returned consumer reads exactly the requested group
-	/// until [`MoqMediaGroupConsumer::next`] returns `None`.
-	pub async fn fetch_media_group(
-		&self,
-		name: String,
-		sequence: u64,
-		container: MoqContainer,
-		options: Option<MoqFetchGroupOptions>,
-	) -> Result<Arc<MoqMediaGroupConsumer>, MoqError> {
-		// Parse the container before fetching so invalid CMAF init data does not leave a
-		// dynamic group request waiting for a consumer that can never read it.
-		let media = media_container(container)?;
-		let options = options.map(moq_net::group::Fetch::from);
-		let track = self.inner.track(&name).map_err(map_fetch_error)?;
-		let group = track.fetch_group(sequence, options).await.map_err(map_fetch_error)?;
-		Ok(Arc::new(MoqMediaGroupConsumer::new(group, media)))
-	}
-
-	/// Subscribe to a track by name, delivering frames in decode order.
-	///
-	/// `container` is the track container from the catalog.
-	/// `subscription` tunes delivery priority, group ordering priority, and group range; omit for defaults.
-	///
-	/// [`MoqSubscription::latency_max_ms`] bounds the local jitter buffer as well as
-	/// the publisher's cache, so both ends skip a stalled group on the same budget.
-	pub async fn subscribe_media(
-		&self,
-		name: String,
-		container: MoqContainer,
-		subscription: Option<MoqSubscription>,
-	) -> Result<Arc<MoqMediaConsumer>, MoqError> {
-		// Parse the container before subscribing so we don't leave a dangling
-		// subscription if init parsing fails.
-		let media = media_container(container)?;
-		let subscription = subscription.map(moq_net::track::Subscription::from).unwrap_or_default();
-		let latency = subscription.latency_max;
-		let track = self.inner.track(&name)?.subscribe(subscription).await?;
-		let consumer = moq_mux::container::Consumer::new(track, media).with_latency(latency);
-		Ok(Arc::new(MoqMediaConsumer {
-			task: Task::new(Media { inner: consumer }),
-		}))
+		self.driver
+			.watch(async {
+				let options = options.map(moq_net::group::Fetch::from);
+				let track = self.inner.track(&name).map_err(map_fetch_error)?;
+				let group = track.fetch_group(sequence, options).await.map_err(map_fetch_error)?;
+				Ok(Arc::new(MoqGroupConsumer::new(group, self.driver.clone())))
+			})
+			.await
 	}
 }
 
-fn map_fetch_error(err: moq_net::Error) -> MoqError {
+pub(crate) fn map_fetch_error(err: moq_net::Error) -> MoqError {
 	match err {
-		moq_net::Error::NotFound => MoqError::NotFound,
+		moq_net::Error::NotFound | moq_net::Error::NotFetchable => MoqError::NotFound,
 		moq_net::Error::Unsupported | moq_net::Error::Version => MoqError::Unsupported,
 		err => err.into(),
 	}
@@ -306,56 +293,285 @@ fn map_fetch_error(err: moq_net::Error) -> MoqError {
 
 // ---- Track Consumer ----
 
+/// A track subscription reading one way or the other.
+///
+/// `moq_net` makes the choice a handle you consume the subscriber into, which a foreign
+/// binding can't express in its type system, so the handle commits on the first group
+/// read instead: whichever group cursor a caller reaches for first is the one this
+/// track keeps, and reaching for the other afterwards is [`MoqError::AlreadyCommitted`].
+/// Datagrams are a separate cursor on either handle, so reading them never commits.
+enum Cursor {
+	/// No group read has happened yet; the track can still commit either way.
+	Uncommitted(moq_net::track::Subscriber),
+	/// Committed to arrival order by the first `recv_group`.
+	Arrival(moq_net::track::Subscriber),
+	/// Committed to sequence order by the first `next_group` or `read_frame`.
+	Ordered(Box<OrderedCursor>),
+	/// Transient, while the subscriber is moved out to be converted.
+	Converting,
+}
+
+/// Sequence-order handle plus the group `read_frame` is in the middle of.
+///
+/// `pending` stays with this cursor so a cancelled `read_frame` does not drop
+/// the group, and so `next_group` takes it rather than skipping ahead.
+struct OrderedCursor {
+	track: moq_net::track::Ordered,
+	/// Group whose first frame `read_frame` has not returned yet.
+	pending: Option<moq_net::group::Consumer>,
+}
+
 struct TrackInner {
-	track: moq_net::track::Subscriber,
+	track: Cursor,
 }
 
 impl TrackInner {
-	async fn recv_group(&mut self) -> Result<Option<moq_net::group::Consumer>, MoqError> {
-		Ok(self.track.recv_group().await?)
+	/// The arrival cursor, committing this track to it, or [`MoqError::AlreadyCommitted`]
+	/// once it committed to sequence order.
+	fn arrival(&mut self) -> Result<&mut moq_net::track::Subscriber, MoqError> {
+		if let Cursor::Uncommitted(_) = &self.track {
+			let Cursor::Uncommitted(track) = std::mem::replace(&mut self.track, Cursor::Converting) else {
+				unreachable!("just matched Uncommitted");
+			};
+			self.track = Cursor::Arrival(track);
+		}
+		match &mut self.track {
+			Cursor::Arrival(track) => Ok(track),
+			Cursor::Ordered(_) => Err(MoqError::AlreadyCommitted),
+			// Only reachable if a previous conversion unwound mid-swap, leaving the
+			// handle with no subscriber to read: poisoned, not misused.
+			Cursor::Uncommitted(_) | Cursor::Converting => Err(MoqError::Closed),
+		}
 	}
 
-	async fn next_group(&mut self) -> Result<Option<moq_net::group::Consumer>, MoqError> {
-		Ok(self.track.next_group().await?)
+	/// The sequence cursor, committing this track to it, or [`MoqError::AlreadyCommitted`]
+	/// once it committed to arrival order.
+	fn ordered(&mut self) -> Result<&mut OrderedCursor, MoqError> {
+		// Only move the subscriber out when there is one to convert: `ordered()` consumes
+		// it, and swapping unconditionally would drop an already-converted handle.
+		if let Cursor::Uncommitted(_) = &self.track {
+			let Cursor::Uncommitted(track) = std::mem::replace(&mut self.track, Cursor::Converting) else {
+				unreachable!("just matched Uncommitted");
+			};
+			self.track = Cursor::Ordered(Box::new(OrderedCursor {
+				track: track.ordered(),
+				pending: None,
+			}));
+		}
+		match &mut self.track {
+			Cursor::Ordered(track) => Ok(track.as_mut()),
+			Cursor::Arrival(_) => Err(MoqError::AlreadyCommitted),
+			// See `arrival`: unreachable unless the handle was left mid-conversion.
+			Cursor::Uncommitted(_) | Cursor::Converting => Err(MoqError::Closed),
+		}
 	}
 
-	async fn read_frame(&mut self) -> Result<Option<MoqFrame>, MoqError> {
-		self.track.read_frame().await?.map(raw_frame).transpose()
+	fn poll_recv_group(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<moq_net::group::Consumer>, MoqError>> {
+		match self.arrival() {
+			Ok(track) => track.poll_recv_group(waiter).map(|r| r.map_err(Into::into)),
+			Err(e) => Poll::Ready(Err(e)),
+		}
 	}
 
-	async fn recv_datagram(&mut self) -> Result<Option<MoqDatagram>, MoqError> {
-		let Some(datagram) = self.track.recv_datagram().await? else {
-			return Ok(None);
+	fn poll_next_group(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<moq_net::group::Consumer>, MoqError>> {
+		match self.ordered() {
+			Ok(ordered) => {
+				if let Some(group) = ordered.pending.take() {
+					return Poll::Ready(Ok(Some(group)));
+				}
+				ordered.track.poll_next_group(waiter).map(|r| r.map_err(Into::into))
+			}
+			Err(e) => Poll::Ready(Err(e)),
+		}
+	}
+
+	fn poll_acquire_pending(&mut self, waiter: &kio::Waiter) -> Poll<Result<bool, MoqError>> {
+		let ordered = match self.ordered() {
+			Ok(ordered) => ordered,
+			Err(e) => return Poll::Ready(Err(e)),
 		};
-		let timestamp_us = datagram
-			.timestamp
-			.as_micros()
-			.try_into()
-			.map_err(|_| MoqError::Codec("timestamp overflow".into()))?;
-		Ok(Some(MoqDatagram {
-			sequence: datagram.sequence,
-			timestamp_us,
-			payload: datagram.payload.to_vec(),
-		}))
+		if ordered.pending.is_some() {
+			return Poll::Ready(Ok(true));
+		}
+		match ready!(ordered.track.poll_next_group(waiter)) {
+			Ok(Some(group)) => {
+				ordered.pending = Some(group);
+				Poll::Ready(Ok(true))
+			}
+			Ok(None) => Poll::Ready(Ok(false)),
+			Err(err) => Poll::Ready(Err(err.into())),
+		}
 	}
+
+	fn poll_pending_frame(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<moq_net::frame::Frame>, MoqError>> {
+		let ordered = match self.ordered() {
+			Ok(ordered) => ordered,
+			Err(e) => return Poll::Ready(Err(e)),
+		};
+		let result = {
+			let group = ordered.pending.as_mut().expect("pending group");
+			ready!(group.poll_read_frame(waiter))
+		};
+		// Drop a completed or failed group so the next call can move on. A
+		// cancelled wait never reaches here, so `pending` stays in that case.
+		ordered.pending = None;
+		match result {
+			Ok(frame) => Poll::Ready(Ok(frame)),
+			// The group expired, here or at a hop that reset it, so move on like an empty one.
+			Err(moq_net::Error::Old | moq_net::Error::Stream(moq_net::StreamError::Old)) => Poll::Ready(Ok(None)),
+			Err(err) => Poll::Ready(Err(err.into())),
+		}
+	}
+
+	fn poll_recv_datagram(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<MoqDatagram>, MoqError>> {
+		// Datagrams are unordered on either handle; reading them never commits the
+		// group cursor.
+		let poll = match &mut self.track {
+			Cursor::Uncommitted(track) | Cursor::Arrival(track) => track.poll_recv_datagram(waiter),
+			Cursor::Ordered(ordered) => ordered.track.poll_recv_datagram(waiter),
+			// Poisoned mid-conversion; see `arrival`. Datagrams never commit a cursor,
+			// so this is the only way they can fail on a live handle.
+			Cursor::Converting => return Poll::Ready(Err(MoqError::Closed)),
+		};
+		let datagram = match ready!(poll) {
+			Ok(Some(datagram)) => datagram,
+			Ok(None) => return Poll::Ready(Ok(None)),
+			Err(err) => return Poll::Ready(Err(err.into())),
+		};
+		Poll::Ready(Ok(Some(MoqDatagram {
+			sequence: datagram.sequence,
+			timestamp_us: datagram.timestamp.map(timestamp_us).transpose()?,
+			payload: datagram.payload.to_vec(),
+		})))
+	}
+}
+
+/// Shared subscriber state for both read lanes.
+///
+/// The mutex is held only across a poll, not the wait: moq-net can serve a
+/// datagram while a group read is parked, and vice versa, as long as we do not
+/// keep exclusive access for the duration of one `recv`.
+struct TrackShared {
+	inner: Mutex<Option<TrackInner>>,
+}
+
+impl TrackShared {
+	fn close(&self) {
+		let _ = self.inner.lock().expect("track reader").take();
+	}
+
+	fn poll<R>(&self, f: impl FnOnce(&mut TrackInner) -> Poll<Result<R, MoqError>>) -> Poll<Result<R, MoqError>> {
+		match self.inner.lock().expect("track reader").as_mut() {
+			Some(inner) => f(inner),
+			None => Poll::Ready(Err(MoqError::Cancelled)),
+		}
+	}
+
+	async fn recv_group(&self) -> Result<Option<moq_net::group::Consumer>, MoqError> {
+		kio::wait(|waiter| self.poll(|inner| inner.poll_recv_group(waiter))).await
+	}
+
+	async fn next_group(&self) -> Result<Option<moq_net::group::Consumer>, MoqError> {
+		kio::wait(|waiter| self.poll(|inner| inner.poll_next_group(waiter))).await
+	}
+
+	async fn recv_datagram(&self) -> Result<Option<MoqDatagram>, MoqError> {
+		kio::wait(|waiter| self.poll(|inner| inner.poll_recv_datagram(waiter))).await
+	}
+
+	async fn read_frame(&self) -> Result<Option<MoqFrame>, MoqError> {
+		loop {
+			let acquired = kio::wait(|waiter| self.poll(|inner| inner.poll_acquire_pending(waiter))).await?;
+			if !acquired {
+				return Ok(None);
+			}
+			if let Some(frame) = kio::wait(|waiter| self.poll(|inner| inner.poll_pending_frame(waiter))).await? {
+				return Ok(Some(raw_frame(frame)?));
+			}
+		}
+	}
+}
+
+/// Serializes one track read lane so two `next_group` calls cannot race the cursor.
+struct ReadLane;
+
+/// Hold the lane guard until `fut` finishes. `Task::run` only serializes while the
+/// guard lives; an unused `_lane` in the closure would drop it before the wait.
+async fn with_lane<R>(_lane: Guard<ReadLane>, fut: impl Future<Output = Result<R, MoqError>>) -> Result<R, MoqError> {
+	fut.await
 }
 
 #[derive(uniffi::Object)]
 pub struct MoqTrackConsumer {
-	task: Task<TrackInner>,
-	control: moq_net::track::SubscriberControl,
+	shared: Arc<TrackShared>,
+	/// Group reads (`recv_group`, `next_group`, `read_frame`). Independent of [`Self::datagrams`].
+	groups: Task<ReadLane>,
+	/// Datagram reads. Independent of [`Self::groups`].
+	datagrams: Task<ReadLane>,
+	control: moq_net::track::Control,
 	info: moq_net::track::Info,
+	/// The owner whose panic ends this track's reads, handed to every group and reader taken from it.
+	driver: Background,
 }
 
 impl MoqTrackConsumer {
-	pub(crate) fn new(track: moq_net::track::Subscriber) -> Self {
+	pub(crate) fn new(track: moq_net::track::Subscriber, driver: Background) -> Self {
 		let control = track.control();
 		let info = track.info().clone();
 		Self {
-			task: Task::new(TrackInner { track }),
+			shared: Arc::new(TrackShared {
+				inner: Mutex::new(Some(TrackInner {
+					track: Cursor::Uncommitted(track),
+				})),
+			}),
+			groups: Task::new(ReadLane).supervised(driver.clone()),
+			datagrams: Task::new(ReadLane).supervised(driver.clone()),
 			control,
 			info,
+			driver,
 		}
+	}
+
+	/// Hand the subscription to a typed reader (a JSON consumer, say), closing this handle.
+	///
+	/// Errors with [`MoqError::AlreadyCommitted`] once a group read has started, since the reader
+	/// would miss whatever that read consumed.
+	pub(crate) fn take(&self) -> Result<(moq_net::track::Subscriber, Background), MoqError> {
+		self.driver.check()?;
+		let mut guard = self.shared.inner.lock().expect("track reader");
+		match guard.as_ref().map(|inner| &inner.track) {
+			Some(Cursor::Uncommitted(_)) => {}
+			Some(_) => return Err(MoqError::AlreadyCommitted),
+			None => return Err(MoqError::Closed),
+		}
+		let Some(TrackInner {
+			track: Cursor::Uncommitted(track),
+		}) = guard.take()
+		else {
+			unreachable!("just matched Uncommitted");
+		};
+		drop(guard);
+		// Wake any datagram read still parked on the subscriber this handle no longer owns.
+		self.cancel_lanes();
+		Ok((track, self.driver.clone()))
+	}
+
+	fn cancel_lanes(&self) {
+		self.shared.close();
+		self.groups.cancel();
+		self.datagrams.cancel();
+	}
+
+	/// True while a group-lane `Task::run` still holds its guard.
+	#[cfg(test)]
+	pub(crate) fn group_lane_busy(&self) -> bool {
+		self.groups.lock().is_none()
+	}
+}
+
+impl Drop for MoqTrackConsumer {
+	fn drop(&mut self) {
+		self.shared.close();
 	}
 }
 
@@ -365,30 +581,47 @@ impl MoqTrackConsumer {
 	///
 	/// Groups are returned as they arrive on the wire, which may be out of sequence
 	/// order (e.g. if a later group lands before an earlier one on a separate stream).
+	/// One that drifts further behind the live edge than the subscription's `max_delay_us`
+	/// is skipped, or ends its pending read if already returned; raise it to keep stalled groups.
+	///
+	/// The first call commits this track to arrival order: sequence-order reads
+	/// ([`Self::next_group`], [`Self::read_frame`]) fail with
+	/// [`MoqError::AlreadyCommitted`] afterwards.
 	pub async fn recv_group(&self) -> Result<Option<Arc<MoqGroupConsumer>>, MoqError> {
-		self.task
-			.run(|mut state| async move {
-				Ok(state.recv_group().await?.map(|group| {
-					Arc::new(MoqGroupConsumer {
-						sequence: group.sequence,
-						task: Task::new(GroupInner { group }),
-					})
-				}))
+		let shared = self.shared.clone();
+		let driver = self.driver.clone();
+		self.groups
+			.run(move |lane| {
+				with_lane(lane, async move {
+					Ok(shared
+						.recv_group()
+						.await?
+						.map(|group| Arc::new(MoqGroupConsumer::new(group, driver))))
+				})
 			})
 			.await
 	}
 
-	/// Return the next group in sequence order, skipping forward if the reader
-	/// has fallen behind. Returns `None` when the track ends.
+	/// Return the next group with a higher sequence number than any previously
+	/// returned, skipping late arrivals. Returns `None` when the track ends.
+	///
+	/// Shares the sequence cursor with [`Self::read_frame`]: a group one method
+	/// has already taken is not returned by the other. A `read_frame` cancelled
+	/// after acquiring a group leaves that group here.
+	///
+	/// The first call commits this track to sequence order: arrival-order reads
+	/// ([`Self::recv_group`]) fail with [`MoqError::AlreadyCommitted`] afterwards.
 	pub async fn next_group(&self) -> Result<Option<Arc<MoqGroupConsumer>>, MoqError> {
-		self.task
-			.run(|mut state| async move {
-				Ok(state.next_group().await?.map(|group| {
-					Arc::new(MoqGroupConsumer {
-						sequence: group.sequence,
-						task: Task::new(GroupInner { group }),
-					})
-				}))
+		let shared = self.shared.clone();
+		let driver = self.driver.clone();
+		self.groups
+			.run(move |lane| {
+				with_lane(lane, async move {
+					Ok(shared
+						.next_group()
+						.await?
+						.map(|group| Arc::new(MoqGroupConsumer::new(group, driver))))
+				})
 			})
 			.await
 	}
@@ -396,18 +629,30 @@ impl MoqTrackConsumer {
 	/// Read the first frame of the next group, including its timestamp.
 	///
 	/// Convenience for tracks using one-frame-per-group (like moq-boy's
-	/// status/command tracks). Returns `None` when the track ends.
+	/// status/command tracks). Completed empty groups are skipped. Returns `None`
+	/// only when the track ends. Cancelling one call keeps the current group so a
+	/// later `read_frame` or [`Self::next_group`] still sees it.
+	///
+	/// Shares the sequence cursor with [`Self::next_group`], committing the track
+	/// the same way.
 	pub async fn read_frame(&self) -> Result<Option<MoqFrame>, MoqError> {
-		self.task.run(|mut state| async move { state.read_frame().await }).await
+		let shared = self.shared.clone();
+		self.groups
+			.run(move |lane| with_lane(lane, async move { shared.read_frame().await }))
+			.await
 	}
 
 	/// Receive the next best-effort datagram in arrival order.
 	///
 	/// Returns `None` when the track ends. Datagram delivery is unavailable over
-	/// IETF moq-transport, pre-lite-05 moq-lite, and stream-only transports.
+	/// pre-lite-05 moq-lite and stream-only transports.
+	/// Datagrams are a separate cursor from groups, so this works alongside either
+	/// group order, never commits the track to one, and progresses while a group
+	/// read is pending.
 	pub async fn recv_datagram(&self) -> Result<Option<MoqDatagram>, MoqError> {
-		self.task
-			.run(|mut state| async move { state.recv_datagram().await })
+		let shared = self.shared.clone();
+		self.datagrams
+			.run(move |lane| with_lane(lane, async move { shared.recv_datagram().await }))
 			.await
 	}
 
@@ -424,8 +669,11 @@ impl MoqTrackConsumer {
 		let _ = self.control.update(subscription.into());
 	}
 
+	/// Cancel all current and future reads.
+	///
+	/// Terminal: the subscription is released here, not when the handle is.
 	pub fn cancel(&self) {
-		self.task.cancel();
+		self.cancel_lanes();
 	}
 }
 
@@ -443,60 +691,28 @@ impl GroupInner {
 pub struct MoqGroupConsumer {
 	sequence: u64,
 	task: Task<GroupInner>,
-}
-
-struct MediaGroupInner {
-	inner: moq_mux::container::GroupConsumer<moq_mux::catalog::hang::Container>,
-}
-
-impl MediaGroupInner {
-	async fn next(&mut self) -> Result<Option<MoqMediaFrame>, MoqError> {
-		self.inner.read().await?.map(media_frame).transpose()
-	}
-}
-
-/// A finite, container-decoded media group returned by
-/// [`MoqBroadcastConsumer::fetch_media_group`].
-#[derive(uniffi::Object)]
-pub struct MoqMediaGroupConsumer {
-	sequence: u64,
-	task: Task<MediaGroupInner>,
-}
-
-impl MoqMediaGroupConsumer {
-	fn new(group: moq_net::group::Consumer, container: moq_mux::catalog::hang::Container) -> Self {
-		let inner = moq_mux::container::GroupConsumer::new(group, container);
-		Self {
-			sequence: inner.sequence(),
-			task: Task::new(MediaGroupInner { inner }),
-		}
-	}
-}
-
-#[uniffi::export]
-impl MoqMediaGroupConsumer {
-	/// The sequence number of this group within the track.
-	pub fn sequence(&self) -> u64 {
-		self.sequence
-	}
-
-	/// Read the next decoded media frame, or `None` when the group ends.
-	pub async fn next(&self) -> Result<Option<MoqMediaFrame>, MoqError> {
-		self.task.run(|mut state| async move { state.next().await }).await
-	}
-
-	/// Cancel all current and future `next()` calls.
-	pub fn cancel(&self) {
-		self.task.cancel();
-	}
+	driver: Background,
 }
 
 impl MoqGroupConsumer {
-	pub(crate) fn new(group: moq_net::group::Consumer) -> Self {
+	pub(crate) fn new(group: moq_net::group::Consumer, driver: Background) -> Self {
 		Self {
 			sequence: group.sequence,
-			task: Task::new(GroupInner { group }),
+			task: Task::new(GroupInner { group }).supervised(driver.clone()),
+			driver,
 		}
+	}
+
+	/// Hand the group to a typed reader (a media group consumer, say), closing this handle.
+	///
+	/// Errors with [`MoqError::AlreadyCommitted`] once a frame has been read, since the reader
+	/// would start mid-group, and [`MoqError::Busy`] while a read is in flight.
+	pub(crate) fn take(&self) -> Result<(moq_net::group::Consumer, Background), MoqError> {
+		let inner = self.task.take(|inner| match inner.group.index() {
+			0 => Ok(()),
+			_ => Err(MoqError::AlreadyCommitted),
+		})?;
+		Ok((inner.group, self.driver.clone()))
 	}
 }
 
@@ -514,36 +730,9 @@ impl MoqGroupConsumer {
 		self.task.run(|mut state| async move { state.read_frame().await }).await
 	}
 
-	pub fn cancel(&self) {
-		self.task.cancel();
-	}
-}
-
-// ---- Catalog Consumer ----
-
-#[uniffi::export]
-impl MoqCatalogConsumer {
-	/// Get the next catalog update. Returns `None` when the track ends or is closed.
-	pub async fn next(&self) -> Result<Option<MoqCatalog>, MoqError> {
-		self.task.run(|mut state| async move { state.next().await }).await
-	}
-
-	/// Cancel all current and future `next()` calls.
-	pub fn cancel(&self) {
-		self.task.cancel();
-	}
-}
-
-// ---- Media Consumer ----
-
-#[uniffi::export]
-impl MoqMediaConsumer {
-	/// Get the next frame. Returns `None` when the track ends or is closed.
-	pub async fn next(&self) -> Result<Option<MoqMediaFrame>, MoqError> {
-		self.task.run(|mut state| async move { state.next().await }).await
-	}
-
-	/// Cancel all current and future `next()` calls.
+	/// Cancel all current and future `read_frame()` calls.
+	///
+	/// Terminal: the group and whatever it still buffers are released here, not when the handle is.
 	pub fn cancel(&self) {
 		self.task.cancel();
 	}

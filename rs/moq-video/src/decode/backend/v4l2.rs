@@ -3,7 +3,7 @@
 //! The mirror of the encode backend, on the same device abstraction and usually
 //! on a sibling node of the same driver: a Raspberry Pi decodes on
 //! `/dev/video10` and encodes on `/dev/video11`, both `bcm2835-codec`. Behind
-//! the same default-on `v4l2` feature.
+//! the same opt-in `v4l2` feature.
 //!
 //! Access units go in on the OUTPUT queue in decode order and pictures come back
 //! on CAPTURE as CPU [`Surface::I420`](crate::Surface). The driver copies each
@@ -21,7 +21,7 @@
 //! Rockchip's `rkvdec` are *stateless* V4L2 decoders: they take per-slice
 //! parameters through the media request API and expect userspace to have parsed
 //! the bitstream, which is a different interface rather than another format
-//! here. [`Config::resize`] is ignored, since these drivers scale on a separate
+//! here. [`Config::scale_hint`] is ignored, since these drivers scale on a separate
 //! ISP node rather than on the decoder.
 //!
 //! Run on a Raspberry Pi 4 (`bcm2835-codec`, `/dev/video10`): a 720p H.264
@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use moq_net::Timestamp;
-use v4l::v4l_sys::{V4L2_CID_MIN_BUFFERS_FOR_CAPTURE, V4L2_DEC_CMD_START, V4L2_DEC_CMD_STOP};
+use moq_v4l::sys::{V4L2_CID_MIN_BUFFERS_FOR_CAPTURE, V4L2_DEC_CMD_START, V4L2_DEC_CMD_STOP};
 
 use super::{Backend, Codec, Config};
 use crate::v4l2::{self, Dequeue, Device, Dir, Format, Planes, Queue, Rect, Request, Role};

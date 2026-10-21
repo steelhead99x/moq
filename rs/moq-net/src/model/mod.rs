@@ -5,44 +5,83 @@ pub mod frame;
 pub mod group;
 pub mod track;
 
-// The origin + announce subsystem shares one implementation (a broadcast tree).
+// The origin + announce subsystem shares one implementation (a route table).
 // It stays in a single private module and is surfaced as two curated public
 // modules so neither leaks the other's plumbing.
 #[path = "origin.rs"]
 mod origin_impl;
+// Reduces the routes covering one path to the one serving it.
+mod follow;
+// The failover state machine origin fronts run; pure, so its transitions are
+// tested without a runtime.
+mod front;
 
+mod aborts;
 mod bytes;
-mod datagram;
+mod clock;
+// private: passthrough
+pub(crate) mod datagram;
+mod delivered;
+mod expiry;
+// pending: /quest/m1/public-model/ingest.md
+pub(crate) mod ledger;
+// private: passthrough
+pub(crate) mod object;
 mod requests;
-pub(crate) mod resume;
+mod resume;
 mod subscription;
 mod time;
+mod timed;
 mod weak_cache;
 
 #[cfg(test)]
-pub(crate) mod test_tracing;
+mod test_tracing;
 
-pub(crate) use requests::Requests;
-pub(crate) use weak_cache::{WeakCache, WeakEntry};
+use requests::Requests;
+use weak_cache::{WeakCache, WeakEntry};
 
 pub use bytes::*;
+// pending: /quest/m1/public-model/serve.md
+pub(crate) use subscription::Cap;
 // Datagram stays flat at the crate root (a small track-adjacent wire type),
 // not under a role module.
 pub use datagram::*;
 pub use time::*;
+pub use timed::Timed;
 
-/// Publishing and consuming the set of broadcasts routed through an origin.
+/// Publishing broadcasts, announcing routes, and consuming both through an origin.
 pub mod origin {
-	pub use super::origin_impl::{Consumer, Dynamic, Info, Producer, Request, Requesting};
-}
-
-/// Subscribing to broadcast (un)announcements from an origin.
-pub mod announce {
 	pub use super::origin_impl::{
-		AnnounceConsumer as Consumer, AnnounceProducer as Producer, OriginAnnounce as Update,
+		Config, Consumer, Cost, DEFAULT_UPDATE_HOLD, Driver, Dynamic, Preference, Producer, Request, Requesting, Route,
+		Routing, Source,
 	};
 }
 
-// Origin identity and the `Consume` conversion trait aren't part of a role
+/// Subscribing to route (un)announcements from an origin.
+pub mod announce {
+	pub use super::follow::Follow;
+	pub use super::origin_impl::{Announce, AnnounceConsumer as Consumer, AnnounceEvent as Event};
+}
+
+// Hop identity and the `Consume` conversion trait aren't part of a role
 // module; keep them flat at the crate root.
-pub use origin_impl::{Consume, InvalidOrigin, Origin, OriginList, TooManyOrigins};
+pub use origin_impl::{Consume, Hop, Hops, InvalidHop};
+
+// The announce-interest prefixes a scope needs on a prefix-shaped wire.
+#[cfg(feature = "async")]
+// pending: /quest/m1/public-model/answer.md
+pub(crate) use origin_impl::interest_prefixes;
+
+// Held by a session while its peer's initial announcements arrive.
+#[cfg(feature = "async")]
+// pending: /quest/m1/public-model/answer.md
+pub(crate) use origin_impl::Snapshot;
+
+// The advertise-only route guard, for tests shaping the route table.
+#[cfg(all(test, feature = "async"))]
+// private: test
+pub(crate) use origin_impl::AnnounceProducer;
+
+#[cfg(all(test, feature = "async"))]
+// private: test
+pub(crate) use origin_impl::ProduceTest;

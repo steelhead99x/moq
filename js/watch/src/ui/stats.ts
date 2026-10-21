@@ -1,3 +1,4 @@
+import { Milli, Nano, now } from "@moq/clock";
 import type { Effect, Getter } from "@moq/signals";
 import * as DOM from "@moq/signals/dom";
 import type MoqWatch from "../element";
@@ -5,7 +6,7 @@ import { formatBitrate, formatFps, formatHz, formatMillis } from "./format";
 import { graph } from "./graph";
 import { audio as audioIcon, icon, network as networkIcon, video as videoIcon } from "./icons";
 
-const POLL_MS = 250;
+const POLL = Nano.fromMilli(Milli(250));
 
 type Kind = "network" | "video" | "audio";
 
@@ -66,6 +67,7 @@ function track(parent: Effect, card: { el: HTMLElement; status: HTMLElement }, o
 /** The Stats tab: live codec/network detail plus rolling graphs. */
 export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 	const container = DOM.create("div", { className: "tab-body stats" });
+	parent.cleanup(watch.connection.probe.subscribe(() => {}));
 
 	// Video card: static detail as rows, live bitrate/fps as graphs (no duplicate rows).
 	const videoCard = card("video", "Video", videoIcon);
@@ -86,6 +88,7 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 	const aRate2 = line(audioCard.grid, "Sample rate");
 	const aChannels = line(audioCard.grid, "Channels");
 	const aBitrate = line(audioCard.grid, "Bitrate");
+	const aUnderruns = line(audioCard.grid, "Underruns");
 	track(parent, audioCard, {
 		catalog: watch.audio.source.out.catalog,
 		flag: watch.controls.muted,
@@ -101,11 +104,12 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 
 	container.append(videoCard.el, audioCard.el, netCard.el);
 
-	let vPrev = { frames: 0, bytes: 0, when: performance.now() };
-	let aPrev = { bytes: 0, when: performance.now() };
+	const at = () => Nano.toMilli(Nano(now()));
+	let vPrev = { frames: 0, bytes: 0, when: at() };
+	let aPrev = { bytes: 0, when: at() };
 
 	parent.interval(() => {
-		const now = performance.now();
+		const now = at();
 
 		// Video. Resolution comes from the active rendition (catalog.display is optional).
 		const vConf = watch.video.source.out.config.peek();
@@ -137,6 +141,10 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 		aBitrate.textContent = aBitrate2 !== undefined ? formatBitrate(aBitrate2) : "—";
 		if (aStats) aPrev = { bytes: aStats.bytesReceived, when: now };
 
+		// A non-zero count means the target is below what arrivals actually need.
+		const aUnder = watch.audio.out.underruns.peek();
+		aUnderruns.textContent = watch.audio.out.stalled.peek() ? `${aUnder} (buffering)` : `${aUnder}`;
+
 		// Network. "Estimated max" is the congestion controller / PROBE estimate;
 		// "Actual" is the goodput we measure from the video + audio byte counters.
 		const probe = watch.connection.probe.peek();
@@ -147,7 +155,7 @@ export function statsTab(parent: Effect, watch: MoqWatch): HTMLElement {
 		nActual.textContent = actual !== undefined ? formatBitrate(actual) : "—";
 		const rtt = probe?.rtt;
 		nRttGraph.push(rtt !== undefined && rtt > 0 ? rtt : undefined);
-	}, POLL_MS);
+	}, POLL);
 
 	return container;
 }

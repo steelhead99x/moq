@@ -1,0 +1,163 @@
+name: Interop
+
+# Cross-language interop test built from THIS checkout (not the published
+# packages, unlike smoke.yml). Stands up a relay and runs the
+# publish x subscribe matrix across rust / python / go / browser / native-js / c,
+# then browser-to-browser media QA. TS validation has its own workflow.
+on:
+  # Manual on-demand runs.
+  workflow_dispatch:
+  # Nightly: catch an interop regression in the current tree before a user does.
+  schedule:
+    - cron: "0 8 * * *"
+  # On release PRs that touch the harness itself, so a backported change to the
+  # interop test is validated before it merges. Main PRs skip it; the schedule
+  # above covers main. `edited` catches a main PR retargeted to release.
+  pull_request:
+    branches: [release]
+    types: [opened, synchronize, reopened, edited]
+    paths:
+      - "test/lib/**"
+      - "test/p2p/**"
+      - "js/p2p/**"
+      - "test/interop/**"
+      - "test/max-age/**"
+      - "test/portrait/**"
+      - "rs/moq-tokio/tests/integration/max_age.rs"
+      # The interop job also depends on the recipe that invokes it and the
+      # workspace membership that links the JS clients to source.
+      - "test/justfile"
+      - "package.json"
+      # The Go client builds against the modules this script stages.
+      - "sh/go/**"
+      - "cpp/moq/**"
+      - ".github/workflows/interop.yml"
+
+concurrency:
+  group: interop-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  interop:
+    name: Interop
+    runs-on: ubuntu-latest
+    # `main` and its merge queue write the Rust cache; see .github/actions/rust-cache.
+    environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/gh-readonly-queue/main/')) && 'cache-write' || '' }}
+    # The matrix runs in real time (ffmpeg -re pacing + per-subscriber timeouts);
+    # this is a safety net against a hung relay/client plus a cold first build.
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/nix
+
+      # The relay, cli, moq-ffi, and moq-c all build from source. The nightly
+      # run publishes them for the pull requests that touch the harness.
+      - name: Rust cache
+        uses: ./.github/actions/rust-cache
+        with:
+          access-key-id: ${{ secrets.MBX_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MBX_R2_SECRET_ACCESS_KEY }}
+
+      # Playwright's Chromium isn't in the nix devShell. Install it plus its apt
+      # runtime libs (`--with-deps` needs the host package manager) so the
+      # browser client can launch headless Chromium. interop.sh's own
+      # `playwright install` then no-ops.
+      - name: Playwright Chromium
+        id: setup
+        run: nix develop --command bash -c "bun install --frozen-lockfile && bunx playwright install --with-deps chromium"
+        shell: bash -leo pipefail {0}
+
+      # Each suite reports independently after setup, while a failed step still fails the job.
+      - name: Optional publisher retention
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: nix develop --command just test max-age
+        shell: bash -leo pipefail {0}
+
+      - name: Harness regressions
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: nix develop --command just test harness
+        shell: bash -leo pipefail {0}
+
+      - name: Subscription termination interop
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: nix develop --command just test bare-fin
+        shell: bash -leo pipefail {0}
+
+      - name: P2P data-channel transport
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: nix develop --command just test p2p
+        shell: bash -leo pipefail {0}
+
+      - name: Interop (full matrix)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: nix develop --command just test interop --all
+        shell: bash -leo pipefail {0}
+        env:
+          # The run writes its directory here, so a failed one is uploaded below
+          # and a passing one is deleted as usual.
+          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
+
+      # Registry installs and the release matrix run only on main, nightly or
+      # on demand: a break only needs catching before the next release.
+      - name: Released wire compatibility
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+        run: nix develop --command just test wire-compat
+        shell: bash -leo pipefail {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
+
+      - name: Portrait transcode
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: nix develop --command just test portrait
+        shell: bash -leo pipefail {0}
+        env:
+          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
+
+      - name: Interop negative control
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: nix develop --command just test interop-negative
+        shell: bash -leo pipefail {0}
+        env:
+          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
+
+      # Browser-to-browser media QA: presented frame progress, audible tone, audio/video skew, and
+      # the publication lifecycle, plus the negative controls that prove each assertion can fail.
+      - name: Media output and lifecycle
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: nix develop --command just test media
+        shell: bash -leo pipefail {0}
+        env:
+          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
+
+      # Run independently so an unrelated cold-start failure cannot hide the
+      # codec replacement and same-track coded-size growth measurements.
+      - name: Media track identity changes
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: nix develop --command just test media --media-cases rename
+        shell: bash -leo pipefail {0}
+        env:
+          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
+
+      # A failing harness run keeps its directory, holding the process logs, the
+      # relay config, and a Playwright trace of the failing page. Upload it for a
+      # short while so a red cell is diagnosable; a passing run deletes its own.
+      # Nothing needs redacting: the certificate and tokens are the harness's
+      # throwaway test ones.
+      - name: Upload failure artifacts
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: interop-failure
+          path: ${{ runner.temp }}/moq-test-runs
+          retention-days: 7
+          if-no-files-found: ignore

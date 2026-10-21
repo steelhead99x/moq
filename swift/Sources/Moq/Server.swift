@@ -4,41 +4,35 @@ import MoqFFI
 public final class Server: Sendable {
     let ffi: MoqServer
 
-    /// Create a server with default settings, ready to configure and `listen()`.
-    public init() {
-        ffi = MoqServer()
-    }
-
-    /// Set the address to bind, e.g. `127.0.0.1:4443`, `[::]:443`, or `localhost:0`.
-    /// Validated syntactically here; DNS hostnames resolve at `listen()` time.
-    public func bind(_ addr: String) throws {
-        try ffi.setBind(addr: addr)
-    }
-
-    /// Load TLS certificate chains from PEM files on disk.
-    public func setTlsCert(_ paths: [String]) {
-        ffi.setTlsCert(paths: paths)
-    }
-
-    /// Load TLS private keys from PEM files on disk.
-    public func setTlsKey(_ paths: [String]) {
-        ffi.setTlsKey(paths: paths)
-    }
-
-    /// Generate self-signed TLS certificates for the given hostnames. Clients
-    /// must pin the fingerprint (see `certFingerprints`) or disable verification.
-    public func generateTls(hostnames: [String]) {
-        ffi.setTlsGenerate(hostnames: hostnames)
-    }
-
-    /// Set the origin to publish broadcasts to incoming sessions.
-    public func setPublish(_ origin: OriginProducer?) {
-        ffi.setPublish(origin: origin?.ffi)
-    }
-
-    /// Set the origin to consume broadcasts from incoming sessions.
-    public func setConsume(_ origin: OriginProducer?) {
-        ffi.setConsume(origin: origin?.ffi)
+    /// Create a server. Nothing binds until `listen()`.
+    ///
+    /// - Parameters:
+    ///   - bind: The address to bind, e.g. `127.0.0.1:4443` or `localhost:0`; `nil` binds
+    ///     `[::]:443`. DNS hostnames resolve at `listen()`.
+    ///   - versions: Protocol versions to accept (`"moq-lite-03"`); empty accepts every
+    ///     supported version.
+    ///   - tls: The served identity: PEM `cert`/`key` files, or hostnames to `generate`
+    ///     a self-signed certificate for (clients then pin `certFingerprints` or skip verification).
+    ///   - quic: QUIC tuning, such as each peer's inbound stream cap.
+    ///   - publish: The origin whose broadcasts are served to incoming sessions.
+    ///   - consume: The origin that receives broadcasts published by incoming sessions.
+    /// - Throws: `MoqError.Config` for a value the native side cannot use.
+    public init(
+        bind: String? = nil,
+        versions: [String] = [],
+        tls: ServerTls = ServerTls(),
+        quic: QuicConfig = QuicConfig(),
+        publish: OriginProducer? = nil,
+        consume: OriginProducer? = nil
+    ) throws {
+        ffi = try MoqServer(config: MoqServerConfig(
+            bind: bind,
+            versions: versions,
+            tls: tls,
+            quic: quic,
+            publish: publish?.ffi,
+            consume: consume?.ffi
+        ))
     }
 
     /// Bind the listening socket. Returns the bound local address, useful when
@@ -60,6 +54,9 @@ public final class Server: Sendable {
     }
 
     /// Cancel any in-flight `listen()` or `accept()` call.
+    ///
+    /// Returns once the listening socket is closed, so the address can be bound
+    /// again immediately.
     public func cancel() {
         ffi.cancel()
     }
@@ -88,27 +85,17 @@ public final class Request: Sendable {
         ffi.query()
     }
 
-    /// The transport type, e.g. `"quic"`, `"iroh"`, or `"websocket"`.
-    public var transport: String {
+    /// The network transport carrying this session.
+    public var transport: Transport {
         ffi.transport()
     }
 
-    /// Override the publish origin for this session, falling back to the server's.
-    public func setPublish(_ origin: OriginProducer?) {
-        ffi.setPublish(origin: origin?.ffi)
+    /// Complete the handshake, inheriting server origins wherever an argument is nil.
+    public func accept(publish: OriginProducer? = nil, consume: OriginProducer? = nil) async throws -> Session {
+        Session(try await ffi.accept(publish: publish?.ffi, consume: consume?.ffi))
     }
 
-    /// Override the consume origin for this session, falling back to the server's.
-    public func setConsume(_ origin: OriginProducer?) {
-        ffi.setConsume(origin: origin?.ffi)
-    }
-
-    /// Complete the handshake and return the established session.
-    public func accept() async throws -> Session {
-        Session(try await ffi.accept())
-    }
-
-    /// Reject the session with the given HTTP status code.
+    /// Reject the session with an application error code; 401 and 403 map to unauthorized.
     public func reject(code: UInt16) async throws {
         try await ffi.reject(code: code)
     }

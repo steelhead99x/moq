@@ -1,8 +1,8 @@
 use super::PublishMode;
+use crate::rml::amf0::Amf0Value;
 use crate::rml::sessions::StreamMetadata;
 use crate::rml::time::RtmpTimestamp;
 use bytes::Bytes;
-use rml_amf0::Amf0Value;
 
 /// The enhanced-RTMP FourCCs a peer advertised for one media kind.
 #[derive(Debug, PartialEq, Clone, Default)]
@@ -34,13 +34,15 @@ pub enum ServerSessionEvent {
 	ClientChunkSizeChanged { new_chunk_size: u32 },
 
 	/// The client is requesting a connection on the specified RTMP application name.
-	/// `caps_ex` is the enhanced-RTMP `capsEx` capability bitmask the client
-	/// advertised in its `connect` command object (0 if absent). The FourCC
+	/// `tc_url` is the URL the client dialed as it reported it in `tcUrl`, when it
+	/// sent one. `caps_ex` is the enhanced-RTMP `capsEx` capability bitmask the
+	/// client advertised in its `connect` command object (0 if absent). The FourCC
 	/// support fields combine `fourCcList` with any per-kind `*FourCcInfoMap`
 	/// entries that set the `CanDecode` bit.
 	ConnectionRequested {
 		request_id: u32,
 		app_name: String,
+		tc_url: Option<String>,
 		caps_ex: u32,
 		video_fourccs: FourCcSupport,
 		audio_fourccs: FourCcSupport,
@@ -94,6 +96,9 @@ pub enum ServerSessionEvent {
 		command_object: Amf0Value,
 		additional_values: Vec<Amf0Value>,
 	},
+
+	/// The client sent an Amf0 data message that isn't stream metadata, such as `onCuePoint`
+	UnhandleableAmf0Data { values: Vec<Amf0Value> },
 
 	/// The client is requesting playback of the specified stream
 	PlayStreamRequested {

@@ -2,37 +2,26 @@ use std::{
 	collections::HashMap,
 	path::PathBuf,
 	sync::{
-		Arc, Mutex,
+		Arc, Mutex, PoisonError,
 		atomic::{AtomicU64, Ordering},
 	},
-	time::{Duration, Instant},
+	time::Duration,
 };
 
 use anyhow::Context;
+use futures::FutureExt as _;
 use moq_net::origin;
-use moq_net::{Origin, Path, stats::Tier};
+use moq_net::{Hop, stats::Tier};
 use reqwest_middleware::ClientWithMiddleware;
 use tokio::task::AbortHandle;
 use tracing::Instrument as _;
 use url::Url;
 
-use crate::{AuthToken, nodes::MESH_PREFIX};
-use rand::RngExt;
+use crate::auth;
 
-/// How often the discovery loop scans for stale entries.
-const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Default for [`ClusterConfig::linger`]: how long a broadcast survives abruptly
-/// losing its last publisher before unannouncing. Long enough for a publisher
-/// restart or a brief network blip to resume seamlessly, short enough that a
-/// genuinely-gone broadcast unannounces promptly.
-const DEFAULT_LINGER: Duration = Duration::from_secs(5);
-
-/// How long a peer must stay unannounced before we abort the dial. Must clear the
-/// "prefer shorter hop" re-announce flap (which arrives as
-/// unannounce-then-announce within sub-milliseconds) plus reasonable churn from
-/// a peer restart.
-const STALE_AFTER: Duration = Duration::from_secs(60);
+/// The request path prefix a LAN mesh dial presents, marking it as a peer rather
+/// than an ordinary publisher or viewer on the same listener.
+pub(crate) const CLUSTER_PATH: &str = "/.cluster";
 
 /// How often the relay re-checks an http(s) `--cluster-connect-api` endpoint. The
 /// HTTP cache middleware suppresses the actual network round-trip while the cached
@@ -41,92 +30,328 @@ const STALE_AFTER: Duration = Duration::from_secs(60);
 /// ticks turn into real conditional GETs.
 const CONNECT_API_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Mesh tiebreaker for gossip-discovered peers. In a full mesh both peers
-/// discover each other and would each open a dial, leaving two redundant
-/// sessions. The session is bidirectional (we publish *and* consume on it), so
-/// one suffices. Break the symmetry on URL order: only dial peers that sort
-/// after us, making the lexicographically-smaller node the client and the
-/// larger the server. The skipped side still gets the connection inbound.
-fn should_dial(self_url: &str, peer: &str) -> bool {
-	peer > self_url
+/// One cluster peer to dial, as listed in [`Config::connect`] or returned
+/// by a `connect_api` endpoint.
+///
+/// Accepts a URL string or an object with `url` plus
+/// policy: `cost` prices the link, `egress` declares this relay's own price to
+/// the peer, `token` carries the peer's credential, and `upstream` marks the
+/// link upstream, so it is never offered a route learned on another upstream
+/// link. `egress` defaults to `cost`; a different effective value is rejected
+/// until asymmetric routing lands. An object `token` behaves exactly like an inline `?jwt=` and is
+/// redacted the same way. Unknown object fields are rejected, as is an object
+/// that sets policy while its `url` still carries `?cost=` or `?jwt=`.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Peer {
+	url: String,
+	cost: Option<u64>,
+	egress: Option<u64>,
+	token: Option<String>,
+	upstream: bool,
+}
+
+impl std::fmt::Debug for Peer {
+	/// Redact `token`: [`crate::Config::load`] traces the whole resolved config,
+	/// so a derived `Debug` would print cluster credentials into logs.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Peer")
+			.field("url", &self.url)
+			.field("cost", &self.cost)
+			.field("egress", &self.egress)
+			.field("token", &self.token.as_ref().map(|_| "..."))
+			.field("upstream", &self.upstream)
+			.finish()
+	}
+}
+
+impl Peer {
+	/// Dial this URL, with no policy.
+	pub fn new(url: impl Into<String>) -> Self {
+		Self {
+			url: url.into(),
+			cost: None,
+			egress: None,
+			token: None,
+			upstream: false,
+		}
+	}
+
+	/// The peer address, as configured. May carry `?cost=` / `?jwt=` in the
+	/// legacy string form.
+	pub fn url(&self) -> &str {
+		&self.url
+	}
+
+	/// What this relay charges to pull from the peer. None prices the link at 1.
+	pub fn cost(&self) -> Option<u64> {
+		self.cost
+	}
+
+	/// What this relay declares in SETUP as its own price toward the peer.
+	/// Defaults to [`Self::cost`]; anything else is rejected for now.
+	pub fn egress(&self) -> Option<u64> {
+		self.egress
+	}
+
+	/// The peer's credential, replacing an inline `?jwt=`.
+	pub fn token(&self) -> Option<&str> {
+		self.token.as_deref()
+	}
+
+	/// Whether the link is upstream: it is never offered a route learned on
+	/// another upstream link.
+	pub fn upstream(&self) -> bool {
+		self.upstream
+	}
+
+	/// Price the link this peer is dialed on.
+	pub fn with_cost(mut self, cost: u64) -> Self {
+		self.cost = Some(cost);
+		self
+	}
+
+	/// Declare this relay's own price toward the peer. Must match the cost.
+	pub fn with_egress(mut self, egress: u64) -> Self {
+		self.egress = Some(egress);
+		self
+	}
+
+	/// Present this credential instead of an inline `?jwt=`.
+	pub fn with_token(mut self, token: impl Into<String>) -> Self {
+		self.token = Some(token.into());
+		self
+	}
+
+	/// Mark the link upstream.
+	pub fn with_upstream(mut self, upstream: bool) -> Self {
+		self.upstream = upstream;
+		self
+	}
+}
+
+impl std::str::FromStr for Peer {
+	type Err = anyhow::Error;
+
+	/// Parse a bare peer URL, preserving CLI input. Fails on an invalid URL
+	/// without echoing any inline credential.
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		peer_url(s)?;
+		Ok(Self::new(s))
+	}
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerObject {
+	url: String,
+	#[serde(default)]
+	cost: Option<u64>,
+	#[serde(default)]
+	egress: Option<u64>,
+	#[serde(default)]
+	token: Option<String>,
+	#[serde(default)]
+	upstream: bool,
+}
+
+/// A bare string is the URL form; a map is the object form. Dispatching on the
+/// shape ourselves (rather than an untagged enum) keeps serde's real error, so a
+/// typo'd field names itself instead of "did not match any variant".
+impl<'de> serde::Deserialize<'de> for Peer {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		struct Visitor;
+
+		impl<'de> serde::de::Visitor<'de> for Visitor {
+			type Value = Peer;
+
+			fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+				f.write_str("a peer URL string or an object with url, cost, egress, token, upstream")
+			}
+
+			fn visit_str<E: serde::de::Error>(self, url: &str) -> Result<Peer, E> {
+				Ok(Peer::new(url))
+			}
+
+			fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Peer, A::Error> {
+				let object: PeerObject =
+					serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+				Ok(Peer {
+					url: object.url,
+					cost: object.cost,
+					egress: object.egress,
+					token: object.token,
+					upstream: object.upstream,
+				})
+			}
+		}
+
+		deserializer.deserialize_any(Visitor)
+	}
+}
+
+impl serde::Serialize for Peer {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		if self.cost.is_none() && self.egress.is_none() && self.token.is_none() && !self.upstream {
+			return serializer.serialize_str(&self.url);
+		}
+		use serde::ser::SerializeStruct as _;
+		let mut len = 1;
+		if self.cost.is_some() {
+			len += 1;
+		}
+		if self.egress.is_some() {
+			len += 1;
+		}
+		if self.token.is_some() {
+			len += 1;
+		}
+		if self.upstream {
+			len += 1;
+		}
+		let mut state = serializer.serialize_struct("Peer", len)?;
+		state.serialize_field("url", &self.url)?;
+		if let Some(cost) = &self.cost {
+			state.serialize_field("cost", cost)?;
+		}
+		if let Some(egress) = &self.egress {
+			state.serialize_field("egress", egress)?;
+		}
+		if let Some(token) = &self.token {
+			state.serialize_field("token", token)?;
+		}
+		if self.upstream {
+			state.serialize_field("upstream", &true)?;
+		}
+		state.end()
+	}
 }
 
 /// One peer's stable identity and the dial-affecting configuration currently
 /// supplied by a discovery source.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DialTarget {
 	key: String,
 	url: Url,
+	/// Extra candidates after [`Self::url`], in dial order. Empty for a
+	/// static or API peer, which has one address.
+	urls: Vec<Url>,
 	cost: Option<u64>,
+	/// Advertised certificate fingerprint to pin. LAN only.
+	fingerprint: Option<String>,
+	/// Present the mDNS credential on `/.cluster/<credential>` and skip
+	/// [`Config::token`]. LAN only.
+	lan: bool,
+	/// Never offer this peer a route learned on another upstream link.
+	upstream: bool,
 }
 
 impl DialTarget {
+	/// Parse a bare peer URL, keeping its inline `?cost=` / `?jwt=`.
+	#[cfg(test)]
 	fn parse(peer: &str) -> anyhow::Result<Self> {
-		let mut url = peer_url(peer)?;
+		Self::from_peer(&Peer::new(peer))
+	}
+
+	/// Normalize a configured [`Peer`] into dial state. A bare URL keeps its
+	/// inline `?cost=` / `?jwt=`; an object carries policy in its fields instead.
+	/// Mixing the two (object policy plus URL params) is rejected rather than
+	/// given a precedence a migration could silently get wrong. `egress`
+	/// defaults to `cost`; anything else is rejected, never ignored.
+	fn from_peer(peer: &Peer) -> anyhow::Result<Self> {
+		let mut url = peer_url(&peer.url)?;
+		let has_cost = url.query_pairs().any(|(key, _)| key == "cost");
+		let has_jwt = url.query_pairs().any(|(key, value)| key == "jwt" && !value.is_empty());
+		if peer.cost.is_some() || peer.egress.is_some() {
+			anyhow::ensure!(
+				!has_cost,
+				"cluster peer sets cost/egress alongside a URL ?cost=; use one or the other"
+			);
+		}
+		let token = peer.token.as_deref().filter(|token| !token.is_empty());
+		if token.is_some() {
+			anyhow::ensure!(
+				!has_jwt,
+				"cluster peer sets token alongside a URL ?jwt=; use one or the other"
+			);
+		}
+		let cost = peer.cost.or(take_cost(&mut url)?);
+		// An unpriced link costs 1 (see `moq_net::Client::with_cost`), so `egress`
+		// alone is symmetric only at that price.
+		let charged = cost.unwrap_or(1);
+		anyhow::ensure!(
+			peer.egress.unwrap_or(charged) == charged,
+			"cluster peer sets egress different from cost; asymmetric costs are not supported yet"
+		);
+		if let Some(token) = token {
+			url.query_pairs_mut().append_pair("jwt", token);
+		}
 		let key = {
 			let mut identity = url.clone();
 			identity.set_query(None);
 			identity.into()
 		};
-		let cost = take_cost(&mut url)?;
-		Ok(Self { key, url, cost })
-	}
-}
-
-/// Every currently-live gossip path for a canonical peer, in announcement order.
-/// Query changes create a new path before the old path necessarily unannounces,
-/// so the latest live path owns the dial configuration.
-#[derive(Default)]
-struct GossipTargets {
-	by_key: HashMap<String, Vec<(String, DialTarget)>>,
-}
-
-enum GossipUpdate {
-	/// The current advertisement changed to this target.
-	Current(DialTarget),
-	/// A non-current or unknown advertisement disappeared.
-	Unchanged,
-	/// The peer has no live advertisements left.
-	Gone,
-}
-
-impl GossipTargets {
-	fn announce(&mut self, advertisement: String, target: DialTarget) -> DialTarget {
-		let targets = self.by_key.entry(target.key.clone()).or_default();
-		targets.retain(|(existing, _)| existing != &advertisement);
-		targets.push((advertisement, target.clone()));
-		target
+		Ok(Self {
+			key,
+			url,
+			urls: Vec::new(),
+			cost,
+			fingerprint: None,
+			lan: false,
+			upstream: peer.upstream,
+		})
 	}
 
-	fn unannounce(&mut self, advertisement: &str, key: &str) -> GossipUpdate {
-		let Some(targets) = self.by_key.get_mut(key) else {
-			return GossipUpdate::Unchanged;
-		};
-		let was_current = targets.last().is_some_and(|(current, _)| current == advertisement);
-		let previous_len = targets.len();
-		targets.retain(|(existing, _)| existing != advertisement);
-		if targets.len() == previous_len {
-			return GossipUpdate::Unchanged;
+	/// Every address to try, [`Self::url`] first.
+	fn addrs(&self) -> Vec<Url> {
+		if self.urls.is_empty() {
+			vec![self.url.clone()]
+		} else {
+			self.urls.clone()
 		}
-		if targets.is_empty() {
-			self.by_key.remove(key);
-			return GossipUpdate::Gone;
+	}
+
+	/// A LAN peer's advertised addresses, each carrying that peer's credential.
+	#[cfg(feature = "cluster-lan")]
+	fn from_lan_peer(peer: &moq_tokio::mdns::Peer) -> anyhow::Result<Self> {
+		let mut urls = peer.urls();
+		anyhow::ensure!(!urls.is_empty(), "peer advertised no reachable address");
+		let mut cost = None;
+		for url in &mut urls {
+			if cost.is_none() {
+				cost = take_cost(url)?;
+			} else {
+				let _ = take_cost(url)?;
+			}
+			strip_jwt(url);
+			url.set_path(&format!("{CLUSTER_PATH}/{}", peer.credential));
 		}
-		if was_current {
-			return GossipUpdate::Current(targets.last().expect("live target exists").1.clone());
-		}
-		GossipUpdate::Unchanged
+		Ok(Self {
+			key: canonicalize_peer_key(&peer.id),
+			url: urls[0].clone(),
+			urls,
+			cost,
+			fingerprint: peer.fingerprint.clone(),
+			lan: true,
+			upstream: false,
+		})
 	}
 }
 
 /// Parse a complete dynamic peer list before mutating the live dial set. A bad
 /// entry or conflicting duplicate rejects the whole update, preserving the
 /// last-known-good topology.
-fn parse_peer_list(list: Vec<String>, node: Option<&str>) -> anyhow::Result<HashMap<String, DialTarget>> {
+fn parse_peer_list(list: Vec<Peer>, node: Option<&str>) -> anyhow::Result<HashMap<String, DialTarget>> {
 	let self_key = node.map(canonicalize_peer_key);
 	let mut desired = HashMap::new();
 	for (index, peer) in list.into_iter().enumerate() {
-		let target = DialTarget::parse(&peer).with_context(|| format!("invalid peer at index {index}"))?;
+		let target = DialTarget::from_peer(&peer).with_context(|| format!("invalid peer at index {index}"))?;
 		if Some(&target.key) == self_key.as_ref() {
 			continue;
 		}
@@ -140,7 +365,7 @@ fn parse_peer_list(list: Vec<String>, node: Option<&str>) -> anyhow::Result<Hash
 }
 
 /// A mechanism that wants a dial kept alive. A single peer can be wanted by more
-/// than one at once (e.g. gossiped *and* listed by `--cluster-connect-api`), so
+/// than one at once (e.g. found on the LAN *and* listed by `--cluster-connect-api`), so
 /// [`DialEntry`] tracks a set of these and only tears the dial down when the last
 /// one releases it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -148,69 +373,88 @@ enum DialSource {
 	/// Seeded from `--cluster-connect`. Never released, so the dial retries forever
 	/// (operator intent says "always dial").
 	Static,
-	/// Discovered via gossip on `.internal/origins/*`. Released by the periodic
-	/// stale-sweep once its unannounce has stuck for [`STALE_AFTER`].
-	Gossip,
 	/// Supplied by `--cluster-connect-api`. Released when a fetched peer list no
 	/// longer contains the peer.
 	Api,
+	/// Discovered on the LAN via mDNS (`--cluster-lan`). Released as soon as the
+	/// advertisement goes away.
+	#[cfg(feature = "cluster-lan")]
+	Mdns,
 }
 
 /// The set of [`DialSource`]s currently keeping a dial alive.
 #[derive(Clone, Default)]
 struct DialSources {
 	seeded: Option<DialTarget>,
-	gossip: Option<DialTarget>,
 	api: Option<DialTarget>,
+	#[cfg(feature = "cluster-lan")]
+	mdns: Option<DialTarget>,
 }
 
 impl DialSources {
 	fn get(&self, source: DialSource) -> Option<&DialTarget> {
 		match source {
 			DialSource::Static => self.seeded.as_ref(),
-			DialSource::Gossip => self.gossip.as_ref(),
 			DialSource::Api => self.api.as_ref(),
+			#[cfg(feature = "cluster-lan")]
+			DialSource::Mdns => self.mdns.as_ref(),
 		}
 	}
 
 	fn set(&mut self, source: DialSource, target: DialTarget) {
 		match source {
 			DialSource::Static => self.seeded = Some(target),
-			DialSource::Gossip => self.gossip = Some(target),
 			DialSource::Api => self.api = Some(target),
+			#[cfg(feature = "cluster-lan")]
+			DialSource::Mdns => self.mdns = Some(target),
 		}
 	}
 
 	fn clear(&mut self, source: DialSource) {
 		match source {
 			DialSource::Static => self.seeded = None,
-			DialSource::Gossip => self.gossip = None,
 			DialSource::Api => self.api = None,
+			#[cfg(feature = "cluster-lan")]
+			DialSource::Mdns => self.mdns = None,
 		}
 	}
 
+	/// The source to fall back to when the active one is released, most durable
+	/// first: operator intent, then the API list, then LAN discovery, whose
+	/// targets come and go on their own.
 	fn fallback(&self) -> Option<(DialSource, &DialTarget)> {
-		self.seeded
+		let fallback = self
+			.seeded
 			.as_ref()
 			.map(|target| (DialSource::Static, target))
-			.or_else(|| self.api.as_ref().map(|target| (DialSource::Api, target)))
-			.or_else(|| self.gossip.as_ref().map(|target| (DialSource::Gossip, target)))
+			.or_else(|| self.api.as_ref().map(|target| (DialSource::Api, target)));
+		#[cfg(feature = "cluster-lan")]
+		let fallback = fallback.or_else(|| self.mdns.as_ref().map(|target| (DialSource::Mdns, target)));
+		fallback
 	}
 }
 
-/// One entry in [`DialMap`]. `unannounced_at` carries the gossip stale timer; the
-/// sweep uses it to decide when the gossip source has truly gone vs. is just
-/// flapping between paths. It's only meaningful while `sources.gossip` is set.
-struct DialEntry {
-	handle: AbortHandle,
-	sources: DialSources,
-	active: DialSource,
-	unannounced_at: Option<Instant>,
+/// A dial task that ends once its [`DialEntry`] is replaced or the [`DialMap`]
+/// drops, so a cancelled `run` takes the dynamic dials, spawned outside its
+/// `JoinSet`, down with it.
+struct DialTask(AbortHandle);
+
+impl Drop for DialTask {
+	fn drop(&mut self) {
+		self.0.abort();
+	}
 }
 
-/// Map of in-flight cluster dials, keyed by canonical peer identity. Cloneable: the inner
-/// map is shared via `Arc<Mutex<_>>` so the discovery task and the static-seed
-/// phase write to the same set of entries.
+/// One entry in [`DialMap`].
+struct DialEntry {
+	task: DialTask,
+	sources: DialSources,
+	active: DialSource,
+}
+
+/// Map of in-flight cluster dials, keyed by canonical peer identity, owning each
+/// dial's task. Cloneable: the inner map is shared via `Arc<Mutex<_>>` so the
+/// discovery tasks and the static-seed phase write to the same set of entries.
 #[derive(Clone, Default)]
 struct DialMap {
 	inner: Arc<Mutex<HashMap<String, DialEntry>>>,
@@ -219,7 +463,10 @@ struct DialMap {
 impl DialMap {
 	/// True if `peer` is already being dialed.
 	fn contains(&self, peer: &str) -> bool {
-		self.inner.lock().expect("dial map poisoned").contains_key(peer)
+		self.inner
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.contains_key(peer)
 	}
 
 	/// Record an already-spawned dial under `source`. If the source is redundant,
@@ -235,36 +482,32 @@ impl DialMap {
 	/// Add or update one source's target, replacing the live dial only when that
 	/// source already owns it. Other sources retain their latest target as a
 	/// fallback without changing the first source's active configuration.
-	fn upsert<F>(&self, target: DialTarget, source: DialSource, spawn: &mut F) -> bool
+	fn upsert<F>(&self, target: DialTarget, source: DialSource, spawn: &mut F)
 	where
 		F: FnMut(DialTarget) -> AbortHandle,
 	{
-		let mut map = self.inner.lock().expect("dial map poisoned");
+		let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
 		if let Some(entry) = map.get_mut(&target.key) {
 			let replace = entry.active == source && entry.sources.get(source) != Some(&target);
 			entry.sources.set(source, target.clone());
-			let reannounced = source == DialSource::Gossip && entry.unannounced_at.take().is_some();
 			if replace {
-				entry.handle.abort();
-				entry.handle = spawn(target);
+				entry.task = DialTask(spawn(target));
 			}
-			return reannounced;
+			return;
 		}
 
 		let key = target.key.clone();
-		let handle = spawn(target.clone());
+		let task = DialTask(spawn(target.clone()));
 		let mut sources = DialSources::default();
 		sources.set(source, target);
 		map.insert(
 			key,
 			DialEntry {
-				handle,
+				task,
 				sources,
 				active: source,
-				unannounced_at: None,
 			},
 		);
-		false
 	}
 
 	/// Release one source. If it owned the live dial, switch to a remaining
@@ -273,7 +516,7 @@ impl DialMap {
 	where
 		F: FnMut(DialTarget) -> AbortHandle,
 	{
-		let mut map = self.inner.lock().expect("dial map poisoned");
+		let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
 		let Some(entry) = map.get_mut(peer) else { return };
 		if entry.sources.get(source).is_none() {
 			return;
@@ -288,50 +531,12 @@ impl DialMap {
 			let next_target = next_target.clone();
 			entry.active = next_source;
 			if active_target.as_ref() != Some(&next_target) {
-				entry.handle.abort();
-				entry.handle = spawn(next_target);
+				entry.task = DialTask(spawn(next_target));
 			}
 			return;
 		}
 
-		let entry = map.remove(peer).expect("entry exists");
-		entry.handle.abort();
-	}
-
-	/// Start the gossip stale timer on `peer` if it isn't already pending. No-op
-	/// unless the peer is currently wanted by gossip. Idempotent: a repeat
-	/// unannounce while a timestamp is pending doesn't reset the clock.
-	fn mark_unannounced(&self, peer: &str, now: Instant) {
-		let mut map = self.inner.lock().expect("dial map poisoned");
-		if let Some(entry) = map.get_mut(peer)
-			&& entry.sources.gossip.is_some()
-		{
-			entry.unannounced_at.get_or_insert(now);
-		}
-	}
-
-	/// Release the gossip source from entries whose unannounce has stuck for at
-	/// least `threshold`, aborting the dial only if no other source still wants it.
-	fn sweep_stale<F>(&self, now: Instant, threshold: Duration, spawn: &mut F)
-	where
-		F: FnMut(DialTarget) -> AbortHandle,
-	{
-		let mut map = self.inner.lock().expect("dial map poisoned");
-		let expired: Vec<String> = map
-			.iter_mut()
-			.filter_map(|(peer, entry)| {
-				let at = entry.unannounced_at?;
-				(now.duration_since(at) >= threshold).then(|| {
-					entry.unannounced_at = None;
-					peer.clone()
-				})
-			})
-			.collect();
-		drop(map);
-
-		for peer in expired {
-			self.release(&peer, DialSource::Gossip, spawn);
-		}
+		map.remove(peer);
 	}
 
 	/// Reconcile the API source against `desired`, including changes to a peer's
@@ -347,7 +552,7 @@ impl DialMap {
 		let removed: Vec<String> = self
 			.inner
 			.lock()
-			.expect("dial map poisoned")
+			.unwrap_or_else(PoisonError::into_inner)
 			.iter()
 			.filter(|(peer, entry)| entry.sources.api.is_some() && !desired.contains_key(*peer))
 			.map(|(peer, _)| peer.clone())
@@ -358,21 +563,163 @@ impl DialMap {
 	}
 }
 
+/// Every dial task and QUIC client the cluster dials peers with, so
+/// [`Cluster::close`] can end each link and send the peer its close before the
+/// runtime stops: a dropped QUIC link only queues the close, and the peer then
+/// keeps the link and its routes until its idle timeout.
+#[derive(Clone)]
+struct Dialers {
+	state: Arc<Mutex<DialersPhase>>,
+	/// Set on close. Each dial task holds a receiver, so [`watch::Sender::closed`]
+	/// waits for every one of them to end.
+	///
+	/// [`watch::Sender::closed`]: tokio::sync::watch::Sender::closed
+	stop: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+struct DialersPhase {
+	/// `None` once closed, which refuses any further dial.
+	open: Option<DialersState>,
+	/// The shutdown the first close started, which every close awaits, so none
+	/// returns before it is done.
+	closing: Option<futures::future::Shared<futures::future::BoxFuture<'static, ()>>>,
+}
+
+struct DialersState {
+	clients: HashMap<u64, moq_tokio::Client>,
+	next: u64,
+	/// Cloned into each background close, so `finished` ends once they all have.
+	closing: tokio::sync::mpsc::Sender<()>,
+	finished: tokio::sync::mpsc::Receiver<()>,
+}
+
+impl Dialers {
+	fn new() -> Self {
+		let (closing, finished) = tokio::sync::mpsc::channel(1);
+		Self {
+			state: Arc::new(Mutex::new(DialersPhase {
+				open: Some(DialersState {
+					clients: HashMap::new(),
+					next: 0,
+					closing,
+					finished,
+				}),
+				closing: None,
+			})),
+			stop: Arc::new(tokio::sync::watch::Sender::new(false)),
+		}
+	}
+
+	fn lock(&self) -> std::sync::MutexGuard<'_, DialersPhase> {
+		self.state.lock().unwrap_or_else(PoisonError::into_inner)
+	}
+
+	/// Keep `client` until [`Self::close`].
+	fn insert(&self, client: &moq_tokio::Client) -> anyhow::Result<u64> {
+		let mut phase = self.lock();
+		let state = phase.open.as_mut().context("cluster closed")?;
+		let id = state.next;
+		state.next += 1;
+		state.clients.insert(id, client.clone());
+		Ok(id)
+	}
+
+	/// Keep `client` until [`Self::close`] or until the guard drops, which closes it
+	/// in the background.
+	fn hold(&self, client: &moq_tokio::Client) -> anyhow::Result<Held> {
+		Ok(Held {
+			id: self.insert(client)?,
+			dialers: self.clone(),
+		})
+	}
+
+	/// Run one dial task until it ends or [`Self::close`] stops it.
+	async fn supervise(&self, dial: impl std::future::Future<Output = ()>) {
+		let mut stop = self.stop.subscribe();
+		tokio::select! {
+			// First, so a dial spawned just before the close never starts.
+			biased;
+			_ = stop.wait_for(|stopped| *stopped) => {}
+			() = dial => {}
+		}
+	}
+
+	/// Stop every dial task and close every client, including those a dropped
+	/// guard is still closing, and refuse further dials.
+	async fn close(&self) {
+		let closing = {
+			let mut phase = self.lock();
+			let phase = &mut *phase;
+			phase
+				.closing
+				.get_or_insert_with(|| {
+					let state = phase.open.take().expect("open until the first close");
+					Self::shutdown(state, self.stop.clone()).boxed().shared()
+				})
+				.clone()
+		};
+		closing.await;
+	}
+
+	async fn shutdown(state: DialersState, stop: Arc<tokio::sync::watch::Sender<bool>>) {
+		stop.send_replace(true);
+		let DialersState {
+			clients,
+			closing,
+			mut finished,
+			..
+		} = state;
+		futures::future::join_all(clients.into_values().map(moq_tokio::Client::close)).await;
+		drop(closing);
+		// Nothing is ever sent: this returns `None` once every sender has dropped.
+		let _ = finished.recv().await;
+		// Each stopped task dropped its link, which ends a non-QUIC one.
+		stop.closed().await;
+	}
+}
+
+/// A dial's claim on its client in [`Dialers`].
+struct Held {
+	dialers: Dialers,
+	id: u64,
+}
+
+impl Drop for Held {
+	fn drop(&mut self) {
+		let mut phase = self.dialers.lock();
+		// Already taken by `Dialers::close`, which closes the client itself.
+		let Some(state) = phase.open.as_mut() else {
+			return;
+		};
+		let Some(client) = state.clients.remove(&self.id) else {
+			return;
+		};
+		let closing = state.closing.clone();
+		// Without a runtime nothing could send the close anyway.
+		if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+			runtime.spawn(async move {
+				client.close().await;
+				drop(closing);
+			});
+		}
+	}
+}
+
 /// Configuration for relay clustering.
 ///
-/// [`Self::connect`] / [`Self::connect_api`] list peers to dial. [`Self::node`] is
-/// this relay's own URL (identity); [`Self::mesh`] enables gossip, advertising that
-/// URL so other peers discover and dial it. Set `node` + `mesh` with no `connect`
-/// to act as a passive rendezvous.
+/// [`Self::connect`] / [`Self::connect_api`] list peers to dial, and
+/// [`Self::node`] is this relay's own URL (identity). A relay only dials peers
+/// configured here or found on the LAN; it never dials a URL learned from an
+/// announcement.
 ///
 /// Hop-based routing on broadcasts prevents announcement loops regardless of topology.
 #[serde_with::serde_as]
-#[derive(clap::Args, Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[derive(usage_rs::Args, Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde_with::skip_serializing_none]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
-#[group(id = "cluster-config")]
-pub struct ClusterConfig {
+pub struct Config {
 	/// Fixed origin (hop) id for this relay, identifying it in the hop chains
 	/// carried on each broadcast for loop detection and shortest-path routing.
 	///
@@ -381,134 +728,405 @@ pub struct ClusterConfig {
 	/// (the wire varint limit); an out-of-range value errors at startup. Keep it
 	/// below 2^53 for compatibility with older `@moq/lite` JS clients, which
 	/// decode hop ids as a `u53` and reject anything larger.
-	#[arg(id = "cluster-id", long = "cluster-id", env = "MOQ_CLUSTER_ID")]
+	#[usage(
+		name = "cluster-id",
+		long = "cluster-id",
+		env = "MOQ_CLUSTER_ID",
+		setting = "cluster.id"
+	)]
 	pub id: Option<u64>,
 
-	/// Connect to one or more other cluster nodes. Each peer is a full URL, e.g.
-	/// `https://host/?jwt=TOKEN`; a bare host or `host:port` is deprecated but
-	/// still accepted (wrapped in `https://.../`). Accepts a comma-separated list
-	/// on the CLI or repeat the flag; in config files use a TOML array.
+	/// Connect to one or more other cluster nodes. Each entry is a full URL, e.g.
+	/// `https://host/?jwt=TOKEN`, or an object with `url`, `cost`, `egress`,
+	/// `token`, and `upstream`; see [`Peer`]. A bare host or `host:port` is refused; pass the
+	/// full URL instead. Accepts a comma-separated list on the CLI or repeat the
+	/// flag; in config files use a TOML array of URLs and/or objects.
 	///
-	/// A `?cost=N` query param prices the link (moq-lite-06+): every
-	/// announcement crossing it adds `N` to its route cost, so routing prefers
-	/// cheap paths over short ones. Use `0` for a same-datacenter sibling and
-	/// something large for a metered backbone; an unpriced link costs 1, which
-	/// reproduces plain hop counting. The param is consumed by this relay, not
-	/// sent to the peer.
-	#[serde(alias = "connect")]
-	#[arg(
-		id = "cluster-connect",
+	/// A `?cost=N` query param (or object `cost`) prices the link (moq-lite-06+):
+	/// every announcement crossing it adds `N` to its route cost, so routing
+	/// prefers cheap paths over short ones. Use `0` for a same-datacenter sibling
+	/// and something large for a metered backbone; an unpriced link costs 1,
+	/// which reproduces plain hop counting. The param is consumed by this relay,
+	/// not sent to the peer. Object `egress` defaults to `cost`; anything else is
+	/// rejected until asymmetric routing lands.
+	#[usage(
+		name = "cluster-connect",
 		long = "cluster-connect",
 		env = "MOQ_CLUSTER_CONNECT",
-		value_delimiter = ','
+		delimiter = ',',
+		setting = "cluster.connect"
 	)]
 	#[serde_as(as = "serde_with::OneOrMany<_>")]
-	pub connect: Vec<String>,
+	pub connect: Vec<Peer>,
 
 	/// Fetch the list of peers to dial from an HTTP(S) URL or a local file,
 	/// reloading at runtime without a restart. The source returns a JSON array
-	/// of peer URLs: `["https://a.pop.example/?cost=1", "b.pop.example"]`. An http(s) URL is
-	/// re-checked on a fixed cadence, with caching, conditional revalidation
+	/// of peers: bare URL strings and/or objects with `url`, `cost`, `egress`,
+	/// `token`, and `upstream`, exactly as [`Self::connect`] accepts, e.g.
+	/// `["https://a.pop.example/?cost=1", {"url": "https://b.pop.example/", "cost": 2}]`.
+	/// An http(s) URL is re-checked on a fixed cadence, with caching, conditional revalidation
 	/// (`ETag` / `Last-Modified`), and stale-if-error handled by the shared HTTP
 	/// cache client, so the response's `Cache-Control` controls how often a real
 	/// fetch hits the endpoint; a local path is watched via OS filesystem
 	/// notifications (with a periodic re-check fallback). This relay's own
 	/// [`Self::node`] value, when set, is sent as a `?node=` query param so the
 	/// server can return this node's peers. The relay keeps the last good list if
-	/// a fetch fails. Composes with [`Self::connect`] and [`Self::mesh`].
-	#[arg(
-		id = "cluster-connect-api",
+	/// a fetch fails. Composes with [`Self::connect`].
+	#[usage(
+		name = "cluster-connect-api",
 		long = "cluster-connect-api",
-		env = "MOQ_CLUSTER_CONNECT_API"
+		env = "MOQ_CLUSTER_CONNECT_API",
+		setting = "cluster.connect_api"
 	)]
 	pub connect_api: Option<String>,
 
+	/// Trust these PEM roots for the peer API instead of the system roots.
+	/// The API hostname comes from its URL; mesh TLS trust is independent.
+	#[usage(
+		name = "cluster-connect-api-tls-root",
+		long = "cluster-connect-api-tls-root",
+		env = "MOQ_CLUSTER_CONNECT_API_TLS_ROOT",
+		setting = "cluster.connect_api_tls_root"
+	)]
+	#[usage(value_hint = usage_rs::ValueHint::FilePath, extensions("pem", "crt", "cer"))]
+	#[serde_as(as = "serde_with::OneOrMany<_>")]
+	pub connect_api_tls_root: Vec<PathBuf>,
+
 	/// This relay's own externally-reachable URL (identity). Sent to
 	/// [`Self::connect_api`] as a `?node=` query param so the endpoint can return
-	/// this node's peers, and advertised to other relays when [`Self::mesh`] gossip
-	/// is enabled. On its own it neither opens nor accepts a connection.
-	#[arg(id = "cluster-node", long = "cluster-node", env = "MOQ_CLUSTER_NODE")]
+	/// this node's peers, and advertised over mDNS when LAN discovery is on. On
+	/// its own it neither opens nor accepts a connection.
+	#[usage(
+		name = "cluster-node",
+		long = "cluster-node",
+		env = "MOQ_CLUSTER_NODE",
+		setting = "cluster.node"
+	)]
 	pub node: Option<String>,
 
-	/// Enable gossip discovery: advertise this relay's [`Self::node`] URL on the
-	/// cluster origin so peers can find and dial it (and so this relay discovers
-	/// peers the same way). Requires [`Self::node`]. Boolean flag: pass
-	/// `--cluster-mesh` (or `=true` / `=false`).
-	///
-	/// Kept as a string for backwards compatibility: `--cluster-mesh` used to take
-	/// this relay's URL. A non-boolean value is treated as a legacy [`Self::node`]
-	/// (with a deprecation warning), or an error if it conflicts with an explicit
-	/// `--cluster-node`. Accepts a TOML boolean or string.
-	#[arg(
-		id = "cluster-mesh",
-		long = "cluster-mesh",
-		env = "MOQ_CLUSTER_MESH",
-		default_missing_value = "true",
-		num_args = 0..=1,
-		require_equals = true,
-	)]
-	#[serde(default, deserialize_with = "deserialize_bool_or_string")]
-	pub mesh: Option<String>,
+	/// LAN discovery over mDNS (`[cluster.lan]`).
+	#[cfg(feature = "cluster-lan")]
+	#[usage(flatten)]
+	#[serde(default)]
+	pub lan: LanConfig,
 
 	/// JWT presented on outbound cluster dials, read from this file. Applied to
-	/// any peer whose URL doesn't already carry a `?jwt=` (so it authenticates
-	/// any peer whose URL has no inline token). An inline `?jwt=` can provide a
-	/// per-peer credential for static or `connect_api` peers. Gossip should use
-	/// this shared token or mTLS because the advertised node URL is public.
-	#[arg(id = "cluster-token", long = "cluster-token", env = "MOQ_CLUSTER_TOKEN")]
+	/// any static or API peer whose URL doesn't already carry a `?jwt=` and
+	/// whose object entry sets no `token`. An inline `?jwt=` or object `token`
+	/// provides a per-peer credential instead. LAN peers never receive it; they
+	/// authenticate with their mDNS credential.
+	#[usage(
+		name = "cluster-token",
+		long = "cluster-token",
+		env = "MOQ_CLUSTER_TOKEN",
+		setting = "cluster.token"
+	)]
 	pub token: Option<PathBuf>,
 
 	/// Billing tier label that cluster-peer (relay-to-relay) traffic records
 	/// stats under. Defaults to the unprefixed tier.
-	#[arg(id = "cluster-tier", long = "cluster-tier", env = "MOQ_CLUSTER_TIER")]
-	pub tier: Option<String>,
-
-	/// How long a broadcast stays alive and announced after abruptly losing its
-	/// last publisher (a session dying without unannouncing), e.g. "5s" or "500ms".
-	/// A publisher reconnecting within the window resumes the same broadcast and
-	/// subscribers never notice; the window expiring unannounces it. A clean
-	/// unannounce always takes effect immediately. Set "0" to unannounce abrupt
-	/// losses immediately too. Defaults to 5s.
-	#[arg(
-		id = "cluster-linger",
-		long = "cluster-linger",
-		env = "MOQ_CLUSTER_LINGER",
-		value_parser = humantime::parse_duration,
+	#[usage(
+		name = "cluster-tier",
+		long = "cluster-tier",
+		env = "MOQ_CLUSTER_TIER",
+		setting = "cluster.tier"
 	)]
-	#[serde(default, with = "humantime_serde")]
-	pub linger: Option<Duration>,
+	pub tier: Option<String>,
+}
+
+impl Config {
+	/// Released spellings this config was parsed from, each paired with what replaced it.
+	pub fn deprecated(&self) -> moq_tokio::cli::Deprecated {
+		let mut found = moq_tokio::cli::Deprecated::default();
+		if self.connect.iter().any(|peer| is_legacy_peer(peer.url())) {
+			found.changed(
+				"--cluster-connect",
+				Some("MOQ_CLUSTER_CONNECT"),
+				"a full URL like https://host/?jwt=TOKEN",
+				"a bare host or host:port is no longer accepted",
+			);
+		}
+		found
+	}
+}
+
+/// LAN discovery configuration (`[cluster.lan]`).
+///
+/// Advertises this process over mDNS and dials the peers that advertise back,
+/// so a rack or a home lab meshes with no seed list and no shared rendezvous.
+/// A LAN peer authenticates with its mDNS credential on `/.cluster/<credential>`
+/// and is never handed [`Config::token`].
+#[derive(usage_rs::Args, Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+#[serde_with::skip_serializing_none]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+#[cfg(feature = "cluster-lan")]
+pub struct LanConfig {
+	/// Enable mDNS discovery. Boolean flag: pass `--cluster-lan` (or `=true` /
+	/// `=false`). Advertises the listener fingerprint when the certificate was
+	/// generated or supplied in-memory, the [`Config::node`] URL when one
+	/// is configured, and needs at least one of them.
+	#[usage(
+		name = "cluster-lan",
+		long = "cluster-lan",
+		env = "MOQ_CLUSTER_LAN",
+		setting = "cluster.lan.enabled",
+		bool_value
+	)]
+	pub enabled: bool,
+
+	/// The shared key admitting a peer to the LAN mesh, as 64 hexadecimal
+	/// characters or a path to a file containing them.
+	///
+	/// Optional. Without it, anyone who can reach the listener joins, so leave
+	/// it unset only on networks you trust. With it, only peers that prove they
+	/// hold the same key are discovered or accepted.
+	#[usage(
+		name = "cluster-lan-secret",
+		long = "cluster-lan-secret",
+		env = "MOQ_CLUSTER_LAN_SECRET",
+		value_name = "HEX_OR_PATH",
+		setting = "cluster.lan.secret"
+	)]
+	pub secret: Option<String>,
+
+	/// DNS-SD application this relay advertises under. Peers using a different
+	/// name never discover this one. Defaults to `default`, which moq-cli
+	/// shares so they find each other with no configuration. An application
+	/// built on the library picks its own name.
+	#[usage(
+		name = "cluster-lan-app",
+		long = "cluster-lan-app",
+		env = "MOQ_CLUSTER_LAN_APP",
+		value_name = "NAME",
+		setting = "cluster.lan.app"
+	)]
+	pub app: Option<moq_tokio::mdns::App>,
+}
+
+#[cfg(feature = "cluster-lan")]
+impl LanConfig {
+	/// Reject a secret or app configured without the mesh that would read it.
+	pub fn validate(&self) -> anyhow::Result<()> {
+		anyhow::ensure!(
+			self.secret.is_none() || self.enabled,
+			"--cluster-lan-secret requires --cluster-lan=true"
+		);
+		anyhow::ensure!(
+			self.app.is_none() || self.enabled,
+			"--cluster-lan-app requires --cluster-lan=true"
+		);
+		Ok(())
+	}
+}
+
+/// What a LAN advertisement publishes besides the listen port.
+///
+/// Pass to [`Cluster::with_advertise`] after the QUIC listener is bound. The
+/// fingerprint is the generated or in-memory certificate's, when there is one;
+/// a loaded certificate is dialed by name via [`Config::node`] instead.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct LanAdvertise {
+	/// The bound QUIC listen port, advertised as the DNS-SD SRV port.
+	pub port: u16,
+	/// Hex SHA-256 fingerprint of a generated or in-memory certificate, to pin when dialing.
+	pub fingerprint: Option<String>,
+}
+
+impl LanAdvertise {
+	/// Advertise this listen port, with no fingerprint.
+	pub fn new(port: u16) -> Self {
+		Self {
+			port,
+			fingerprint: None,
+		}
+	}
+
+	/// Pin this generated or in-memory certificate fingerprint when peers dial.
+	pub fn with_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+		self.fingerprint = Some(fingerprint.into());
+		self
+	}
+}
+
+/// The per-advertisement credential [`Connection::authenticate`] checks on
+/// `/.cluster/<credential>`. Shared via `Arc` so clones taken before
+/// [`Cluster::start`] still see it.
+#[cfg(feature = "cluster-lan")]
+struct LanAuth {
+	credential: String,
+}
+
+/// Construction settings for a [`Cluster`]: identity, discovery, and the origin cache.
+///
+/// The origin is built once from these, so cache settings cannot detach a handle
+/// taken after construction. Independent services ([`Cluster::with_connect`],
+/// [`Cluster::with_stats`]) attach afterwards without rebuilding it.
+#[derive(Default)]
+#[non_exhaustive]
+pub struct Options {
+	/// Request caps for ordinary client sessions.
+	pub session: crate::limits::Session,
+	/// Request caps and QUIC limits for authenticated peers and outbound cluster links.
+	pub peer: crate::limits::Peer,
+	/// Cluster identity, peers, and discovery.
+	pub config: Config,
+
+	/// Shared group pool and per-track retention ceiling.
+	///
+	/// `None` uses an unbounded pool with the standard LRU window and no
+	/// media-timestamp ceiling.
+	pub cache: Option<crate::cache::Cache>,
+}
+
+impl Options {
+	/// Construct from cluster config, leaving the origin cache at its defaults.
+	pub fn new(config: Config) -> Self {
+		Self {
+			config,
+			..Default::default()
+		}
+	}
+
+	/// Use this resolved cache when constructing the origin.
+	pub fn with_cache(mut self, cache: crate::cache::Cache) -> Self {
+		self.cache = Some(cache);
+		self
+	}
+}
+
+/// A [`Cluster`] whose config is validated and whose resources are bound,
+/// produced by [`Cluster::start`] and run with [`run`](Self::run).
+///
+/// It owns the cluster it came from rather than being handed back to one. The
+/// two carry matched state (a resolved node URL, a token, a live mDNS
+/// advertisement), so letting a caller pair them up would let one cluster run on
+/// another's identity, or a standalone startup silently disable a configured
+/// cluster. Owning it makes that unrepresentable instead of merely wrong.
+///
+/// Holding one means the config parsed and the LAN advertisement (if any) is
+/// live, so dropping it without running retires that advertisement.
+pub struct Started {
+	cluster: Cluster,
+	/// `None` when nothing is configured, so [`run`](Self::run) dials nothing.
+	work: Option<Work>,
+}
+
+impl Started {
+	/// True when nothing is configured, so [`run`](Self::run) dials nothing.
+	pub fn standalone(&self) -> bool {
+		self.work.is_none()
+	}
+
+	/// Run the cluster until it stops, or until a task it cannot serve without (its
+	/// origin driver, cache governor, or certificate reload) panics.
+	///
+	/// Standalone, this only waits for such a panic. Returning, a failure
+	/// included, closes every dial as [`Cluster::close`] does. A cancelled `run`
+	/// starts each link's close but cannot wait for it, so a caller that must have
+	/// peers told before exiting awaits [`Cluster::close`] or lets `run` return.
+	pub async fn run(self) -> anyhow::Result<()> {
+		// Registered only now, so a start that fails or never runs drops its client
+		// and frees the bind. A closed cluster has nothing left to run.
+		if let Some(dial) = &self.cluster.dial
+			&& self.cluster.dialers.insert(dial).is_err()
+		{
+			return Ok(());
+		}
+		let critical = self.cluster.critical.clone();
+		let dialers = self.cluster.dialers.clone();
+		let work = async move {
+			match self.work {
+				Some(work) => self.cluster.run_work(work).await,
+				None => std::future::pending().await,
+			}
+		};
+		let result = tokio::select! {
+			res = work => res,
+			err = critical.failed() => Err(err),
+		};
+		// The dial tasks went with `work`, and a caller that consumed the cluster
+		// has no handle left to close it, so each peer gets its close here.
+		dialers.close().await;
+		result
+	}
+}
+
+/// Hand-written because the bound mDNS advertisement isn't `Debug`, and the
+/// contents are internal anyway: what a reader wants is whether there is
+/// anything to run.
+impl std::fmt::Debug for Started {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Started")
+			.field("standalone", &self.work.is_none())
+			.finish()
+	}
+}
+
+/// The resolved settings behind a [`Started`] that has work to do.
+struct Work {
+	node: Option<String>,
+	token: String,
+	http: Option<ClientWithMiddleware>,
+	/// The live mDNS advertisement, bound by [`Cluster::start`].
+	#[cfg(feature = "cluster-lan")]
+	discovery: Option<moq_tokio::mdns::Discovery>,
 }
 
 /// A relay cluster built around a single [`origin::Producer`].
 ///
 /// Local sessions and remote cluster connections all publish into the same
 /// origin. Loop prevention and route preference come from the hop list carried
-/// on each broadcast's route (see [`moq_net::broadcast::Route`]).
+/// on each announced route (see [`moq_net::origin::Route`]).
 ///
-/// Construct with [`Cluster::new`], then attach a QUIC client and (optionally)
+/// Construct with [`Cluster::new`], then attach a dial template and (optionally)
 /// a [`stats::Registry`](moq_net::stats::Registry) with the `with_*` builder
-/// methods. A cluster without a client can serve local sessions but cannot
-/// dial remote peers.
+/// methods. Those builders do not rebuild the origin. A cluster without a
+/// dial template can serve local sessions but cannot dial remote peers.
 #[derive(Clone)]
 pub struct Cluster {
-	config: ClusterConfig,
-	client: Option<moq_native::Client>,
+	session_limits: moq_net::session::Limits,
+	peer_limits: moq_net::session::Limits,
+	peer_quic: crate::limits::Quic,
+	config: Config,
+	/// Dial template every peer dial is built from; see [`Self::peer_client`].
+	connect: Option<moq_tokio::connect::Config>,
+	quic: Option<moq_tokio::quic::Config>,
+	#[cfg(feature = "iroh")]
+	iroh: Option<moq_tokio::iroh::Endpoint>,
+	/// The client static and API peers share, on the template's bind address, so
+	/// a fixed `[connect]` bind port stays the cluster's egress port. Built by
+	/// [`Self::start`] and joins [`Self::dialers`] once [`Started::run`] begins.
+	dial: Option<moq_tokio::Client>,
+	/// Every dial client, shared by all clones, for [`Self::close`].
+	dialers: Dialers,
+	/// Bound listen port and optional generated-certificate fingerprint.
+	advertise: Option<LanAdvertise>,
+	/// Set by [`Self::start`] when LAN discovery is on, so inbound
+	/// `/.cluster/<credential>` can be verified on every clone.
+	#[cfg(feature = "cluster-lan")]
+	lan_auth: Arc<std::sync::OnceLock<LanAuth>>,
 	pub(crate) nodes: crate::nodes::Nodes,
+
+	/// Sessions admission turned away, by reason. Shared by every listener and
+	/// runtime so `/metrics` sees every refusal on the node.
+	pub(crate) refusals: crate::refusals::Refusals,
 
 	/// Hands out the `conn` id every session logs under, inbound and outbound
 	/// alike, so one id space covers the whole process and an id in the `/nodes`
 	/// view always points at the same session in the logs.
 	connection_ids: Arc<AtomicU64>,
 
-	/// The origin's construction config (identity, cache pool, linger). Kept so
-	/// the `with_*` builders can rebuild the origin without losing each other's
-	/// settings.
-	info: origin::Info,
-
 	/// Client TLS config used to build the `--cluster-connect-api` HTTP client, so
 	/// peer-list fetches present the same cluster cert the QUIC dials do. `Arc` so
 	/// cloning a `Cluster` per connection stays cheap.
 	client_tls: Option<Arc<rustls::ClientConfig>>,
+
+	/// The origin driver, cache governor, and certificate reload: a panic in any
+	/// of them stops [`Relay::run`](crate::Relay::run).
+	pub(crate) critical: crate::critical::Critical,
 
 	/// All broadcasts, local and remote. Downstream sessions read from here
 	/// (filtered by their auth token) and remote dials both read and write here.
@@ -529,72 +1147,253 @@ pub struct Cluster {
 	_stats_publisher: Option<moq_stats::Producer>,
 }
 
+/// A gateway or network session admitted with its lease, scoped origins, and stats.
+#[non_exhaustive]
+pub struct Admitted {
+	/// The live authorization that must be held for the session's lifetime.
+	pub lease: auth::Lease,
+	/// Where an admitted publisher writes its broadcasts.
+	pub publisher: Option<origin::Producer>,
+	/// Where an admitted subscriber reads broadcasts.
+	pub subscriber: Option<origin::Consumer>,
+	/// The session's root and tier attribution.
+	pub stats: moq_net::stats::Session,
+}
+
 impl Cluster {
-	/// Creates a new cluster with a fresh origin and no peers, client, or stats.
+	/// The request caps for an admitted session: only a `peer` grant gets the peer policy.
+	pub(crate) fn limits(&self, lease: &auth::Lease) -> moq_net::session::Limits {
+		if lease.token().peer {
+			self.peer_limits
+		} else {
+			self.session_limits
+		}
+	}
+
+	/// The QUIC limits an admitted session widens to, if any: only a `peer` grant does.
+	#[cfg(any(feature = "quic", all(target_os = "linux", feature = "_uring")))]
+	pub(crate) fn quic_limits(&self, lease: &auth::Lease) -> Option<moq_quic::Limits> {
+		lease.token().peer.then(|| self.peer_quic.limits())
+	}
+
+	/// The origin ID used by this relay on the wire.
+	pub fn id(&self) -> u64 {
+		self.origin.hop().id()
+	}
+
+	/// Creates a cluster with one origin, using [`Options`] for identity
+	/// and cache.
 	///
-	/// Use [`with_client`](Self::with_client) to enable dialing remote peers
+	/// Use [`with_connect`](Self::with_connect) to enable dialing remote peers
 	/// (required when `config.connect` is non-empty), and
-	/// [`with_stats`](Self::with_stats) to enable metrics publishing.
+	/// [`with_stats`](Self::with_stats) to enable metrics publishing. Those
+	/// builders do not rebuild the origin.
+	///
+	/// Must be called within a tokio runtime: the origin's lifecycle driver is
+	/// spawned here, so the origin serves sessions whether or not
+	/// [`start`](Self::start) (the mesh half) is ever called.
 	///
 	/// Errors if `config.id` is set but invalid: it must be non-zero and below
 	/// 2^62 (the wire varint limit). An unset id picks a fresh random origin.
-	pub fn new(config: ClusterConfig) -> anyhow::Result<Self> {
+	/// Errors too if the `peer.quic` receive window does not fit a QUIC varint.
+	pub fn new(options: Options) -> anyhow::Result<Self> {
+		let Options {
+			config,
+			cache,
+			session,
+			peer,
+		} = options;
 		let id = match config.id {
 			Some(0) => anyhow::bail!("--cluster-id must be non-zero"),
 			Some(id) if id >= 1 << 62 => {
 				anyhow::bail!("--cluster-id must be below 2^62 (wire varint limit), got {id}")
 			}
-			Some(id) => Origin::new(id).expect("cluster id already validated"),
-			None => Origin::random(),
+			Some(id) => Hop::new(id).expect("cluster id already validated"),
+			None => Hop::random(),
 		};
-		let info = origin::Info::new(id).with_linger(config.linger.unwrap_or(DEFAULT_LINGER));
-		let origin = info.clone().produce();
-		let nodes = crate::nodes::Nodes::new(origin.clone());
-		tracing::info!(origin_id = %origin.id(), configured = config.id.is_some(), "cluster initialized");
+		let deprecated = config.deprecated();
+		anyhow::ensure!(deprecated.is_empty(), "{deprecated}");
+		// Reject a repeated static identity with conflicting policy up front,
+		// matching the `--cluster-connect-api` validation, instead of silently
+		// keeping the first entry when dials spawn.
+		parse_peer_list(config.connect.clone(), None).context("invalid --cluster-connect peer list")?;
+		peer.quic.validate()?;
+		let critical = crate::critical::Critical::default();
+		let mut origin_config = origin::Config::new(id);
+		if let Some(cache) = cache {
+			origin_config.pool = cache.pool;
+			origin_config.cache_duration = cache.duration;
+			if let Some(governor) = cache.governor {
+				critical.spawn("cache governor", governor);
+			}
+		}
+		let (origin, driver) = origin::Producer::new(origin_config);
+		critical.spawn("origin driver", async move {
+			moq_net::time::run(driver).await;
+		});
+		let nodes = crate::nodes::Nodes::default();
+		tracing::info!(hop_id = %origin.hop(), configured = config.id.is_some(), "cluster initialized");
 		Ok(Cluster {
+			session_limits: session.resolve(),
+			peer_limits: peer.resolve(),
+			peer_quic: peer.quic,
 			config,
-			client: None,
+			connect: None,
+			quic: None,
+			dial: None,
+			dialers: Dialers::new(),
+			#[cfg(feature = "iroh")]
+			iroh: None,
+			advertise: None,
+			#[cfg(feature = "cluster-lan")]
+			lan_auth: Arc::new(std::sync::OnceLock::new()),
 			nodes,
+			refusals: Default::default(),
 			connection_ids: Arc::default(),
 			client_tls: None,
-			info,
+			critical,
 			origin,
 			stats: moq_net::stats::Registry::disabled(),
 			_stats_publisher: None,
 		})
 	}
 
-	/// Attach the resolved [`Cache`](crate::Cache) (the shared group pool and the
-	/// per-track retention ceiling) so every session's broadcasts cache into one
-	/// memory budget bounded by both bytes and age. Call before deriving any origin
-	/// handles (e.g. [`with_stats`](Self::with_stats)) so they inherit the settings.
+	/// Admit a gateway session and scope both origin directions from its grant.
+	pub async fn admit(&self, auth: &auth::Auth, request: moq_auth::Request) -> Result<Admitted, auth::Error> {
+		let result = async {
+			if !matches!(request.event, moq_auth::Event::Connect) {
+				return Err(auth::Error::Request("admission requires a connect event".into()));
+			}
+			let lease = auth.admit(request.clone()).await?;
+			self.scope(lease, &request)
+		}
+		.await;
+		result.inspect_err(|err| self.refusals.record_auth(err))
+	}
+
+	/// Network sessions enforce changing grants in AUTH, within a fixed root and SETUP role.
+	pub(crate) async fn admit_session(
+		&self,
+		auth: &auth::Auth,
+		request: moq_auth::Request,
+	) -> Result<Admitted, auth::Error> {
+		let result = async {
+			let lease = auth.admit(request.clone()).await?;
+			self.scope_session(lease, &request)
+		}
+		.await;
+		result.inspect_err(|err| self.refusals.record_auth(err))
+	}
+
+	pub(crate) fn scope_session(
+		&self,
+		lease: auth::Lease,
+		request: &moq_auth::Request,
+	) -> Result<Admitted, auth::Error> {
+		let mut admitted = self.scope(lease, request)?;
+		let mut bound = admitted.lease.token().clone();
+		bound.publish = moq_net::Pattern::all().into();
+		bound.subscribe = moq_net::Pattern::all().into();
+		if request.role != Some(moq_auth::Role::Subscriber) {
+			admitted.publisher = self
+				.publisher(&bound)
+				.map(|origin| origin.with_stats(admitted.stats.clone()));
+		}
+		if request.role != Some(moq_auth::Role::Publisher) {
+			admitted.subscriber = self.subscriber(&bound).map(|origin| {
+				origin
+					.consume()
+					.with_hidden(request.tls.is_some() || Self::is_lan_path(&request.path))
+					.with_stats(admitted.stats.clone())
+			});
+		}
+		Ok(admitted)
+	}
+
+	/// Resolve origin handles for a lease already admitted by a local relay rule.
+	pub(crate) fn scope(&self, lease: auth::Lease, request: &moq_auth::Request) -> Result<Admitted, auth::Error> {
+		let token = lease.token();
+		token.uncapped()?;
+		let publisher = self.publisher(token);
+		let subscriber = self.subscriber(token);
+		let allowed = match request.role {
+			Some(moq_auth::Role::Publisher) => publisher.is_some(),
+			Some(moq_auth::Role::Subscriber) => subscriber.is_some(),
+			None => publisher.is_some() || subscriber.is_some(),
+		};
+		if !allowed {
+			let wanted = match request.role {
+				Some(moq_auth::Role::Publisher) => "publisher",
+				Some(moq_auth::Role::Subscriber) => "subscriber",
+				None => "any",
+			};
+			return Err(auth::Error::Forbidden(format!(
+				"grant does not allow {wanted} access to {}",
+				token.root
+			)));
+		}
+
+		let stats = self.stats.tier(token.tier.clone()).session(&token.label);
+		tracing::info!(transport = %request.transport, ?request.role, tier = %token.tier, root = %token.root,
+			publish = ?publisher.as_ref().map(origin::Producer::allowed),
+			subscribe = ?subscriber.as_ref().map(origin::Producer::allowed),
+			"session accepted");
+		let publisher = match request.role {
+			Some(moq_auth::Role::Subscriber) => None,
+			_ => publisher.map(|origin| origin.with_stats(stats.clone())),
+		};
+		// An authenticated cluster peer (a verified client certificate or the LAN
+		// credential) discovers hidden routes whether or not it asks. A peer that
+		// predates the hidden opt-in (below moq-lite-07-wip, or moq-transport without
+		// MoQ Hidden) would otherwise lose every dot path during a rolling upgrade.
+		// TODO: drop the exemption once deployed peers all opt in.
+		let cluster_peer = request.tls.is_some() || Self::is_lan_path(&request.path);
+		let subscriber = match request.role {
+			Some(moq_auth::Role::Publisher) => None,
+			_ => subscriber.map(|origin| origin.consume().with_hidden(cluster_peer).with_stats(stats.clone())),
+		};
+		Ok(Admitted {
+			lease: lease.with_stats(stats.clone()),
+			publisher,
+			subscriber,
+			stats,
+		})
+	}
+
+	/// Attach the dial template every peer dial is built from, with the
+	/// [`Options::peer`] QUIC limits. Static and API peers share one socket on its
+	/// bind address; each LAN dial takes an ephemeral port.
 	///
-	/// Rebuilds the origin with the cache: safe because the cluster's origin is
-	/// still pristine here (no broadcasts published, no scopes derived).
-	pub fn with_cache(mut self, cache: crate::Cache) -> Self {
-		self.info = self
-			.info
-			.clone()
-			.with_pool(cache.pool)
-			.with_cache_duration(cache.duration);
-		self.origin = self.info.clone().produce();
-		self.nodes = self.nodes.with_origin(self.origin.clone());
+	/// Required when any peer is configured; [`start`](Self::start) returns an
+	/// error otherwise.
+	pub fn with_connect(mut self, connect: moq_tokio::connect::Config, quic: moq_tokio::quic::Config) -> Self {
+		self.connect = Some(connect);
+		self.quic = Some(quic);
 		self
 	}
 
-	/// Attach a QUIC client used to dial cluster peers.
+	/// Dial `iroh://` peers through this endpoint.
+	#[cfg(feature = "iroh")]
+	pub fn with_iroh(mut self, iroh: moq_tokio::iroh::Endpoint) -> Self {
+		self.iroh = Some(iroh);
+		self
+	}
+
+	/// Advertise this bound listener on the LAN.
 	///
-	/// Required when `config.connect` is non-empty; [`run`](Self::run) returns
-	/// an error otherwise.
-	pub fn with_client(mut self, client: moq_native::Client) -> Self {
-		self.client = Some(client);
+	/// Required when `--cluster-lan` is on; [`start`](Self::start) returns an
+	/// error otherwise. The fingerprint is set when the certificate was
+	/// generated or supplied in-memory, so peers can pin it.
+	pub fn with_advertise(mut self, advertise: LanAdvertise) -> Self {
+		self.advertise = Some(advertise);
 		self
 	}
 
 	/// Attach the client TLS config used for `--cluster-connect-api` peer-list
-	/// fetches. Required when `config.connect_api` is set; pass the same config
-	/// used to build the QUIC [`with_client`](Self::with_client) so the endpoint
-	/// sees this relay's cluster certificate.
+	/// fetches. Only its client identity is shared; the API has separate server
+	/// trust and verifies the hostname in its URL. Required for an HTTP(S) API; pass the TLS config of
+	/// the [`with_connect`](Self::with_connect) template so the endpoint sees this
+	/// relay's cluster certificate.
 	pub fn with_client_tls(mut self, tls: rustls::ClientConfig) -> Self {
 		self.client_tls = Some(Arc::new(tls));
 		self
@@ -603,9 +1402,9 @@ impl Cluster {
 	/// Reserve the next `conn` id, the handle a session is logged under.
 	///
 	/// One counter serves inbound accepts and outbound cluster dials, so an id in
-	/// the internal `/nodes` view names exactly one session in the logs. Use it for
-	/// the [`Connection::id`](crate::Connection::id) of every request you accept,
-	/// rather than counting separately.
+	/// the internal `/nodes` view names exactly one session in the logs. Pass it to
+	/// [`Connection::with_id`](crate::Connection::with_id) for every request you
+	/// accept, rather than counting separately.
 	pub fn next_connection_id(&self) -> u64 {
 		self.connection_ids.fetch_add(1, Ordering::Relaxed)
 	}
@@ -613,12 +1412,13 @@ impl Cluster {
 	/// Attach a stats producer, replacing the default disabled registry with its
 	/// registry and taking over keeping its publish task alive.
 	///
-	/// Build one with [`StatsConfig::build`](crate::StatsConfig::build), passing
+	/// Build one with [`stats::Config::build`](crate::stats::Config::build), passing
 	/// [`Self::origin`] so it publishes through the same origin cluster peers read
 	/// from. The cluster holds the producer from here on, so the caller may drop
 	/// its own handle: publishing lasts exactly as long as the cluster does.
 	pub fn with_stats(mut self, stats: moq_stats::Producer) -> Self {
 		self.stats = stats.registry().clone();
+		self.refusals = crate::refusals::Refusals::new(&self.stats);
 		self._stats_publisher = Some(stats);
 		self
 	}
@@ -632,77 +1432,184 @@ impl Cluster {
 	/// Returns an [`origin::Producer`] scoped to this session's subscribe permissions.
 	///
 	/// Passed by reference to [`moq_net::Server::with_publisher`] (or the
-	/// equivalent per-request setter), which derives the read handle.
-	pub fn subscriber(&self, token: &AuthToken) -> Option<origin::Producer> {
-		self.origin.with_root(&token.root)?.scope(&token.subscribe)
+	/// equivalent per-request setter), which derives the read handle. On an
+	/// upstream grant that handle never sees a route learned from another upstream.
+	pub fn subscriber(&self, token: &auth::Token) -> Option<origin::Producer> {
+		self.mounted(token)?.scope(&token.root, &token.subscribe.path).ok()
 	}
 
-	/// Returns an [`origin::Producer`] scoped to this session's publish permissions.
-	pub fn publisher(&self, token: &AuthToken) -> Option<origin::Producer> {
-		self.origin.with_root(&token.root)?.scope(&token.publish)
+	/// Returns an [`origin::Producer`] scoped to this session's publish permissions,
+	/// marked [`origin::Producer::peer`] when the grant names a cluster peer and
+	/// [`origin::Producer::upstream`] when that peer is upstream.
+	/// Nothing is published beneath the grant's mounts.
+	pub fn publisher(&self, token: &auth::Token) -> Option<origin::Producer> {
+		self.mounted(token)?.scope(&token.root, &token.publish.path).ok()
 	}
 
-	/// Resolve whether gossip is on and which URL this relay advertises, from
-	/// `cluster.node` and the (string-typed) `cluster.mesh` toggle.
-	///
-	/// `mesh` is `"true"` / `"false"` normally. For backwards compatibility a
-	/// non-boolean value is the legacy "advertise this URL" form: it turns gossip
-	/// on and supplies the node URL (with a deprecation warning), unless it
-	/// conflicts with an explicit `cluster.node`, which is an error.
-	fn resolve_mesh(&self) -> anyhow::Result<(bool, Option<String>)> {
-		let node = self.config.node.clone();
-		match self.config.mesh.as_deref() {
-			None => Ok((false, node)),
-			Some("true") => Ok((true, node)),
-			Some("false") => Ok((false, node)),
-			Some(legacy) => {
-				tracing::warn!(
-					value = %legacy,
-					"`--cluster-mesh` is now a boolean; treating the value as `--cluster-node` for backwards \
-					 compatibility. Set `--cluster-node <url>` and `--cluster-mesh` instead."
-				);
-				match &node {
-					Some(node) if node != legacy => anyhow::bail!(
-						"`--cluster-mesh` was given URL {legacy:?}, which conflicts with `--cluster-node` {node:?}. \
-						 `--cluster-mesh` is now a boolean; set the address only via `--cluster-node`."
-					),
-					_ => Ok((true, Some(legacy.to_owned()))),
+	/// The origin marked with the grant's link and with its mounts applied,
+	/// before it is scoped to the session. A mount the origin refuses
+	/// (overlapping another) admits nothing.
+	fn mounted(&self, token: &auth::Token) -> Option<origin::Producer> {
+		let mut origin = match (token.upstream, token.peer) {
+			(true, _) => self.origin.clone().upstream(),
+			(false, true) => self.origin.clone().peer(),
+			(false, false) => self.origin.clone(),
+		};
+		for (at, target) in &token.mounts {
+			origin = match origin.mount(token.root.join(at), target) {
+				Ok(origin) => origin,
+				Err(err) => {
+					tracing::warn!(root = %token.root, %at, %target, %err, "grant mount refused");
+					return None;
 				}
+			};
+		}
+		Some(origin)
+	}
+
+	/// Whether `--cluster-lan` asked this relay to discover peers over mDNS.
+	fn lan(&self) -> bool {
+		#[cfg(feature = "cluster-lan")]
+		return self.config.lan.enabled;
+		#[cfg(not(feature = "cluster-lan"))]
+		false
+	}
+
+	/// The credential a LAN path carries, if `path` is `/.cluster/<credential>`.
+	///
+	/// `/.cluster` and `/.cluster/` with no credential, and a path that merely
+	/// starts with those letters (`/.clusterish`), yield `None`.
+	pub(crate) fn lan_credential(path: &str) -> Option<&str> {
+		let rest = path.strip_prefix(CLUSTER_PATH)?;
+		match rest.strip_prefix('/') {
+			Some(credential) if !credential.is_empty() => Some(credential),
+			_ => None,
+		}
+	}
+
+	/// Whether `path` is the LAN mesh marker, with or without a credential.
+	pub fn is_lan_path(path: &str) -> bool {
+		path == CLUSTER_PATH || path.starts_with(concat!("/.cluster", "/"))
+	}
+
+	/// Verify a presented `/.cluster/<credential>` against the live advertisement.
+	///
+	/// `None` means this cluster has no LAN discovery, so the path must be
+	/// refused rather than routed through JWT or public prefixes.
+	#[cfg(feature = "cluster-lan")]
+	pub(crate) fn verify_lan_credential(&self, presented: &str) -> Option<bool> {
+		self.lan_auth
+			.get()
+			.map(|auth| moq_tokio::mdns::ct_eq(&auth.credential, presented))
+	}
+
+	/// Verify a presented `/.cluster/<credential>` against the live advertisement.
+	///
+	/// Without the `cluster-lan` feature there is no discovery to consult.
+	#[cfg(not(feature = "cluster-lan"))]
+	pub(crate) fn verify_lan_credential(&self, _presented: &str) -> Option<bool> {
+		None
+	}
+
+	/// The grant a LAN peer gets once its membership proof checks out: everything,
+	/// billed under `--cluster-tier`. The proof is a secret this relay minted for
+	/// itself, so no auth server is asked.
+	pub(crate) fn lan_peer_grant(&self) -> moq_auth::Grant {
+		let mut grant = moq_auth::Grant::new(moq_auth::Pattern::all(), moq_auth::Pattern::all());
+		grant.tier = self.config.tier.clone().filter(|tier| !tier.is_empty());
+		grant.peer = true;
+		grant
+	}
+
+	/// Whether a protocol version carries the request path used to mark a mesh dial.
+	pub(crate) fn carries_request_path(version: &moq_net::Version) -> bool {
+		!version.is_lite() || version.code() >= 0xff0dad05
+	}
+
+	/// Reject version restrictions that leave a LAN dial with no request path.
+	pub fn validate_lan_versions(
+		client: &moq_tokio::connect::Config,
+		server: &moq_tokio::listen::Config,
+	) -> anyhow::Result<()> {
+		let client = client.versions();
+		let server = server.versions();
+		anyhow::ensure!(
+			client
+				.iter()
+				.any(|version| Self::carries_request_path(version) && server.contains(version)),
+			"--cluster-lan needs --connect-version and --listen-version to share a version that carries a request path (moq-lite-05 and newer, or any moq-transport version)"
+		);
+		Ok(())
+	}
+
+	/// Close every peer link this cluster dialed, on any transport, and wait until
+	/// each peer has been sent its close. Call it before the runtime stops: a
+	/// dropped link only queues its close, so the peer would keep the link and its
+	/// routes until its idle timeout. Dialing stops for good, on every clone, and
+	/// every caller waits for the same shutdown. [`Relay::run`](crate::Relay::run)
+	/// calls it on the way out.
+	pub async fn close(&self) {
+		self.dialers.close().await;
+	}
+
+	/// Validate the cluster config and bind anything that can fail, returning a
+	/// [`Started`] to run.
+	///
+	/// Split from running because that future is first polled well after the
+	/// process reports itself ready. Anything fallible left inside it (a malformed
+	/// node URL, an unreadable token file, a bad LAN key, an mDNS bind failure)
+	/// would release systemd's dependent units on a relay that is about to exit.
+	/// Call this before signalling readiness, and hand the result to `run`.
+	///
+	/// Bails when peers are configured to dial but no usable dial template was
+	/// attached via [`with_connect`](Self::with_connect).
+	pub async fn start(mut self) -> anyhow::Result<Started> {
+		let node = self.config.node.clone();
+		let lan = self.lan();
+		#[cfg(feature = "cluster-lan")]
+		self.config.lan.validate()?;
+		#[cfg(feature = "cluster-lan")]
+		if lan {
+			let advertise = self.advertise.as_ref();
+			anyhow::ensure!(
+				advertise.is_some(),
+				"`--cluster-lan` needs a QUIC listener (call Cluster::with_advertise). \
+				 See https://doc.moq.dev/bin/relay/cluster."
+			);
+			anyhow::ensure!(
+				advertise.is_some_and(|a| a.fingerprint.is_some()) || node.is_some(),
+				"`--cluster-lan` needs `--cluster-node <self-url>` or a generated certificate to advertise. \
+				 See https://doc.moq.dev/bin/relay/cluster."
+			);
+			if let Some(connect) = &self.connect {
+				anyhow::ensure!(
+					connect.versions().iter().any(Self::carries_request_path),
+					"--cluster-lan needs --connect-version to include a version that carries a request path (moq-lite-05 and newer, or any moq-transport version)"
+				);
+			} else {
+				anyhow::bail!("`--cluster-lan` needs a dial template (call Cluster::with_connect)");
 			}
 		}
-	}
 
-	/// Runs the cluster event loop.
-	///
-	/// Modes are derived from config: standalone (no work) returns immediately;
-	/// passive rendezvous (`node` + `mesh` gossip, no peers to dial) parks after
-	/// publishing self-registration and does not require a QUIC client; active
-	/// (`connect` / `connect_api` set) dials peers and, when `mesh` gossip is on,
-	/// also advertises `node` and runs discovery.
-	///
-	/// Bails when `mesh` gossip is on without `node`, or when peers are configured
-	/// to dial but no client was attached via [`with_client`](Self::with_client).
-	pub async fn run(self) -> anyhow::Result<()> {
-		let (gossip, node) = self.resolve_mesh()?;
-		anyhow::ensure!(
-			!gossip || node.is_some(),
-			"`--cluster-mesh` (gossip) requires `--cluster-node <self-url>` so there's an address to advertise. \
-			 See https://doc.moq.dev/bin/relay/cluster."
-		);
-
-		let has_outbound = !self.config.connect.is_empty() || self.config.connect_api.is_some();
-		let has_work = has_outbound || gossip;
-		if !has_work {
+		let can_dial = !self.config.connect.is_empty() || self.config.connect_api.is_some() || lan;
+		if !can_dial {
 			tracing::info!("no cluster peers configured; running standalone");
-			return Ok(());
+			return Ok(Started {
+				work: None,
+				cluster: self,
+			});
 		}
 
-		if has_outbound {
-			anyhow::ensure!(
-				self.client.is_some(),
-				"cluster peers configured but no QUIC client attached (call Cluster::with_client)"
-			);
-		}
+		// Build here so malformed API roots fail startup, before background work.
+		let http = if self.config.connect_api.as_deref().is_some_and(connect_api_is_http) {
+			let tls = self
+				.client_tls
+				.as_ref()
+				.context("cluster.connect_api with an http(s) URL needs client TLS (call Cluster::with_client_tls)")?;
+			Some(crate::http_client::build(tls, &self.config.connect_api_tls_root)?)
+		} else {
+			None
+		};
 
 		// Token presented on outbound dials whose URL doesn't already carry a
 		// `?jwt=`. This remains the shared credential for any peer without a
@@ -715,27 +1622,78 @@ impl Cluster {
 			None => String::new(),
 		};
 
-		// Static `--cluster-connect` peers and gossip-discovered peers share one
-		// dial map so a peer reached via both paths only opens a single dial.
-		// Gossip-driven unannounces don't abort immediately. The discovery loop
-		// runs a periodic sweep that only aborts entries whose unannounce has
-		// stuck for [`STALE_AFTER`]. That filters out the prefer-shorter-hop flap
-		// (sub-millisecond unannounce-then-announce) while still cleaning up
-		// peers that truly left.
+		// Binds the multicast socket and reads the key, so it belongs here rather
+		// than in `run`: both fail loudly, and the whole point of `--cluster-lan` is
+		// that a relay which cannot join the mesh is misconfigured, not degraded.
+		#[cfg(feature = "cluster-lan")]
+		let discovery = match lan {
+			true => {
+				let advertise = self
+					.advertise
+					.as_ref()
+					.expect("--cluster-lan needs Cluster::with_advertise");
+				let secret = self.config.lan.secret.as_deref();
+				let app = self.config.lan.app.clone().unwrap_or_default();
+				Some(lan_discovery(advertise, node.as_deref(), secret, app).await?)
+			}
+			false => None,
+		};
+
+		// Built here, so a bad template fails startup rather than every dial, and
+		// last, so a start that fails earlier never binds a fixed `[connect]` port.
+		// Static and API peers share this client; LAN dials each build their own,
+		// so a LAN-only node builds one only to check the template.
+		let statics = !self.config.connect.is_empty() || self.config.connect_api.is_some();
+		let client = self
+			.peer_client(!statics, None)
+			.context("cluster peers configured but the dial template is unusable")?;
+		self.dial = statics.then_some(client);
+
+		// After everything fallible, so a failed start leaves no credential behind.
+		#[cfg(feature = "cluster-lan")]
+		if let Some(discovery) = &discovery {
+			let _ = self.lan_auth.set(LanAuth {
+				credential: discovery.credential().to_string(),
+			});
+		}
+
+		Ok(Started {
+			work: Some(Work {
+				http,
+				node,
+				token,
+				#[cfg(feature = "cluster-lan")]
+				discovery,
+			}),
+			cluster: self,
+		})
+	}
+
+	/// Runs the cluster event loop against the work [`start`](Self::start)
+	/// resolved: dials the static peers, then keeps the `connect_api` list and
+	/// LAN discovery reconciled into the same dial set.
+	async fn run_work(self, work: Work) -> anyhow::Result<()> {
+		let Work {
+			http,
+			node,
+			token,
+			#[cfg(feature = "cluster-lan")]
+			discovery,
+		} = work;
+
+		// Every source shares one dial map so a peer reached via several only
+		// opens a single dial.
 		let dialed = DialMap::default();
 		let mut tasks = tokio::task::JoinSet::new();
+		// Tasks whose ending is a failure rather than an ordinary lifecycle event,
+		// so their result has to be looked at instead of drained.
+		#[allow(unused_mut, reason = "only the cluster-lan feature spawns into it")]
+		let mut supervised: tokio::task::JoinSet<anyhow::Result<()>> = tokio::task::JoinSet::new();
 
 		for peer in &self.config.connect {
-			let target = DialTarget::parse(peer).context("invalid --cluster-connect peer URL")?;
+			let target = DialTarget::from_peer(peer).context("invalid --cluster-connect peer URL")?;
 			if dialed.contains(&target.key) {
 				continue;
-			}
-			if is_legacy_peer(peer) {
-				tracing::warn!(
-					%peer,
-					"DEPRECATED: pass --cluster-connect as a full URL like \"https://<host>/?jwt=TOKEN\"; \
-					 a bare host or \"host:port\" is deprecated and will be removed in a future release"
-				);
 			}
 			let this = self.clone();
 			let token = token.clone();
@@ -745,161 +1703,99 @@ impl Cluster {
 		}
 
 		if let Some(source) = self.config.connect_api.clone() {
-			// Only http(s) sources need the TLS client; a local file doesn't.
-			anyhow::ensure!(
-				!connect_api_is_http(&source) || self.client_tls.is_some(),
-				"cluster.connect_api with an http(s) URL needs client TLS (call Cluster::with_client_tls)"
-			);
 			let this = self.clone();
 			let token = token.clone();
 			let dialed = dialed.clone();
 			let node = node.clone();
 			tasks.spawn(async move {
-				this.run_connect_api(source, node, token, dialed).await;
+				this.run_connect_api(source, node, token, dialed, http).await;
 			});
 		}
 
-		// Held in scope so the registration stays announced until `run` exits.
-		// Discovery is paired with it: a gossip-only relay (passive rendezvous) has
-		// nothing to discover, so we only run it when we also have an outbound peer.
-		let self_registration: Option<moq_net::broadcast::Producer> = if gossip {
-			// Checked above: gossip requires `node`.
-			let node = node.as_deref().expect("gossip requires --cluster-node");
-			let path = Path::new(MESH_PREFIX).join(node);
-			let broadcast = self
-				.origin
-				.create_broadcast(&path, moq_net::broadcast::Route::new().with_announce(true))
-				.expect(".internal/origins is within the relay origin's root");
-			tracing::info!(%node, %path, "advertising cluster node URL");
-
-			if has_outbound {
-				let this = self.clone();
-				let token = token.clone();
-				let dialed = dialed.clone();
-				// Canonical, so the tiebreaker compares the same spelling both sides do.
-				let self_url = canonicalize_peer_key(node);
-				tasks.spawn(async move {
-					this.run_discovery(self_url, token, dialed).await;
-				});
-			}
-
-			Some(broadcast)
-		} else {
-			None
-		};
-
-		if tasks.is_empty() {
-			// Passive rendezvous: park to keep `self_registration` alive. The
-			// process still exits via the other arms of `tokio::select!` in main.
-			std::future::pending::<()>().await
+		#[cfg(feature = "cluster-lan")]
+		if let Some(discovery) = discovery {
+			let this = self.clone();
+			let dialed = dialed.clone();
+			// Supervised rather than fire-and-forget: a dial task ending is ordinary
+			// (that peer went away), but discovery ending is the relay going blind.
+			supervised.spawn(async move { this.run_mdns(dialed, discovery).await });
 		}
 
-		while tasks.join_next().await.is_some() {}
-
-		// Deliberate shutdown: finish the registration rather than dropping it, so
-		// there is no dropped-without-finish warning.
-		if let Some(mut registration) = self_registration {
-			registration.finish();
+		loop {
+			tokio::select! {
+				// A supervised task ending at all is a failure, so its result decides
+				// the cluster's. A panic surfaces too rather than being swallowed.
+				Some(res) = supervised.join_next() => res.context("cluster task panicked")??,
+				// A dial task ending is ordinary: that peer went away. A panic is not:
+				// each dial attempt contains its own, so one here is in the loop itself.
+				Some(res) = tasks.join_next() => if let Err(err) = res && err.is_panic() {
+					return Err(err).context("cluster task panicked");
+				},
+				else => break,
+			}
 		}
 		Ok(())
 	}
 
-	/// Watch `.internal/origins/*` for peer registrations and dial each newly-
-	/// announced URL that sorts after our own (see [`should_dial`]); the peer on
-	/// the other side of that comparison dials us, so each pair opens one session
-	/// instead of two. Unannounces don't abort immediately. They just mark the
-	/// entry as "pending cleanup" with a timestamp. A periodic sweep evicts
-	/// entries whose unannounce has stuck for [`STALE_AFTER`]. The "prefer
-	/// shorter hop" path in origin::Producer delivers re-announces as
-	/// unannounce-then-announce within sub-milliseconds, which clears the
-	/// pending-cleanup timestamp long before the sweep fires.
-	async fn run_discovery(self, self_url: String, token: String, dialed: DialMap) {
-		let Some(consumer) = self.origin.consume().with_root(MESH_PREFIX) else {
-			tracing::warn!("could not scope cluster origin to {MESH_PREFIX}; discovery disabled");
-			return;
+	/// Dial every process that advertises itself on the LAN.
+	///
+	/// Each candidate is [`Peer::urls`](moq_tokio::mdns::Peer::urls) in order
+	/// (node first) on `/.cluster/<credential>`, with the advertised fingerprint
+	/// pinned. The lower discovery id dials; the other waits inbound. A LAN dial
+	/// never carries `?jwt=`: [`Config::token`] is for static and API peers
+	/// only.
+	#[cfg(feature = "cluster-lan")]
+	async fn run_mdns(self, dialed: DialMap, mut discovery: moq_tokio::mdns::Discovery) -> anyhow::Result<()> {
+		use moq_tokio::mdns::Event;
+
+		// Logged by key, never by the target's URL, so an inline query stays out of
+		// the logs. Empty token: LAN authenticates with the mDNS credential.
+		let mut spawn = |target: DialTarget| {
+			tracing::info!(peer = %target.key, "dialing LAN cluster peer");
+			tokio::spawn(self.clone().supervise_remote(target, String::new())).abort_handle()
 		};
-		let mut announced = consumer.announced();
-		let mut live = GossipTargets::default();
 
-		let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
-		sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-		// Skip the first immediate tick; nothing has had a chance to go stale yet.
-		sweep.tick().await;
-
-		loop {
-			tokio::select! {
-				ann = announced.next() => {
-					let Some(moq_net::announce::Update { path: relative, broadcast }) = ann else { return; };
-					// The address to dial, which keeps its query: `run_remote` reads
-					// `?cost=` and `?jwt=` off it. The key is only its identity.
-					let peer = advertised_node_url(relative.as_str());
-					let target = match DialTarget::parse(&peer) {
+		while let Some(event) = discovery.recv().await {
+			match event {
+				Event::Found(peer) => {
+					if !discovery.should_dial(&peer.id) {
+						continue;
+					}
+					let target = match DialTarget::from_lan_peer(&peer) {
 						Ok(target) => target,
 						Err(err) => {
-							tracing::warn!(%err, "invalid gossiped cluster peer URL; ignoring update");
+							tracing::warn!(%err, peer = %peer.id, "LAN peer advertised nothing reachable; skipping");
 							continue;
 						}
 					};
-					// Skip self and any peer we lose the tiebreaker to; that side
-					// dials us instead, so each pair forms a single session.
-					if !should_dial(&self_url, &target.key) {
-						continue;
-					}
-					let advertisement = relative.as_str().to_owned();
-					match broadcast {
-						Some(_) => {
-							let target = live.announce(advertisement, target);
-							let mut spawn = |target: DialTarget| {
-								tracing::info!(peer = %target.key, "discovered cluster peer; dialing");
-								tokio::spawn(self.clone().supervise_remote(target, token.clone())).abort_handle()
-							};
-							let key = target.key.clone();
-							if dialed.upsert(target, DialSource::Gossip, &mut spawn) {
-								tracing::debug!(peer = %key, "reannounce within sweep window; keeping dial");
-							}
-						}
-						None => match live.unannounce(&advertisement, &target.key) {
-							GossipUpdate::Current(target) => {
-								let mut spawn = |target: DialTarget| {
-									tracing::info!(peer = %target.key, "cluster peer advertisement changed; redialing");
-									tokio::spawn(self.clone().supervise_remote(target, token.clone())).abort_handle()
-								};
-								dialed.upsert(target, DialSource::Gossip, &mut spawn);
-							}
-							GossipUpdate::Unchanged => {}
-							GossipUpdate::Gone => dialed.mark_unannounced(&target.key, Instant::now()),
-						},
-					}
+					dialed.upsert(target, DialSource::Mdns, &mut spawn);
 				}
-				_ = sweep.tick() => {
-					let mut spawn = |target: DialTarget| {
-						tracing::info!(peer = %target.key, "cluster peer source changed; redialing");
-						tokio::spawn(self.clone().supervise_remote(target, token.clone())).abort_handle()
-					};
-					dialed.sweep_stale(Instant::now(), STALE_AFTER, &mut spawn);
-				}
+				Event::Lost(id) => dialed.release(&canonicalize_peer_key(&id), DialSource::Mdns, &mut spawn),
+				_ => continue,
 			}
 		}
+
+		// Discovery only ends if the daemon or its channel died. The relay would
+		// otherwise keep serving, still reporting ready, while permanently blind to
+		// LAN peers. Startup refuses to come up without mDNS, so losing it later is
+		// the same failure arriving late.
+		anyhow::bail!("LAN discovery stopped unexpectedly");
 	}
 
 	/// Drive `--cluster-connect-api`: an http(s) URL is polled, a local path (or
 	/// `file://` URL) is watched for changes. Either way the source yields a JSON
-	/// array of peer URLs that's reconciled into the shared dial map.
-	async fn run_connect_api(self, source: String, node: Option<String>, token: String, dialed: DialMap) {
+	/// array of peers that's reconciled into the shared dial map.
+	async fn run_connect_api(
+		self,
+		source: String,
+		node: Option<String>,
+		token: String,
+		dialed: DialMap,
+		http: Option<ClientWithMiddleware>,
+	) {
 		match Url::parse(&source) {
 			Ok(url) if matches!(url.scheme(), "http" | "https") => {
-				// Validated in `run`: an http(s) source has client TLS attached.
-				let tls = self
-					.client_tls
-					.as_ref()
-					.expect("http(s) connect_api source requires client TLS");
-				let http = match crate::http_client::build(tls) {
-					Ok(http) => http,
-					Err(err) => {
-						tracing::error!(%err, "cluster.connect_api: failed to build HTTP client");
-						return;
-					}
-				};
+				let http = http.expect("http(s) connect_api client built at startup");
 				self.run_connect_api_http(url, node, token, dialed, http).await;
 			}
 			Ok(url) if url.scheme() == "file" => match url.to_file_path() {
@@ -949,13 +1845,13 @@ impl Cluster {
 	}
 
 	/// Watch a local peer-list file, reconciling whenever it changes. Backed by
-	/// [`moq_native::watch::FileWatcher`] (OS notifications with a polling fallback).
+	/// [`moq_tokio::watch::Files`] (OS notifications with a polling fallback).
 	/// Fails static: a missing or malformed file keeps the current dials, and the
 	/// next change triggers a fresh attempt.
 	async fn run_connect_api_file(&self, path: PathBuf, node: Option<String>, token: String, dialed: DialMap) {
 		self.reload_connect_api_file(&path, &node, &token, &dialed);
 
-		let mut watcher = match moq_native::watch::FileWatcher::new(std::slice::from_ref(&path)) {
+		let mut watcher = match moq_tokio::watch::Files::new(std::slice::from_ref(&path)) {
 			Ok(watcher) => watcher,
 			Err(err) => {
 				tracing::error!(%err, ?path, "failed to watch cluster.connect_api file; updates disabled");
@@ -970,15 +1866,15 @@ impl Cluster {
 	}
 
 	/// Re-read the peer-list file and reconcile. Any read/parse error keeps the
-	/// current dials; the [`FileWatcher`](moq_native::watch::FileWatcher) only
+	/// current dials; the [`Files`](moq_tokio::watch::Files) only
 	/// re-invokes this on a real change, so a malformed file isn't re-warned on a
 	/// loop.
 	fn reload_connect_api_file(&self, path: &std::path::Path, node: &Option<String>, token: &str, dialed: &DialMap) {
 		match std::fs::read_to_string(path) {
-			Ok(body) => match serde_json::from_str::<Vec<String>>(&body) {
+			Ok(body) => match serde_json::from_str::<Vec<Peer>>(&body) {
 				Ok(list) => self.apply_peer_list(list, node, token, dialed),
 				Err(err) => {
-					tracing::warn!(%err, ?path, "cluster.connect_api file is not a JSON array; keeping current peers")
+					tracing::warn!(%err, ?path, "cluster.connect_api file is not a JSON array of peers; keeping current peers")
 				}
 			},
 			Err(err) => tracing::warn!(%err, ?path, "failed to read cluster.connect_api file; keeping current peers"),
@@ -988,7 +1884,7 @@ impl Cluster {
 	/// Fetch and parse the peer list. Caching, conditional revalidation, and
 	/// stale-if-error are handled by the HTTP cache middleware on `http`, so this
 	/// just issues the request and parses the (possibly cache-served) body.
-	async fn fetch_peer_list(http: &ClientWithMiddleware, url: Url) -> anyhow::Result<Vec<String>> {
+	async fn fetch_peer_list(http: &ClientWithMiddleware, url: Url) -> anyhow::Result<Vec<Peer>> {
 		let body = http
 			.get(url)
 			.send()
@@ -1000,13 +1896,13 @@ impl Cluster {
 			.await
 			.context("failed to read cluster.connect_api body")?;
 
-		serde_json::from_str(&body).context("cluster.connect_api response is not a JSON array of peer URLs")
+		serde_json::from_str(&body).context("cluster.connect_api response is not a JSON array of peers")
 	}
 
 	/// Reconcile a freshly fetched peer list into the dial map: dial peers that
 	/// are new and drop API peers that disappeared. The relay's own [`node`] URL
 	/// is filtered out so it never dials itself.
-	fn apply_peer_list(&self, list: Vec<String>, node: &Option<String>, token: &str, dialed: &DialMap) {
+	fn apply_peer_list(&self, list: Vec<Peer>, node: &Option<String>, token: &str, dialed: &DialMap) {
 		// Dedupe against the shared dial map (and filter out self) on stable identity,
 		// while retaining the full dial configuration so a cost or credential update
 		// replaces the existing session.
@@ -1027,135 +1923,244 @@ impl Cluster {
 
 	async fn supervise_remote(self, target: DialTarget, token: String) {
 		let log_peer = target.key.clone();
-		if let Err(err) = self.run_remote(&target, token).await {
-			tracing::warn!(%err, peer = %log_peer, "cluster peer connection ended");
-		}
+		let dialers = self.dialers.clone();
+		dialers
+			.supervise(async move {
+				if let Err(err) = self.run_remote(&target, token).await {
+					tracing::warn!(%err, peer = %log_peer, "cluster peer connection ended");
+				}
+			})
+			.await;
 	}
 
 	#[tracing::instrument("remote", skip_all, err, fields(remote = %target.key))]
 	async fn run_remote(self, target: &DialTarget, token: String) -> anyhow::Result<()> {
-		let mut url = target.url.clone();
-		let cost = target.cost;
+		let mut urls = target.addrs();
 		// Apply the shared cluster token unless the URL already carries its own
-		// non-empty `?jwt=` (a per-peer inline token wins; the shared token still
-		// covers peers that have none). An empty
-		// `?jwt=` counts as absent, matching `AuthParams::from_url`.
-		if !token.is_empty() && !url.query_pairs().any(|(key, value)| key == "jwt" && !value.is_empty()) {
-			url.query_pairs_mut().append_pair("jwt", &token);
+		// non-empty `?jwt=` (a per-peer inline token or object `token` wins; the
+		// shared token still covers peers that have none). An empty
+		// `?jwt=` counts as absent, as `moq auth serve` reads it.
+		// LAN dials never get the token: they authenticate with the mDNS credential.
+		if !target.lan && !token.is_empty() {
+			for url in &mut urls {
+				if !url.query_pairs().any(|(key, value)| key == "jwt" && !value.is_empty()) {
+					url.query_pairs_mut().append_pair("jwt", &token);
+				}
+			}
 		}
 
-		// A peer is supervised for the life of the relay, so there is no give-up deadline: one that is
-		// unreachable for an hour still has to be redialed when it comes back. The ceiling stays low
-		// so a returning peer is picked up within seconds, and the warn below fires at least that
-		// often, so a dead peer is loudly broken rather than silently parked.
-		let base_delay = tokio::time::Duration::from_secs(1);
-		let max_delay = tokio::time::Duration::from_secs(10);
-		let mut delay = base_delay;
+		let addrs = moq_tokio::Addrs::collect(urls).context("peer advertised no reachable address")?;
 
+		let base_backoff = tokio::time::Duration::from_secs(1);
+		let max_backoff = tokio::time::Duration::from_secs(300);
 		// Sessions shorter than this are treated as churn: we keep backing off
 		// instead of resetting, otherwise a peer that rejects us instantly would
 		// turn into a tight reconnect loop.
 		let stable_threshold = tokio::time::Duration::from_secs(10);
 
+		let mut backoff = base_backoff;
+
 		loop {
-			let attempt = self.run_remote_once(&url, cost).await;
+			let started = tokio::time::Instant::now();
+			let result = self.run_remote_once(&addrs, target).await;
+			let elapsed = started.elapsed();
 
-			// A session that came up and lasted is a healthy peer: clear the escalation so a one-off
-			// drop redials promptly. Keyed on the session's own lifetime, not on how long the call
-			// took, because a peer that blackholes until the connect timeout would otherwise look
-			// stable and reset the backoff on every attempt, so the escalation would never happen.
-			let stable = attempt.connected.is_some_and(|at| at.elapsed() >= stable_threshold);
-			if stable {
-				delay = base_delay;
-			}
-
-			if let Err(err) = attempt.result {
-				match stable {
-					true => tracing::warn!(%err, "cluster peer session closed; reconnecting"),
-					false => tracing::warn!(%err, "cluster peer error; will retry"),
+			match result {
+				Ok(()) if elapsed >= stable_threshold => backoff = base_backoff,
+				Ok(()) => {
+					tracing::warn!(?elapsed, "cluster peer session closed cleanly but quickly; backing off");
+					backoff = (backoff * 2).min(max_backoff);
+				}
+				Err(err) => {
+					tracing::warn!(%err, "cluster peer error; will retry");
+					backoff = (backoff * 2).min(max_backoff);
 				}
 			}
 
-			// Jittered so a restarting cluster doesn't have every peer redial on the same tick.
-			let wait = delay.mul_f64(0.5 + rand::rng().random::<f64>() / 2.0);
-			delay = (delay * 2).min(max_delay);
-			tokio::time::sleep(wait).await;
+			tokio::time::sleep(backoff).await;
 		}
 	}
 
-	async fn run_remote_once(&self, url: &Url, cost: Option<u64>) -> Attempt {
+	/// One session to `target` over `addrs`, which carry any credential.
+	async fn run_remote_once(&self, addrs: &moq_tokio::Addrs, target: &DialTarget) -> anyhow::Result<()> {
 		// Each attempt is its own session, so it gets its own id. Matches the span an
 		// accepted connection runs under, so both directions log the same way.
 		let id = self.next_connection_id();
-		self.run_remote_session(id, url, cost)
+		// A panic fails this attempt like any other error, so the peer is redialed.
+		moq_tokio::panic::isolate(self.run_remote_session(id, addrs, target))
 			.instrument(tracing::info_span!("conn", id))
 			.await
+			.context("cluster peer session panicked")?
 	}
 
-	async fn run_remote_session(&self, id: u64, url: &Url, cost: Option<u64>) -> Attempt {
-		// The peer URL carries the cluster JWT in its query, so neither the log line
-		// nor the node label below may show the raw URL.
-		let redacted = moq_native::RedactedUrl::new(url);
+	async fn run_remote_session(&self, id: u64, addrs: &moq_tokio::Addrs, target: &DialTarget) -> anyhow::Result<()> {
+		// The peer URL may carry the cluster JWT in its query, so neither the log
+		// line nor the node label below may show the raw URL.
+		let first = addrs.as_slice().first().expect("Addrs is non-empty").url();
+		let redacted = moq_tokio::RedactedUrl::new(first);
 		tracing::info!(url = %redacted, "dialing cluster peer");
 
-		// Checked at the start of `run`; per-peer tasks inherit that guarantee.
-		let client = match self
-			.client
-			.clone()
-			.context("internal: cluster peer dial without an attached QUIC client")
-		{
-			Ok(client) => client,
-			Err(err) => return Attempt::failed(err),
+		// A LAN client is this dial's alone, so it closes when the dial ends.
+		let (client, _held) = match target.lan {
+			true => {
+				let client = self.peer_client(true, target.fingerprint.as_deref())?;
+				let held = self.dialers.hold(&client)?;
+				(client, Some(held))
+			}
+			false => (
+				self.dial
+					.clone()
+					.context("internal: cluster peer dial before Cluster::start")?,
+				None,
+			),
 		};
 
 		// Cluster dials use their configured stats tier. Cluster peers carry no auth
 		// root, so presence is keyed under the empty root within the cluster tier.
+		// The peer's routes entered the cluster elsewhere, and an upstream peer is
+		// never offered another upstream's. A peer that predates the hidden opt-in
+		// still discovers our hidden routes; see `Cluster::scope`.
+		let origin = match target.upstream {
+			true => self.origin.clone().upstream(),
+			false => self.origin.clone().peer(),
+		};
+		let stats = self.stats.tier(self.cluster_tier()).session("");
 		let mut client = client
-			.with_publisher(&self.origin)
-			.with_subscriber(self.origin.clone())
-			.with_stats(self.stats.tier(self.cluster_tier()).session(""));
-		if let Some(cost) = cost {
+			.with_publisher(origin.consume().with_hidden(true))
+			.with_subscriber(origin)
+			.with_stats(stats.clone())
+			.with_limits(self.peer_limits);
+		if let Some(cost) = target.cost {
 			client = client.with_cost(cost);
 		}
-		let cs = match client
-			.connect(url.clone())
-			.await
-			.context("failed to connect to cluster peer")
-		{
-			Ok(cs) => cs,
-			Err(err) => return Attempt::failed(err),
+		// The GOAWAY lifecycle lives in the reconnect loop: on an upstream GOAWAY it
+		// dials the replacement while the old session keeps serving, so the old
+		// routes stay attached and the origin hands live tracks over at a group
+		// boundary. A peer that redirects us straight after the handshake counts as
+		// a failed attempt, so an A-redirects-to-B-redirects-to-A loop escalates
+		// through backoff and eventually gives up instead of migrating forever.
+		// Downstream sessions never see a GOAWAY of their own.
+		//
+		// Forced on regardless of `--client-reconnect`: that flag is about the
+		// relay's own upstream dial, and a cluster peer link that stopped following
+		// GOAWAY would break rolling handoff, redialing the drained URL after the
+		// old session finally closed instead of migrating to the replacement.
+		let mut reconnect = client.with_reconnect(true).connect(addrs.clone());
+		let mut connection = None;
+		let mut established = false;
+		loop {
+			match remote_status(&stats, &mut established, reconnect.status().await)? {
+				moq_tokio::Status::Connected if connection.is_none() => {
+					connection = Some(self.nodes.connect_outbound(id, redacted.to_string()));
+				}
+				moq_tokio::Status::Disconnected => connection = None,
+				moq_tokio::Status::Migrating => {}
+				_ => {}
+			}
+		}
+	}
+
+	/// A peer client from the dial template, with the [`Options::peer`] QUIC
+	/// limits, since every dial is a peer. A LAN client is built per dial, so it
+	/// takes an ephemeral port beside the shared static client, keeps only
+	/// request-path versions, and pins the advertised fingerprint on a clean TLS
+	/// config, so the relay's CA roots cannot combine with it.
+	fn peer_client(&self, lan: bool, fingerprint: Option<&str>) -> anyhow::Result<moq_tokio::Client> {
+		let mut connect = self
+			.connect
+			.clone()
+			.context("cluster dial without a dial template (call Cluster::with_connect)")?;
+		if lan {
+			let mut bind = connect.resolve().bind;
+			bind.set_port(0);
+			connect.bind = Some(bind);
+			connect.backoff.timeout = Some(std::time::Duration::ZERO);
+			connect.once = Some(false);
+			connect.version = connect
+				.versions()
+				.iter()
+				.filter(|version| Self::carries_request_path(version))
+				.copied()
+				.collect();
+		}
+		if let Some(fingerprint) = fingerprint {
+			connect.tls = moq_tokio::tls::Connect::default();
+			connect.tls.fingerprint = vec![fingerprint.to_string()];
+		}
+		let mut quic = self.quic.clone().unwrap_or_default();
+		self.peer_quic.dial(&mut quic);
+		let client = connect.init(quic)?;
+		#[cfg(feature = "iroh")]
+		let client = match &self.iroh {
+			Some(iroh) => client.with_iroh(iroh.clone()),
+			None => client,
 		};
+		Ok(client)
+	}
 
-		let connected = tokio::time::Instant::now();
-		let _connection = self.nodes.connect_outbound(id, redacted.to_string());
-
-		Attempt {
-			connected: Some(connected),
-			result: Err(cs.closed().await.into()),
+	/// Start a reconnecting LAN session from discovered details. Tests wire this
+	/// without multicast.
+	#[cfg(all(test, feature = "cluster-lan"))]
+	fn dial_lan_target(&self, target: &DialTarget) -> anyhow::Result<moq_tokio::Connection> {
+		let addrs = moq_tokio::Addrs::collect(target.addrs()).context("peer advertised no reachable address")?;
+		let mut client = self
+			.peer_client(true, target.fingerprint.as_deref())?
+			.with_origin(self.origin.clone().peer());
+		if let Some(cost) = target.cost {
+			client = client.with_cost(cost);
 		}
+		Ok(client.connect(addrs))
+	}
+
+	#[cfg(all(test, feature = "cluster-lan"))]
+	fn set_lan_credential(&self, credential: impl Into<String>) {
+		let _ = self.lan_auth.set(LanAuth {
+			credential: credential.into(),
+		});
 	}
 }
 
-/// One peer dial: when its session came up, and how it ended.
-///
-/// The instant is what the backoff reset keys on, which is why the dial and the session are timed
-/// separately. A session always ends in an `Err` (it hands back its own close reason), so the
-/// outcome alone can't tell a healthy peer from a dead one.
-struct Attempt {
-	/// When `connect` handed back a live session, or `None` if the dial never got that far.
-	connected: Option<tokio::time::Instant>,
-	/// How the attempt ended.
-	result: anyhow::Result<()>,
-}
-
-impl Attempt {
-	/// An attempt that never established a session.
-	fn failed(err: anyhow::Error) -> Self {
-		Self {
-			connected: None,
-			result: Err(err),
-		}
+/// Advertise this listener on the LAN: fingerprint when the certificate was
+/// generated, node URL when configured, secret when shared.
+#[cfg(feature = "cluster-lan")]
+async fn lan_discovery(
+	advertise: &LanAdvertise,
+	node: Option<&str>,
+	secret: Option<&str>,
+	app: moq_tokio::mdns::App,
+) -> anyhow::Result<moq_tokio::mdns::Discovery> {
+	let mut config = moq_tokio::mdns::Config::new(app, advertise.port);
+	if let Some(fingerprint) = &advertise.fingerprint {
+		config = config.with_fingerprint(fingerprint.clone());
 	}
+	if let Some(node) = node {
+		let url = peer_url(node)?;
+		// The advertisement is multicast in the clear. The secret authenticates the
+		// record, it does not hide it, so anything in the query is handed to every
+		// listener on the network.
+		//
+		// An allowlist rather than a `jwt` denylist: `cost` is the only query param a
+		// peer needs off the advertised URL, and listing what may go out means the
+		// next credential-bearing param is refused the day it is added instead of
+		// leaking until someone remembers to ban it.
+		let published: Vec<String> = url
+			.query_pairs()
+			.map(|(key, _)| key.into_owned())
+			.filter(|key| key != "cost")
+			.collect();
+		anyhow::ensure!(
+			published.is_empty(),
+			"`--cluster-node` carries query parameters that `--cluster-lan` would broadcast in the clear ({}). \
+			 Only `?cost=` may be advertised; pass credentials with `--cluster-token` instead.",
+			published.join(", ")
+		);
+		config = config.with_node(url);
+	}
+	if let Some(secret) = secret {
+		let secret = moq_tokio::mdns::Secret::load(secret).context("invalid --cluster-lan-secret")?;
+		config = config.with_secret(secret);
+	}
+	Ok(config.advertise().await?)
 }
 
 /// Extract and remove the `cost` query param from a peer URL.
@@ -1191,6 +2196,23 @@ fn take_cost(url: &mut Url) -> anyhow::Result<Option<u64>> {
 	Ok(Some(cost))
 }
 
+/// Drop `?jwt=` so a LAN dial never presents [`Config::token`].
+#[cfg(feature = "cluster-lan")]
+fn strip_jwt(url: &mut Url) {
+	let remaining: Vec<(String, String)> = url
+		.query_pairs()
+		.filter(|(key, _)| key != "jwt")
+		.map(|(key, value)| (key.into_owned(), value.into_owned()))
+		.collect();
+	url.set_query(None);
+	if !remaining.is_empty() {
+		let mut pairs = url.query_pairs_mut();
+		for (key, value) in &remaining {
+			pairs.append_pair(key, value);
+		}
+	}
+}
+
 /// Whether a `--cluster-connect-api` source is an http(s) URL (otherwise it's
 /// treated as a local file path, which needs no TLS client).
 fn connect_api_is_http(source: &str) -> bool {
@@ -1200,9 +2222,9 @@ fn connect_api_is_http(source: &str) -> bool {
 /// Resolve a cluster peer to the URL we dial.
 ///
 /// The modern form is a full URL, e.g. `https://host/?jwt=TOKEN`, which is used
-/// verbatim. A bare host or `host:port` is still accepted for backwards
-/// compatibility and wrapped in `https://.../` (callers warn about this legacy
-/// form for user-supplied `--cluster-connect` entries).
+/// verbatim. A bare host or `host:port` is wrapped in `https://.../` for
+/// `--cluster-connect-api` lists; user-supplied `--cluster-connect` entries
+/// refuse that form through [`Config::deprecated`].
 fn peer_url(peer: &str) -> anyhow::Result<Url> {
 	// A full URL has a scheme separator; a bare host or `host:port` does not
 	// (and `Url::parse` would otherwise mis-read `host:port` as scheme `host`).
@@ -1213,35 +2235,9 @@ fn peer_url(peer: &str) -> anyhow::Result<Url> {
 	Url::parse(&format!("https://{peer}/")).context("invalid cluster peer host")
 }
 
-/// The address to dial for a node advertised under `MESH_PREFIX`.
-///
-/// A relay advertises its URL as a broadcast path, and [`Path`] collapses slash
-/// runs, so `https://relay-b.example/` arrives as `https:/relay-b.example`. The
-/// scheme is put back here rather than read as a hostname.
-///
-/// The trailing colon on the leading segment is what marks a scheme: a bare
-/// `host:port` carries its colon in the middle of the segment, never at the end,
-/// so the two spellings can't be mistaken for each other and no list of known
-/// schemes is needed. A scheme-less advertisement means `https`, exactly as
-/// [`peer_url`] reads a bare host.
-///
-/// The query survives, because [`Cluster::run_remote`] reads `?cost=` and `?jwt=`
-/// off the address it dials. Pass the result through [`canonicalize_peer_key`]
-/// for an identity key; don't dial the key, which drops the query.
-///
-/// A trailing slash on a non-empty URL path does not survive, since a path has no
-/// way to spell one. `https://a.example/edge/` advertises the same as
-/// `https://a.example/edge`.
-pub(crate) fn advertised_node_url(advertised: &str) -> String {
-	match advertised.split_once('/') {
-		// The segment already ends in `:`, so this restores the `//` the path ate.
-		Some((scheme, rest)) if scheme.ends_with(':') => format!("{scheme}//{rest}"),
-		_ => advertised.to_owned(),
-	}
-}
-
-/// Whether a peer string uses the deprecated bare-host / `host:port` form rather
-/// than a full URL. Used to warn on legacy `--cluster-connect` entries.
+/// Whether a peer string uses the released bare-host / `host:port` form rather
+/// than a full URL. Used so [`Config::deprecated`] can refuse
+/// `--cluster-connect` entries that still use it.
 fn is_legacy_peer(peer: &str) -> bool {
 	!peer.contains("://")
 }
@@ -1252,51 +2248,182 @@ fn is_legacy_peer(peer: &str) -> bool {
 /// session. Drops the query (the jwt isn't part of a peer's identity) and lets
 /// `Url` normalize the scheme, host case, and default port. Falls back to the
 /// raw string if the peer can't be parsed.
+///
+/// It has to absorb every normalization a discovery path applies on the way in,
+/// or one relay gets two keys and is dialed twice.
 pub(crate) fn canonicalize_peer_key(peer: &str) -> String {
 	match peer_url(peer) {
 		Ok(mut url) => {
 			url.set_query(None);
+			// mDNS strips these before advertising, so a key that kept them would
+			// give one relay two identities.
+			url.set_fragment(None);
+			url.set_username("").ok();
+			url.set_password(None).ok();
+			// Trim and collapse path slashes: a non-special scheme like `moqt` keeps
+			// its trailing slash otherwise, and `moqt://a.example:4443/` is an
+			// ordinary way to spell the same node as `moqt://a.example:4443`.
+			let segments: Vec<&str> = url.path().split('/').filter(|s| !s.is_empty()).collect();
+			let path = match segments.is_empty() {
+				true => String::new(),
+				false => format!("/{}", segments.join("/")),
+			};
+			url.set_path(&path);
 			url.into()
 		}
 		Err(_) => peer.to_string(),
 	}
 }
 
-/// Deserialize a field that accepts either a TOML boolean or string into an
-/// `Option<String>` (booleans become `"true"` / `"false"`). Lets `cluster.mesh`
-/// take the modern `mesh = true` form or the legacy `mesh = "<url>"` form.
-fn deserialize_bool_or_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-	D: serde::Deserializer<'de>,
-{
-	use serde::Deserialize as _;
-
-	#[derive(serde::Deserialize)]
-	#[serde(untagged)]
-	enum BoolOrString {
-		Bool(bool),
-		Str(String),
+/// A reconnecting peer keeps one logical presence until its loop actually ends.
+fn remote_status(
+	stats: &moq_net::stats::Session,
+	established: &mut bool,
+	status: moq_tokio::Result<moq_tokio::Status>,
+) -> moq_tokio::Result<moq_tokio::Status> {
+	match &status {
+		Ok(moq_tokio::Status::Connected) => *established = true,
+		Err(moq_tokio::Error::MoqNet(error)) if *established => {
+			if let Some(kind) = crate::connection::failure(error) {
+				stats.fail(kind);
+			}
+		}
+		// The retry window ran out after the link was lost, so the link failed to recover.
+		Err(moq_tokio::Error::Reconnect(_)) if *established => stats.fail(moq_net::stats::Failure::Transport),
+		// The peer sent GOAWAY and is draining; not following its redirect is no failure.
+		Err(moq_tokio::Error::RefusedRedirect(_) | moq_tokio::Error::PinnedRedirect) => {}
+		// Any other terminal error, such as a reconnect the peer refused, ends a live link.
+		Err(_) if *established => stats.fail(moq_net::stats::Failure::Application),
+		_ => {}
 	}
-
-	Ok(
-		Option::<BoolOrString>::deserialize(deserializer)?.map(|value| match value {
-			BoolOrString::Bool(value) => value.to_string(),
-			BoolOrString::Str(value) => value,
-		}),
-	)
+	status
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::Config;
+	use crate::Config as RelayConfig;
+
+	#[tokio::test]
+	async fn fixed_leases_cannot_bypass_cap_refusal() {
+		let cluster = Cluster::new(Options::default()).unwrap();
+		let mut grant = moq_auth::Grant::new(moq_net::Pattern::all(), moq_net::Patterns::new());
+		grant.publish.rate = Some(moq_auth::Rate::from_bps(8000).unwrap());
+		let lease = auth::Lease::new("/room", moq_auth::lease::Consumer::fixed(grant));
+		let request = moq_auth::Request::new("test", moq_auth::Transport::Http, "/room");
+		assert!(matches!(cluster.scope(lease, &request), Err(auth::Error::Forbidden(_))));
+	}
+
+	#[tokio::test]
+	async fn request_limits_follow_the_admitted_grant() {
+		let mut options = Options::default();
+		options.session.announces = 2;
+		options.session.subscriptions = 3;
+		options.session.fetches = 4;
+		options.peer.announces = 20;
+		options.peer.subscriptions = 30;
+		options.peer.fetches = 40;
+		let cluster = Cluster::new(options).unwrap();
+		for (peer, upstream, expected) in [
+			(false, false, (2, 3, 4)),
+			(true, false, (20, 30, 40)),
+			(true, true, (20, 30, 40)),
+		] {
+			let mut grant = moq_auth::Grant::new(moq_auth::Patterns::new(), moq_auth::Patterns::new());
+			grant.peer = peer;
+			grant.upstream = upstream;
+			let (_producer, consumer) = moq_auth::lease::Producer::new(grant);
+			// A cluster-looking path alone never selects the peer policy.
+			let lease = auth::Lease::new("/.cluster/untrusted", consumer);
+			let limits = cluster.limits(&lease);
+			assert_eq!((limits.announces, limits.subscriptions, limits.fetches), expected);
+		}
+	}
+
+	/// A millisecond track: the frames written here carry timestamps.
+	fn timed() -> moq_net::track::Info {
+		moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI)
+	}
+
+	/// The next route and whether it is active.
+	async fn next_update(announced: &mut moq_net::announce::Consumer) -> Option<(moq_net::announce::Announce, bool)> {
+		match announced.next().await? {
+			moq_net::announce::Event::Start(route)
+			| moq_net::announce::Event::Update(route)
+			| moq_net::announce::Event::Restart(route) => Some((route, true)),
+			moq_net::announce::Event::End(route) => Some((route, false)),
+		}
+	}
+
+	/// The next announcement without blocking.
+	fn try_next_announced(announced: &mut moq_net::announce::Consumer) -> Option<moq_net::announce::Announce> {
+		match announced.try_next()? {
+			moq_net::announce::Event::Start(route) => Some(route),
+			other => panic!("expected an announcement: got {other:?}"),
+		}
+	}
+
+	fn new_cluster(config: Config) -> anyhow::Result<Cluster> {
+		Cluster::new(Options::new(config))
+	}
+
+	/// A grant's mount reaches the target for subscribe and refuses publish, both
+	/// named from the session's root.
+	#[tokio::test]
+	async fn session_handles_apply_grant_mounts() {
+		let cluster = new_cluster(Config::default()).expect("cluster");
+		let everything = || moq_net::Patterns::from(moq_net::Pattern::all());
+		let mut grant = moq_auth::Grant::new(everything(), everything());
+		grant.mounts.insert(".svc".into(), ".svc/pid".into());
+		let token = auth::Token::new("/pid", &grant);
+
+		let _worker = cluster
+			.origin
+			.publish(".svc/pid/foo", origin::Route::default())
+			.expect("publish at the fleet path");
+		let subscriber = cluster.subscriber(&token).expect("subscribe grant").consume();
+		let broadcast = subscriber
+			.request_broadcast(".svc/foo", None)
+			.await
+			.expect("resolves through the mount");
+		assert_eq!(broadcast.info().path.as_str(), ".svc/foo");
+
+		let publisher = cluster.publisher(&token).expect("publish grant");
+		assert!(publisher.create_broadcast(".svc/foo").is_err());
+		publisher.create_broadcast("cam").expect("publish outside the mount");
+
+		// A mount the origin refuses admits nothing rather than half a grant.
+		grant.mounts.insert(".svc/x".into(), ".other".into());
+		let token = auth::Token::new("/pid", &grant);
+		assert!(cluster.subscriber(&token).is_none());
+		assert!(cluster.publisher(&token).is_none());
+	}
+
+	/// A grant whose mounts chain, or whose mount point is a wildcard, admits
+	/// nothing. Mounts apply in key order, so the chain is written with the
+	/// mount point on the target sorting last.
+	#[tokio::test]
+	async fn session_handles_refuse_invalid_grant_mounts() {
+		let cluster = new_cluster(Config::default()).expect("cluster");
+		let everything = || moq_net::Patterns::from(moq_net::Pattern::all());
+		let invalid: [&[(&str, &str)]; 2] = [&[(".a", "pid/.z"), (".z", "secret")], &[("*", ".svc/pid")]];
+		for mounts in invalid {
+			let mut grant = moq_auth::Grant::new(everything(), everything());
+			for (at, target) in mounts {
+				grant.mounts.insert((*at).into(), (*target).into());
+			}
+			let token = auth::Token::new("/pid", &grant);
+			assert!(cluster.subscriber(&token).is_none(), "{mounts:?}");
+			assert!(cluster.publisher(&token).is_none(), "{mounts:?}");
+		}
+	}
 
 	/// The publish task holds only a `Weak` to its producer, so it stops when the
 	/// last `moq_stats::Producer` clone drops. Attaching one must therefore hand
-	/// its lifetime to the cluster: an embedder driving its own loop takes the
-	/// pieces it needs off a `Relay` and drops the rest, and a relay that keeps
-	/// serving while silently publishing nothing is exactly the class of failure
-	/// this API exists to rule out. Moving the ONLY handle in must keep it alive.
+	/// its lifetime to the cluster: an embedder clones handles off a `Relay` and
+	/// does not have to keep the producer, and a relay that keeps serving while
+	/// silently publishing nothing is exactly the class of failure this API
+	/// exists to rule out. Moving the ONLY handle in must keep it alive.
 	///
 	/// Asserts the broadcast is still live AFTER a few publish intervals, not
 	/// merely that one appeared: the task publishes once before it can notice its
@@ -1304,42 +2431,126 @@ mod tests {
 	/// proves nothing.
 	#[tokio::test]
 	async fn stats_publishing_outlives_the_producer_handle() {
-		let config = crate::StatsConfig {
-			enabled: Some(true),
+		let config = crate::stats::Config {
+			enabled: true,
 			node: Some("test".to_string()),
 			..Default::default()
 		};
 
-		let cluster = Cluster::new(ClusterConfig::default()).expect("cluster");
+		let cluster = new_cluster(Config::default()).expect("cluster");
 		let stats = config.build(cluster.origin.clone());
 		let cluster = cluster.with_stats(stats);
 
 		let path = moq_net::Path::new(".stats").join("node").join("test");
-		let broadcast = tokio::time::timeout(
-			std::time::Duration::from_secs(5),
-			cluster.origin.consume().announced_broadcast(&path),
-		)
-		.await
-		.expect("stats broadcast announced within 5s")
-		.expect("stats broadcast present");
+		let consumer = cluster.origin.consume();
+		let route = tokio::time::timeout(std::time::Duration::from_secs(5), consumer.routed(&path))
+			.await
+			.expect("stats broadcast announced within 5s")
+			.expect("stats broadcast present");
+		assert!(route.epoch.is_some(), "stats announce under an epoch");
+		let broadcast = consumer
+			.request_broadcast(&path, None)
+			.await
+			.expect("stats broadcast resolves");
 
 		// Several publish intervals (1s each by default) after the handle went out
 		// of scope, the task is still running and its broadcast still open. The
 		// re-check is bounded: without the keepalive the broadcast is gone and
-		// `announced_broadcast` waits forever, which must read as a failure rather
+		// `routed` waits forever, which must read as a failure rather
 		// than a hung test.
 		tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
-		let still_live = tokio::time::timeout(
-			std::time::Duration::from_secs(2),
-			cluster.origin.consume().announced_broadcast(&path),
-		)
-		.await;
+		let still_live = tokio::time::timeout(std::time::Duration::from_secs(2), consumer.routed(&path)).await;
 		assert!(
 			matches!(still_live, Ok(Some(_))),
 			"stats broadcast unannounced after the producer handle was dropped: \
 			 the publish task stopped while the cluster kept serving"
 		);
 		drop(broadcast);
+	}
+
+	#[test]
+	fn remote_logical_outcome_ignores_retries_and_counts_one_terminal_close() {
+		use moq_net::stats::Registry;
+		let registry = Registry::new(Default::default());
+		let stats = registry.tier(Tier::default()).session("");
+		let mut established = false;
+		let _ = remote_status(
+			&stats,
+			&mut established,
+			Err(moq_tokio::Error::MoqNet(moq_net::Error::ProtocolViolation)),
+		);
+		for status in [
+			moq_tokio::Status::Connected,
+			moq_tokio::Status::Disconnected,
+			moq_tokio::Status::Connected,
+			moq_tokio::Status::Migrating,
+		] {
+			remote_status(&stats, &mut established, Ok(status)).unwrap();
+		}
+		assert_eq!(
+			registry.snapshot().sessions()[0].1.sessions_failed,
+			moq_net::stats::Failures::default()
+		);
+		let _ = remote_status(
+			&stats,
+			&mut established,
+			Err(moq_tokio::Error::MoqNet(moq_net::Error::IdleTimeout)),
+		);
+		let _ = remote_status(
+			&stats,
+			&mut established,
+			Err(moq_tokio::Error::MoqNet(moq_net::Error::Session(
+				moq_net::SessionError::App(42),
+			))),
+		);
+		drop(stats);
+		let presence = registry.snapshot().sessions()[0].1;
+		assert_eq!(presence.sessions_started, 1);
+		assert_eq!(presence.sessions_ended, 1);
+		assert_eq!(presence.sessions_failed.idle_timeout, 1);
+		assert_eq!(presence.sessions_failed.application, 0);
+	}
+
+	#[test]
+	fn remote_reconnect_exhaustion_fails_only_an_established_link() {
+		use moq_net::stats::{Failure, Registry};
+		let exhausted = |established: bool| {
+			let registry = Registry::new(Default::default());
+			let stats = registry.tier(Tier::default()).session("");
+			let mut connected = false;
+			if established {
+				remote_status(&stats, &mut connected, Ok(moq_tokio::Status::Connected)).unwrap();
+			}
+			let gave_up = Err(moq_tokio::Error::Reconnect("gave up".into()));
+			let _ = remote_status(&stats, &mut connected, gave_up);
+			drop(stats);
+			registry.snapshot().sessions()[0]
+				.1
+				.sessions_failed
+				.count(Failure::Transport)
+		};
+		assert_eq!(exhausted(false), 0);
+		assert_eq!(exhausted(true), 1);
+	}
+
+	#[test]
+	fn remote_terminal_errors_fail_an_established_link_except_a_refused_redirect() {
+		use moq_net::stats::{Failures, Registry};
+		let ended = |err: moq_tokio::Error| {
+			let registry = Registry::new(Default::default());
+			let stats = registry.tier(Tier::default()).session("");
+			let mut connected = false;
+			remote_status(&stats, &mut connected, Ok(moq_tokio::Status::Connected)).unwrap();
+			let _ = remote_status(&stats, &mut connected, Err(err));
+			drop(stats);
+			registry.snapshot().sessions()[0].1.sessions_failed
+		};
+		assert_eq!(ended(moq_tokio::Error::ConnectFailed).application, 1);
+		assert_eq!(ended(moq_tokio::Error::PinnedRedirect), Failures::default());
+		assert_eq!(
+			ended(moq_tokio::Error::RefusedRedirect("policy".into())),
+			Failures::default()
+		);
 	}
 
 	/// `?cost=` is read and stripped (it rides SETUP, not the URL), other
@@ -1359,12 +2570,12 @@ mod tests {
 		assert!(take_cost(&mut url).is_err());
 	}
 
-	#[test]
-	fn cluster_tier_defaults_to_unprefixed() {
-		let cluster = Cluster::new(ClusterConfig::default()).expect("cluster");
+	#[tokio::test]
+	async fn cluster_tier_defaults_to_unprefixed() {
+		let cluster = new_cluster(Config::default()).expect("cluster");
 		assert_eq!(cluster.cluster_tier(), Tier::default());
 
-		let cluster = Cluster::new(ClusterConfig {
+		let cluster = new_cluster(Config {
 			tier: Some("region/sjc".to_string()),
 			..Default::default()
 		})
@@ -1381,7 +2592,11 @@ mod tests {
 		DialTarget {
 			key: key.to_string(),
 			url: Url::parse(&format!("https://{key}/")).expect("test URL"),
+			urls: Vec::new(),
 			cost: None,
+			fingerprint: None,
+			lan: false,
+			upstream: false,
 		}
 	}
 
@@ -1389,138 +2604,20 @@ mod tests {
 		keys.iter().map(|key| ((*key).to_string(), target(key))).collect()
 	}
 
-	/// A query change creates a new gossip path before the old path necessarily
-	/// unannounces. Removing that old path must not stale the replacement.
-	#[test]
-	fn gossip_old_unannounce_keeps_new_target() {
-		let mut live = GossipTargets::default();
-		let old = DialTarget::parse("https://peer.example/?cost=1").unwrap();
-		let new = DialTarget::parse("https://peer.example/?cost=2").unwrap();
-		live.announce("peer.example/?cost=1".to_string(), old.clone());
-		live.announce("peer.example/?cost=2".to_string(), new.clone());
-
-		assert!(matches!(
-			live.unannounce("peer.example/?cost=1", &old.key),
-			GossipUpdate::Unchanged
-		));
-		assert!(matches!(
-			live.unannounce("peer.example/?cost=2", &new.key),
-			GossipUpdate::Gone
-		));
-	}
-
-	/// If the current gossip path disappears while an older one is still live,
-	/// the remaining target becomes current again.
-	#[test]
-	fn gossip_current_unannounce_restores_live_fallback() {
-		let mut live = GossipTargets::default();
-		let old = DialTarget::parse("https://peer.example/?cost=1").unwrap();
-		let new = DialTarget::parse("https://peer.example/?cost=2").unwrap();
-		live.announce("peer.example/?cost=1".to_string(), old.clone());
-		live.announce("peer.example/?cost=2".to_string(), new.clone());
-
-		let GossipUpdate::Current(current) = live.unannounce("peer.example/?cost=2", &new.key) else {
-			panic!("older live advertisement must become current");
-		};
-		assert!(current == old);
-	}
-
-	/// `mark_unannounced` is a no-op for static peers (operator intent says
-	/// "always dial"), so the sweep never has a stale timestamp to act on.
-	#[tokio::test]
-	async fn sweep_preserves_static_peer() {
-		let dialed = DialMap::default();
-		dialed.insert(target("static-peer:4443"), placeholder_handle(), DialSource::Static);
-
-		let long_ago = Instant::now() - Duration::from_secs(3600);
-		dialed.mark_unannounced("static-peer:4443", long_ago);
-		dialed.sweep_stale(Instant::now(), STALE_AFTER, &mut |_| panic!("must not redial"));
-
-		assert!(dialed.contains("static-peer:4443"));
-	}
-
-	/// A gossip-discovered peer whose unannounce has stuck longer than the
-	/// threshold gets aborted and removed.
-	#[tokio::test]
-	async fn sweep_evicts_stale_gossip_peer() {
-		let dialed = DialMap::default();
-		let now = Instant::now();
-		dialed.insert(target("gone:4443"), placeholder_handle(), DialSource::Gossip);
-		dialed.mark_unannounced("gone:4443", now - STALE_AFTER - Duration::from_secs(1));
-
-		dialed.sweep_stale(now, STALE_AFTER, &mut |_| panic!("must not redial"));
-
-		assert!(!dialed.contains("gone:4443"));
-	}
-
-	/// A gossip-discovered peer whose unannounce is recent stays in the map; the
-	/// sweep is only allowed to evict entries past the full threshold so that the
-	/// prefer-shorter-hop flap (sub-millisecond unannounce-then-announce) doesn't
-	/// trip it.
-	#[tokio::test]
-	async fn sweep_keeps_recently_unannounced_peer() {
-		let dialed = DialMap::default();
-		let now = Instant::now();
-		dialed.insert(target("flapping:4443"), placeholder_handle(), DialSource::Gossip);
-		dialed.mark_unannounced("flapping:4443", now - Duration::from_millis(50));
-
-		dialed.sweep_stale(now, STALE_AFTER, &mut |_| panic!("must not redial"));
-
-		assert!(dialed.contains("flapping:4443"));
-	}
-
-	/// A peer that's currently announced (no pending unannounce) is never swept.
-	#[tokio::test]
-	async fn sweep_keeps_currently_announced_peer() {
-		let dialed = DialMap::default();
-		dialed.insert(target("healthy:4443"), placeholder_handle(), DialSource::Gossip);
-		// No mark_unannounced -> stays announced.
-
-		dialed.sweep_stale(Instant::now(), STALE_AFTER, &mut |_| panic!("must not redial"));
-
-		assert!(dialed.contains("healthy:4443"));
-	}
-
-	/// A re-announce after an unannounce clears the pending-sweep timestamp, so
-	/// the entry survives even if the original unannounce was old enough to
-	/// otherwise trigger eviction.
-	#[tokio::test]
-	async fn reannounce_cancels_pending_sweep() {
-		let dialed = DialMap::default();
-		let now = Instant::now();
-		let target = target("flap:4443");
-		dialed.insert(target.clone(), placeholder_handle(), DialSource::Gossip);
-		dialed.mark_unannounced("flap:4443", now - STALE_AFTER - Duration::from_secs(1));
-
-		// Re-adding the gossip source (a reannounce) clears the pending sweep.
-		assert!(
-			dialed.upsert(target.clone(), DialSource::Gossip, &mut |_| panic!("must not redial")),
-			"should report a cleared pending-sweep"
-		);
-		dialed.sweep_stale(now, STALE_AFTER, &mut |_| panic!("must not redial"));
-
-		assert!(dialed.contains("flap:4443"));
-		// A second reannounce has nothing to clear.
-		assert!(!dialed.upsert(target, DialSource::Gossip, &mut |_| panic!("must not redial")));
-	}
-
-	/// A peer wanted by both gossip and the API survives losing either source: the
-	/// dial is only torn down once the last source releases it.
+	/// A peer wanted by both a static seed and the API survives losing either
+	/// source: the dial is only torn down once the last source releases it.
 	#[tokio::test]
 	async fn multi_source_peer_survives_until_last_release() {
 		let dialed = DialMap::default();
-		let now = Instant::now();
-		// Gossiped first, then also appears in the API list.
-		dialed.insert(target("both:4443"), placeholder_handle(), DialSource::Gossip);
+		// Seeded first, then also appears in the API list.
+		dialed.insert(target("both:4443"), placeholder_handle(), DialSource::Static);
 		dialed.reconcile_api(&desired(&["both:4443"]), |_| panic!("already dialed"));
 
-		// Dropped from the API list -> still wanted by gossip.
-		dialed.reconcile_api(&HashMap::new(), |_| panic!("gossip dial stays active"));
-		assert!(dialed.contains("both:4443"), "gossip still wants it");
+		// Dropped from the API list -> still wanted by the seed.
+		dialed.reconcile_api(&HashMap::new(), |_| panic!("static dial stays active"));
+		assert!(dialed.contains("both:4443"), "the seed still wants it");
 
-		// Now gossip goes stale too -> the dial is finally released.
-		dialed.mark_unannounced("both:4443", now - STALE_AFTER - Duration::from_secs(1));
-		dialed.sweep_stale(now, STALE_AFTER, &mut |_| panic!("must not redial"));
+		dialed.release("both:4443", DialSource::Static, &mut |_| panic!("must not redial"));
 		assert!(!dialed.contains("both:4443"));
 	}
 
@@ -1529,27 +2626,26 @@ mod tests {
 	#[tokio::test]
 	async fn insert_merges_redundant_dial() {
 		let dialed = DialMap::default();
-		dialed.insert(target("p:4443"), placeholder_handle(), DialSource::Gossip);
+		dialed.insert(target("p:4443"), placeholder_handle(), DialSource::Static);
 		dialed.insert(target("p:4443"), placeholder_handle(), DialSource::Api);
 
-		// Dropping the API source leaves the gossip source holding the dial.
-		dialed.reconcile_api(&HashMap::new(), |_| panic!("gossip dial stays active"));
-		assert!(dialed.contains("p:4443"), "gossip source still holds the dial");
+		// Dropping the API source leaves the static source holding the dial.
+		dialed.reconcile_api(&HashMap::new(), |_| panic!("static dial stays active"));
+		assert!(dialed.contains("p:4443"), "static source still holds the dial");
 	}
 
 	/// `reconcile_api` drops API dials missing from the desired set, reports the
-	/// newly desired ones for the caller to spawn, and never touches Static or
-	/// Gossip dials (even when they're absent from the API list).
+	/// newly desired ones for the caller to spawn, and never touches Static dials
+	/// (even when they're absent from the API list).
 	#[tokio::test]
 	async fn reconcile_api_adds_and_removes_only_api() {
 		let dialed = DialMap::default();
 		dialed.insert(target("static:4443"), placeholder_handle(), DialSource::Static);
-		dialed.insert(target("gossip:4443"), placeholder_handle(), DialSource::Gossip);
 		dialed.insert(target("api-keep:4443"), placeholder_handle(), DialSource::Api);
 		dialed.insert(target("api-drop:4443"), placeholder_handle(), DialSource::Api);
 
 		// Desired: keep one existing API peer, drop the other, add a new one.
-		// Static/Gossip peers are not in the list but must survive.
+		// The static peer is not in the list but must survive.
 		let mut to_add = Vec::new();
 		dialed.reconcile_api(&desired(&["api-keep:4443", "api-new:4443"]), |target| {
 			to_add.push(target.key);
@@ -1561,7 +2657,6 @@ mod tests {
 		assert!(dialed.contains("api-keep:4443"));
 		assert!(!dialed.contains("api-drop:4443"), "dropped API peer must be removed");
 		assert!(dialed.contains("static:4443"), "static peer must survive reconcile");
-		assert!(dialed.contains("gossip:4443"), "gossip peer must survive reconcile");
 	}
 
 	/// A peer already dialed via another source is not re-reported for dialing,
@@ -1581,19 +2676,17 @@ mod tests {
 	#[tokio::test]
 	async fn inactive_source_update_applies_on_takeover() {
 		let dialed = DialMap::default();
-		let gossip = DialTarget::parse("https://peer.example/?cost=1").unwrap();
+		let seeded = DialTarget::parse("https://peer.example/?cost=1").unwrap();
 		let api = DialTarget::parse("https://peer.example/?cost=3").unwrap();
 		let old_task = tokio::spawn(std::future::pending::<()>());
-		dialed.insert(gossip.clone(), old_task.abort_handle(), DialSource::Gossip);
+		dialed.insert(seeded.clone(), old_task.abort_handle(), DialSource::Static);
 
 		let desired = [(api.key.clone(), api.clone())].into_iter().collect();
 		dialed.reconcile_api(&desired, |_| panic!("inactive source must not redial"));
 		assert!(!old_task.is_finished());
 
-		let now = Instant::now();
-		dialed.mark_unannounced(&gossip.key, now - STALE_AFTER - Duration::from_secs(1));
 		let mut spawned = Vec::new();
-		dialed.sweep_stale(now, STALE_AFTER, &mut |target| {
+		dialed.release(&seeded.key, DialSource::Static, &mut |target| {
 			spawned.push(target);
 			placeholder_handle()
 		});
@@ -1611,14 +2704,14 @@ mod tests {
 		let dialed = DialMap::default();
 		let target = DialTarget::parse("https://peer.example/?cost=1").unwrap();
 		let task = tokio::spawn(std::future::pending::<()>());
-		dialed.insert(target.clone(), task.abort_handle(), DialSource::Gossip);
+		dialed.insert(target.clone(), task.abort_handle(), DialSource::Static);
 
 		let desired = [(target.key.clone(), target.clone())].into_iter().collect();
 		dialed.reconcile_api(&desired, |_| panic!("inactive source must not redial"));
 
-		let now = Instant::now();
-		dialed.mark_unannounced(&target.key, now - STALE_AFTER - Duration::from_secs(1));
-		dialed.sweep_stale(now, STALE_AFTER, &mut |_| panic!("identical fallback must not redial"));
+		dialed.release(&target.key, DialSource::Static, &mut |_| {
+			panic!("identical fallback must not redial")
+		});
 
 		assert!(!task.is_finished(), "healthy dial must be preserved");
 		let map = dialed.inner.lock().expect("dial map");
@@ -1697,14 +2790,14 @@ mod tests {
 	/// tear down or reconfigure the last-known-good dial set.
 	#[tokio::test]
 	async fn malformed_peer_list_preserves_current_dial() {
-		let cluster = Cluster::new(ClusterConfig::default()).expect("cluster");
+		let cluster = new_cluster(Config::default()).expect("cluster");
 		let dialed = DialMap::default();
 		let current = DialTarget::parse("https://peer.example/?cost=1").unwrap();
 		let task = tokio::spawn(std::future::pending::<()>());
 		dialed.insert(current.clone(), task.abort_handle(), DialSource::Api);
 
 		cluster.apply_peer_list(
-			vec!["https://peer.example/?cost=invalid".to_string()],
+			vec![Peer::new("https://peer.example/?cost=invalid")],
 			&None,
 			"",
 			&dialed,
@@ -1723,8 +2816,8 @@ mod tests {
 	fn peer_list_rejects_conflicting_duplicate() {
 		let Err(err) = parse_peer_list(
 			vec![
-				"https://peer.example/?cost=1".to_string(),
-				"https://peer.example/?cost=2".to_string(),
+				Peer::new("https://peer.example/?cost=1"),
+				Peer::new("https://peer.example/?cost=2"),
 			],
 			None,
 		) else {
@@ -1733,53 +2826,286 @@ mod tests {
 		assert!(format!("{err:#}").contains("conflicting configurations"));
 	}
 
-	/// The peer-list wire format is a JSON array of URL strings.
+	/// The peer-list wire format is a JSON array of bare URL strings and/or
+	/// objects, parsed by the same type static config uses.
 	#[test]
 	fn peer_list_parses_as_string_array() {
 		let body = r#"["a.pop.example", "b.pop.example:4443"]"#;
-		let list: Vec<String> = serde_json::from_str(body).expect("parse peer list");
-		assert_eq!(
-			list,
-			vec!["a.pop.example".to_string(), "b.pop.example:4443".to_string()]
+		let list: Vec<Peer> = serde_json::from_str(body).expect("parse peer list");
+		assert_eq!(list, vec![Peer::new("a.pop.example"), Peer::new("b.pop.example:4443")]);
+	}
+
+	/// A bare URL keeps working, and an equivalent object normalizes to the same
+	/// dial target, so the two forms dedupe instead of conflicting.
+	#[test]
+	fn peer_object_form_matches_bare_url() {
+		let from_url = DialTarget::from_peer(&Peer::new("https://peer.example/?cost=2")).unwrap();
+		let object: Peer =
+			serde_json::from_str(r#"{"url": "https://peer.example/", "cost": 2}"#).expect("parse object peer");
+		let from_object = DialTarget::from_peer(&object).unwrap();
+		assert_eq!(from_url, from_object);
+
+		let desired = parse_peer_list(vec![Peer::new("https://peer.example/?cost=2"), object], None)
+			.expect("equivalent forms dedupe");
+		assert_eq!(desired.len(), 1);
+		assert_eq!(desired.values().next().expect("one peer"), &from_url);
+	}
+
+	/// An object `token` rides the same inline credential path: the dial URL
+	/// carries `?jwt=`, the identity drops it, and the shared token does not
+	/// override it.
+	#[test]
+	fn peer_object_token_matches_inline_credential() {
+		let inline = DialTarget::from_peer(&Peer::new("https://peer.example/?jwt=secret")).unwrap();
+		let object: Peer =
+			serde_json::from_str(r#"{"url": "https://peer.example/", "token": "secret"}"#).expect("parse object peer");
+		let from_object = DialTarget::from_peer(&object).unwrap();
+		assert_eq!(inline, from_object);
+		assert_eq!(inline.key, "https://peer.example/");
+		assert!(
+			inline
+				.url
+				.query_pairs()
+				.any(|(key, value)| key == "jwt" && value == "secret"),
+			"the credential must reach the dial URL: {}",
+			inline.url
 		);
 	}
 
-	/// The mesh tiebreaker only dials peers that sort after us, so exactly one
-	/// side of each pair opens the dial. Self never dials self.
+	/// `upstream` is object-only policy: it round-trips, reaches the dial target,
+	/// and flipping it is a different configuration, so the API redials.
 	#[test]
-	fn should_dial_prefers_larger_url() {
-		// Smaller hostname is the client: it dials the larger.
-		assert!(should_dial("a.example.com:4443", "b.example.com:4443"));
-		// Larger hostname is the server: it waits for the inbound dial.
-		assert!(!should_dial("b.example.com:4443", "a.example.com:4443"));
-		// Never dial self.
-		assert!(!should_dial("self.example.com:4443", "self.example.com:4443"));
+	fn peer_object_upstream() {
+		let object: Peer =
+			serde_json::from_str(r#"{"url": "https://core.example/", "upstream": true}"#).expect("parse upstream peer");
+		assert_eq!(object, Peer::new("https://core.example/").with_upstream(true));
+		assert_eq!(
+			serde_json::to_string(&object).unwrap(),
+			r#"{"url":"https://core.example/","upstream":true}"#
+		);
+		let upstream = DialTarget::from_peer(&object).unwrap();
+		assert!(upstream.upstream);
+		let plain = DialTarget::from_peer(&Peer::new("https://core.example/")).unwrap();
+		assert_eq!(upstream.key, plain.key);
+		assert_ne!(upstream, plain);
+		assert_eq!(
+			serde_json::to_string(&Peer::new("https://core.example/")).unwrap(),
+			r#""https://core.example/""#
+		);
 	}
 
-	/// Enabling gossip (`--cluster-mesh`) without `--cluster-node` has no address to
-	/// advertise, so it must fail fast with a message naming the missing flag.
+	/// `egress` defaults to `cost`, so a matching value is accepted and prices
+	/// the link exactly like the bare URL form. An unpriced link costs 1, so
+	/// `egress = 1` alone is symmetric too.
+	#[test]
+	fn peer_symmetric_egress_is_supported() {
+		let cost_only = DialTarget::from_peer(&Peer::new("https://peer.example/?cost=2")).unwrap();
+		let symmetric: Peer = serde_json::from_str(r#"{"url": "https://peer.example/", "cost": 2, "egress": 2}"#)
+			.expect("parse symmetric peer");
+		assert_eq!(DialTarget::from_peer(&symmetric).unwrap(), cost_only);
+
+		let unpriced = DialTarget::from_peer(&Peer::new("https://peer.example/")).unwrap();
+		let default_egress = DialTarget::from_peer(&Peer::new("https://peer.example/").with_egress(1)).unwrap();
+		assert_eq!(default_egress, unpriced);
+	}
+
+	/// An `egress` that differs from the effective cost is refused, never
+	/// silently ignored. That includes an egress with no cost at all.
+	#[test]
+	fn peer_asymmetric_egress_is_rejected() {
+		for peer in [
+			Peer::new("https://peer.example/").with_cost(1).with_egress(2),
+			Peer::new("https://peer.example/").with_egress(2),
+		] {
+			let err = DialTarget::from_peer(&peer).expect_err("asymmetric egress must fail");
+			assert!(
+				format!("{err:#}").contains("not supported"),
+				"egress refusal must say so: {err:#}"
+			);
+		}
+
+		let Err(err) = parse_peer_list(
+			vec![Peer::new("https://peer.example/").with_cost(1).with_egress(2)],
+			None,
+		) else {
+			panic!("asymmetric egress must reject the list");
+		};
+		assert!(format!("{err:#}").contains("not supported"));
+	}
+
+	/// Object policy and URL params each get one home. Setting both is rejected
+	/// rather than given a precedence a migration could silently get wrong.
+	#[test]
+	fn peer_mixed_policy_is_rejected() {
+		let cost_mix: Peer =
+			serde_json::from_str(r#"{"url": "https://peer.example/?cost=1", "cost": 1}"#).expect("parse mixed peer");
+		assert!(DialTarget::from_peer(&cost_mix).is_err());
+
+		let token_mix: Peer = serde_json::from_str(r#"{"url": "https://peer.example/?jwt=secret", "token": "secret"}"#)
+			.expect("parse mixed peer");
+		assert!(DialTarget::from_peer(&token_mix).is_err());
+	}
+
+	/// Unknown object fields reject the entry, so a typo keeps the last-good
+	/// topology instead of dialing with a silently dropped policy. The error
+	/// names the field rather than a generic shape mismatch.
+	#[test]
+	fn peer_unknown_field_is_rejected() {
+		let err = serde_json::from_str::<Vec<Peer>>(r#"[{"url": "https://peer.example/", "cosst": 1}]"#)
+			.expect_err("unknown field must fail");
+		assert!(err.to_string().contains("cosst"), "error must name the field: {err}");
+
+		#[derive(Debug, serde::Deserialize)]
+		struct Doc {
+			#[allow(dead_code)]
+			connect: Vec<Peer>,
+		}
+		let err = toml::from_str::<Doc>("connect = [{ url = \"https://peer.example/\", cost = \"cheap\" }]")
+			.expect_err("wrong type must fail");
+		assert!(err.to_string().contains("cost"), "error must name the field: {err}");
+	}
+
+	/// Equivalent URL and object forms of one peer dedupe, while differing
+	/// policies for one identity conflict, whatever their forms.
+	#[test]
+	fn peer_list_mixed_forms_conflict_on_policy() {
+		let object: Peer =
+			serde_json::from_str(r#"{"url": "https://peer.example/", "cost": 3}"#).expect("parse object peer");
+		let Err(err) = parse_peer_list(vec![Peer::new("https://peer.example/?cost=1"), object], None) else {
+			panic!("differing policies must conflict");
+		};
+		assert!(format!("{err:#}").contains("conflicting configurations"));
+	}
+
+	/// `Config::load` traces the whole resolved config, so `Peer` redacts its
+	/// credential from `Debug` instead of printing it into logs.
+	#[test]
+	fn peer_debug_redacts_token() {
+		let peer = Peer::new("https://peer.example/").with_cost(2).with_token("secret");
+		let debug = format!("{peer:?}");
+		assert!(!debug.contains("secret"), "Debug must not leak the credential: {debug}");
+		assert!(
+			debug.contains("https://peer.example/"),
+			"Debug keeps the address: {debug}"
+		);
+	}
+
+	/// Static `--cluster-connect` entries get the same all-or-nothing
+	/// validation as `--cluster-connect-api` lists: a repeated identity with
+	/// conflicting policy fails construction instead of silently keeping the
+	/// first entry, while equivalent entries dedupe.
 	#[tokio::test]
-	async fn gossip_without_node_errors() {
-		let config = ClusterConfig {
-			mesh: Some("true".to_string()),
+	async fn static_conflicting_peers_fail_at_construction() {
+		let conflicting = Config {
+			connect: vec![
+				Peer::new("https://peer.example/?cost=1"),
+				Peer::new("https://peer.example/?cost=2"),
+			],
 			..Default::default()
 		};
-		let err = Cluster::new(config).unwrap().run().await.expect_err("should error");
-		let msg = format!("{err}");
-		assert!(msg.contains("--cluster-node"), "missing --cluster-node in: {msg}");
-		assert!(msg.contains("--cluster-mesh"), "missing --cluster-mesh in: {msg}");
+		let Err(err) = new_cluster(conflicting) else {
+			panic!("conflicting static peers must fail");
+		};
+		assert!(
+			format!("{err:#}").contains("conflicting configurations"),
+			"refusal must say so: {err:#}"
+		);
+
+		let equivalent = Config {
+			connect: vec![
+				Peer::new("https://peer.example/?cost=2"),
+				serde_json::from_str(r#"{"url": "https://peer.example/", "cost": 2}"#).expect("parse object peer"),
+			],
+			..Default::default()
+		};
+		new_cluster(equivalent).expect("equivalent static peers dedupe");
 	}
 
-	/// A valid `cluster.id` is used verbatim as the relay's origin id, giving the
+	/// A malformed object entry keeps the last-good dials, exactly like a
+	/// malformed URL does.
+	#[tokio::test]
+	async fn malformed_object_peer_list_preserves_current_dial() {
+		let cluster = new_cluster(Config::default()).expect("cluster");
+		let dialed = DialMap::default();
+		let current = DialTarget::from_peer(&Peer::new("https://peer.example/?cost=1")).unwrap();
+		let task = tokio::spawn(std::future::pending::<()>());
+		dialed.insert(current.clone(), task.abort_handle(), DialSource::Api);
+
+		let asymmetric = Peer::new("https://peer.example/").with_cost(1).with_egress(2);
+		cluster.apply_peer_list(vec![asymmetric], &None, "", &dialed);
+
+		assert!(!task.is_finished(), "last-known-good dial must stay active");
+		let map = dialed.inner.lock().expect("dial map");
+		let entry = map.get(&current.key).expect("current dial");
+		assert!(entry.sources.get(entry.active) == Some(&current));
+		task.abort();
+	}
+
+	/// A valid `cluster.id` is used verbatim as the relay's Hop ID, giving the
 	/// node a stable identity across restarts.
-	#[test]
-	fn cluster_id_sets_origin() {
-		let cluster = Cluster::new(ClusterConfig {
+	#[tokio::test]
+	async fn cluster_id_sets_origin() {
+		let cluster = new_cluster(Config {
 			id: Some(42),
 			..Default::default()
 		})
 		.expect("valid id");
-		assert_eq!(cluster.origin.id(), 42);
+		assert_eq!(cluster.origin.hop().id(), 42);
+	}
+
+	/// Cache settings land on the one origin serving and stats share. A handle
+	/// cloned at construction stays on that origin.
+	#[tokio::test]
+	async fn constructed_origin_keeps_cache_and_handles() {
+		let duration = Duration::from_secs(5);
+		let mut cache = crate::cache::Config::default();
+		cache.duration = Some(duration);
+		let cache = cache.init().expect("cache");
+		let pool = cache.pool.clone();
+
+		let cluster = Cluster::new(
+			Options::new(Config {
+				id: Some(42),
+				..Default::default()
+			})
+			.with_cache(cache),
+		)
+		.expect("cluster");
+
+		let origin = cluster.origin.clone();
+		assert_eq!(origin.hop().id(), 42);
+		assert_eq!(origin.config().cache_duration, duration);
+		assert_eq!(origin.config().pool.expiry(), Some(duration));
+
+		let stats = crate::stats::Config {
+			enabled: true,
+			node: Some("test".to_string()),
+			..Default::default()
+		}
+		.build(origin.clone());
+		let cluster = cluster.with_stats(stats);
+
+		assert_eq!(cluster.origin.hop().id(), origin.hop().id());
+		assert_eq!(cluster.origin.config().cache_duration, duration);
+		assert_eq!(cluster.origin.config().pool.expiry(), Some(duration));
+
+		let broadcast = origin.create_broadcast("cam").expect("create");
+		broadcast.announce(Default::default()).expect("announce");
+		let mut track = broadcast.create_track("data", timed()).expect("track");
+		track.write_frame(moq_net::Timestamp::ZERO, b"hello").expect("write");
+		assert!(pool.used() > 0, "writes charge the constructed cache pool");
+
+		let consumer = cluster.origin.consume();
+		tokio::time::timeout(Duration::from_secs(2), consumer.request_broadcast("cam", None))
+			.await
+			.expect("broadcast resolves")
+			.expect("broadcast present");
+
+		let stats_path = moq_net::Path::new(".stats").join("node").join("test");
+		tokio::time::timeout(Duration::from_secs(5), consumer.routed(&stats_path))
+			.await
+			.expect("stats announced")
+			.expect("stats present");
 	}
 
 	/// A reserved (0) or out-of-range (>= 2^62) `cluster.id` is rejected rather
@@ -1787,7 +3113,7 @@ mod tests {
 	#[test]
 	fn cluster_id_out_of_range_errors() {
 		for bad in [0, 1u64 << 62] {
-			let err = Cluster::new(ClusterConfig {
+			let err = new_cluster(Config {
 				id: Some(bad),
 				..Default::default()
 			})
@@ -1797,82 +3123,59 @@ mod tests {
 		}
 	}
 
-	/// A relay configured with `cluster.node` + `cluster.mesh` gossip and no peers
-	/// (passive rendezvous) must run without a QUIC client, publish its
-	/// self-registration on the cluster origin, and keep that registration alive
-	/// (i.e. not exit and drop the broadcast).
-	#[tokio::test(start_paused = true)]
-	async fn passive_rendezvous_runs_without_client_and_advertises_self() {
-		let cluster = Cluster::new(ClusterConfig {
-			node: Some("rendezvous.example.com:4443".to_string()),
-			mesh: Some("true".to_string()),
-			..Default::default()
-		})
-		.unwrap();
-
-		// Snapshot a consumer on the cluster origin before run() takes ownership of
-		// `cluster` so we can later check that the registration was published.
-		let mut watcher = cluster.origin.consume().announced();
-
-		let cluster_run = cluster.clone();
-		let mut handle = tokio::spawn(async move { cluster_run.run().await });
-
-		// Give the runtime a moment to execute the synchronous setup work.
-		tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-		// The self-registration broadcast must be visible on the origin.
-		let moq_net::announce::Update { path, broadcast } =
-			watcher.try_next().expect("self-registration must be published");
-		assert_eq!(path.as_str(), ".internal/origins/rendezvous.example.com:4443");
-		assert!(broadcast.is_some());
-
-		// run() must NOT have returned: dropping the broadcast (via run returning)
-		// would unannounce the registration immediately. Use a short timeout to
-		// confirm we're still parked.
-		let still_running = tokio::time::timeout(tokio::time::Duration::from_millis(50), &mut handle)
-			.await
-			.is_err();
-		assert!(still_running, "passive rendezvous run() should park, not return");
-
-		handle.abort();
-	}
-
-	/// `cluster.node` (identity) and `cluster.mesh` (gossip toggle) round-trip
-	/// through TOML and survive the CLI re-parse when no flags override them.
-	/// `mesh` is a string (clobber-safe) that accepts a TOML boolean.
+	/// `cluster.node` (identity) round-trips through TOML and survives the CLI
+	/// re-parse when no flags override it.
 	#[test]
-	fn cluster_node_and_mesh_round_trip() {
-		// clap reads the environment while parsing, so serialize with the tests
+	fn cluster_node_round_trip() {
+		// Usage reads the environment while parsing, so serialize with the tests
 		// that mutate it.
 		let _env = crate::test_env::EnvGuard::lock();
 
-		let toml =
-			"[cluster]\nnode = \"us-east.example.com:4443\"\nmesh = true\nconnect = [\"root.example.com:4443\"]\n";
+		let toml = "[cluster]\nnode = \"us-east.example.com:4443\"\nconnect = [\"https://root.example.com:4443/\"]\n";
 		let dir = std::env::temp_dir().join("moq-relay-cluster-test");
 		std::fs::create_dir_all(&dir).unwrap();
-		let path = dir.join("cluster-node-mesh-toml.toml");
+		let path = dir.join("cluster-node-toml.toml");
 		std::fs::write(&path, toml).unwrap();
 
 		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
-		let config = Config::parse_and_merge(args).expect("config load");
+		let config = RelayConfig::parse_and_merge(args).expect("config load");
 		assert_eq!(config.cluster.node.as_deref(), Some("us-east.example.com:4443"));
-		// A TOML boolean deserializes into the string form.
-		assert_eq!(config.cluster.mesh.as_deref(), Some("true"));
-		assert_eq!(config.cluster.connect, vec!["root.example.com:4443".to_string()]);
+		assert_eq!(
+			config.cluster.connect,
+			vec![Peer::new("https://root.example.com:4443/")]
+		);
 	}
 
-	/// The legacy `--cluster-mesh <url>` form (now a boolean) is honored for
-	/// backwards compatibility: it enables gossip and supplies the node URL.
+	/// Static config accepts the object form beside bare URLs, through the same
+	/// type the connect API parses.
 	#[test]
-	fn legacy_mesh_url_enables_gossip_as_node() {
-		let cluster = Cluster::new(ClusterConfig {
-			mesh: Some("rendezvous.example.com:4443".to_string()),
-			..Default::default()
-		})
-		.unwrap();
-		let (gossip, node) = cluster.resolve_mesh().expect("legacy mesh url resolves");
-		assert!(gossip);
-		assert_eq!(node.as_deref(), Some("rendezvous.example.com:4443"));
+	fn cluster_connect_object_form_round_trip() {
+		// Usage reads the environment while parsing, so serialize with the tests
+		// that mutate it.
+		let _env = crate::test_env::EnvGuard::lock();
+
+		let toml = "[cluster]\nconnect = [\"https://a.example/?cost=1\", { url = \"https://b.example/\", cost = 2, egress = 2, token = \"secret\", upstream = true }]\n";
+		let dir = std::env::temp_dir().join("moq-relay-cluster-test");
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("cluster-connect-object-toml.toml");
+		std::fs::write(&path, toml).unwrap();
+
+		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
+		let config = RelayConfig::parse_and_merge(args).expect("config load");
+		assert_eq!(
+			config.cluster.connect,
+			vec![
+				Peer::new("https://a.example/?cost=1"),
+				Peer::new("https://b.example/")
+					.with_cost(2)
+					.with_egress(2)
+					.with_token("secret")
+					.with_upstream(true),
+			]
+		);
+		// The object normalizes exactly like its URL spellings.
+		let desired = parse_peer_list(config.cluster.connect, None).expect("static peers parse");
+		assert_eq!(desired.len(), 2);
 	}
 
 	/// `--cluster-connect` accepts a full URL verbatim (preserving its `?jwt=`)
@@ -1897,85 +3200,28 @@ mod tests {
 		assert!(!is_legacy_peer("https://cdn.example.com/?jwt=abc"));
 	}
 
+	/// A bare `--cluster-connect` host still parses so the process can name what
+	/// replaced it, but it configures nothing and must stop a run.
+	#[test]
+	fn released_cluster_spellings_are_reported_not_applied() {
+		let config = Config {
+			connect: vec![Peer::new("root.example.com:4443")],
+			..Default::default()
+		};
+		let reported = config.deprecated().to_string();
+		assert!(
+			reported.contains("a full URL like https://host/?jwt=TOKEN"),
+			"{reported}"
+		);
+		assert!(new_cluster(config).is_err());
+	}
+
 	/// A malformed URL may contain a credential, so parse errors must not echo the
 	/// raw input into logs.
 	#[test]
 	fn peer_url_error_redacts_inline_credential() {
 		let err = peer_url("https://peer.example:bad/?jwt=top-secret").unwrap_err();
 		assert!(!format!("{err:#}").contains("top-secret"));
-	}
-
-	/// What a discovering relay reads off `announced()` for this node.
-	fn advertised(node: &str) -> String {
-		Path::new(MESH_PREFIX)
-			.join(node)
-			.as_str()
-			.strip_prefix(&format!("{MESH_PREFIX}/"))
-			.expect("advertised under the mesh prefix")
-			.to_owned()
-	}
-
-	/// A node URL is advertised as a broadcast path, which collapses the `//` after
-	/// the scheme. It has to come back as the same address anyway, or every
-	/// gossip-discovered peer is dialed as the hostname `https`.
-	#[test]
-	fn a_node_url_survives_a_broadcast_path() {
-		for node in [
-			"https://a.example/",
-			"https://b.example:4443/",
-			"tcp://c.example:4443",
-			"https://d.example/?cost=7",
-			"https://e.example/deep/path",
-			// Legacy bare forms, which carry no scheme and default to https.
-			"rendezvous.example.com:4443",
-			"cdn.example.com",
-		] {
-			let dialed = advertised_node_url(&advertised(node));
-			assert_eq!(
-				peer_url(&dialed).unwrap(),
-				peer_url(node).unwrap(),
-				"{node} did not survive a round trip through a broadcast path"
-			);
-		}
-	}
-
-	/// The dialed address keeps its query. `run_remote` reads `?cost=` off it to
-	/// price the link, so canonicalizing first (which drops the query) would leave
-	/// every gossip-discovered link silently at the default cost.
-	#[test]
-	fn an_advertised_url_keeps_the_query_it_is_dialed_with() {
-		let dialed = advertised_node_url(&advertised("https://a.example/?cost=10"));
-		assert_eq!(dialed, "https://a.example/?cost=10");
-
-		// The value has to reach where `run_remote` reads it.
-		let mut url = peer_url(&dialed).unwrap();
-		assert_eq!(take_cost(&mut url).unwrap(), Some(10));
-		assert_eq!(url.as_str(), "https://a.example/");
-	}
-
-	/// The colon that ends a scheme is the only signal, so a bare `host:port` (whose
-	/// colon sits mid-segment) must not be read as one.
-	#[test]
-	fn a_bare_host_port_is_not_read_as_a_scheme() {
-		assert_eq!(
-			advertised_node_url("rendezvous.example.com:4443"),
-			"rendezvous.example.com:4443"
-		);
-		assert_eq!(
-			canonicalize_peer_key(&advertised_node_url("rendezvous.example.com:4443")),
-			"https://rendezvous.example.com:4443/"
-		);
-	}
-
-	/// With both sides canonical, exactly one of a pair dials.
-	#[test]
-	fn gossiped_urls_keep_the_tiebreaker_symmetric() {
-		let a = canonicalize_peer_key("https://a.example/");
-		let b = canonicalize_peer_key(&advertised_node_url("https:/b.example"));
-		assert!(
-			should_dial(&a, &b) != should_dial(&b, &a),
-			"exactly one side of a pair must dial"
-		);
 	}
 
 	/// The same relay spelled as a bare `host:port`, a full URL, or a URL with an
@@ -2000,40 +3246,719 @@ mod tests {
 		assert_ne!(canonicalize_peer_key("host:4443"), canonicalize_peer_key("host:5555"));
 	}
 
-	/// A legacy mesh URL that disagrees with an explicit `--cluster-node` is a
-	/// conflict, not a silent pick.
+	/// The nested `[cluster.lan]` table survives the TOML-to-CLI merge.
+	#[cfg(feature = "cluster-lan")]
 	#[test]
-	fn legacy_mesh_url_conflicting_with_node_errors() {
-		let cluster = Cluster::new(ClusterConfig {
-			mesh: Some("a.example.com:4443".to_string()),
-			node: Some("b.example.com:4443".to_string()),
-			..Default::default()
-		})
-		.unwrap();
-		let err = cluster.resolve_mesh().expect_err("conflict should error");
-		assert!(format!("{err}").contains("conflicts with"), "got: {err}");
+	fn cluster_lan_survives_toml_merge() {
+		// Usage reads the environment while parsing, so serialize with the tests
+		// that mutate it.
+		let _env =
+			crate::test_env::EnvGuard::clear(&["MOQ_CLUSTER_LAN", "MOQ_CLUSTER_LAN_SECRET", "MOQ_CLUSTER_LAN_APP"]);
+
+		let toml = "[cluster]\nnode = \"https://relay.example.com\"\n\n[cluster.lan]\nenabled = true\nsecret = \"cluster.key\"\napp = \"custom\"\n";
+		let dir = std::env::temp_dir().join("moq-relay-cluster-test");
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("cluster-lan-toml.toml");
+		std::fs::write(&path, toml).unwrap();
+
+		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
+		let config = RelayConfig::parse_and_merge(args).expect("config load");
+		assert!(config.cluster.lan.enabled);
+		assert_eq!(config.cluster.lan.secret.as_deref(), Some("cluster.key"));
+		assert_eq!(
+			config.cluster.lan.app.as_ref().map(ToString::to_string).as_deref(),
+			Some("custom")
+		);
+		assert_eq!(config.cluster.node.as_deref(), Some("https://relay.example.com"));
 	}
 
-	/// `cluster.connect_api` set in TOML must survive the CLI re-parse when no
-	/// `--cluster-connect-api` flag is passed (same clap+TOML clobber pitfall the
-	/// config tests guard, which is why the field is `Option<String>`).
+	/// A CLI flag overrides the same key from TOML, rather than the nesting
+	/// hiding it from `update_from`.
+	#[cfg(feature = "cluster-lan")]
+	#[test]
+	fn cli_overrides_toml_cluster_lan() {
+		let _env =
+			crate::test_env::EnvGuard::clear(&["MOQ_CLUSTER_LAN", "MOQ_CLUSTER_LAN_SECRET", "MOQ_CLUSTER_LAN_APP"]);
+
+		let toml = "[cluster.lan]\nenabled = true\nsecret = \"from-toml.key\"\napp = \"from-toml\"\n";
+		let dir = std::env::temp_dir().join("moq-relay-cluster-test");
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("cluster-lan-override.toml");
+		std::fs::write(&path, toml).unwrap();
+
+		let args = vec![
+			std::ffi::OsString::from("moq-relay"),
+			std::ffi::OsString::from(&path),
+			std::ffi::OsString::from("--cluster-lan-secret"),
+			std::ffi::OsString::from("from-cli.key"),
+			std::ffi::OsString::from("--cluster-lan-app"),
+			std::ffi::OsString::from("from-cli"),
+		];
+		let config = RelayConfig::parse_and_merge(args).expect("config load");
+		assert_eq!(config.cluster.lan.secret.as_deref(), Some("from-cli.key"));
+		assert_eq!(
+			config.cluster.lan.app.as_ref().map(ToString::to_string).as_deref(),
+			Some("from-cli")
+		);
+		assert!(config.cluster.lan.enabled, "the untouched key survives");
+	}
+
+	/// A path-capable client version that the listener does not offer cannot
+	/// negotiate, so start-up must refuse it rather than retry forever.
+	#[cfg(feature = "cluster-lan")]
+	#[test]
+	fn lan_versions_must_overlap_on_a_path_capable_version() {
+		let lite04: moq_net::Version = "moq-lite-04".parse().unwrap();
+		let lite05: moq_net::Version = "moq-lite-05".parse().unwrap();
+
+		let mut client = moq_tokio::connect::Config::default();
+		client.version = vec![lite04, lite05];
+		let mut server = moq_tokio::listen::Config::default();
+		server.version = vec![lite04];
+		let err = Cluster::validate_lan_versions(&client, &server)
+			.expect_err("lite-05 client vs lite-04 listener")
+			.to_string();
+		assert!(
+			err.contains("--connect-version") || err.contains("--listen-version"),
+			"{err}"
+		);
+
+		server.version = vec![lite05];
+		Cluster::validate_lan_versions(&client, &server).expect("shared lite-05");
+	}
+
+	/// A LAN mesh without a node URL still starts when the listener has a
+	/// generated certificate to advertise.
+	#[cfg(feature = "cluster-lan")]
+	#[tokio::test]
+	async fn lan_without_node_needs_a_fingerprint() {
+		let config = Config {
+			lan: LanConfig {
+				enabled: true,
+				..Default::default()
+			},
+			..Default::default()
+		};
+		let err = new_cluster(config.clone())
+			.unwrap()
+			.start()
+			.await
+			.expect_err("--cluster-lan without advertise must fail");
+		let msg = format!("{err}");
+		assert!(msg.contains("with_advertise") || msg.contains("--cluster-lan"), "{msg}");
+
+		let err = new_cluster(config)
+			.unwrap()
+			.with_advertise(LanAdvertise::new(4443))
+			.with_connect(Default::default(), Default::default())
+			.start()
+			.await
+			.expect_err("neither node nor fingerprint");
+		let msg = format!("{err}");
+		assert!(msg.contains("--cluster-node") || msg.contains("generated"), "{msg}");
+	}
+
+	/// The secret is optional: without one the mesh is open, and start-up does
+	/// not refuse it. Binding mDNS is skipped here by not attaching a client;
+	/// the missing-fingerprint/node check still runs first.
+	#[cfg(feature = "cluster-lan")]
+	#[tokio::test]
+	async fn lan_without_a_secret_is_open() {
+		let config = Config {
+			node: Some("https://us-west.example.com".to_string()),
+			lan: LanConfig {
+				enabled: true,
+				secret: None,
+				..Default::default()
+			},
+			..Default::default()
+		};
+		let err = new_cluster(config)
+			.unwrap()
+			.with_advertise(LanAdvertise::new(4443))
+			.start()
+			.await
+			.expect_err("open LAN still needs with_connect");
+		let msg = format!("{err}");
+		assert!(msg.contains("with_connect"), "{msg}");
+		assert!(
+			!msg.contains("--cluster-lan-secret"),
+			"an open mesh must not demand a secret: {msg}"
+		);
+	}
+
+	/// A secret or app without the mesh is an error, not a silently ignored flag.
+	#[cfg(feature = "cluster-lan")]
+	#[test]
+	fn lan_secret_and_app_require_the_mesh() {
+		assert!(
+			LanConfig {
+				enabled: false,
+				secret: Some("cluster.key".into()),
+				..Default::default()
+			}
+			.validate()
+			.unwrap_err()
+			.to_string()
+			.contains("--cluster-lan=true")
+		);
+		assert!(
+			LanConfig {
+				enabled: false,
+				app: Some("custom".parse().expect("valid app")),
+				..Default::default()
+			}
+			.validate()
+			.unwrap_err()
+			.to_string()
+			.contains("--cluster-lan-app")
+		);
+	}
+
+	/// A LAN dial presents the peer's credential on the mesh path and drops
+	/// `?jwt=` even when the advertised node URL carried one.
+	#[cfg(feature = "cluster-lan")]
+	#[test]
+	fn lan_dial_urls_carry_the_credential_not_the_token() {
+		let mut url = Url::parse("https://relay.example.com/anon?jwt=secret&cost=2").expect("url");
+		let cost = take_cost(&mut url).expect("cost");
+		strip_jwt(&mut url);
+		url.set_path(&format!("{CLUSTER_PATH}/theirs"));
+		assert_eq!(cost, Some(2));
+		assert_eq!(url.path(), "/.cluster/theirs");
+		assert!(!url.query().unwrap_or("").contains("jwt"));
+	}
+
+	#[test]
+	fn lan_credential_is_the_path_segment_after_the_marker() {
+		assert_eq!(Cluster::lan_credential("/.cluster/abc"), Some("abc"));
+		assert_eq!(Cluster::lan_credential("/.cluster"), None);
+		assert_eq!(Cluster::lan_credential("/.cluster/"), None);
+		assert_eq!(Cluster::lan_credential("/.clusterish/abc"), None);
+		assert_eq!(Cluster::lan_credential("/room"), None);
+		assert!(Cluster::is_lan_path("/.cluster"));
+		assert!(Cluster::is_lan_path("/.cluster/abc"));
+		assert!(!Cluster::is_lan_path("/.clusterish/abc"));
+		assert!(!Cluster::is_lan_path("/room"));
+	}
+
+	/// mDNS is just another wanter: a peer also reached by a static seed keeps
+	/// its dial when the advertisement goes away, and only the last release
+	/// tears it down.
+	#[cfg(feature = "cluster-lan")]
+	#[tokio::test]
+	async fn mdns_release_respects_the_other_sources() {
+		let dialed = DialMap::default();
+		let peer = target("peer:4443");
+		dialed.insert(peer.clone(), placeholder_handle(), DialSource::Mdns);
+		dialed.insert(peer.clone(), placeholder_handle(), DialSource::Static);
+
+		// The static seed wants the same target, so the takeover reuses the dial.
+		dialed.release(&peer.key, DialSource::Mdns, &mut |_| panic!("must not redial"));
+		assert!(dialed.contains(&peer.key), "the static seed still wants it");
+
+		dialed.release(&peer.key, DialSource::Static, &mut |_| panic!("must not redial"));
+		assert!(!dialed.contains(&peer.key), "the last release abandons the dial");
+
+		// Releasing an unknown peer is a no-op, not a panic.
+		dialed.release("never-dialed", DialSource::Mdns, &mut |_| panic!("must not redial"));
+	}
+
 	#[test]
 	fn cluster_connect_api_survives_toml_merge() {
-		// clap reads the environment while parsing, so serialize with the tests
+		// Usage reads the environment while parsing, so serialize with the tests
 		// that mutate it.
 		let _env = crate::test_env::EnvGuard::lock();
 
-		let toml = "[cluster]\nconnect_api = \"https://api.example.com/cluster/connect\"\n";
+		let toml = "[cluster]\nconnect_api = \"https://api.example.com/cluster/connect\"\nconnect_api_tls_root = [\"api.pem\"]\n";
 		let dir = std::env::temp_dir().join("moq-relay-cluster-test");
 		std::fs::create_dir_all(&dir).unwrap();
 		let path = dir.join("cluster-connect-api-toml.toml");
 		std::fs::write(&path, toml).unwrap();
 
 		let args = vec![std::ffi::OsString::from("moq-relay"), std::ffi::OsString::from(&path)];
-		let config = Config::parse_and_merge(args).expect("config load");
+		let config = RelayConfig::parse_and_merge(args).expect("config load");
 		assert_eq!(
 			config.cluster.connect_api.as_deref(),
 			Some("https://api.example.com/cluster/connect")
+		);
+		assert_eq!(config.cluster.connect_api_tls_root, vec![PathBuf::from("api.pem")]);
+	}
+
+	/// Two in-process origins share broadcasts both ways over one
+	/// fingerprint-pinned `/.cluster/<credential>` session. Wires accept to dial
+	/// directly, so the test needs no multicast and stays CI-safe. It does not
+	/// exercise `run_mdns`, `Peer::urls()` order, or `discovery.should_dial`;
+	/// the names "node" and "fingerprint" are the two origins, not two
+	/// advertising modes.
+	#[cfg(feature = "cluster-lan")]
+	#[tokio::test]
+	async fn lan_cluster_path_carries_broadcasts_both_ways() {
+		const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+		let _ = moq_tokio::crypto::install_default();
+
+		let node = new_cluster(Config::default()).expect("node cluster");
+		let fingerprint = new_cluster(Config::default()).expect("fingerprint cluster");
+
+		let _from_node = node.origin.create_broadcast("from-node").expect("create");
+		_from_node.announce(Default::default()).expect("announce");
+
+		let mut listen = moq_tokio::listen::Config::default();
+		listen.bind = Some("127.0.0.1:0".parse().unwrap());
+		listen.tls.generate = vec!["moq-cluster-lan".to_string()];
+		let server = listen.init(Default::default()).expect("bind");
+		let port = server.local_addr().expect("local addr").port();
+		let fp = server
+			.certificates()
+			.fingerprints()
+			.into_iter()
+			.next()
+			.expect("generated fingerprint");
+		let listener = server.listen().await.expect("listen");
+
+		node.set_lan_credential("listener-proof");
+		let accept = node.clone();
+		tokio::spawn(async move {
+			let mut listener = listener;
+			while let Some(request) = listener.accept().await {
+				let conn = crate::Connection::new(request, accept.clone(), crate::auth::Auth::refuse("test"));
+				tokio::spawn(async move {
+					conn.run().await;
+				});
+			}
+		});
+
+		let mut connect = moq_tokio::connect::Config::default();
+		connect.once = Some(true);
+		let fingerprint = fingerprint
+			.with_connect(connect, Default::default())
+			.with_advertise(LanAdvertise::new(port).with_fingerprint(fp.clone()));
+		let url: Url = format!("moqt://127.0.0.1:{port}{CLUSTER_PATH}/listener-proof")
+			.parse()
+			.expect("url");
+		let target = DialTarget {
+			key: format!("moqt://127.0.0.1:{port}/"),
+			url: url.clone(),
+			urls: vec![url],
+			cost: None,
+			fingerprint: Some(fp),
+			lan: true,
+			upstream: false,
+		};
+		let _dial = fingerprint.dial_lan_target(&target).expect("dial");
+
+		let mut announced = fingerprint.origin.consume().announced();
+		let (update, _) = tokio::time::timeout(TIMEOUT, next_update(&mut announced))
+			.await
+			.expect("timed out waiting for from-node")
+			.expect("origin closed");
+		assert_eq!(update.prefix.as_str(), "from-node");
+		// The dialer marks what the peer forwards: it entered at `node`, not here.
+		assert_eq!(update.route.source(), origin::Source::Peer(node.origin.hop()));
+
+		let _from_fp = fingerprint.origin.create_broadcast("from-fingerprint").expect("create");
+		_from_fp.announce(Default::default()).expect("announce");
+		let mut announced = node.origin.consume().announced();
+		loop {
+			let (update, _) = tokio::time::timeout(TIMEOUT, next_update(&mut announced))
+				.await
+				.expect("timed out waiting for from-fingerprint")
+				.expect("origin closed");
+			if update.prefix.as_str() == "from-fingerprint" {
+				// The acceptor marks a LAN peer the same way.
+				assert_eq!(update.route.source(), origin::Source::Peer(fingerprint.origin.hop()));
+				break;
+			}
+		}
+
+		// Each relay's local view holds only what it ingested itself.
+		let mut local = node.origin.consume().local().announced();
+		let update = try_next_announced(&mut local).expect("from-node is local");
+		assert_eq!(update.prefix.as_str(), "from-node");
+		assert_eq!(update.route.source(), origin::Source::Local);
+		assert!(
+			try_next_announced(&mut local).is_none(),
+			"a peer's broadcast is not local"
+		);
+	}
+
+	/// A start that fails binds no dial socket, so a corrected start on the same
+	/// fixed `[connect]` port succeeds. One that never runs registers nothing, so
+	/// dropping it releases its client rather than leaving it to `close`.
+	#[tokio::test]
+	async fn a_failed_start_leaves_the_dial_bind_free() {
+		let _ = moq_tokio::crypto::install_default();
+		let dir = tempfile::tempdir().expect("tempdir");
+		let token = dir.path().join("token");
+		let config = Config {
+			connect: vec![Peer::new("moql://127.0.0.1:9/")],
+			token: Some(token.clone()),
+			..Default::default()
+		};
+		let mut connect = moq_tokio::connect::Config::default();
+		// Borrow a free port from the OS, then hand it to the dial template.
+		connect.bind = Some(
+			std::net::UdpSocket::bind("127.0.0.1:0")
+				.expect("probe socket")
+				.local_addr()
+				.expect("probe addr"),
+		);
+		let cluster = new_cluster(config)
+			.expect("cluster")
+			.with_connect(connect, Default::default());
+
+		let err = cluster.clone().start().await.expect_err("the token file is missing");
+		assert!(format!("{err:#}").contains("cluster token"), "{err:#}");
+		std::fs::write(&token, "secret").expect("write token");
+		let _started = cluster.clone().start().await.expect("a corrected start binds the port");
+		let registered = cluster.dialers.lock().open.as_ref().expect("open").clients.len();
+		assert_eq!(registered, 0, "a start registers its client only once it runs");
+	}
+
+	/// A QUIC endpoint that accepts the ALPNs of `connect` and speaks no MoQ, so a
+	/// test sees the transport close of the dial itself. `idle` outlasts any wait.
+	#[cfg(feature = "quic")]
+	fn bare_quic_server(
+		connect: &moq_tokio::connect::Config,
+		idle: std::time::Duration,
+	) -> moq_tokio::quic::driver::Endpoint {
+		use moq_tokio::quic::driver;
+		let key = rcgen::KeyPair::generate().expect("keypair");
+		let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+			.expect("cert params")
+			.self_signed(&key)
+			.expect("self-signed cert");
+		let mut tls = rustls::ServerConfig::builder()
+			.with_no_client_auth()
+			.with_single_cert(
+				vec![cert.der().clone()],
+				rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+			)
+			.expect("server tls");
+		tls.alpn_protocols = connect
+			.versions()
+			.alpns()
+			.iter()
+			.map(|alpn| alpn.as_bytes().to_vec())
+			.collect();
+		let crypto = driver::crypto::rustls::QuicServerConfig::try_from(tls).expect("quic crypto");
+		let mut transport = driver::TransportConfig::default();
+		transport.max_idle_timeout(Some(idle.try_into().expect("idle timeout")));
+		let mut server_config = driver::ServerConfig::with_crypto(Arc::new(crypto));
+		server_config.transport_config(Arc::new(transport));
+		driver::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).expect("server")
+	}
+
+	/// Cancelling `run` aborts the dials a peer list started, which run outside
+	/// the tasks of `run` itself, so none keeps redialing with nothing left to close it.
+	#[cfg(feature = "quic")]
+	#[tokio::test]
+	async fn cancelling_run_stops_its_dynamic_dials() {
+		const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+		const IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+		let _ = moq_tokio::crypto::install_default();
+
+		let mut connect = moq_tokio::connect::Config::default();
+		connect.tls.insecure = Some(true);
+		let server = bare_quic_server(&connect, IDLE);
+		let port = server.local_addr().expect("server addr").port();
+		let dir = tempfile::tempdir().expect("tempdir");
+		let peers = dir.path().join("peers.json");
+		std::fs::write(&peers, format!(r#"["moql://127.0.0.1:{port}/"]"#)).expect("write peers");
+
+		let config = Config {
+			connect_api: Some(peers.display().to_string()),
+			..Default::default()
+		};
+		let mut quic = moq_tokio::quic::Config::default();
+		quic.idle_timeout = Some(IDLE);
+		let cluster = new_cluster(config).expect("cluster").with_connect(connect, quic);
+		let started = cluster.clone().start().await.expect("start");
+		let running = tokio::spawn(started.run());
+
+		let _conn = tokio::time::timeout(TIMEOUT, server.accept())
+			.await
+			.expect("dial timeout")
+			.expect("incoming")
+			.await
+			.expect("handshake");
+		running.abort();
+		let _ = running.await;
+		// Each dial holds a stop receiver until its task ends.
+		tokio::time::timeout(TIMEOUT, cluster.dialers.stop.closed())
+			.await
+			.expect("a peer-list dial outlived its cancelled run");
+	}
+
+	/// A critical failure ends `run`, which closes the dials on the way out: the
+	/// caller consumed the cluster, so nothing else could. The dialing runtime stops
+	/// right after, as a process exit would, and the peer's idle timeout is far past
+	/// the wait, so only the close explains the link ending.
+	#[cfg(feature = "quic")]
+	#[tokio::test]
+	async fn a_critical_failure_closes_the_dials() {
+		use moq_tokio::quic::driver;
+		const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+		const IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+		let _ = moq_tokio::crypto::install_default();
+
+		let mut connect = moq_tokio::connect::Config::default();
+		connect.tls.insecure = Some(true);
+		let server = bare_quic_server(&connect, IDLE);
+		let port = server.local_addr().expect("server addr").port();
+
+		let config = Config {
+			connect: vec![Peer::new(format!("moql://127.0.0.1:{port}/"))],
+			..Default::default()
+		};
+		let mut quic = moq_tokio::quic::Config::default();
+		quic.idle_timeout = Some(IDLE);
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.expect("dialer runtime");
+		let (cluster, running) = runtime
+			.spawn(async move {
+				let cluster = new_cluster(config).expect("cluster").with_connect(connect, quic);
+				let started = cluster.clone().start().await.expect("start");
+				(cluster, tokio::spawn(started.run()))
+			})
+			.await
+			.expect("dialer task");
+
+		let conn = tokio::time::timeout(TIMEOUT, server.accept())
+			.await
+			.expect("dial timeout")
+			.expect("incoming")
+			.await
+			.expect("handshake");
+		cluster
+			.critical
+			.spawn("injected", async { panic!("injected critical failure") });
+		let result = tokio::time::timeout(TIMEOUT, running)
+			.await
+			.expect("run returns on a critical failure")
+			.expect("run task");
+		assert!(result.is_err(), "a critical failure fails run");
+		runtime.shutdown_background();
+
+		let err = tokio::time::timeout(TIMEOUT, conn.closed())
+			.await
+			.expect("the peer heard no close before its idle timeout");
+		match err {
+			driver::ConnectionError::ApplicationClosed(close) => assert_eq!(&close.reason[..], b"client shutdown"),
+			other => panic!("the link ended with {other:?}, not the shutdown close"),
+		}
+	}
+
+	/// A second close awaits the shutdown the first started, and still finishes it
+	/// when the first caller gives up, so no caller returns while links are open.
+	#[tokio::test]
+	async fn concurrent_closes_share_one_shutdown() {
+		let dialers = Dialers::new();
+		// Stands in for a dropped guard's background close, which holds the shutdown open.
+		let background = dialers.lock().open.as_ref().expect("open").closing.clone();
+		let first = tokio::spawn({
+			let dialers = dialers.clone();
+			async move { dialers.close().await }
+		});
+		while dialers.lock().open.is_some() {
+			tokio::task::yield_now().await;
+		}
+
+		let mut second = std::pin::pin!(dialers.close());
+		assert!(
+			futures::poll!(second.as_mut()).is_pending(),
+			"a second close returned before the shutdown finished"
+		);
+		first.abort();
+		let _ = first.await;
+		drop(background);
+		tokio::time::timeout(std::time::Duration::from_secs(5), second)
+			.await
+			.expect("the second close finishes the shutdown");
+	}
+
+	/// A LAN dial owns its client, so closing the cluster closes that too: the peer
+	/// drops the dialer's routes at once, though the dialing runtime stops right
+	/// after, as a process exit would. Both idle timeouts are far past the wait.
+	#[cfg(feature = "cluster-lan")]
+	#[tokio::test]
+	async fn closing_a_cluster_closes_its_lan_dials() {
+		const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+		const IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+		let _ = moq_tokio::crypto::install_default();
+		let mut quic = moq_tokio::quic::Config::default();
+		quic.idle_timeout = Some(IDLE);
+
+		let node = new_cluster(Config::default()).expect("node cluster");
+		let mut listen = moq_tokio::listen::Config::default();
+		listen.bind = Some("127.0.0.1:0".parse().unwrap());
+		listen.tls.generate = vec!["moq-cluster-lan".to_string()];
+		let server = listen.init(quic.clone()).expect("bind");
+		let port = server.local_addr().expect("local addr").port();
+		let fp = server
+			.certificates()
+			.fingerprints()
+			.into_iter()
+			.next()
+			.expect("generated fingerprint");
+		let listener = server.listen().await.expect("listen");
+		node.set_lan_credential("listener-proof");
+		let accept = node.clone();
+		tokio::spawn(async move {
+			let mut listener = listener;
+			while let Some(request) = listener.accept().await {
+				let conn = crate::Connection::new(request, accept.clone(), crate::auth::Auth::refuse("test"));
+				tokio::spawn(conn.run());
+			}
+		});
+
+		let url: Url = format!("moqt://127.0.0.1:{port}{CLUSTER_PATH}/listener-proof")
+			.parse()
+			.expect("url");
+		let target = DialTarget {
+			key: format!("moqt://127.0.0.1:{port}/"),
+			url: url.clone(),
+			urls: vec![url],
+			cost: None,
+			fingerprint: Some(fp),
+			lan: true,
+			upstream: false,
+		};
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.expect("dialer runtime");
+		let (dialer, broadcast) = runtime
+			.spawn(async move {
+				let dialer = new_cluster(Config::default())
+					.expect("dialer cluster")
+					.with_connect(Default::default(), quic);
+				let broadcast = dialer.origin.create_broadcast("from-dialer").expect("create");
+				broadcast.announce(Default::default()).expect("announce");
+				tokio::spawn(dialer.clone().supervise_remote(target, String::new()));
+				(dialer, broadcast)
+			})
+			.await
+			.expect("dialer task");
+
+		let mut announced = node.origin.consume().announced();
+		loop {
+			let (update, active) = tokio::time::timeout(TIMEOUT, next_update(&mut announced))
+				.await
+				.expect("timed out waiting for from-dialer")
+				.expect("origin closed");
+			if update.prefix.as_str() == "from-dialer" && active {
+				break;
+			}
+		}
+
+		runtime.spawn(async move { dialer.close().await }).await.expect("close");
+		runtime.shutdown_background();
+		// Held throughout: dropping it would unannounce over a live link instead.
+		let _broadcast = broadcast;
+
+		loop {
+			let (update, active) = tokio::time::timeout(TIMEOUT, next_update(&mut announced))
+				.await
+				.expect("the peer kept the dialer's route past the close")
+				.expect("origin closed");
+			if update.prefix.as_str() == "from-dialer" && !active {
+				break;
+			}
+		}
+	}
+
+	/// A grant naming a cluster peer marks the session's routes as a peer's, so the
+	/// relay's local view leaves them out; any other grant ingests here.
+	#[tokio::test]
+	async fn peer_grant_marks_the_session_publisher() {
+		let cluster = new_cluster(Config::default()).expect("cluster");
+		let all: moq_net::Patterns = [moq_net::Pattern::all()].into_iter().collect();
+
+		let client = auth::Token::new("/", &moq_auth::Grant::new(all.clone(), all.clone()));
+		let mut grant = moq_auth::Grant::new(all.clone(), all);
+		grant.peer = true;
+		let peer = auth::Token::new("/", &grant);
+
+		let _ingest = cluster
+			.publisher(&client)
+			.expect("client")
+			.publish("ingest", Default::default());
+		let _forwarded = cluster
+			.publisher(&peer)
+			.expect("peer")
+			.publish("forwarded", Default::default());
+
+		let mut announced = cluster.origin.consume().announced();
+		let forwarded = try_next_announced(&mut announced).expect("forwarded");
+		assert_eq!(forwarded.prefix.as_str(), "forwarded");
+		assert!(matches!(forwarded.route.source(), origin::Source::Peer(_)));
+		let ingest = try_next_announced(&mut announced).expect("ingest");
+		assert_eq!(ingest.route.source(), origin::Source::Local);
+
+		let mut local = cluster.origin.consume().local().announced();
+		assert_eq!(
+			try_next_announced(&mut local).expect("ingest").prefix.as_str(),
+			"ingest"
+		);
+		assert!(try_next_announced(&mut local).is_none());
+	}
+
+	/// An upstream grant's session is a peer that never reads another upstream's
+	/// routes: two accepted cores never transit through this relay.
+	#[tokio::test]
+	async fn upstream_grant_hides_other_upstreams() {
+		let cluster = new_cluster(Config::default()).expect("cluster");
+		let all: moq_net::Patterns = [moq_net::Pattern::all()].into_iter().collect();
+
+		let client = auth::Token::new("/", &moq_auth::Grant::new(all.clone(), all.clone()));
+		let mut grant = moq_auth::Grant::new(all.clone(), all);
+		grant.peer = true;
+		let peer = auth::Token::new("/", &grant);
+		grant.upstream = true;
+		let core = auth::Token::new("/", &grant);
+
+		let _ingest = cluster
+			.publisher(&client)
+			.expect("client")
+			.publish("ingest", Default::default());
+		let _mesh = cluster
+			.publisher(&peer)
+			.expect("peer")
+			.publish("mesh", Default::default());
+		let _core = cluster
+			.publisher(&core)
+			.expect("core")
+			.publish("core", Default::default());
+
+		let mut everyone = cluster.subscriber(&client).expect("client").consume().announced();
+		let mut prefixes = std::iter::from_fn(|| try_next_announced(&mut everyone))
+			.map(|announce| announce.prefix.to_string())
+			.collect::<Vec<_>>();
+		prefixes.sort();
+		assert_eq!(prefixes, ["core", "ingest", "mesh"]);
+
+		let mut toward_core = cluster.subscriber(&core).expect("core").consume().announced();
+		let mut prefixes = std::iter::from_fn(|| try_next_announced(&mut toward_core))
+			.map(|announce| announce.prefix.to_string())
+			.collect::<Vec<_>>();
+		prefixes.sort();
+		assert_eq!(prefixes, ["ingest", "mesh"]);
+	}
+
+	/// A `/.cluster` request on a cluster without LAN discovery is refused.
+	#[cfg(feature = "cluster-lan")]
+	#[tokio::test]
+	async fn lan_path_without_discovery_is_refused() {
+		assert_eq!(
+			new_cluster(Config::default())
+				.expect("cluster")
+				.verify_lan_credential("anything"),
+			None
 		);
 	}
 }

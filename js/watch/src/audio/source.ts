@@ -1,11 +1,7 @@
+import { Milli } from "@moq/clock";
 import type * as Catalog from "@moq/hang/catalog";
-import type * as Moq from "@moq/net";
-import { Time } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
-
-// AudioWorklet always renders in 128-sample quanta.
-const WORKLET_QUANTUM = 128;
 
 export type Target = {
 	// Optional manual override for the selected rendition name.
@@ -36,8 +32,8 @@ type SourceOutput = {
 	track: Signal<string | undefined>;
 	config: Signal<Catalog.AudioConfig | undefined>;
 
-	// The per-rendition jitter (ms) to add to the sync buffer. Wired into Sync by the parent.
-	jitter: Signal<Moq.Time.Milli | undefined>;
+	// The jitter the selected rendition advertises (ms): a floor on the decoder's playout target.
+	jitter: Signal<Milli | undefined>;
 };
 
 /**
@@ -52,7 +48,7 @@ export class Source {
 		available: new Signal<Record<string, Catalog.AudioConfig>>({}),
 		track: new Signal<string | undefined>(undefined),
 		config: new Signal<Catalog.AudioConfig | undefined>(undefined),
-		jitter: new Signal<Moq.Time.Milli | undefined>(undefined),
+		jitter: new Signal<Milli | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -88,13 +84,10 @@ export class Source {
 		effect.spawn(async () => {
 			const available: Record<string, Catalog.AudioConfig> = {};
 
-			// `supported` comes from the consumer, so we cannot assume it ever settles. A rerun
-			// waits for the tasks it spawned, so an unraced probe would hold the next run shut
-			// for good. Captured here so it stays this run's promise once we start awaiting.
-			const cancelled = effect.cancel.then(() => undefined);
-
 			for (const [name, config] of Object.entries(renditions)) {
-				const isSupported = await Promise.race([supported(config), cancelled]);
+				// `supported` comes from the consumer, so we cannot assume it ever settles. A rerun
+				// waits for the tasks it spawned, so an unraced probe would hold the next run shut.
+				const isSupported = await effect.race(supported(config));
 
 				// Torn down: stop probing and publish nothing, since the rerun redoes this.
 				if (effect.abort.aborted) return;
@@ -111,7 +104,10 @@ export class Source {
 	}
 
 	#runSelected(effect: Effect): void {
-		const available = effect.get(this.#out.available);
+		// A disabled rendition has no frames coming, so it is never selected, even by name.
+		const available = Object.fromEntries(
+			Object.entries(effect.get(this.#out.available)).filter(([, config]) => config.enabled !== false),
+		);
 		if (Object.keys(available).length === 0) return;
 
 		const target = effect.get(this.in.target);
@@ -130,12 +126,8 @@ export class Source {
 		effect.set(this.#out.track, selected.track);
 		effect.set(this.#out.config, selected.config);
 
-		// Use catalog jitter if available, otherwise estimate from codec frame duration.
-		// Add the worklet render quantum so the ring buffer has margin between frame arrivals.
-		const codecJitter = selected.config.jitter ?? defaultAudioJitter(selected.config) ?? 0;
-		const overhead = Math.ceil((WORKLET_QUANTUM / selected.config.sampleRate) * 1000);
-		const jitter = codecJitter + overhead;
-		effect.set(this.#out.jitter, Time.Milli(jitter));
+		const jitter = selected.config.jitter;
+		effect.set(this.#out.jitter, jitter !== undefined ? Milli(jitter) : undefined);
 	}
 
 	/**
@@ -171,26 +163,4 @@ export class Source {
 	close(): void {
 		this.#signals.close();
 	}
-}
-
-// Estimate the minimum jitter (frame duration) based on the audio codec.
-// TODO these are defaults; the actual frame duration depends on encoder config.
-function defaultAudioJitter(config: Catalog.AudioConfig): number | undefined {
-	if (config.codec.startsWith("opus")) {
-		// Opus supports 2.5–60ms but 20ms is the real-time default.
-		return 20;
-	}
-
-	if (config.codec.startsWith("mp4a")) {
-		// 1024 samples for LC-AAC; HE-AAC/AAC-LD use different sizes.
-		return Math.ceil((1024 / config.sampleRate) * 1000);
-	}
-
-	if (config.codec === "mp3") {
-		// 1152 samples per frame for MPEG-1 Layer III; MPEG-2/2.5 use 576.
-		const samples = config.sampleRate >= 32000 ? 1152 : 576;
-		return Math.ceil((samples / config.sampleRate) * 1000);
-	}
-
-	return undefined;
 }

@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { MissingSnapshot } from "../error.ts";
 import { Decoder } from "./decoder.ts";
 import { type Config, Encoder } from "./encoder.ts";
 
@@ -80,6 +81,13 @@ test("a null field forces a keyframe", () => {
 	expect(frames.map((f) => f[0])).toEqual([true, true]);
 });
 
+// A null nested in an object written whole would ride the patch as a deletion too, so the decoder
+// would drop the key instead of reconstructing the null.
+test("a null inside a new object forces a keyframe", () => {
+	const values = [{ items: {} }, { items: { a: { parent: null, n: 1 } } }];
+	expect(roundtrip({ deltaRatio: 100 }, values)).toEqual(values);
+});
+
 // A caller that closes the group behind the encoder's back has to say so, or the next value would be
 // a delta against a window and a baseline the new group never carried.
 test("reset forces the next update to be a keyframe", () => {
@@ -127,14 +135,14 @@ test("compressed roundtrip", () => {
 		{ a: 1, b: 2 },
 		{ a: 5, b: 2 },
 	];
-	expect(roundtrip({ compression: true }, values)).toEqual(values);
+	expect(roundtrip({ compression: "deflate" }, values)).toEqual(values);
 });
 
 // The window is per group, so a keyframe mid-stream has to restart it on both sides. A decoder that
 // kept the old window here would fail to inflate the new group's snapshot.
 test("compressed roundtrip across a group boundary", () => {
 	const values: Doc[] = Array.from({ length: 41 }, (_, n) => ({ n }));
-	const got = roundtrip({ deltaRatio: 2, compression: true }, values);
+	const got = roundtrip({ deltaRatio: 2, compression: "deflate" }, values);
 	expect(got.at(-1)).toEqual({ n: 40 });
 });
 
@@ -170,7 +178,10 @@ test("frames apply without materializing", () => {
 
 test("compressed deltas reuse the group window", () => {
 	const phrase = "Media over QUIC delivers real-time latency at massive scale";
-	const frames = encode({ deltaRatio: 100, compression: true }, [{ note: phrase }, { note: phrase, echo: phrase }]);
+	const frames = encode({ deltaRatio: 100, compression: "deflate" }, [
+		{ note: phrase },
+		{ note: phrase, echo: phrase },
+	]);
 
 	// The raw patch repeats the whole phrase; compressed against the window it's a fraction.
 	const raw = new TextEncoder().encode(JSON.stringify({ echo: phrase })).length;
@@ -279,11 +290,11 @@ test("update after finish reports the closed track", async () => {
 
 	const track = new Track.Producer("test");
 	const producer = new Producer<Doc>({ track, deltaRatio: 100 });
-	producer.update({ a: 1 });
-	producer.update({ a: 2 }); // a delta, so a group is open
+	producer.update({ value: { a: 1 } });
+	producer.update({ value: { a: 2 } }); // a delta, so a group is open
 	producer.finish();
 
-	expect(() => producer.update({ a: 3 })).toThrow("track is closed");
+	expect(() => producer.update({ value: { a: 3 } })).toThrow("track is closed");
 });
 
 // A root that isn't an object has no recursive merge patch, so it forces a snapshot regardless of
@@ -315,4 +326,9 @@ test("the frame cap forces a keyframe", () => {
 	expect(frames.length).toBe(FRAME_CAP + 1);
 	expect(frames.filter((f) => f[0]).length).toBe(2);
 	expect(frames[FRAME_CAP][0]).toBe(true);
+});
+
+test("delta before snapshot has a typed error", () => {
+	const decoder = new Decoder<Doc>();
+	expect(() => decoder.delta(new TextEncoder().encode("{}"))).toThrow(MissingSnapshot);
 });

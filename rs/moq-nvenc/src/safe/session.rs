@@ -5,21 +5,18 @@
 //! frames. The [`Session`] also stores some information such as the encode
 //! width and height so that you do not have to keep repeating it each time.
 
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use super::{
-	api::ENCODE_API,
 	encoder::Encoder,
 	result::{EncodeError, ErrorKind},
 };
 use crate::{
 	sys::nvEncodeAPI::{
-		GUID, NV_ENC_BUFFER_FORMAT, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID,
-		NV_ENC_CODEC_PIC_PARAMS, NV_ENC_CONFIG, NV_ENC_INITIALIZE_PARAMS, NV_ENC_PIC_FLAGS, NV_ENC_PIC_PARAMS,
-		NV_ENC_PIC_PARAMS_AV1, NV_ENC_PIC_PARAMS_H264, NV_ENC_PIC_PARAMS_HEVC, NV_ENC_PIC_PARAMS_VER,
-		NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE, NV_ENC_RECONFIGURE_PARAMS, NV_ENC_RECONFIGURE_PARAMS_VER,
+		GUID, NV_ENC_BUFFER_FORMAT, NV_ENC_CONFIG, NV_ENC_INITIALIZE_PARAMS, NV_ENC_PIC_FLAGS, NV_ENC_PIC_PARAMS,
+		NV_ENC_PIC_PARAMS_VER, NV_ENC_PIC_STRUCT, NV_ENC_RECONFIGURE_PARAMS, NV_ENC_RECONFIGURE_PARAMS_VER,
 	},
-	EncoderInput, EncoderOutput,
+	Bitstream, EncoderInput,
 };
 
 /// An encoding session to create input/output buffers and encode frames.
@@ -28,7 +25,7 @@ use crate::{
 /// encode frames using the session. On drop, the session will automatically
 /// send an empty EOS frame to flush the encoder.
 pub struct Session {
-	pub(crate) encoder: Encoder,
+	pub(crate) encoder: Arc<Encoder>,
 	pub(crate) width: u32,
 	pub(crate) height: u32,
 	pub(crate) buffer_format: NV_ENC_BUFFER_FORMAT,
@@ -117,9 +114,12 @@ impl Session {
 	/// # Errors
 	///
 	/// Returns [`ErrorKind::InvalidParam`] when the session was started without
-	/// an encode config, since there is then no config to resubmit. Otherwise
-	/// returns whatever `NvEncReconfigureEncoder` reports, e.g.
+	/// an encode config, since there is then no config to resubmit, when
+	/// `bitrate` is zero, when a nonzero VBV would scale to zero, or when the
+	/// proportionally scaled VBV overflows.
+	/// Otherwise returns whatever `NvEncReconfigureEncoder` reports, e.g.
 	/// [`ErrorKind::UnsupportedParam`] if the driver rejects the rate change.
+	/// After any error the session keeps its last accepted rate settings.
 	pub fn reconfigure(&mut self, bitrate: u32) -> Result<(), EncodeError> {
 		let Some(config) = self.config.as_mut() else {
 			return Err(EncodeError::new(
@@ -127,24 +127,16 @@ impl Session {
 				Some("session was started without an encode config to reconfigure".into()),
 			));
 		};
-
-		config.rcParams.averageBitRate = bitrate;
 		debug_assert_eq!(
 			self.init.encodeConfig,
 			std::ptr::from_mut::<NV_ENC_CONFIG>(&mut **config),
 			"init.encodeConfig must point at our owned copy, not the caller's dead one"
 		);
 
-		let mut params = NV_ENC_RECONFIGURE_PARAMS {
-			version: NV_ENC_RECONFIGURE_PARAMS_VER,
-			reInitEncodeParams: self.init,
-			..unsafe { std::mem::zeroed() }
-		};
-		// Leave resetEncoder and forceIDR clear: retune in place, no keyframe.
-		params.set_resetEncoder(0);
-		params.set_forceIDR(0);
-
-		unsafe { (ENCODE_API.reconfigure_encoder)(self.encoder.ptr, &mut params) }.result(&self.encoder)
+		let encoder = &self.encoder;
+		retune(&self.init, config, bitrate, |params| {
+			unsafe { (encoder.api.reconfigure_encoder)(encoder.ptr, params) }.result(encoder)
+		})
 	}
 
 	/// Encode a frame.
@@ -156,20 +148,28 @@ impl Session {
 	/// Could error if the encode picture parameters were invalid or otherwise
 	/// incorrect, or if we run out memory.
 	///
-	/// There are two recoverable errors:
+	/// An encoder-busy result is returned as an error so the caller can retry.
+	/// A need-more-input result is instead represented by the returned
+	/// [`Submission`], which retains both buffers until completion.
+	/// [`Encoder::start_session`] refuses lookahead and B-frames, which are what
+	/// make the driver hold a frame and then reject [`Submission::finish`].
+	///
+	/// Safe code cannot release the input while it is in flight because the
+	/// submission owns it:
+	///
+	/// ```compile_fail
+	/// # use moq_nvenc::{Bitstream, Buffer, EncodePictureParams, Session};
+	/// fn submit(session: &Session, input: Buffer, output: Bitstream) {
+	///     let pending = session.encode_picture(input, output, EncodePictureParams::default()).unwrap();
+	///     drop(input);
+	///     drop(pending);
+	/// }
+	/// ```
+	///
+	/// There is one recoverable error:
 	/// - If this returns an error with
 	///   [`ErrorKind::EncoderBusy`](super::ErrorKind::EncoderBusy) then you
 	///   should retry after a few milliseconds.
-	/// - If this returns an error with
-	///   [`ErrorKind::NeedMoreInput`](super::ErrorKind::NeedMoreInput), the
-	///   client should not lock the output bitstream yet. They should continue
-	///   encoding until this function returns `Ok`, and then lock the
-	///   bitstreams in the order in which they were originally used.
-	///
-	/// # Panics
-	///
-	/// Panics if codec specific parameters are provided for a different codec
-	/// than the one used in the session.
 	///
 	/// # Examples
 	///
@@ -214,14 +214,14 @@ impl Session {
 	/// # let mut input_buffer = session
 	/// #     .create_input_buffer()
 	/// #     .unwrap();
-	/// # let mut output_bitstream = session.create_output_bitstream().unwrap();
+	/// # let output_bitstream = session.create_output_bitstream().unwrap();
 	///
 	/// // Encode frame.
 	/// unsafe { input_buffer.lock().unwrap().write(&[0; DATA_LEN]) };
-	/// session
+	/// let submission = session
 	///     .encode_picture(
-	///         &mut input_buffer,
-	///         &mut output_bitstream,
+	///         input_buffer,
+	///         output_bitstream,
 	///         // Optional picture parameters
 	///         EncodePictureParams {
 	///             input_timestamp: 42,
@@ -229,21 +229,19 @@ impl Session {
 	///         }
 	///     )
 	///     .unwrap();
-	/// # // TODO: check that output is correct.
-	/// let _data = output_bitstream.lock().unwrap().data();
+	/// let (data, _input_buffer, _output_bitstream) = submission.finish().unwrap();
 	/// ```
-	pub fn encode_picture<I: EncoderInput, O: EncoderOutput>(
+	pub fn encode_picture<I: EncoderInput>(
 		&self,
-		input_buffer: &mut I,
-		output_bitstream: &mut O,
+		mut input_buffer: I,
+		output_bitstream: Bitstream,
 		params: EncodePictureParams,
-	) -> Result<(), EncodeError> {
-		if let Some(codec_params) = &params.codec_params {
-			assert_eq!(
-				codec_params.get_codec_guid(),
-				self.encode_guid,
-				"The provided codec specific params must match the codec used"
-			);
+	) -> Result<Submission<I>, EncodeError> {
+		if !same_session(input_buffer.encoder(), &output_bitstream.encoder, &self.encoder) {
+			return Err(EncodeError::new(
+				ErrorKind::InvalidParam,
+				Some("input and output must belong to this session".into()),
+			));
 		}
 		let mut encode_pic_params = NV_ENC_PIC_PARAMS {
 			version: NV_ENC_PIC_PARAMS_VER,
@@ -251,12 +249,10 @@ impl Session {
 			inputHeight: self.height,
 			inputPitch: input_buffer.pitch(),
 			inputBuffer: input_buffer.handle(),
-			outputBitstream: output_bitstream.handle(),
+			outputBitstream: output_bitstream.ptr,
 			bufferFmt: self.buffer_format,
 			pictureStruct: NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME,
 			inputTimeStamp: params.input_timestamp,
-			codecPicParams: params.codec_params.map(Into::into).unwrap_or_default(),
-			pictureType: params.picture_type,
 			// Force an IDR at this frame regardless of the encoder's own GOP /
 			// picture-type decision. Unlike `pictureType` (honored only when
 			// picture-type decision is disabled), `NV_ENC_PIC_FLAG_FORCEIDR`
@@ -269,7 +265,15 @@ impl Session {
 			},
 			..Default::default()
 		};
-		unsafe { (ENCODE_API.encode_picture)(self.encoder.ptr, &mut encode_pic_params) }.result(&self.encoder)
+		let result = unsafe { (self.encoder.api.encode_picture)(self.encoder.ptr, &mut encode_pic_params) }
+			.result(&self.encoder);
+		match result {
+			Ok(()) => Ok(Submission::new(input_buffer, output_bitstream)),
+			Err(error) if error.kind() == ErrorKind::NeedMoreInput => {
+				Ok(Submission::new(input_buffer, output_bitstream))
+			}
+			Err(error) => Err(error),
+		}
 	}
 
 	/// Send an EOS notifications to flush the encoder.
@@ -286,76 +290,480 @@ impl Session {
 	/// should retry after a few milliseconds.
 	pub fn end_of_stream(&self) -> Result<(), EncodeError> {
 		let mut encode_pic_params = NV_ENC_PIC_PARAMS::end_of_stream();
-		unsafe { (ENCODE_API.encode_picture)(self.encoder.ptr, &mut encode_pic_params) }.result(&self.encoder)
+		unsafe { (self.encoder.api.encode_picture)(self.encoder.ptr, &mut encode_pic_params) }.result(&self.encoder)
 	}
 }
 
 /// Send an EOS notifications on drop to flush the encoder.
 impl Drop for Session {
 	fn drop(&mut self) {
-		if !std::thread::panicking() {
-			self.end_of_stream().expect("The encoder should not be busy.");
-		}
+		let _ = self.end_of_stream();
 	}
 }
 
 /// Optional parameters for [`Session::encode_picture`].
-#[allow(missing_debug_implementations)] // CodecPictureParams doesn't implement Debug
+#[derive(Debug, Default)]
 pub struct EncodePictureParams {
 	/// Opaque data used for identifying the corresponding encoded frame
 	pub input_timestamp: u64,
-	/// The picture type to use, if picture type decision is disabled in the
-	/// encoder
-	pub picture_type: NV_ENC_PIC_TYPE,
 	/// Force this frame to be an IDR (`NV_ENC_PIC_FLAG_FORCEIDR`). Works with
 	/// picture-type decision enabled, so it is the way to request an
 	/// out-of-cadence keyframe.
 	pub force_idr: bool,
-	/// Codec-specific parameters
-	pub codec_params: Option<CodecPictureParams>,
 }
 
-impl Default for EncodePictureParams {
-	fn default() -> Self {
+/// Resources retained until NVENC has completed a submitted picture.
+#[derive(Debug)]
+#[must_use = "dropping a submission waits for completion before releasing its resources"]
+pub struct Submission<I> {
+	pending: Pending<SdkDriver<I>>,
+}
+
+impl<I> Submission<I> {
+	fn new(input: I, output: Bitstream) -> Self
+	where
+		I: EncoderInput,
+	{
+		let driver = SdkDriver {
+			abandon_input: I::abandon,
+		};
 		Self {
-			input_timestamp: 0,
-			picture_type: NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_UNKNOWN,
-			force_idr: false,
-			codec_params: None,
+			pending: Pending::new(driver, input, output),
+		}
+	}
+
+	/// Wait for completion, copy the encoded bytes, and return reusable buffers.
+	///
+	/// # Errors
+	///
+	/// Returns the driver's error when the output cannot be locked. Both
+	/// buffers are then abandoned, since the driver may still be using them.
+	pub fn finish(mut self) -> Result<(Vec<u8>, I, Bitstream), EncodeError> {
+		self.pending.finish()
+	}
+}
+
+fn same_session<T>(input: &Arc<T>, output: &Arc<T>, session: &Arc<T>) -> bool {
+	Arc::ptr_eq(input, session) && Arc::ptr_eq(output, session)
+}
+
+/// Submit `config` retuned to `bitrate` and commit it only once `submit`
+/// accepts, so a rejected change cannot skew the basis of the next one.
+fn retune(
+	init: &NV_ENC_INITIALIZE_PARAMS,
+	config: &mut NV_ENC_CONFIG,
+	bitrate: u32,
+	submit: impl FnOnce(&mut NV_ENC_RECONFIGURE_PARAMS) -> Result<(), EncodeError>,
+) -> Result<(), EncodeError> {
+	let invalid = |reason: &str| EncodeError::new(ErrorKind::InvalidParam, Some(reason.into()));
+	// A zero rate would also zero a proportional VBV, which no later rate could scale back up.
+	if bitrate == 0 {
+		return Err(invalid("bitrate must be nonzero"));
+	}
+
+	let mut candidate = *config;
+	let rc = &mut candidate.rcParams;
+	// Keep a caller-sized VBV proportional to the rate, so a buffer sized to
+	// one frame at open stays one frame: left alone it would loosen the
+	// keyframe cap as the bitrate falls, right when the link can least afford it.
+	if rc.vbvBufferSize != 0 && rc.averageBitRate != 0 {
+		let basis = u64::from(rc.averageBitRate);
+		let scale = |v: u32| {
+			let scaled = u64::from(v) * u64::from(bitrate) / basis;
+			// Rounding a nonzero VBV to zero is the same dead end as a zero rate:
+			// the next retune would skip this branch and could never restore it.
+			if v != 0 && scaled == 0 {
+				return Err(invalid("scaled VBV must be nonzero"));
+			}
+			u32::try_from(scaled).map_err(|_| invalid("scaled VBV exceeds u32"))
+		};
+		rc.vbvBufferSize = scale(rc.vbvBufferSize)?;
+		rc.vbvInitialDelay = scale(rc.vbvInitialDelay)?;
+	}
+	rc.averageBitRate = bitrate;
+
+	// NVENC copies the config during the call, so pointing it at the local
+	// candidate is sound; `init` keeps pointing at the committed copy.
+	let mut params = NV_ENC_RECONFIGURE_PARAMS {
+		version: NV_ENC_RECONFIGURE_PARAMS_VER,
+		reInitEncodeParams: NV_ENC_INITIALIZE_PARAMS {
+			encodeConfig: &mut candidate,
+			..*init
+		},
+		..unsafe { std::mem::zeroed() }
+	};
+	// Leave resetEncoder and forceIDR clear: retune in place, no keyframe.
+	params.set_resetEncoder(0);
+	params.set_forceIDR(0);
+
+	submit(&mut params)?;
+	*config = candidate;
+	Ok(())
+}
+
+trait CompletionDriver {
+	type Input;
+	type Output;
+
+	fn wait(&self, output: &mut Self::Output) -> Result<Vec<u8>, EncodeError>;
+
+	/// Give up both buffers after a failed wait.
+	fn abandon(&self, input: Self::Input, output: Self::Output);
+}
+
+#[derive(Debug)]
+struct SdkDriver<I> {
+	// A function rather than an `EncoderInput` bound, which `Submission` would
+	// have to repeat in its public signature.
+	abandon_input: fn(I),
+}
+
+impl<I> CompletionDriver for SdkDriver<I> {
+	type Input = I;
+	type Output = Bitstream;
+
+	fn wait(&self, output: &mut Self::Output) -> Result<Vec<u8>, EncodeError> {
+		Ok(output.lock()?.data().to_vec())
+	}
+
+	fn abandon(&self, input: I, output: Bitstream) {
+		(self.abandon_input)(input);
+		output.abandon();
+	}
+}
+
+#[derive(Debug)]
+struct Pending<D: CompletionDriver> {
+	driver: D,
+	/// `None` once finished or abandoned.
+	buffers: Option<(D::Input, D::Output)>,
+}
+
+impl<D: CompletionDriver> Pending<D> {
+	fn new(driver: D, input: D::Input, output: D::Output) -> Self {
+		Self {
+			driver,
+			buffers: Some((input, output)),
+		}
+	}
+
+	fn finish(&mut self) -> Result<(Vec<u8>, D::Input, D::Output), EncodeError> {
+		let (input, mut output) = self.buffers.take().expect("submission buffers");
+		// Wait without sending end-of-stream: flushing here would end the
+		// session, while the caller may still submit further frames.
+		match self.driver.wait(&mut output) {
+			Ok(data) => Ok((data, input, output)),
+			Err(error) => {
+				// A failed wait cannot prove the driver released either buffer, so
+				// leak them rather than permit a use-after-free. Their encoder
+				// reference still goes: a session left open at exit deadlocks the
+				// driver's own exit handler, hanging the process.
+				self.driver.abandon(input, output);
+				Err(error)
+			}
 		}
 	}
 }
 
-/// Codec specific picture parameters
-#[allow(missing_debug_implementations)] // NV_ENC_PIC_PARAMS_H264 contains a union, thus doesn't derive Debug
-pub enum CodecPictureParams {
-	/// Parameters for H.264
-	H264(NV_ENC_PIC_PARAMS_H264),
-	/// Parameters for HEVC or H.265
-	Hevc(NV_ENC_PIC_PARAMS_HEVC),
-	/// Parameters for AV1
-	Av1(NV_ENC_PIC_PARAMS_AV1),
-}
-
-impl CodecPictureParams {
-	/// Returns the GUID representing the codec for which the parameters are
-	/// specified.
-	#[must_use]
-	pub fn get_codec_guid(&self) -> GUID {
-		match self {
-			Self::H264(_) => NV_ENC_CODEC_H264_GUID,
-			Self::Hevc(_) => NV_ENC_CODEC_HEVC_GUID,
-			Self::Av1(_) => NV_ENC_CODEC_AV1_GUID,
+impl<D: CompletionDriver> Drop for Pending<D> {
+	fn drop(&mut self) {
+		if self.buffers.is_some() {
+			let _ = self.finish();
 		}
 	}
 }
 
-impl From<CodecPictureParams> for NV_ENC_CODEC_PIC_PARAMS {
-	fn from(value: CodecPictureParams) -> Self {
-		match value {
-			CodecPictureParams::H264(params) => Self { h264PicParams: params },
-			CodecPictureParams::Hevc(params) => Self { hevcPicParams: params },
-			CodecPictureParams::Av1(params) => Self { av1PicParams: params },
+#[cfg(test)]
+mod tests {
+	use std::sync::{Arc, Mutex};
+
+	use cudarc::driver::CudaContext;
+
+	use super::*;
+	use crate::{
+		sys::nvEncodeAPI::{
+			NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
+			NV_ENC_CODEC_H264_GUID, NV_ENC_CONFIG, NV_ENC_PRESET_P1_GUID, NV_ENC_PRESET_P7_GUID,
+			NV_ENC_TUNING_INFO::{NV_ENC_TUNING_INFO_HIGH_QUALITY, NV_ENC_TUNING_INFO_LOW_LATENCY},
+		},
+		EncoderInitParams,
+	};
+
+	type Events = Arc<Mutex<Vec<&'static str>>>;
+
+	#[derive(Debug)]
+	struct Resource(&'static str, Events);
+
+	impl Drop for Resource {
+		fn drop(&mut self) {
+			self.1.lock().unwrap().push(self.0);
 		}
+	}
+
+	#[derive(Debug)]
+	struct FakeDriver {
+		events: Events,
+		fail: bool,
+	}
+
+	impl CompletionDriver for FakeDriver {
+		type Input = Resource;
+		type Output = Resource;
+
+		fn wait(&self, _: &mut Self::Output) -> Result<Vec<u8>, EncodeError> {
+			self.events.lock().unwrap().push("wait");
+			if self.fail {
+				return Err(EncodeError::new(ErrorKind::InvalidParam, None));
+			}
+			Ok(vec![1, 2, 3])
+		}
+
+		fn abandon(&self, input: Resource, output: Resource) {
+			self.events.lock().unwrap().push("abandon");
+			std::mem::forget((input, output));
+		}
+	}
+
+	fn pending(events: &Events, fail: bool) -> Pending<FakeDriver> {
+		let driver = FakeDriver {
+			events: events.clone(),
+			fail,
+		};
+		Pending::new(
+			driver,
+			Resource("input", events.clone()),
+			Resource("output", events.clone()),
+		)
+	}
+
+	#[test]
+	fn delayed_completion_retains_resources_until_wait() {
+		let events = Events::default();
+		let (data, input, output) = pending(&events, false).finish().unwrap();
+		assert_eq!(data, [1, 2, 3]);
+		assert_eq!(*events.lock().unwrap(), ["wait"]);
+		drop((input, output));
+		assert_eq!(*events.lock().unwrap(), ["wait", "input", "output"]);
+	}
+
+	#[test]
+	fn cancellation_completes_before_releasing_resources() {
+		let events = Events::default();
+		drop(pending(&events, false));
+		assert_eq!(*events.lock().unwrap(), ["wait", "input", "output"]);
+	}
+
+	fn rate_config(bitrate: u32, vbv: u32) -> NV_ENC_CONFIG {
+		let mut config = NV_ENC_CONFIG::default();
+		config.rcParams.averageBitRate = bitrate;
+		config.rcParams.vbvBufferSize = vbv;
+		config.rcParams.vbvInitialDelay = vbv;
+		config
+	}
+
+	/// The (average, VBV size, VBV delay) a reconfigure submitted.
+	fn submitted(params: &NV_ENC_RECONFIGURE_PARAMS) -> (u32, u32, u32) {
+		let rc = unsafe { &(*params.reInitEncodeParams.encodeConfig).rcParams };
+		(rc.averageBitRate, rc.vbvBufferSize, rc.vbvInitialDelay)
+	}
+
+	fn rates(config: &NV_ENC_CONFIG) -> (u32, u32, u32) {
+		let rc = &config.rcParams;
+		(rc.averageBitRate, rc.vbvBufferSize, rc.vbvInitialDelay)
+	}
+
+	#[test]
+	fn rejected_rate_change_keeps_the_last_accepted_basis() {
+		let init = NV_ENC_INITIALIZE_PARAMS {
+			encodeWidth: 1280,
+			..Default::default()
+		};
+		let mut config = rate_config(1_000_000, 100_000);
+
+		let error = retune(&init, &mut config, 500_000, |params| {
+			assert_eq!(submitted(params), (500_000, 50_000, 50_000));
+			assert_eq!(params.reInitEncodeParams.encodeWidth, 1280);
+			Err(EncodeError::new(ErrorKind::UnsupportedParam, None))
+		})
+		.expect_err("the driver rejected the change");
+		assert_eq!(error.kind(), ErrorKind::UnsupportedParam);
+		assert_eq!(rates(&config), (1_000_000, 100_000, 100_000));
+
+		// Scaled from the last accepted rate, not the rejected one.
+		retune(&init, &mut config, 2_000_000, |params| {
+			assert_eq!(submitted(params), (2_000_000, 200_000, 200_000));
+			Ok(())
+		})
+		.unwrap();
+		assert_eq!(rates(&config), (2_000_000, 200_000, 200_000));
+	}
+
+	#[test]
+	fn rate_that_zeroes_a_nonzero_vbv_is_refused_before_the_driver() {
+		let init = NV_ENC_INITIALIZE_PARAMS::default();
+		let mut config = rate_config(1_000, 1);
+		let error =
+			retune(&init, &mut config, 1, |_| panic!("submitted a zero VBV")).expect_err("the scaled VBV is zero");
+		assert_eq!(error.kind(), ErrorKind::InvalidParam);
+		assert_eq!(rates(&config), (1_000, 1, 1));
+	}
+
+	#[test]
+	fn invalid_rate_change_is_refused_before_the_driver() {
+		let init = NV_ENC_INITIALIZE_PARAMS::default();
+		let mut config = rate_config(1, u32::MAX);
+		for bitrate in [0, 2] {
+			let error = retune(&init, &mut config, bitrate, |_| panic!("submitted an invalid rate"))
+				.expect_err("the rate is invalid");
+			assert_eq!(error.kind(), ErrorKind::InvalidParam);
+			assert_eq!(rates(&config), (1, u32::MAX, u32::MAX));
+		}
+	}
+
+	#[test]
+	fn failed_wait_abandons_without_waiting_again() {
+		let events = Events::default();
+		assert!(pending(&events, true).finish().is_err());
+		assert_eq!(*events.lock().unwrap(), ["wait", "abandon"]);
+
+		let events = Events::default();
+		drop(pending(&events, true));
+		assert_eq!(*events.lock().unwrap(), ["wait", "abandon"]);
+	}
+
+	#[test]
+	fn session_identity_rejects_cross_session_resources() {
+		let first = Arc::new(());
+		let second = Arc::new(());
+		assert!(same_session(&first, &first, &first));
+		assert!(!same_session(&first, &second, &first));
+	}
+
+	/// Whether an NVENC session can run here. Hardware tests return early
+	/// without one, so they pass on GPU-less CI.
+	fn driver_available() -> bool {
+		// cudarc panics while loading a missing libcuda, so probe for it first.
+		// SAFETY: the library is opened only to test presence, never called.
+		let cuda = ["libcuda.so.1", "libcuda.so"]
+			.iter()
+			.any(|name| unsafe { libloading::Library::new(*name) }.is_ok());
+		cuda && Encoder::load().is_ok()
+	}
+
+	/// Whether an NVENC device can encode here. Library presence is not enough:
+	/// the loader succeeds when no device is assigned.
+	fn try_encoder() -> Option<Encoder> {
+		if !driver_available() {
+			return None;
+		}
+		let Ok(cuda) = CudaContext::new(0) else {
+			return None;
+		};
+		Encoder::initialize_with_cuda(cuda).ok()
+	}
+
+	/// A session the driver will not hold frames for. `None` when NVENC cannot run.
+	fn low_latency_session() -> Option<Session> {
+		let encoder = try_encoder()?;
+		let (codec, preset, tuning) = (
+			NV_ENC_CODEC_H264_GUID,
+			NV_ENC_PRESET_P1_GUID,
+			NV_ENC_TUNING_INFO_LOW_LATENCY,
+		);
+		let mut config = encoder.get_preset_config(codec, preset, tuning).unwrap().presetCfg;
+		config.frameIntervalP = 1;
+		config.rcParams.set_enableLookahead(0);
+		config.rcParams.set_enableExtLookahead(0);
+		let mut init = EncoderInitParams::new(codec, 320, 240);
+		init.preset_guid(preset)
+			.tuning_info(tuning)
+			.enable_picture_type_decision();
+		// SAFETY: the preset config holds no borrowed extension pointers.
+		unsafe { init.encode_config(config) };
+		Some(
+			encoder
+				.start_session(NV_ENC_BUFFER_FORMAT_NV12, init)
+				.expect("low-latency session was refused"),
+		)
+	}
+
+	/// P7 high-quality defaults, and an explicit lookahead or B-frame config, are
+	/// refused before the driver can accept a frame it will not give back.
+	/// A low-latency session still encodes.
+	#[test]
+	fn start_session_refuses_held_frames() {
+		let Some(encoder) = try_encoder() else {
+			return;
+		};
+		let codec = NV_ENC_CODEC_H264_GUID;
+		let preset = encoder
+			.get_preset_config(codec, NV_ENC_PRESET_P7_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY)
+			.unwrap()
+			.presetCfg;
+		assert!(
+			preset.rcParams.enableLookahead() != 0 || preset.frameIntervalP > 1,
+			"P7 high quality no longer holds frames"
+		);
+		let mut init = EncoderInitParams::new(codec, 320, 240);
+		init.preset_guid(NV_ENC_PRESET_P7_GUID)
+			.tuning_info(NV_ENC_TUNING_INFO_HIGH_QUALITY)
+			.enable_picture_type_decision();
+		let error = encoder
+			.start_session(NV_ENC_BUFFER_FORMAT_NV12, init)
+			.expect_err("preset lookahead or B-frames were accepted");
+		assert_eq!(error.kind(), ErrorKind::InvalidParam);
+
+		refuse_explicit(|config| config.rcParams.set_enableLookahead(1));
+		refuse_explicit(|config| config.rcParams.set_enableExtLookahead(1));
+		refuse_explicit(|config| config.frameIntervalP = 2);
+
+		let session = low_latency_session().expect("NVENC device disappeared");
+		let input = session.create_input_buffer().unwrap();
+		let output = session.create_output_bitstream().unwrap();
+		session
+			.encode_picture(input, output, EncodePictureParams::default())
+			.unwrap()
+			.finish()
+			.expect("an allowed session did not encode");
+	}
+
+	fn refuse_explicit(set: fn(&mut NV_ENC_CONFIG)) {
+		let encoder = try_encoder().expect("NVENC device disappeared");
+		let mut config = NV_ENC_CONFIG::default();
+		config.frameIntervalP = 1;
+		set(&mut config);
+		let mut init = EncoderInitParams::new(NV_ENC_CODEC_H264_GUID, 320, 240);
+		// SAFETY: this config holds no borrowed extension pointers.
+		unsafe { init.encode_config(config) };
+		let error = encoder
+			.start_session(NV_ENC_BUFFER_FORMAT_NV12, init)
+			.expect_err("held frames were accepted");
+		assert_eq!(error.kind(), ErrorKind::InvalidParam);
+	}
+
+	/// A failed lock must not keep the session open: one still open at exit
+	/// deadlocks the driver's exit handler, so the process never exits.
+	/// Lookahead used to force that error, and [`Encoder::start_session`] now
+	/// refuses it, so the output pointer is cleared instead. The driver rejects
+	/// a null output immediately rather than waiting on a frame it does not have.
+	#[test]
+	fn failed_submission_releases_the_session() {
+		let Some(session) = low_latency_session() else {
+			return;
+		};
+		let encoder = Arc::downgrade(&session.encoder);
+
+		let reject = || {
+			let input = session.create_input_buffer().unwrap();
+			let mut output = session.create_output_bitstream().unwrap();
+			output.ptr = std::ptr::null_mut();
+			Submission::new(input, output)
+		};
+		// One submission fails to finish and one is dropped unfinished.
+		assert!(reject().finish().is_err(), "the driver locked a null output");
+		drop(reject());
+
+		drop(session);
+		assert!(encoder.upgrade().is_none(), "failed submissions kept the session open");
 	}
 }

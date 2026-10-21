@@ -15,11 +15,14 @@ use std::task::Poll;
 use bytes::Bytes;
 
 mod consumer;
+mod decode;
 mod group;
 mod producer;
 mod source;
 #[cfg(test)]
 pub(crate) mod test_util;
+mod text;
+mod ttml;
 
 pub mod flv;
 pub mod fmp4;
@@ -32,6 +35,49 @@ pub use consumer::Consumer;
 pub use group::GroupConsumer;
 pub use producer::Producer;
 pub(crate) use source::ExportSource;
+
+/// The media role that determines how a container represents frame durations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+	/// Audio packets carry codec-defined durations.
+	Audio,
+	/// Video frames can need a duration marker at group end.
+	Video,
+	/// Opaque data has no sample-duration semantics.
+	Data,
+}
+
+/// One item of a [`Consumer`] read, in delivery order.
+#[derive(Clone, Debug)]
+pub enum Read {
+	/// A media frame from `group`.
+	Frame {
+		/// The group's sequence number. Only equality means anything: numbers may skip.
+		group: u64,
+		frame: Frame,
+	},
+	/// Media after an item already read will never reach this reader: a group was skipped,
+	/// evicted, or never arrived. A decoder resumes from here without the references or
+	/// state that media built. Joining mid-track is not a gap: nothing was read before it.
+	///
+	/// The span is an upper bound, in the scale of the item that follows.
+	Gap {
+		/// The furthest presentation point already read. Without a per-frame duration this
+		/// is the last frame's timestamp, one frame early.
+		timestamp: moq_net::Timestamp,
+		/// How long until the next item resumes, so it also covers any declared pause.
+		duration: moq_net::Timestamp,
+	},
+	/// The publisher declared that its media stops at `end`: it paused, switched source, or
+	/// finished. Frames that follow from the same `group` are the stopped encoder's final
+	/// packets (an audio codec's drain), whose output at or past `end` is padding. The next
+	/// group starts fresh.
+	End {
+		/// The group's sequence number. Only equality means anything: numbers may skip.
+		group: u64,
+		end: moq_net::Timestamp,
+	},
+}
 
 /// A decoded media frame: timestamp, payload bytes, keyframe flag.
 ///
@@ -52,24 +98,48 @@ pub struct Frame {
 
 	/// Sample duration in the frame's own scale, when the container reports it.
 	///
-	/// CMAF carries a per-sample duration (trun sample-duration); containers
-	/// that don't (Legacy, LOC) leave this `None`. The [`Consumer`] adds it to
-	/// `timestamp` to learn how far a group has presented, so it can advance to
-	/// a newer group as soon as the gap is covered instead of waiting out the
-	/// latency budget.
+	/// CMAF carries a per-sample duration (trun sample-duration). Legacy and LOC
+	/// can fill it from a duration marker that has already landed when a
+	/// [`GroupConsumer`] reads the frame, as in a fetched group. Streaming
+	/// muxers receive the later endpoint separately, so media stays immediately available.
+	/// The [`Consumer`] adds it to `timestamp` to learn how far a group has
+	/// presented, so it can advance to a newer group as soon as the gap is
+	/// covered instead of waiting out the max delay budget.
 	pub duration: Option<moq_net::Timestamp>,
 
 	/// Encoded codec payload.
 	pub payload: Bytes,
 
-	/// Whether this frame is a keyframe.
+	/// Whether this frame opens a group, or is a video keyframe.
 	///
 	/// Containers that carry the bit on the wire (CMAF reads it from
-	/// trun sample-flags) should set it; containers that don't (Legacy,
+	/// trun sample-flags) set it for video; containers that don't (Legacy,
 	/// LOC) leave it `false`. The wrapping [`Consumer`] still asserts
 	/// "first frame in a group is a keyframe" as a fallback, so the
-	/// Legacy/LOC case lands correctly without anyone having to know.
+	/// Legacy/LOC case lands correctly without anyone having to know. For
+	/// audio, whose samples are all independently decodable, that fallback
+	/// is the only source: the bit marks the group boundary the publisher
+	/// drew, never a per-sample sync flag.
 	pub keyframe: bool,
+}
+
+/// Stamp `frame` with the duration that ends at `bound`, unless it already has one.
+pub(crate) fn close_duration(frame: &mut Frame, bound: moq_net::Timestamp) {
+	if frame.duration.is_some() {
+		return;
+	}
+	let Some(delta) = bound.as_micros().checked_sub(frame.timestamp.as_micros()) else {
+		return;
+	};
+	if delta == 0 {
+		return;
+	}
+	let Ok(delta) = u64::try_from(delta) else {
+		return;
+	};
+	if let Ok(duration) = moq_net::Timestamp::from_micros(delta) {
+		frame.duration = Some(duration);
+	}
 }
 
 /// A non-keyframe frame arrived with no open group.
@@ -82,6 +152,25 @@ pub struct Frame {
 #[error("missing keyframe: a group must open on a keyframe")]
 pub struct MissingKeyframe;
 
+/// An explicit endpoint precedes the last frame of an ordered video group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("video group endpoint precedes its last frame")]
+pub struct InvalidEnd;
+
+/// A group starts before the previous group did: the source restarted, which is a new broadcast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+	"frame timestamp {} µs is below the previous group's start {} µs",
+	.timestamp.as_micros(),
+	.floor.as_micros()
+)]
+pub struct TimestampRewind {
+	/// The refused frame's timestamp.
+	pub timestamp: moq_net::Timestamp,
+	/// The lowest allowed timestamp: the previous group's start.
+	pub floor: moq_net::Timestamp,
+}
+
 /// Encode and decode media frames over a moq-lite group.
 ///
 /// Implementors decide how many [`Frame`]s map onto one moq-lite frame:
@@ -89,9 +178,16 @@ pub struct MissingKeyframe;
 /// pack many samples into a single moof+mdat fragment.
 pub trait Container {
 	/// Container-specific error. Must be convertible from [`moq_net::Error`]
-	/// (so IO errors propagate) and [`MissingKeyframe`] (so the producer can
-	/// reject a group that doesn't open on a keyframe).
-	type Error: std::error::Error + Send + Sync + Unpin + From<moq_net::Error> + From<MissingKeyframe>;
+	/// (so IO errors propagate), [`MissingKeyframe`], [`InvalidEnd`], and
+	/// [`TimestampRewind`] (so the producer can reject invalid group boundaries).
+	type Error: std::error::Error
+		+ Send
+		+ Sync
+		+ Unpin
+		+ From<moq_net::Error>
+		+ From<MissingKeyframe>
+		+ From<InvalidEnd>
+		+ From<TimestampRewind>;
 
 	/// Encode one or more frames into a single moq-lite frame appended to `group`.
 	fn write(&self, group: &mut moq_net::group::Producer, frames: &[Frame]) -> Result<(), Self::Error>;
@@ -105,17 +201,37 @@ pub trait Container {
 	/// (e.g. a CMAF fragment with zero samples). That is not end-of-group; poll
 	/// again for the next batch. Callers accumulating frames must not treat an
 	/// empty batch as completion.
+	///
+	/// On a data track an empty batch is the discontinuity marker, so a data
+	/// container returns one only for an object with no bytes, and refuses any
+	/// other object that decodes to no frames.
 	fn poll_read(
 		&self,
 		group: &mut moq_net::group::Consumer,
 		waiter: &kio::Waiter,
 	) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>;
 
-	/// Return the exclusive media endpoint when `frame` is a container marker.
+	/// Return the endpoint timestamp when `frame` carries empty-payload metadata.
 	///
-	/// Formats without endpoint markers use the default implementation.
+	/// For video this bounds the preceding frame; for audio it bounds source samples
+	/// before terminal codec packets. A consumer never submits the marker to a decoder.
+	/// Formats without endpoint metadata use the default.
 	fn end(&self, _frame: &Frame) -> Option<moq_net::Timestamp> {
 		None
+	}
+
+	/// The media role, when this format represents an audio or video track.
+	fn kind(&self) -> Kind {
+		Kind::Data
+	}
+
+	/// Write any format-specific endpoint before the producer closes the group.
+	fn finish_group(
+		&self,
+		_group: &mut moq_net::group::Producer,
+		_end: Option<moq_net::Timestamp>,
+	) -> Result<(), Self::Error> {
+		Ok(())
 	}
 
 	/// Async wrapper around [`Self::poll_read`]. Carries the same contract: only

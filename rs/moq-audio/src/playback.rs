@@ -11,15 +11,20 @@
 //! use moq_audio::playback;
 //!
 //! let engine = playback::Engine::open(playback::Config::default()).await?;
-//! let mut sink = engine.sink(playback::Input {
-//!     sample_rate: audio.sample_rate(),
-//!     channels: audio.channels(),
-//!     ..Default::default()
-//! })?;
+//! let mut input = playback::Input::default();
+//! input.sample_rate = audio.sample_rate();
+//! input.layout = audio.layout();
 //!
-//! while let Some(frame) = audio.read().await? {
-//!     sink.write(&frame.data)?;
+//! let mut sink = engine.sink(input)?;
+//!
+//! while let Some(event) = audio.read().await? {
+//!     let moq_audio::decode::Read::Frame { frame, .. } = event else { continue };
+//!     let write = sink.write(&frame.data)?;
+//!     if write.dropped_sample_frames > 0 {
+//!         eprintln!("dropped {} live audio frames", write.dropped_sample_frames);
+//!     }
 //! }
+//! sink.finish().await;
 //! # Ok(())
 //! # }
 //! ```
@@ -37,17 +42,19 @@
 mod device;
 mod driver;
 mod mixer;
+mod observe;
 mod sink;
 
 use std::sync::Arc;
 
 pub use device::{Device, devices};
-pub use sink::{Control, Input, Sink};
+pub use observe::{Gap, Observation, Observer, Stall};
+pub use sink::{Control, Drain, Input, Sink, Write};
 
 #[cfg(feature = "aec")]
 pub(crate) use driver::Shared;
 #[cfg(feature = "aec")]
-pub(crate) use mixer::BUS_CHANNELS;
+pub(crate) use mixer::REFERENCE_CHANNELS;
 
 use crate::Error;
 
@@ -134,13 +141,14 @@ impl Engine {
 	/// Add a stream to the mix, taking PCM in the layout `input` describes.
 	///
 	/// Independent of the device: several sinks can play at different rates and
-	/// channel counts, and each is resampled on its way to the mix. One device
+	/// layouts, and each is resampled and remixed to the device's on its way to
+	/// the mix. One device
 	/// mixes up to 64 of them, past which this returns an error rather than
 	/// handing back a sink that plays nothing.
 	pub fn sink(&self, input: Input) -> Result<Sink, Error> {
 		let sink = self
 			.shared
-			.add(|id, rate| sink::new(id, rate, input, self.shared.clone(), self.handle.clone()))?;
+			.add(|id, rate, bus| sink::new(id, rate, bus, input, self.shared.clone(), self.handle.clone()))?;
 
 		// Covers the case where the mixer's command queue was momentarily full,
 		// so a sink is never left silently unmixed.
@@ -148,18 +156,25 @@ impl Engine {
 		Ok(sink)
 	}
 
-	/// Build an echo canceller that subtracts this engine's mix from a
-	/// microphone.
+	/// Watch what this engine plays: every buffer the device pulls, counted in
+	/// 128-frame quanta on the audio thread without blocking it.
 	///
-	/// Hand the result to
-	/// [`capture::Config::aec`](crate::capture::Config::aec). At most one is
-	/// live per engine: a second call replaces the first, which then cancels
-	/// nothing. Clone the canceller instead if two places need to reach it.
+	/// Returns [`Error::Busy`] while another observer from this engine is alive.
+	pub fn observe(&self) -> Result<Observer, Error> {
+		Observer::new(self.shared.observe.clone())
+	}
+
+	/// Build echo-cancellation controls for this engine and one microphone.
+	///
+	/// Hand a clone to [`capture::Config::aec`](crate::capture::Config::aec) and
+	/// keep another for UI toggles. Only one control set can own this engine's
+	/// reference; a second call returns [`Error::Busy`] until every control and
+	/// microphone attachment from the first is dropped.
 	///
 	/// Requires the `aec` feature.
 	#[cfg(feature = "aec")]
-	pub fn canceller(&self, config: crate::aec::Config) -> crate::aec::Canceller {
-		crate::aec::Canceller::new(self.shared.clone(), config)
+	pub fn canceller(&self, config: crate::aec::Config) -> Result<crate::aec::Control, Error> {
+		crate::aec::Control::new(self.shared.clone(), config)
 	}
 
 	/// Move playback to the device `config` names, or back to the system default

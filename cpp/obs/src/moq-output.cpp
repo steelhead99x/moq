@@ -2,25 +2,100 @@
 #include <obs.hpp>
 
 #include "moq-output.h"
+#include "moq-error.h"
 #include "moq-settings.h"
+#include "moq-url.h"
+#include "logger.h"
 #include "util/util_uint64.h"
 
-extern "C" {
-#include "moq.h"
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <variant>
+#include <vector>
+
+namespace {
+
+bool LooksGenericOffline(const std::string &reason)
+{
+	if (reason.empty() || reason == "offline")
+		return true;
+	// Case-insensitive contains for "offline" only as a whole-ish token.
+	for (size_t i = 0; i + 6 < reason.size() + 1; i++) {
+		char buf[8] = {};
+		for (int j = 0; j < 7 && i + j < reason.size(); j++) {
+			char c = reason[i + j];
+			buf[j] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+		}
+		if (std::strncmp(buf, "offline", 7) == 0)
+			return true;
+	}
+	return false;
 }
 
-MoQOutput::MoQOutput(obs_data_t *settings, obs_output_t *output)
-	: output(output),
-	  server_url(),
-	  path(),
-	  total_bytes_sent(0),
-	  connect_time_ms(0),
-	  origin(moq_origin_create()),
-	  broadcast(0),
-	  outstanding_sessions(0),
-	  session(0),
-	  session_attempt(0),
-	  session_connected(false)
+// Dial URL scheme only. https races WebTransport vs WebSocket, and the session
+// does not report which won, so do not invent a transport name here.
+std::string DialSchemeLabel(const std::string &url)
+{
+	const auto colon = url.find(':');
+	if (colon == std::string::npos || colon == 0)
+		return {};
+	std::string scheme = url.substr(0, colon);
+	for (char &c : scheme) {
+		if (c >= 'A' && c <= 'Z')
+			c = static_cast<char>(c - 'A' + 'a');
+	}
+	if (scheme == "moqt" || scheme == "moql" || scheme == "quic")
+		return "quic";
+	if (scheme == "tcp")
+		return "tcp";
+	if (scheme == "unix")
+		return "unix";
+	return scheme;
+}
+
+// The failure code the dock classifies a moq::Error by, beside its text.
+MoQError::Code FailureCode(const moq::Error &error)
+{
+	const auto &variant = error.get_variant();
+	if (std::holds_alternative<moq::Error::kUnauthorized>(variant) ||
+	    std::holds_alternative<moq::Error::kExpired>(variant))
+		return MoQError::Code::Unauthorized;
+	if (std::holds_alternative<moq::Error::kForbidden>(variant))
+		return MoQError::Code::Forbidden;
+	if (std::holds_alternative<moq::Error::kConnect>(variant))
+		return MoQError::Code::Connect;
+	if (const auto *protocol = std::get_if<moq::Error::kProtocol>(&variant)) {
+		if (protocol->details.kind == moq::ProtocolKind::kTooManyRequests)
+			return MoQError::Code::TooManyRequests;
+		if (protocol->details.kind == moq::ProtocolKind::kUnauthorized ||
+		    protocol->details.kind == moq::ProtocolKind::kExpired)
+			return MoQError::Code::Unauthorized;
+	}
+	return MoQError::Code::Other;
+}
+
+// Retune `encoder` to `bitrate_bps`, the way OBS's own RTMP dynamic bitrate does.
+void SetBitrate(obs_encoder_t *encoder, uint64_t bitrate_bps)
+{
+	OBSDataAutoRelease settings = obs_data_create();
+	obs_data_set_int(settings, "bitrate", (long long)(bitrate_bps / 1000));
+	obs_encoder_update(encoder, settings);
+}
+
+// Whether `rate_control` lets the "bitrate" setting drive the encoder's output.
+// Encoders without the setting are bitrate-driven by construction.
+bool BitrateDriven(const std::string &rate_control)
+{
+	std::string mode = rate_control;
+	for (char &c : mode)
+		c = static_cast<char>(c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c);
+	return mode.empty() || mode == "CBR" || mode == "VBR" || mode == "ABR";
+}
+
+} // namespace
+
+MoQOutput::MoQOutput(obs_data_t *settings, obs_output_t *output) : output(output), path(), total_bytes_sent(0)
 {
 	MoQEventConfig event_config;
 	if (settings) {
@@ -40,21 +115,38 @@ MoQOutput::MoQOutput(obs_data_t *settings, obs_output_t *output)
 
 MoQOutput::~MoQOutput()
 {
-	// Retires the attempt, so a terminal callback that is still in flight won't
-	// signal a stop on an output that is going away.
+	// Retires the attempt, so a continuation that is already queued won't signal a
+	// stop on an output that is going away.
 	Stop();
 
-	// Reset() closed the session and finished the tracks and the broadcast, so
-	// the origin has no children left.
-	moq_origin_close(origin);
+	// Let the sessions finish draining, so the relay sees the tracks end rather than a
+	// cancel. moq-ffi bounds each drain to about a second.
+	std::vector<moq::Future<void>> drains;
+	{
+		std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
+		drains.swap(draining);
+	}
+	for (auto &drain : drains)
+		drain.wait();
 
-	// Wait for any outstanding session terminal callback to fire before `this`
-	// is freed, so a late callback on the libmoq runtime thread can't touch freed
-	// memory. Bounded so a missing terminal degrades to a warning, not a hang.
-	std::unique_lock<std::mutex> lock(session_mutex);
-	if (!session_cv.wait_for(lock, std::chrono::seconds(2), [this] { return outstanding_sessions == 0; }))
-		LOG_WARNING("Output teardown timed out with %d MoQ session callback(s) outstanding",
-			    outstanding_sessions);
+	// Drops whatever is still queued and waits out a continuation in flight, which
+	// may be parked on signal_mutex; so this must not hold it. Nothing touches this
+	// object once it returns.
+	worker.Stop();
+}
+
+template<typename Output, typename Callback>
+std::function<void(Output)> MoQOutput::Current(const std::shared_ptr<Attempt> &current, Callback callback)
+{
+	return [this, weak = std::weak_ptr<Attempt>(current), callback = std::move(callback)](Output output) {
+		// Held across the check and whatever the callback reports, so a Stop() can't
+		// retire the attempt in between.
+		std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
+		auto current = weak.lock();
+		if (!current || current != attempt)
+			return;
+		callback(current, std::move(output));
+	};
 }
 
 bool MoQOutput::Start()
@@ -66,7 +158,8 @@ bool MoQOutput::Start()
 	obs_service_t *service = obs_output_get_service(output);
 	if (!service) {
 		LOG_ERROR("Failed to get service from output");
-		SignalStop(OBS_OUTPUT_ERROR);
+		std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
+		obs_output_signal_stop(output, OBS_OUTPUT_ERROR);
 		return false;
 	}
 
@@ -81,10 +174,11 @@ bool MoQOutput::Start()
 	}
 
 	const char *server_value = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
-	server_url = server_value ? server_value : "";
-	if (server_url.empty()) {
+	const std::string server = server_value ? server_value : "";
+	if (server.empty()) {
 		LOG_ERROR("Server URL is empty");
-		SignalStop(OBS_OUTPUT_BAD_PATH);
+		std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
+		obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
 		return false;
 	}
 
@@ -105,102 +199,195 @@ bool MoQOutput::Start()
 		return false;
 	}
 
-	// Advanced settings live on the service alongside the URL and path. A 0 handle
-	// means the group is switched off, which moq_client_connect reads as "defaults":
-	// the same dial moq_session_connect would have made.
-	OBSDataAutoRelease service_settings = obs_service_get_settings(service);
-	int client = MoQSettings::CreateClient(service_settings);
-	if (client < 0) {
-		// CreateClient logged which setting was rejected and why. Refusing to start
-		// beats connecting with a setting the user asked for quietly dropped.
-		obs_output_set_last_error(output, "Invalid advanced MoQ settings; see the log for details.");
-		SignalStop(OBS_OUTPUT_CONNECT_FAILED);
+	// Create the broadcast on an origin of our own, then announce it so subscribers
+	// can discover it. Stop() finishes it, so each Start creates a fresh one.
+	LOG_INFO("Publishing broadcast: %s", path.c_str());
+	auto next_origin = moq::OriginProducer::init(moq::OriginConfig{});
+	auto next_broadcast = next_origin->create_broadcast(path);
+	if (!next_broadcast) {
+		LOG_ERROR("Failed to create broadcast: %s", next_broadcast.error().to_string().c_str());
+		return false;
+	}
+	moq::Route route;
+	route.epoch = moq::mint_epoch();
+	if (auto announced = (*next_broadcast)->announce(route); !announced) {
+		LOG_ERROR("Failed to announce broadcast: %s", announced.error().to_string().c_str());
 		return false;
 	}
 
-	LOG_INFO("Connecting to MoQ server: %s", server_url.c_str());
+	// Advanced settings live on the service alongside the URL and path. With the group
+	// switched off the client keeps the library defaults.
+	moq::ClientConfig config;
+	config.publish = next_origin;
+	OBSDataAutoRelease service_settings = obs_service_get_settings(service);
+	std::string invalid = MoQSettings::Configure(service_settings, config);
+	std::shared_ptr<moq::Client> client;
+	if (invalid.empty()) {
+		if (auto init = moq::Client::init(config))
+			client = *init;
+		else
+			invalid = init.error().to_string();
+	}
+	if (!client) {
+		// Refusing to start beats connecting with a setting the user asked for
+		// quietly dropped.
+		LOG_ERROR("Invalid advanced MoQ settings: %s", invalid.c_str());
+		std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
+		obs_output_set_last_error(output, ("Invalid advanced MoQ settings: " + invalid).c_str());
+		obs_output_signal_stop(output, OBS_OUTPUT_CONNECT_FAILED);
+		return false;
+	}
 
-	// Held from the connect through obs_output_begin_data_capture. The status
-	// callback takes the same lock before reporting anything, so this attempt's
-	// terminal cannot signal a failure against an output that is only half
-	// started: it waits until the output is committed, and OBS then handles the
-	// stop through its normal active-output path.
+	auto next = std::make_shared<Attempt>();
+	next->client = client;
+	next->url = server;
+
+	LOG_INFO("Connecting to MoQ server: %s", MoQRedactUrl(server).c_str());
+
+	// Held from the connect through obs_output_begin_data_capture. Every
+	// continuation takes the same lock before reporting anything, so this attempt's
+	// failure cannot signal against an output that is only half started: it waits
+	// until the output is committed, and OBS then handles the stop through its
+	// normal active-output path.
 	std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
 
-	uint64_t attempt;
+	attempt = next;
 	{
-		std::lock_guard<std::mutex> lock(session_mutex);
-		attempt = session_attempt;
-
-		// Pre-account for the session subscription before handing the reference to
-		// libmoq: the connection can fail and fire its terminal callback before
-		// connect returns, and the destructor must wait for that callback.
-		outstanding_sessions++;
+		std::lock_guard<std::mutex> lock(mutex);
+		url = server;
+		epoch = *route.epoch;
+	}
+	{
+		std::lock_guard<std::mutex> lock(media_mutex);
+		origin = next_origin;
+		broadcast = *next_broadcast;
 	}
 
-	// Everything the callbacks need about this attempt, copied so they never read
-	// a member the next Start() may be rewriting. Freed by the terminal callback,
-	// so it outlives this scope.
-	auto ref = new SessionRef{this, attempt, server_url, std::chrono::steady_clock::now()};
-
-	// Start establishing a session with the MoQ server
 	// NOTE: You could publish the same broadcasts to multiple sessions if you want (redundant ingest).
-	int handle = moq_client_connect(server_url.data(), server_url.size(), (uint32_t)client, origin, 0,
-					MoQOutput::SessionStatus, ref);
-
-	// The connect copied the config, so the handle has done its job either way.
-	if (client > 0)
-		moq_client_close(client);
-
-	if (handle < 0) {
-		const char *reason = moq_error();
-		LOG_ERROR("Failed to initialize MoQ server: %d: %s", handle, reason ? reason : "unknown error");
-		delete ref;
-		// No subscription was created, so no terminal will fire; undo the ref.
-		std::lock_guard<std::mutex> lock(session_mutex);
-		if (--outstanding_sessions == 0)
-			session_cv.notify_all();
-		return false;
-	}
-
-	bool superseded;
-	{
-		std::lock_guard<std::mutex> lock(session_mutex);
-		// Holding signal_mutex keeps this attempt current: libmoq delivers the
-		// terminal on its runtime thread, which parks in SessionClosed until we
-		// commit. The check stands guard over that assumption rather than trusting
-		// libmoq's threading to stay as it is.
-		superseded = session_attempt != attempt;
-		if (!superseded)
-			session = handle;
-	}
-
-	if (superseded) {
-		// The session died during connect without going through the callback's
-		// signal path. Refuse the start rather than capturing into a dead session;
-		// OBS surfaces the last error we recorded when info.start returns false.
-		LOG_ERROR("MoQ session failed before the output started: %s", server_url.c_str());
-		return false;
-	}
-
-	LOG_INFO("Publishing broadcast: %s", path.c_str());
-
-	// Create the broadcast on the origin we created; it starts live so the session
-	// announces it. Stop() finishes it, so each Start creates a fresh one.
-	broadcast = moq_origin_publish(origin, path.data(), path.size());
-	if (broadcast < 0) {
-		LOG_ERROR("Failed to publish broadcast to session: %d", broadcast);
-		broadcast = 0;
-		// The session connected above; close it so a retry on this same output
-		// doesn't reuse the stale handle. Its terminal callback releases the
-		// outstanding-session reference the destructor waits on.
-		Stop(false);
-		return false;
-	}
+	next->started = std::chrono::steady_clock::now();
+	next->pending = next->client->connect(server).then(
+		worker.Executor(), Current<moq::expected<std::shared_ptr<moq::Session>>>(
+					   next, [this](const std::shared_ptr<Attempt> &current, auto result) {
+						   OnConnect(current, std::move(result));
+					   }));
 
 	obs_output_begin_data_capture(output, 0);
 
 	return true;
+}
+
+void MoQOutput::OnConnect(const std::shared_ptr<Attempt> &current, moq::expected<std::shared_ptr<moq::Session>> result)
+{
+	if (!result) {
+		Fail(current, result.error());
+		return;
+	}
+
+	auto elapsed = std::chrono::steady_clock::now() - current->started;
+	auto ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+	const int connects = static_cast<int>((*result)->connects());
+
+	current->session = *result;
+	current->connected = true;
+	current->live = true;
+	// Before the session reads as live, so the first frame after can reserve.
+	{
+		std::lock_guard<std::mutex> lock(media_mutex);
+		bandwidth = current->session->bandwidth();
+	}
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		session = current->session;
+		recv_bandwidth = session->recv_bandwidth();
+		connected = true;
+		live = true;
+		last_failure_code = MoQError::None;
+		last_failure_reason.clear();
+	}
+	// OBS and older dock paths treat connect_time_ms == 0 as "never connected".
+	// Clamp sub-millisecond connects to 1 so that sentinel stays honest.
+	connect_time_ms = ms > 0 ? ms : 1;
+
+	LOG_INFO("MoQ session connected (%d ms, connect %d): %s", ms, connects, MoQRedactUrl(current->url).c_str());
+
+	WatchStatus(current);
+}
+
+void MoQOutput::WatchStatus(const std::shared_ptr<Attempt> &current)
+{
+	// Replacing `pending` from inside its own continuation is fine: that call has
+	// already completed, so dropping it cancels nothing.
+	current->pending = current->session->status().then(
+		worker.Executor(), Current<moq::expected<moq::ConnectionStatus>>(
+					   current, [this](const std::shared_ptr<Attempt> &current, auto result) {
+						   OnStatus(current, std::move(result));
+					   }));
+}
+
+void MoQOutput::OnStatus(const std::shared_ptr<Attempt> &current, moq::expected<moq::ConnectionStatus> result)
+{
+	// The status stream ends in an error once reconnecting gives up for good.
+	if (!result) {
+		Fail(current, result.error());
+		return;
+	}
+
+	switch (*result) {
+	case moq::ConnectionStatus::kConnected: {
+		const int connects = static_cast<int>(current->session->connects());
+		current->live = true;
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			live = true;
+			last_failure_code = MoQError::None;
+			last_failure_reason.clear();
+		}
+		LOG_INFO("MoQ session reconnected (connect %d): %s", connects, MoQRedactUrl(current->url).c_str());
+		break;
+	}
+	case moq::ConnectionStatus::kDisconnected: {
+		current->live = false;
+		std::lock_guard<std::mutex> lock(mutex);
+		live = false;
+		LOG_WARNING("MoQ session dropped, reconnecting: %s", MoQRedactUrl(current->url).c_str());
+		break;
+	}
+	case moq::ConnectionStatus::kMigrating:
+		// The old session keeps serving while the replacement dials.
+		LOG_INFO("MoQ session migrating: %s", MoQRedactUrl(current->url).c_str());
+		break;
+	}
+
+	WatchStatus(current);
+}
+
+void MoQOutput::Fail(const std::shared_ptr<Attempt> &current, const moq::Error &error)
+{
+	const std::string reason = error.to_string();
+	const bool was_connected = current->connected;
+
+	// Retire the attempt, which also limits the failure signal to one per Start().
+	// The broadcast stays until Reset(), as OBS stops or restarts the output next.
+	attempt.reset();
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		recv_bandwidth.reset();
+		session.reset();
+		connected = false;
+		live = false;
+		last_failure_code = FailureCode(error);
+		last_failure_reason = reason;
+	}
+	connect_time_ms = 0;
+
+	LOG_ERROR("MoQ session failed: %s: %s", MoQRedactUrl(current->url).c_str(), reason.c_str());
+
+	// Reconnection gave up, so nothing is reaching the server any more. Without
+	// this OBS keeps encoding and reporting the stream as live forever.
+	obs_output_set_last_error(output, reason.c_str());
+	// CONNECT_FAILED is terminal for OBS. DISCONNECTED lets its own reconnect
+	// logic retry, which is only worth offering once we know the server works.
+	obs_output_signal_stop(output, was_connected ? OBS_OUTPUT_DISCONNECTED : OBS_OUTPUT_CONNECT_FAILED);
 }
 
 void MoQOutput::Stop(bool signal)
@@ -209,158 +396,213 @@ void MoQOutput::Stop(bool signal)
 
 	Reset();
 
-	if (signal) {
+	if (signal)
 		obs_output_signal_stop(output, OBS_OUTPUT_SUCCESS);
-	}
-}
-
-void MoQOutput::SignalStop(int code)
-{
-	std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
-	obs_output_signal_stop(output, code);
 }
 
 void MoQOutput::Reset()
 {
-	// Excludes the status callback's report: retiring the attempt and signalling
-	// a failure must not interleave, or a stop that already happened gets followed
-	// by a failure OBS turns into a reconnect.
+	// Excludes a continuation's report: retiring the attempt and signalling a
+	// failure must not interleave, or a stop that already happened gets followed by
+	// a failure OBS turns into a reconnect.
 	std::lock_guard<std::recursive_mutex> signal_lock(signal_mutex);
 
-	int stale;
+	// Dropping the attempt cancels its pending connect or status call.
+	std::shared_ptr<moq::Session> retired = attempt ? attempt->session : nullptr;
+	attempt.reset();
+
 	{
-		std::lock_guard<std::mutex> lock(session_mutex);
-		// Retire the attempt so an in-flight terminal callback stays out of the way.
-		session_attempt++;
-		session_connected = false;
-		connect_time_ms = 0;
-		stale = session;
-		session = 0;
+		std::lock_guard<std::mutex> lock(mutex);
+		recv_bandwidth.reset();
+		session.reset();
+		connected = false;
+		live = false;
+		url.clear();
+		epoch.clear();
+		last_failure_code = MoQError::None;
+		last_failure_reason.clear();
 	}
+	connect_time_ms = 0;
 
-	// Outside the lock: the status callback takes session_mutex, and libmoq is
-	// free to run it on its own thread while we're here.
-	if (stale > 0)
-		moq_session_close(stale);
+	// Following the grant rewrote the encoder's bitrate, which the next Start()
+	// reads back as the configured rate. Restored after media_mutex is released:
+	// an idle encoder applies the update inline.
+	std::vector<std::pair<OBSEncoder, uint64_t>> restore;
 
-	for (auto &[encoder, handle] : video_tracks) {
-		if (handle > 0)
-			moq_publish_media_finish(handle);
+	std::unique_lock<std::mutex> lock(media_mutex);
+	for (auto &[encoder, track] : video_tracks) {
+		if (track.producer)
+			track.producer->finish();
+		if (track.rate && track.rate->Target() != track.rate->Max()) {
+			if (OBSEncoder strong = OBSGetStrongRef(track.encoder))
+				restore.emplace_back(std::move(strong), track.rate->Max());
+		}
 	}
 	video_tracks.clear();
 
-	for (auto &[encoder, handle] : audio_tracks) {
-		if (handle > 0)
-			moq_publish_media_finish(handle);
+	for (auto &[encoder, track] : audio_tracks) {
+		if (track.producer)
+			track.producer->finish();
 	}
 	audio_tracks.clear();
+	bandwidth.reset();
 
-	// Finish the broadcast so the origin unpublishes it immediately; Start()
+	// Close the broadcast so the origin retracts it immediately; Start()
 	// creates a fresh one on restart.
-	if (broadcast > 0) {
-		moq_publish_finish(broadcast);
-		broadcast = 0;
+	if (broadcast)
+		broadcast->close();
+	broadcast.reset();
+	origin.reset();
+
+	// Drain once tracks finish. Default lite-06 waits for transport ACKs, not
+	// confirmation that the peer received the tail. Keep the future past this
+	// attempt because dropping it aborts the drain.
+	if (retired) {
+		draining.erase(std::remove_if(draining.begin(), draining.end(),
+					      [](const moq::Future<void> &drain) {
+						      return drain.wait_for(std::chrono::seconds(0)) ==
+							     std::future_status::ready;
+					      }),
+			       draining.end());
+		draining.push_back(retired->shutdown());
 	}
+	lock.unlock();
+
+	for (auto &[encoder, bitrate] : restore)
+		SetBitrate(encoder, bitrate);
 }
 
-// libmoq status codes (>= 0.3.0): > 0 = (re)connected, carrying the connection
-// epoch; 0 = closed cleanly (terminal); < 0 = fatal, reconnection gave up (terminal).
-void MoQOutput::SessionStatus(void *user_data, int code)
+std::string MoQOutput::GetEpoch()
 {
-	auto ref = static_cast<SessionRef *>(user_data);
+	std::lock_guard<std::mutex> lock(mutex);
+	return epoch;
+}
 
-	if (code > 0) {
-		ref->output->SessionConnected(*ref, code);
+bool MoQOutput::TryGetConnectionStats(ConnectionStats *out)
+{
+	if (!out)
+		return false;
+
+	std::shared_ptr<moq::Session> current;
+	std::shared_ptr<moq::BandwidthConsumer> receive;
+	std::string dial_url;
+	bool current_live = false;
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		if (!session)
+			return false;
+		current = session;
+		receive = recv_bandwidth;
+		dial_url = url;
+		current_live = live;
+	}
+
+	if (!current_live) {
+		RecordReconnectFailure(current);
+		return false;
+	}
+
+	const moq::ConnectionStats raw = current->stats();
+
+	ConnectionStats snapshot;
+	snapshot.reconnects = GetReconnectCount();
+	snapshot.rtt_valid = raw.rtt_us.has_value();
+	snapshot.rtt_ms = raw.rtt_us ? static_cast<double>(*raw.rtt_us) / 1000.0 : 0;
+	snapshot.estimated_send_rate_valid = raw.estimated_send_rate_bps.has_value();
+	snapshot.estimated_send_rate_bps =
+		raw.estimated_send_rate_bps ? static_cast<double>(*raw.estimated_send_rate_bps) : 0;
+	const auto recv_rate = receive ? receive->peek() : std::nullopt;
+	snapshot.estimated_recv_rate_valid = recv_rate.has_value();
+	snapshot.estimated_recv_rate_bps = recv_rate ? static_cast<double>(*recv_rate) : 0;
+	snapshot.bytes_sent_valid = raw.bytes_sent.has_value();
+	snapshot.bytes_sent = raw.bytes_sent.value_or(0);
+	if (raw.packets_sent && raw.packets_lost && *raw.packets_sent > 0) {
+		snapshot.loss_valid = true;
+		snapshot.loss_pct =
+			100.0 * static_cast<double>(*raw.packets_lost) / static_cast<double>(*raw.packets_sent);
+	}
+	snapshot.protocol = raw.version.value_or("");
+	snapshot.dial = DialSchemeLabel(dial_url);
+
+	return CommitConnectionStats(current, std::move(snapshot), out);
+}
+
+void MoQOutput::RecordReconnectFailure(const std::shared_ptr<moq::Session> &current)
+{
+	// Read outside the lock: it calls into moq-ffi.
+	const auto failure = current->failure();
+
+	std::lock_guard<std::mutex> lock(mutex);
+	// A Stop(), restart, or reconnect while failure() ran made this one stale.
+	if (session != current || live)
 		return;
+	if (failure) {
+		last_failure_code = FailureCode(*failure);
+		last_failure_reason = failure->to_string();
+	} else if (last_failure_reason.empty() || LooksGenericOffline(last_failure_reason)) {
+		// Nothing named yet. Keep a more specific prior failure over a generic blip.
+		last_failure_code = MoQError::Offline;
+		last_failure_reason = "offline";
 	}
-
-	// Terminal: libmoq never touches user_data again, so we own the reference.
-	// SessionClosed is the last access to the output, but not to `ref`.
-	std::unique_ptr<SessionRef> owned(ref);
-	owned->output->SessionClosed(*owned, code);
 }
 
-void MoQOutput::SessionConnected(const SessionRef &ref, int epoch)
+bool MoQOutput::CommitConnectionStats(const std::shared_ptr<moq::Session> &current, ConnectionStats snapshot,
+				      ConnectionStats *out)
 {
-	auto elapsed = std::chrono::steady_clock::now() - ref.started;
-	auto ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
-
-	{
-		std::lock_guard<std::mutex> lock(session_mutex);
-		if (session_attempt != ref.attempt)
-			return;
-		session_connected = true;
-		// The dock reads this as the live connected indicator, so publish it under
-		// the same lock as the stamp check: a restart must not be able to clear it
-		// between the two and leave the old attempt's time showing.
-		connect_time_ms = ms;
-	}
-
-	LOG_INFO("MoQ session connected (%d ms, epoch %d): %s", ms, epoch, ref.url.c_str());
+	// A Stop(), restart, or disconnect while stats() ran retired this session, so
+	// its numbers no longer describe the output.
+	std::lock_guard<std::mutex> lock(mutex);
+	if (session != current || !live)
+		return false;
+	*out = std::move(snapshot);
+	return true;
 }
 
-void MoQOutput::SessionClosed(const SessionRef &ref, int code)
+int MoQOutput::GetReconnectCount()
 {
-	// moq_error() only describes the most recent call on this thread, so copy the
-	// reason out before anything below can overwrite it.
-	std::string reason;
-	if (code < 0) {
-		const char *message = moq_error();
-		reason = message ? message : "unknown error";
-	}
-
-	// Held across both the decision below and the signal itself. Taking it before
-	// session_mutex is the required lock order, and holding it through the signal
-	// is what stops a teardown from landing in between: without that, Stop() can
-	// retire the attempt after we decide to report, and OBS turns the late
-	// OBS_OUTPUT_DISCONNECTED into a reconnect of a stopped stream.
-	std::unique_lock<std::recursive_mutex> signal_lock(signal_mutex);
-
-	bool current;
-	bool connected = false;
+	std::shared_ptr<moq::Session> current;
 	{
-		std::lock_guard<std::mutex> lock(session_mutex);
-		current = session_attempt == ref.attempt;
-		if (current) {
-			connected = session_connected;
-			// The session task has ended and dropped the handle, so retire it here
-			// rather than closing a handle libmoq no longer knows about.
-			session = 0;
-			session_attempt++;
-			session_connected = false;
-			connect_time_ms = 0;
+		std::lock_guard<std::mutex> lock(mutex);
+		current = session;
+	}
+	// Read live rather than tracked from status(), which coalesces a drop that
+	// reconnects before it is asked again.
+	const uint64_t connects = current ? current->connects() : 0;
+	return connects > 1 ? static_cast<int>(connects - 1) : 0;
+}
+
+bool MoQOutput::IsLiveSession()
+{
+	std::lock_guard<std::mutex> lock(mutex);
+	return connected && session != nullptr;
+}
+
+void MoQOutput::CopyLastFailure(int *code, std::string *reason)
+{
+	std::lock_guard<std::mutex> lock(mutex);
+	if (code)
+		*code = last_failure_code;
+	if (reason)
+		*reason = last_failure_reason;
+}
+
+bool MoQOutput::TryGetVideoRate(VideoRate *out)
+{
+	VideoRate rate;
+	bool following = false;
+	{
+		std::lock_guard<std::mutex> lock(media_mutex);
+		for (const auto &[encoder, track] : video_tracks) {
+			if (!track.rate || !track.reservation)
+				continue;
+			following = true;
+			rate.target_bps += track.rate->Target();
+			rate.configured_bps += track.rate->Max();
 		}
 	}
-
-	if (code == 0) {
-		LOG_INFO("MoQ session closed: %s", ref.url.c_str());
-	} else {
-		LOG_ERROR("MoQ session failed (%d): %s: %s", code, ref.url.c_str(), reason.c_str());
-	}
-
-	// Reconnection gave up, so nothing is reaching the server any more. Without
-	// this OBS keeps encoding and reporting the stream as live forever. Only the
-	// current attempt signals, which is what keeps it to one signal per Start().
-	// `this` and `output` are still alive here because the destructor is blocked
-	// on the reference released below.
-	if (code < 0 && current) {
-		obs_output_set_last_error(output, reason.c_str());
-		// CONNECT_FAILED is terminal for OBS. DISCONNECTED lets its own reconnect
-		// logic retry, which is only worth offering once we know the server works.
-		obs_output_signal_stop(output, connected ? OBS_OUTPUT_DISCONNECTED : OBS_OUTPUT_CONNECT_FAILED);
-	}
-
-	// Nothing below reports to OBS, so narrow the hold: the destructor can be
-	// blocked in Reset() waiting for this lock, and it only reaches its
-	// session_cv wait once it has it.
-	signal_lock.unlock();
-
-	// Terminal callback: the session task has ended and will not touch `this`
-	// again. Release the lifetime reference the destructor waits on. This is the
-	// last access to `this`.
-	std::lock_guard<std::mutex> lock(session_mutex);
-	if (--outstanding_sessions == 0)
-		session_cv.notify_all();
+	if (following && out)
+		*out = rate;
+	return following;
 }
 
 void MoQOutput::Data(struct encoder_packet *packet)
@@ -381,8 +623,26 @@ void MoQOutput::Data(struct encoder_packet *packet)
 	}
 }
 
+// The packet's timestamp on the broadcast clock, or nothing when it falls before zero.
+static std::optional<uint64_t> PacketTimestamp(const struct encoder_packet *packet)
+{
+	// Add ~1 second offset to handle negative PTS from audio priming frames, and
+	// the same to video for A/V sync.
+	// TODO: This is slightly wrong when den is not evenly divisible by num, but close enough.
+	int64_t pts = packet->pts + packet->timebase_den / packet->timebase_num;
+	if (pts < 0)
+		return std::nullopt;
+	return util_mul_div64(pts, 1000000ULL * packet->timebase_num, packet->timebase_den);
+}
+
+static moq::Frame PacketFrame(const struct encoder_packet *packet, uint64_t timestamp_us)
+{
+	return moq::Frame{std::vector<uint8_t>(packet->data, packet->data + packet->size), timestamp_us};
+}
+
 void MoQOutput::AudioData(struct encoder_packet *packet)
 {
+	std::lock_guard<std::mutex> lock(media_mutex);
 	obs_encoder_t *encoder = packet->encoder;
 
 	auto it = audio_tracks.find(encoder);
@@ -390,25 +650,35 @@ void MoQOutput::AudioData(struct encoder_packet *packet)
 		AudioInit(encoder);
 		it = audio_tracks.find(encoder);
 	}
-	if (it == audio_tracks.end() || it->second < 0) {
-		// We failed to initialize the audio track, so we can't write any data.
+	if (it == audio_tracks.end())
 		return;
-	}
-	int handle = it->second;
+	auto &track = it->second;
+	if (!track.producer)
+		return;
+	Reserve(track);
 
-	// Add ~1 second offset to handle negative PTS from audio priming frames.
-	// TODO: This is slightly wrong when den is not evenly divisible by num, but close enough.
-	int64_t pts = packet->pts + packet->timebase_den / packet->timebase_num;
-	if (pts < 0) {
+	auto timestamp = PacketTimestamp(packet);
+	if (!timestamp) {
 		LOG_WARNING("Dropping audio frame with negative PTS: %lld", (long long)packet->pts);
 		return;
 	}
 
-	auto pts_us = util_mul_div64(pts, 1000000ULL * packet->timebase_num, packet->timebase_den);
+	if (auto result = track.producer->write_frame(PacketFrame(packet, *timestamp)); !result) {
+		LOG_ERROR("Failed to write audio frame: %s", result.error().to_string().c_str());
+		return;
+	}
 
-	auto result = moq_publish_media_frame(handle, packet->data, packet->size, pts_us);
-	if (result < 0) {
-		LOG_ERROR("Failed to write audio frame: %d", result);
+	// Audio has no keyframes, so it has no group boundary of its own: without this the whole
+	// stream is one group. Cut per frame, which is one QUIC stream per packet forwarded without
+	// waiting for the next, the right trade for live. Video groups at its own keyframes.
+	// Cut before observing the flush so a failed observation never leaves the group open.
+	if (auto result = track.producer->cut(); !result) {
+		LOG_ERROR("Failed to cut audio group: %s", result.error().to_string().c_str());
+		return;
+	}
+
+	if (auto result = track.producer->flush(*timestamp); !result) {
+		LOG_ERROR("Failed to observe audio encoder flush: %s", result.error().to_string().c_str());
 		return;
 	}
 
@@ -417,6 +687,7 @@ void MoQOutput::AudioData(struct encoder_packet *packet)
 
 void MoQOutput::VideoData(struct encoder_packet *packet)
 {
+	std::lock_guard<std::mutex> lock(media_mutex);
 	obs_encoder_t *encoder = packet->encoder;
 
 	auto it = video_tracks.find(encoder);
@@ -424,25 +695,33 @@ void MoQOutput::VideoData(struct encoder_packet *packet)
 		VideoInit(encoder);
 		it = video_tracks.find(encoder);
 	}
-	if (it == video_tracks.end() || it->second < 0)
+	if (it == video_tracks.end() || !it->second.producer)
 		return;
-	int handle = it->second;
+	auto &track = it->second;
+	Reserve(track);
 
-	// Add ~1 second offset to match audio for A/V sync.
-	// TODO: This is slightly wrong when den is not evenly divisible by num, but close enough.
-	int64_t pts = packet->pts + packet->timebase_den / packet->timebase_num;
-	if (pts < 0) {
+	// Read before the frame is written, so a retune lands on the encoder's next
+	// frame. obs_encoder_update only flags an active encoder for its own thread.
+	if (track.rate && track.reservation) {
+		if (auto next = track.rate->Update(track.reservation->grant(), MoQRate::Clock::now()))
+			SetBitrate(encoder, *next);
+	}
+
+	auto timestamp = PacketTimestamp(packet);
+	if (!timestamp) {
 		LOG_WARNING("Dropping video frame with negative PTS: %lld", (long long)packet->pts);
 		return;
 	}
 
-	auto pts_us = util_mul_div64(pts, 1000000ULL * packet->timebase_num, packet->timebase_den);
+	ProcessEventMarkers(*timestamp);
 
-	ProcessEventMarkers(pts_us);
+	if (auto result = track.producer->write_frame(PacketFrame(packet, *timestamp)); !result) {
+		LOG_ERROR("Failed to write video frame: %s", result.error().to_string().c_str());
+		return;
+	}
 
-	auto result = moq_publish_media_frame(handle, packet->data, packet->size, pts_us);
-	if (result < 0) {
-		LOG_ERROR("Failed to write video frame: %d", result);
+	if (auto result = track.producer->flush(*timestamp); !result) {
+		LOG_ERROR("Failed to observe video encoder flush: %s", result.error().to_string().c_str());
 		return;
 	}
 
@@ -461,25 +740,35 @@ void MoQOutput::ProcessEventMarkers(uint64_t pts_us)
 	}
 }
 
+// NOTE: Caller must hold media_mutex.
+void MoQOutput::Reserve(Track &track)
+{
+	if (track.reservation || !bandwidth || track.bitrate_bps == 0)
+		return;
+	auto demand = track.producer->demand();
+	if (!demand) {
+		LOG_ERROR("Failed to reserve bandwidth: %s", demand.error().to_string().c_str());
+		track.bitrate_bps = 0;
+		return;
+	}
+	track.reservation = bandwidth->reserve(*demand, track.bitrate_bps);
+}
+
+// NOTE: Caller must hold media_mutex.
 void MoQOutput::VideoInit(obs_encoder_t *encoder)
 {
 	if (!encoder) {
 		LOG_ERROR("Failed to get video encoder");
 		return;
 	}
-
-	// TODO Pass these along to the video catalog somehow.
-	/*
-	OBSDataAutoRelease settings = obs_encoder_get_settings(encoder);
-	if (!settings) {
-		LOG_ERROR("Failed to get video encoder settings");
+	// Stopped, or not started yet: no broadcast to publish on.
+	if (!broadcast)
 		return;
-	}
 
-	auto video_bitrate = (int)obs_data_get_int(settings, "bitrate");
-	auto video_width = obs_encoder_get_width(encoder);
-	auto video_height = obs_encoder_get_height(encoder);
-	*/
+	OBSDataAutoRelease settings = obs_encoder_get_settings(encoder);
+	const auto video_width = obs_encoder_get_width(encoder);
+	const auto video_height = obs_encoder_get_height(encoder);
+	const int video_bitrate_kbps = settings ? (int)obs_data_get_int(settings, "bitrate") : 0;
 
 	uint8_t *extra_data = nullptr;
 	size_t extra_size = 0;
@@ -492,44 +781,75 @@ void MoQOutput::VideoInit(obs_encoder_t *encoder)
 
 	const char *codec = obs_encoder_get_codec(encoder);
 
-	// Transform codec string for MoQ
-	const char *moq_codec = codec;
+	// Map the OBS codec name onto a MoQ format. Both H.26x entries are the Annex-B framing
+	// with inline parameter sets, which is what OBS hands us.
+	moq::VideoInit config{};
 	if (strcmp(codec, "h264") == 0) {
-		// H.264 with inline SPS/PPS
-		moq_codec = "avc3";
+		config.format = moq::VideoFormat::kAvc3;
 	} else if (strcmp(codec, "hevc") == 0) {
-		// H.265 with inline VPS/SPS/PPS
-		moq_codec = "hev1";
-	}
-
-	// Intialize the media import module with the codec and initialization data.
-	int handle = moq_publish_media(broadcast, moq_codec, strlen(moq_codec), extra_data, extra_size);
-	video_tracks[encoder] = handle;
-	if (handle < 0) {
-		LOG_ERROR("Failed to initialize video track: %d", handle);
+		config.format = moq::VideoFormat::kHev1;
+	} else if (strcmp(codec, "av1") == 0) {
+		config.format = moq::VideoFormat::kAv01;
+	} else {
+		LOG_ERROR("Unsupported video codec: %s", codec);
+		video_tracks[encoder] = Track{};
 		return;
 	}
 
-	LOG_INFO("Video track initialized successfully");
+	if (extra_data && extra_size > 0)
+		config.data.assign(extra_data, extra_data + extra_size);
+
+	// Seed catalog fields a downstream moq-transcode needs before measured rates
+	// arrive: coded size (also from SPS once parsed) and configured CBR bitrate so
+	// same-height ladder rungs can undercut the mezzanine.
+	moq::VideoHint hint{};
+	if (video_width > 0 && video_height > 0)
+		hint.coded = moq::Dimensions{video_width, video_height};
+	const std::string rate_control = settings ? obs_data_get_string(settings, "rate_control") : "";
+	if (video_bitrate_kbps > 0 && (rate_control == "CBR" || rate_control == "cbr"))
+		hint.bitrate = (uint64_t)video_bitrate_kbps * 1000ULL;
+	hint.optimize_for_latency = true;
+	config.hint = hint;
+
+	auto track = moq::MediaTrackProducer::video(broadcast, moq::MediaTarget::kNamed{}, config);
+	if (!track) {
+		LOG_ERROR("Failed to initialize video track: %s", track.error().to_string().c_str());
+		video_tracks[encoder] = Track{};
+		return;
+	}
+
+	Track entry;
+	entry.producer = *track;
+	if (video_bitrate_kbps > 0) {
+		entry.bitrate_bps = (uint64_t)video_bitrate_kbps * 1000ULL;
+		// Following needs an encoder that retunes live and a rate control the
+		// bitrate drives; a quality target (CQP, CRF) only reserves.
+		const bool dynamic = obs_encoder_get_caps(encoder) & OBS_ENCODER_CAP_DYN_BITRATE;
+		if (dynamic && BitrateDriven(rate_control)) {
+			entry.rate.emplace(entry.bitrate_bps);
+			entry.encoder = OBSGetWeakRef(encoder);
+		} else {
+			LOG_INFO("Video bitrate stays at %d kbps: the encoder cannot follow the bandwidth grant (%s)",
+				 video_bitrate_kbps, rate_control.empty() ? "no rate control" : rate_control.c_str());
+		}
+	}
+	video_tracks[encoder] = std::move(entry);
+
+	LOG_INFO("Video track initialized (%ux%u, %d kbps)", video_width, video_height, video_bitrate_kbps);
 }
 
+// NOTE: Caller must hold media_mutex.
 void MoQOutput::AudioInit(obs_encoder_t *encoder)
 {
 	if (!encoder) {
 		LOG_ERROR("Failed to get audio encoder");
 		return;
 	}
-
-	// TODO Pass these along to the audio catalog somehow.
-	/*
-	OBSDataAutoRelease settings = obs_encoder_get_settings(encoder);
-	if (!settings) {
-		LOG_ERROR("Failed to get audio encoder settings");
+	if (!broadcast)
 		return;
-	}
 
-	auto audio_bitrate = (int)obs_data_get_int(settings, "bitrate");
-	*/
+	OBSDataAutoRelease settings = obs_encoder_get_settings(encoder);
+	const int audio_bitrate_kbps = settings ? (int)obs_data_get_int(settings, "bitrate") : 0;
 
 	uint8_t *extra_data = nullptr;
 	size_t extra_size = 0;
@@ -542,12 +862,36 @@ void MoQOutput::AudioInit(obs_encoder_t *encoder)
 
 	const char *codec = obs_encoder_get_codec(encoder);
 
-	int handle = moq_publish_media(broadcast, codec, strlen(codec), extra_data, extra_size);
-	audio_tracks[encoder] = handle;
-	if (handle < 0) {
-		LOG_ERROR("Failed to initialize audio track: %d", handle);
+	// Mapping the codec here means OBS says which one it was, rather than the importer
+	// failing on it deep inside.
+	moq::AudioInit config{};
+	if (strcmp(codec, "opus") == 0) {
+		config.format = moq::AudioFormat::kOpus;
+	} else if (strcmp(codec, "aac") == 0) {
+		config.format = moq::AudioFormat::kAac;
+	} else if (strcmp(codec, "flac") == 0) {
+		config.format = moq::AudioFormat::kFlac;
+	} else {
+		LOG_ERROR("Unsupported audio codec: %s", codec);
+		audio_tracks[encoder] = Track{};
 		return;
 	}
+
+	if (extra_data && extra_size > 0)
+		config.data.assign(extra_data, extra_data + extra_size);
+
+	auto track = moq::MediaTrackProducer::audio(broadcast, moq::MediaTarget::kNamed{}, config);
+	if (!track) {
+		LOG_ERROR("Failed to initialize audio track: %s", track.error().to_string().c_str());
+		audio_tracks[encoder] = Track{};
+		return;
+	}
+	// Audio reserves so video's grant leaves room for it, and never follows.
+	Track entry;
+	entry.producer = *track;
+	if (audio_bitrate_kbps > 0)
+		entry.bitrate_bps = (uint64_t)audio_bitrate_kbps * 1000ULL;
+	audio_tracks[encoder] = std::move(entry);
 
 	LOG_INFO("Audio track initialized successfully");
 }

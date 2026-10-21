@@ -35,15 +35,17 @@ use windows::Win32::Media::MediaFoundation::{
 	MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
 	MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
 	MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_HEVC,
-	MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoPrimaries_SMPTE170M,
-	MFVideoTransFunc_709, MFVideoTransferMatrix_BT601, MFVideoTransferMatrix_BT709, eAVEncCommonRateControlMode_CBR,
-	eAVEncH264VProfile_High, eAVEncH265VProfile_Main_420_8,
+	MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoPrimaries_BT2020,
+	MFVideoPrimaries_EBU3213, MFVideoPrimaries_SMPTE170M, MFVideoTransFunc_709, MFVideoTransFunc_2084,
+	MFVideoTransFunc_HLG, MFVideoTransferMatrix_BT601, MFVideoTransferMatrix_BT709, MFVideoTransferMatrix_BT2020_10,
+	eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_High, eAVEncH265VProfile_Main_420_8,
 };
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
 use windows::core::{GUID, Interface};
 
-use super::super::encoder::{Codec, Config};
-use super::{Backend, Encoded};
+use super::super::encoder::{Applied, Codec, Config, Gop};
+use super::{Backend, Encoded, keyframe_annexb};
+use crate::color::{Matrix, Primaries, Range, Transfer};
 use crate::frame::{Surface, interleave_uv};
 use crate::mf::{ComGuard, mf_err, pack_2x32};
 use crate::{Color, Error, Frame};
@@ -63,8 +65,9 @@ pub(crate) struct MediaFoundation {
 	codec: Codec,
 	width: u32,
 	height: u32,
-	framerate: u32,
+	framerate: crate::Rate,
 	bitrate: u32,
+	/// Keyframe interval in frames.
 	gop: u32,
 	/// The color space of the input frames, stamped onto both media types so the
 	/// encoder writes it into the bitstream's VUI.
@@ -100,12 +103,6 @@ pub(crate) struct MediaFoundation {
 	_manager: Option<IMFDXGIDeviceManager>,
 	_com: ComGuard,
 }
-
-// The MFT and its COM handles are created, driven, and dropped only on the
-// dedicated encode thread (see `encode::sink`), so the per-thread COM apartment
-// this opens in `ComGuard::new` stays balanced. `Send` lets the boxed trait
-// object satisfy `Backend: Send`.
-unsafe impl Send for MediaFoundation {}
 
 impl MediaFoundation {
 	pub(crate) fn open(config: &Config) -> Result<Box<dyn Backend>, Error> {
@@ -143,8 +140,11 @@ impl MediaFoundation {
 			width: config.width,
 			height: config.height,
 			framerate: config.framerate,
-			bitrate: clamp_u32(config.resolved_bitrate()),
-			gop: config.gop,
+			bitrate: clamp_u32(config.resolved_bitrate().as_bps()),
+			gop: {
+				let Gop::Keyframe { interval } = config.gop;
+				interval
+			},
 			color: config.resolved_color(),
 			started: false,
 			provides_samples: false,
@@ -232,15 +232,25 @@ impl MediaFoundation {
 	/// stream; the conversion picks the matrix an untagged stream implies, which
 	/// is what keeps that case correct.
 	fn set_color(&self, media: &IMFMediaType) -> Result<(), Error> {
-		let (primaries, matrix) = match self.color {
-			Color::Bt601Limited | Color::Bt601Full => (MFVideoPrimaries_SMPTE170M, MFVideoTransferMatrix_BT601),
-			Color::Bt709Limited | Color::Bt709Full => (MFVideoPrimaries_BT709, MFVideoTransferMatrix_BT709),
+		let primaries = match self.color.primaries {
+			Primaries::Smpte170m => MFVideoPrimaries_SMPTE170M,
+			Primaries::Bt470bg => MFVideoPrimaries_EBU3213,
+			Primaries::Bt709 => MFVideoPrimaries_BT709,
+			Primaries::Bt2020 => MFVideoPrimaries_BT2020,
 		};
-		// BT.601 and BT.709 share a transfer curve; only primaries and matrix differ.
-		let transfer = MFVideoTransFunc_709;
-		let range = match self.color.limited() {
-			true => MFNominalRange_16_235,
-			false => MFNominalRange_0_255,
+		let transfer = match self.color.transfer {
+			Transfer::Bt709 => MFVideoTransFunc_709,
+			Transfer::Pq => MFVideoTransFunc_2084,
+			Transfer::Hlg => MFVideoTransFunc_HLG,
+		};
+		let matrix = match self.color.matrix {
+			Matrix::Bt601 => MFVideoTransferMatrix_BT601,
+			Matrix::Bt709 => MFVideoTransferMatrix_BT709,
+			Matrix::Bt2020 => MFVideoTransferMatrix_BT2020_10,
+		};
+		let range = match self.color.range {
+			Range::Limited => MFNominalRange_16_235,
+			Range::Full => MFNominalRange_0_255,
 		};
 
 		unsafe {
@@ -283,7 +293,10 @@ impl MediaFoundation {
 				.SetUINT64(&MF_MT_FRAME_SIZE, pack_2x32(self.width, self.height))
 				.map_err(|e| mf_err("output frame size", e))?;
 			media
-				.SetUINT64(&MF_MT_FRAME_RATE, pack_2x32(self.framerate, 1))
+				.SetUINT64(
+					&MF_MT_FRAME_RATE,
+					pack_2x32(self.framerate.numerator(), self.framerate.denominator()),
+				)
 				.map_err(|e| mf_err("output frame rate", e))?;
 			self.set_color(&media)?;
 			self.transform
@@ -309,7 +322,10 @@ impl MediaFoundation {
 				.SetUINT64(&MF_MT_FRAME_SIZE, pack_2x32(self.width, self.height))
 				.map_err(|e| mf_err("input frame size", e))?;
 			media
-				.SetUINT64(&MF_MT_FRAME_RATE, pack_2x32(self.framerate, 1))
+				.SetUINT64(
+					&MF_MT_FRAME_RATE,
+					pack_2x32(self.framerate.numerator(), self.framerate.denominator()),
+				)
 				.map_err(|e| mf_err("input frame rate", e))?;
 			self.set_color(&media)?;
 			self.transform
@@ -360,7 +376,7 @@ impl MediaFoundation {
 
 	/// One frame's worth of the Media Foundation sample clock, in 100ns units.
 	fn tick(&self) -> i64 {
-		HNS_PER_SEC / self.framerate.max(1) as i64
+		HNS_PER_SEC * i64::from(self.framerate.denominator()) / i64::from(self.framerate.numerator())
 	}
 
 	/// The sample time for the frame currently going in.
@@ -492,10 +508,11 @@ impl MediaFoundation {
 
 		let Some(sample) = sample else { return Ok(None) };
 		let sample_time = unsafe { sample.GetSampleTime() }.ok();
-		Ok(Some(Encoded::new(
-			sample_to_bytes(&sample)?,
-			self.take_timestamp(sample_time),
-		)))
+		let payload = sample_to_bytes(&sample)?;
+		// Read from the bitstream rather than `MFSampleExtension_CleanPoint`, which a
+		// hardware MFT is not required to set.
+		let keyframe = keyframe_annexb(self.codec, &payload);
+		Ok(Some(Encoded::new(payload, self.take_timestamp(sample_time), keyframe)))
 	}
 
 	/// End the stream and wait the MFT's tail out, returning everything it was
@@ -579,7 +596,7 @@ impl MediaFoundation {
 }
 
 impl Backend for MediaFoundation {
-	fn encode(&mut self, frame: &Frame, keyframe: bool) -> Result<Vec<Encoded>, Error> {
+	fn encode(&mut self, frame: &Frame, cut: bool) -> Result<Vec<Encoded>, Error> {
 		if !self.started {
 			self.start(&frame.surface)?;
 		}
@@ -587,7 +604,7 @@ impl Backend for MediaFoundation {
 		let mut out = Vec::new();
 		self.wait_for_input(&mut out)?;
 
-		if keyframe {
+		if cut {
 			self.set_codec(&CODECAPI_AVEncVideoForceKeyFrame, variant_u32(1))?;
 		}
 
@@ -654,8 +671,18 @@ impl Backend for MediaFoundation {
 		Ok(())
 	}
 
-	fn name(&self) -> &str {
+	fn can_cut(&self) -> bool {
+		true
+	}
+
+	fn name(&self) -> &'static str {
 		NAME
+	}
+
+	fn applied(&self) -> Applied {
+		// `set_codec` only logs a refused knob, and the MFT is configured lazily on
+		// the first frame, so nothing confirms low-latency mode took.
+		Applied::unconfirmed("AVLowLatencyMode requested, unconfirmed; CBR")
 	}
 }
 

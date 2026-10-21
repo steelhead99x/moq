@@ -1,0 +1,252 @@
+//! The negotiated registries for errors reported by a stream.
+
+use crate::{Error, StreamError, ietf, lite};
+
+/// The stream reset registry of the protocol a stream belongs to.
+///
+/// Every [`Reader`](super::Reader) and [`Writer`](super::Writer) carries the negotiated
+/// version, which is what picks the registry here. The two wires draw on the same names,
+/// but they do not agree on every value: moq-lite's are fixed by
+/// [`StreamError::to_code`] (a later version adds codes but never moves one), while
+/// moq-transport's moved across the drafts we negotiate (see the `ietf::error` module). Sending a code from the wrong table is silent, because the
+/// number is valid in both.
+///
+/// Encoding and decoding live on one trait so a peer cannot be told a code from one table
+/// and read against another: implement both halves or neither.
+#[cfg_attr(not(feature = "async"), allow(dead_code))]
+pub trait StreamCodes {
+	/// The code to reset a stream, or send STOP_SENDING, with.
+	fn encode_stream_code(&self, err: &StreamError) -> u32;
+
+	/// Read a code the peer reset a stream (or sent STOP_SENDING) with.
+	fn decode_stream_code(&self, code: u32) -> StreamError;
+
+	/// Read the session close reported while using this stream's protocol.
+	fn decode_session_code(&self, code: u32) -> crate::SessionError {
+		crate::SessionError::from_code(code)
+	}
+
+	/// Turn a transport failure into an [`Error`], reading a stream reset with this
+	/// registry.
+	///
+	/// Session closes use the same negotiated protocol as stream resets.
+	fn transport_error<E: crate::transport::Error>(&self, err: E) -> Error {
+		if let Some((code, _reason)) = err.session_error() {
+			return self.decode_session_code(code).into();
+		}
+
+		if let Some(code) = err.stream_error() {
+			return self.decode_stream_code(code).into();
+		}
+
+		Error::from_transport(err)
+	}
+}
+
+/// moq-lite's registry, specified by draft-lcurley-moq-lite (Error Codes). A code a version
+/// lacks is sent there as the closest one it has, and not read back there.
+impl StreamCodes for lite::Version {
+	fn decode_session_code(&self, code: u32) -> crate::SessionError {
+		lite::error::from_session_code(code)
+	}
+
+	fn encode_stream_code(&self, err: &StreamError) -> u32 {
+		match err {
+			StreamError::NotFetchable if !self.has_not_fetchable() => StreamError::NotFound.to_code(),
+			err => err.to_code(),
+		}
+	}
+
+	fn decode_stream_code(&self, code: u32) -> StreamError {
+		match StreamError::from_code(code) {
+			StreamError::NotFetchable if !self.has_not_fetchable() => StreamError::Unknown(code),
+			err => err,
+		}
+	}
+}
+
+/// moq-transport's registry, which is per draft.
+impl StreamCodes for ietf::Version {
+	fn encode_stream_code(&self, err: &StreamError) -> u32 {
+		ietf::error::to_stream_code(err, *self)
+	}
+
+	fn decode_stream_code(&self, code: u32) -> StreamError {
+		ietf::error::from_stream_code(code, *self)
+	}
+}
+
+/// The negotiated version before it is narrowed to one protocol, e.g. the SETUP stream a
+/// pre-lite-05 session opens.
+impl StreamCodes for crate::Version {
+	fn decode_session_code(&self, code: u32) -> crate::SessionError {
+		match self {
+			Self::Lite(version) => version.decode_session_code(code),
+			Self::Ietf(version) => version.decode_session_code(code),
+		}
+	}
+
+	fn encode_stream_code(&self, err: &StreamError) -> u32 {
+		match self {
+			Self::Lite(version) => version.encode_stream_code(err),
+			Self::Ietf(version) => version.encode_stream_code(err),
+		}
+	}
+
+	fn decode_stream_code(&self, code: u32) -> StreamError {
+		match self {
+			Self::Lite(version) => version.decode_stream_code(code),
+			Self::Ietf(version) => version.decode_stream_code(code),
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The registry follows the negotiated protocol, not the other way around: a group
+	/// dropped for being old is a moq-lite code and an INTERNAL_ERROR on the IETF
+	/// wire, and the same number read back on each wire has to mean what that wire said.
+	#[test]
+	fn the_version_picks_the_registry() {
+		let lite = crate::Version::Lite(lite::Version::Lite05);
+		let ietf = crate::Version::Ietf(ietf::Version::Draft20);
+
+		assert_eq!(lite.encode_stream_code(&StreamError::Old), StreamError::Old.to_code());
+		assert_eq!(ietf.encode_stream_code(&StreamError::Old), ietf::error::INTERNAL_ERROR);
+
+		// Both agree on a cancellation, which is the one code that has to be right.
+		assert_eq!(lite.encode_stream_code(&StreamError::Cancel), ietf::error::CANCELLED);
+		assert_eq!(ietf.encode_stream_code(&StreamError::Cancel), ietf::error::CANCELLED);
+
+		// GOING_AWAY is moq-lite's 0x4 and draft-20's, but draft-17 gives 0x4 to
+		// UNKNOWN_OBJECT_STATUS, so it is not sent there and not read back there.
+		let draft17 = crate::Version::Ietf(ietf::Version::Draft17);
+		assert_eq!(lite.decode_stream_code(0x4), StreamError::GoingAway);
+		assert_eq!(ietf.decode_stream_code(0x4), StreamError::GoingAway);
+		assert_eq!(draft17.decode_stream_code(0x4), StreamError::Unknown(0x4));
+		assert_eq!(
+			draft17.encode_stream_code(&StreamError::GoingAway),
+			ietf::error::INTERNAL_ERROR
+		);
+	}
+
+	/// NOT_FETCHABLE is lite-07's: an earlier peer is told NOT_FOUND, the miss it would
+	/// have been told before, and is not credited with a code its version never assigned.
+	#[test]
+	fn not_fetchable_is_lite_07s() {
+		for version in [lite::Version::Lite05, lite::Version::Lite06] {
+			assert_eq!(
+				version.encode_stream_code(&StreamError::NotFetchable),
+				StreamError::NotFound.to_code(),
+				"{version}"
+			);
+			assert_eq!(
+				version.decode_stream_code(0x3a),
+				StreamError::Unknown(0x3a),
+				"{version}"
+			);
+		}
+
+		let version = lite::Version::Lite07;
+		assert_eq!(version.encode_stream_code(&StreamError::NotFetchable), 0x3a);
+		assert_eq!(version.decode_stream_code(0x3a), StreamError::NotFetchable);
+		assert_eq!(
+			version.decode_stream_code(StreamError::NotFound.to_code()),
+			StreamError::NotFound
+		);
+	}
+
+	/// A dropped [`Writer`](super::Writer) resets with a cancellation, and `Drop` cannot
+	/// carry the bound that would reach the negotiated registry. It does not need one only
+	/// while every registry we speak agrees on the value, so pin that.
+	#[test]
+	fn both_registries_agree_about_a_cancellation() {
+		let versions = crate::Versions::all().iter().copied().collect::<Vec<_>>();
+
+		for version in versions {
+			assert_eq!(
+				version.encode_stream_code(&StreamError::Cancel),
+				StreamError::Cancel.to_code(),
+				"{version:?} cancels with a different code than the Writer's Drop sends"
+			);
+		}
+	}
+
+	/// `Closed` also describes virtual streams, so it cannot claim that the transport's
+	/// connection closed. Native transport adapters supply that metadata themselves.
+	#[test]
+	fn a_virtual_stream_close_does_not_claim_the_connection_closed() {
+		let version = ietf::Version::Draft16;
+		assert!(matches!(version.transport_error(Error::Closed), Error::Transport(_)));
+		assert!(matches!(
+			version.transport_error(Error::IdleTimeout),
+			Error::IdleTimeout
+		));
+	}
+
+	/// A session close is not stream-scoped, so it keeps the session registry whichever
+	/// wire the stream is on.
+	#[test]
+	fn a_session_close_keeps_the_session_registry() {
+		#[derive(Debug, thiserror::Error)]
+		#[error("failed")]
+		struct Failed {
+			session: Option<u32>,
+			stream: Option<u32>,
+		}
+
+		impl crate::transport::Error for Failed {
+			fn session_error(&self) -> Option<(u32, String)> {
+				self.session.map(|code| (code, "closed".to_string()))
+			}
+			fn stream_error(&self) -> Option<u32> {
+				self.stream
+			}
+		}
+
+		let version = ietf::Version::Draft20;
+
+		// 0x0 ends a session cleanly, but fails a stream.
+		assert!(matches!(
+			version.transport_error(Failed {
+				session: Some(0x0),
+				stream: None
+			}),
+			Error::Session(crate::SessionError::Cancel)
+		));
+		assert!(matches!(
+			version.transport_error(Failed {
+				session: None,
+				stream: Some(0x0)
+			}),
+			Error::Stream(StreamError::Internal)
+		));
+
+		// A session-level failure still needs the stream's negotiated protocol.
+		assert!(matches!(
+			version.transport_error(Failed {
+				session: Some(0x30),
+				stream: None
+			}),
+			Error::Session(crate::SessionError::Unknown(0x30))
+		));
+		assert!(matches!(
+			lite::Version::Lite07.transport_error(Failed {
+				session: Some(0x30),
+				stream: None
+			}),
+			Error::Session(crate::SessionError::Unsupported)
+		));
+
+		// Neither: the transport itself failed.
+		assert!(matches!(
+			version.transport_error(Failed {
+				session: None,
+				stream: None
+			}),
+			Error::Transport(_)
+		));
+	}
+}

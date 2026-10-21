@@ -1,4 +1,4 @@
-import { Time } from "@moq/net";
+import { Micro, type Milli, Second } from "@moq/clock";
 
 export class AudioRingBuffer {
 	#buffer: Float32Array[];
@@ -8,6 +8,13 @@ export class AudioRingBuffer {
 	readonly rate: number;
 	readonly channels: number;
 	#stalled = true;
+	#underruns = 0;
+
+	// Samples in the most recent write, i.e. one decoded chunk. The overflow band tolerates this
+	// much above the target before dropping, so a ring sitting exactly on the target doesn't drop
+	// audio the moment the next chunk lands. The most recent write rather than a running maximum:
+	// one oversized decode would otherwise widen the band for the life of the ring.
+	#chunk = 0;
 
 	// Buffered mode: play through everything buffered without skipping ahead.
 	readonly #buffered: boolean;
@@ -19,23 +26,25 @@ export class AudioRingBuffer {
 	constructor(props: {
 		rate: number;
 		channels: number;
-		latency: Time.Milli;
+		latency: Milli;
 		buffered?: boolean;
 	}) {
 		if (props.channels <= 0) throw new Error("invalid channels");
 		if (props.rate <= 0) throw new Error("invalid sample rate");
 		if (props.latency <= 0) throw new Error("invalid latency");
 
-		this.#latencySamples = Math.ceil(props.rate * Time.Second.fromMilli(props.latency));
+		this.#latencySamples = Math.ceil(props.rate * Second.fromMilli(props.latency));
 		if (this.#latencySamples === 0) throw new Error("empty buffer");
 
 		this.rate = props.rate;
 		this.channels = props.channels;
 		this.#buffered = props.buffered ?? false;
 
-		// The ring holds the latency floor as PCM. Buffered mode gives it headroom above the floor
-		// so the backpressure-paced decode loop (on the main thread) doesn't overflow-drop; the rest
-		// of the lookahead stays encoded upstream.
+		// The ring holds the latency floor as PCM, with headroom above it. Sizing capacity to the
+		// floor exactly makes the ring physically incapable of holding the slack the overflow band
+		// wants, so every chunk that arrives while the ring is on target drops the oldest samples.
+		// In buffered mode the headroom is also what keeps the backpressure-paced decode loop (on
+		// the main thread) from overflow-dropping; the rest of the lookahead stays encoded upstream.
 		const capacity = this.#capacityFor(this.#latencySamples);
 
 		this.#buffer = [];
@@ -45,15 +54,20 @@ export class AudioRingBuffer {
 	}
 
 	#capacityFor(latencySamples: number): number {
-		return this.#buffered ? latencySamples * 2 : latencySamples;
+		return latencySamples * 2;
 	}
 
 	get stalled(): boolean {
 		return this.#stalled;
 	}
 
-	get timestamp(): Time.Micro {
-		return Time.Micro.fromSecond((this.#readIndex / this.rate) as Time.Second);
+	/** How many times the reader has run dry mid-playback. */
+	get underruns(): number {
+		return this.#underruns;
+	}
+
+	get timestamp(): Micro {
+		return Micro.fromSecond((this.#readIndex / this.rate) as Second);
 	}
 
 	get length(): number {
@@ -64,11 +78,25 @@ export class AudioRingBuffer {
 		return this.#buffer[0]?.length;
 	}
 
-	resize(latency: Time.Milli): void {
-		this.#latencySamples = Math.ceil(this.rate * Time.Second.fromMilli(latency));
+	resize(latency: Milli): void {
+		const latencySamples = Math.ceil(this.rate * Second.fromMilli(latency));
+
+		// A deeper floor parks playback until it refills. Video holds the extra delay on its own, so
+		// audio that kept draining at the old depth would run ahead by the difference. Parking keeps
+		// what is buffered, so a rise costs only its own size in silence, and none if the buffer
+		// already covers the new floor.
+		if (latencySamples > this.#latencySamples) this.#stalled = true;
+		this.#latencySamples = latencySamples;
 
 		const newCapacity = this.#capacityFor(this.#latencySamples);
-		if (newCapacity === this.capacity) return;
+		if (newCapacity !== this.capacity) this.#reallocate(newCapacity);
+
+		// Resume a refill that the buffer already covers, which `write` would only notice on the
+		// next frame, never for a source that has stopped.
+		if (latencySamples > 0 && this.length >= latencySamples) this.#stalled = false;
+	}
+
+	#reallocate(newCapacity: number): void {
 		if (newCapacity === 0) throw new Error("empty buffer");
 
 		const newBuffer: Float32Array[] = [];
@@ -98,10 +126,10 @@ export class AudioRingBuffer {
 		if (samplesToKeep === 0) this.#stalled = true;
 	}
 
-	write(timestamp: Time.Micro, data: Float32Array[]): void {
+	write(timestamp: Micro, data: Float32Array[]): void {
 		if (data.length !== this.channels) throw new Error("wrong number of channels");
 
-		let start = Math.round(Time.Second.fromMicro(timestamp) * this.rate);
+		let start = Math.round(Second.fromMicro(timestamp) * this.rate);
 		let samples = data[0].length;
 
 		// Anchor both indices to the first sample so we play from its timestamp instead of
@@ -127,13 +155,18 @@ export class AudioRingBuffer {
 		}
 
 		const end = start + samples;
+		this.#chunk = data[0].length;
 
-		// Check if we need to discard old samples to prevent overflow
-		const overflow = end - this.#readIndex - this.#buffer[0].length;
-		if (overflow >= 0) {
-			// Discard old samples and exit stalled mode
-			this.#stalled = false;
-			this.#readIndex += overflow;
+		// Bound the ring. While playing, drop the oldest once it holds a whole chunk more than the
+		// target and land back on the target: frames arrive one chunk at a time, so a ring sitting
+		// exactly on the target is a chunk above it the moment the next one lands, and dropping on
+		// that overshoot discards audio on every single write. While stalled the reader is not
+		// consuming, so only the hard capacity applies; the band would throw away the very audio the
+		// refill is accumulating. Buffered mode plays through everything, so it is capacity-bound too.
+		const playing = !this.#stalled && !this.#buffered;
+		const limit = playing ? Math.min(this.#latencySamples + this.#chunk, this.capacity) : this.capacity;
+		if (end - this.#readIndex > limit) {
+			this.#readIndex = end - (playing ? Math.min(this.#latencySamples, this.capacity) : this.capacity);
 		}
 
 		// Fill gaps with zeros if there's a discontinuity
@@ -171,9 +204,10 @@ export class AudioRingBuffer {
 			this.#writeIndex = end;
 		}
 
-		// Start playback once we've buffered the latency target. In buffered mode the cap
-		// is large, so we usually un-stall here rather than via the overflow path above.
-		if (this.#buffered && this.length >= this.#latencySamples) {
+		// Start playback once we've buffered the latency target. This is the only way out of a
+		// stall, so an underrun mid-playback refills to the target before resuming rather than
+		// playing the next chunk on an empty cushion.
+		if (this.length >= this.#latencySamples) {
 			this.#stalled = false;
 		}
 	}
@@ -184,8 +218,8 @@ export class AudioRingBuffer {
 	 * A successor track overwrites the slots its own samples land on, but anything the previous
 	 * track wrote beyond them would otherwise still play once the successor runs out.
 	 */
-	truncate(timestamp: Time.Micro): void {
-		const target = Math.round(Time.Second.fromMicro(timestamp) * this.rate);
+	truncate(timestamp: Micro): void {
+		const target = Math.round(Second.fromMicro(timestamp) * this.rate);
 		if (target >= this.#writeIndex) return;
 		// Never retreat past the playhead: those samples are already due.
 		this.#writeIndex = Math.max(target, this.#readIndex);
@@ -204,7 +238,12 @@ export class AudioRingBuffer {
 		if (this.#stalled) return 0;
 
 		const samples = Math.min(this.#writeIndex - this.#readIndex, output[0].length);
-		if (samples === 0) return 0;
+		if (samples <= 0) {
+			// Ran dry mid-playback: re-stall so write() refills to the target before resuming.
+			this.#stalled = true;
+			this.#underruns++;
+			return 0;
+		}
 
 		for (let channel = 0; channel < this.channels; channel++) {
 			const dst = output[channel];
@@ -219,6 +258,12 @@ export class AudioRingBuffer {
 		}
 
 		this.#readIndex += samples;
+
+		// A short quantum ends in silence, so it counts as an underrun even if a chunk lands before
+		// the next read. It does not park playback: the shortfall is under one quantum, and a
+		// refill would spend the whole target as silence to cover it.
+		if (samples < output[0].length) this.#underruns++;
+
 		return samples;
 	}
 }

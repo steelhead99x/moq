@@ -9,26 +9,9 @@ public final class BroadcastConsumer: Sendable {
         self.ffi = ffi
     }
 
-    /// The route the broadcast currently takes to reach this origin: relay hop
-    /// ids (oldest first) plus the publisher's advertised cost (lower wins).
-    public var route: Route {
-        ffi.route()
-    }
-
-    /// Watch the broadcast's route: yields the current route first, then every
-    /// change (e.g. an upstream failover).
-    public func routeUpdates() -> RouteWatch {
-        RouteWatch(ffi.routeUpdates())
-    }
-
-    /// Subscribe to the broadcast's catalog (the description of its tracks).
-    public func subscribeCatalog() async throws -> CatalogConsumer {
-        CatalogConsumer(try await ffi.subscribeCatalog())
-    }
-
     /// Subscribe to a track by name, delivering raw frame payloads with no codec
-    /// or container parsing. `subscription` tunes delivery priority, group ordering priority,
-    /// and group range; omit for defaults.
+    /// or container parsing. `subscription` tunes delivery priority, group range, and
+    /// staleness; omit for defaults.
     public func subscribeTrack(name: String, subscription: Subscription? = nil) async throws -> TrackConsumer {
         TrackConsumer(try await ffi.subscribeTrack(name: name, subscription: subscription))
     }
@@ -43,98 +26,21 @@ public final class BroadcastConsumer: Sendable {
         GroupConsumer(try await ffi.fetchGroup(name: name, sequence: sequence, options: options))
     }
 
-    /// Fetch one complete group and decode its track container into media frames.
-    public func fetchMediaGroup(
-        name: String,
-        sequence: UInt64,
-        container: Container,
-        options: FetchGroupOptions? = nil
-    ) async throws -> MediaGroupConsumer {
-        MediaGroupConsumer(
-            try await ffi.fetchMediaGroup(
-                name: name,
-                sequence: sequence,
-                container: container,
-                options: options
-            )
-        )
-    }
-
-    /// Subscribe to a media track, delivering frames in decode order. `container`
-    /// comes from the catalog. `subscription` tunes delivery priority, group ordering
-    /// priority, group range, and the latency budget; omit for defaults. Raise
-    /// `Subscription.latencyMaxMs` to buffer instead of skipping a stalled group.
-    public func subscribeMedia(
-        name: String,
-        container: Container,
-        subscription: Subscription? = nil
-    ) async throws -> MediaConsumer {
-        MediaConsumer(
-            try await ffi.subscribeMedia(
-                name: name, container: container, subscription: subscription))
-    }
-
-    /// Subscribe to a raw-audio track, decoding to PCM in the layout `output`
-    /// declares. `catalogAudio` is the matching rendition from the catalog.
-    public func subscribeAudio(name: String, catalogAudio: Audio, output: AudioDecoderOutput) async throws -> AudioConsumer {
-        AudioConsumer(try await ffi.subscribeAudio(name: name, catalogAudio: catalogAudio, output: output))
-    }
-
-    /// Subscribe to a JSON snapshot track (lossy latest-value), decoding each value as `Value`.
+    /// Resolve a catalog rendition's `broadcast` reference to the broadcast serving its track.
     ///
-    /// Yields only the newest value, collapsing the backlog for a reader that has fallen behind.
-    /// `compression` must match the flag the producer used.
-    public func subscribeJsonSnapshot<Value: Decodable & Sendable>(
-        name: String,
-        as _: Value.Type,
-        compression: Bool = false
-    ) async throws -> JsonSnapshotConsumer<Value> {
-        // deltaRatio is producer-only, so leave it at its default here.
-        JsonSnapshotConsumer(try await ffi.subscribeJsonSnapshot(name: name, config: MoqJsonSnapshotConfig(compression: compression)))
-    }
-
-    /// Subscribe to a JSON stream track (lossless append-log), decoding each record as `Value`.
+    /// `reference` is `Media.Video.broadcast` / `Media.Audio.broadcast`: `nil` or empty names this
+    /// broadcast, anything else names a sibling relative to it (e.g. `./source`). Call it on a
+    /// rendition that carries one before `subscribeTrack` or `fetchGroup`, which take a track name
+    /// rather than a rendition: the rendition's `track`, or its ID when `nil`. The
+    /// rendition-based `Media.TrackConsumer.subscribe`, `Media.GroupConsumer.fetch`,
+    /// `Audio.Consumer.subscribe`, and `Video.Consumer.subscribe` resolve both themselves.
     ///
-    /// Yields every record in order. `compression` must match the flag the producer used.
-    public func subscribeJsonStream<Value: Decodable & Sendable>(
-        name: String,
-        as _: Value.Type,
-        compression: Bool = false
-    ) async throws -> JsonStreamConsumer<Value> {
-        JsonStreamConsumer(try await ffi.subscribeJsonStream(name: name, config: MoqJsonStreamConfig(compression: compression)))
-    }
-}
-
-/// A watch over a broadcast's route: an async sequence yielding the current
-/// route first, then every change, ending when the broadcast does. Created by
-/// `BroadcastConsumer.routeUpdates`.
-public final class RouteWatch: AsyncSequence, Sendable {
-    /// The route emitted by this sequence.
-    public typealias Element = Route
-
-    let ffi: MoqRouteWatch
-
-    init(_ ffi: MoqRouteWatch) {
-        self.ffi = ffi
+    /// Throws if this broadcast came from a local producer rather than an origin, since a
+    /// standalone broadcast has no sibling to name.
+    public func resolve(_ reference: String?) async throws -> BroadcastConsumer {
+        BroadcastConsumer(try await ffi.resolve(reference: reference))
     }
 
-    /// Suspend until the next route: the current one on the first call, then
-    /// each change. Returns nil once the broadcast ends.
-    public func next() async throws -> Route? {
-        try await ffi.next()
-    }
-
-    /// Stop the watch, unblocking any in-flight `next()`.
-    public func cancel() {
-        ffi.cancel()
-    }
-
-    /// Create an iterator that cancels native reads when iteration ends.
-    public func makeAsyncIterator() -> AsyncThrowingStream<Route, Swift.Error>.Iterator {
-        moqStream(cancel: { [ffi] in ffi.cancel() }) { [ffi] in
-            try await ffi.next()
-        }.makeAsyncIterator()
-    }
 }
 
 /// Write side of a broadcast: open tracks and publish frames.
@@ -166,58 +72,17 @@ public final class BroadcastProducer: Sendable {
         BroadcastDynamic(try ffi.dynamic())
     }
 
-    /// Update the broadcast's route: the hop chain, cost, and liveness it advertises.
+    /// Advertise this broadcast's exact path as a route.
     ///
-    /// Use this as conditions shift (e.g. a standby transcoder lowering its cost
-    /// once warm); consumers observe the change via `BroadcastConsumer.routeUpdates()`.
-    public func setRoute(_ route: Route) throws {
-        try ffi.setRoute(route: route)
+    /// Announcing again re-prices the route in place. Until announced, the
+    /// broadcast is invisible and unroutable for local consumers and peers alike.
+    public func announce(route: Route = Route()) throws {
+        try ffi.announce(route: route)
     }
 
-    /// Set whether the broadcast is announced, keeping the rest of its route.
-    ///
-    /// The origin advertises the path only while announced; an unannounced
-    /// broadcast stays reachable by exact path for subscribes and fetches. This is
-    /// how a publisher goes on and off the air without tearing down the broadcast.
-    public func setAnnounce(_ announce: Bool) throws {
-        try ffi.setAnnounce(announce: announce)
-    }
-
-    /// Replace the catalog properties shared by every video rendition.
-    public func setVideoProperties(_ properties: VideoProperties) throws {
-        try ffi.setVideoProperties(properties: properties)
-    }
-
-    /// Open a media track. `format` controls how `initData` and frame payloads
-    /// are interpreted (e.g. `"opus"`, `"avc3"`). `video` seeds catalog fields
-    /// that the stream cannot reveal before its first keyframe.
-    public func publishMedia(
-        format: String,
-        initData: Data = Data(),
-        video: VideoHint? = nil
-    ) throws -> MediaProducer {
-        MediaProducer(try ffi.publishMedia(init: MoqInit(format: format, data: initData, video: video)))
-    }
-
-    /// Publish a single media track requested through `BroadcastDynamic`.
-    public func publishMedia(
-        on request: TrackRequest,
-        format: String,
-        initData: Data = Data(),
-        video: VideoHint? = nil
-    ) throws -> MediaProducer {
-        MediaProducer(
-            try ffi.publishMediaOnTrack(
-                request: request.ffi,
-                init: MoqInit(format: format, data: initData, video: video)
-            )
-        )
-    }
-
-    /// Open a media track fed by a raw byte stream with inferred frame boundaries
-    /// (e.g. piped Annex-B H.264). Only self-describing formats are supported.
-    public func publishMediaStream(format: String, video: VideoHint? = nil) throws -> MediaStreamProducer {
-        MediaStreamProducer(try ffi.publishMediaStream(init: MoqInit(format: format, data: Data(), video: video)))
+    /// Retract this broadcast's advertisement, if any, from local consumers and peers alike.
+    public func unannounce() throws {
+        try ffi.unannounce()
     }
 
     /// Open a track for arbitrary byte payloads, with no codec or container.
@@ -226,65 +91,10 @@ public final class BroadcastProducer: Sendable {
         TrackProducer(try ffi.publishTrack(name: name, info: info))
     }
 
-    /// Open a raw-audio track. PCM written via `AudioProducer.write` is encoded
-    /// (e.g. to Opus) inside the FFI boundary per `input`/`output`.
-    public func publishAudio(name: String, input: AudioEncoderInput, output: AudioEncoderOutput) throws -> AudioProducer {
-        AudioProducer(try ffi.publishAudio(name: name, input: input, output: output))
-    }
-
-    /// Open a raw-video track. Pixels written via `VideoProducer.write` are
-    /// encoded (H.264 or H.265) inside the FFI boundary per `input`/`output`.
+    /// End the broadcast for good: retract it and serve no new tracks.
     ///
-    /// Set `output.track` to choose the track name; otherwise one is derived from
-    /// the codec (`.avc3` / `.hev1`). The catalog rendition is published
-    /// immediately so subscribers can discover it before the first frame exists.
-    public func publishVideo(input: VideoEncoderInput, output: VideoEncoderOutput) throws -> VideoProducer {
-        VideoProducer(try ffi.publishVideo(input: input, output: output))
-    }
-
-    /// Open a JSON snapshot track (lossy latest-value), encoding each value from `Value`.
-    ///
-    /// Each `update` supersedes the last; a late joiner only sees the newest value. `deltaRatio`
-    /// controls how aggressively merge-patch deltas replace full snapshots (`0` disables deltas).
-    /// Set `compression` to DEFLATE each group; the consumer must pass the same flag. Advertise
-    /// the track with `setCatalogSection` if consumers should discover it.
-    public func publishJsonSnapshot<Value: Encodable>(
-        name: String,
-        of _: Value.Type,
-        deltaRatio: UInt32 = MoqJsonSnapshotConfig().deltaRatio,
-        compression: Bool = false
-    ) throws -> JsonSnapshotProducer<Value> {
-        JsonSnapshotProducer(try ffi.publishJsonSnapshot(name: name, config: MoqJsonSnapshotConfig(deltaRatio: deltaRatio, compression: compression)))
-    }
-
-    /// Open a JSON stream track (lossless append-log), encoding each record from `Value`.
-    ///
-    /// Every appended record is preserved and delivered in order. Set `compression` to DEFLATE
-    /// the group; the consumer must pass the same flag.
-    public func publishJsonStream<Value: Encodable>(
-        name: String,
-        of _: Value.Type,
-        compression: Bool = false
-    ) throws -> JsonStreamProducer<Value> {
-        JsonStreamProducer(try ffi.publishJsonStream(name: name, config: MoqJsonStreamConfig(compression: compression)))
-    }
-
-    /// Set (or replace) an untyped application catalog section by name.
-    ///
-    /// `json` is any JSON document as a string; it rides alongside `video`/`audio` and reaches
-    /// subscribers via `Catalog.sections`. `name` must not be a reserved media section
-    /// (`video`/`audio`). The catalog is republished automatically.
-    public func setCatalogSection(name: String, json: String) throws {
-        try ffi.setCatalogSection(name: name, json: json)
-    }
-
-    /// Remove an untyped application catalog section by name. A no-op if it was absent.
-    public func removeCatalogSection(name: String) throws {
-        try ffi.removeCatalogSection(name: name)
-    }
-
-    /// Finish the broadcast, finalizing the catalog stream.
-    public func finish() throws {
-        try ffi.finish()
+    /// Tracks already subscribed carry on to their own end. Closing again is a no-op.
+    public func close() throws {
+        try ffi.close()
     }
 }

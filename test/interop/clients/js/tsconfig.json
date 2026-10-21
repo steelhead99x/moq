@@ -1,0 +1,22 @@
+{
+	"extends": "../../../../js/tsconfig.json",
+	"compilerOptions": {
+		"types": ["bun", "vite/client"]
+	},
+	"include": [
+		"close.ts",
+		"driver.ts",
+		"harness.ts",
+		"harness.browser.ts",
+		"open-gop.browser.ts",
+		"open-gop",
+		"capture-channel-count.browser.ts",
+		"buffering",
+		"publish-ui.browser.ts",
+		"publish-ui",
+		"media.ts",
+		"src",
+		"vite.config.ts",
+		"../../../../js/common/worklet.d.ts"
+	]
+}

@@ -15,10 +15,7 @@
 //!
 //! Run with `just rs loom`; `cfg(loom)` is never set in a normal build.
 
-use std::{
-	sync::Arc as StdArc,
-	task::{Poll, Wake},
-};
+use std::task::Poll;
 
 use loom::{
 	future::block_on,
@@ -29,20 +26,7 @@ use loom::{
 	thread,
 };
 
-use crate::{Closed, Fan, Lock, Producer, Queue, Ref, Shared, Waiter, WaiterList, wait};
-
-/// Records whether it was woken using Loom's atomic ordering model.
-struct Flag(AtomicBool);
-
-impl Wake for Flag {
-	fn wake(self: StdArc<Self>) {
-		self.wake_by_ref();
-	}
-
-	fn wake_by_ref(self: &StdArc<Self>) {
-		self.0.store(true, Ordering::SeqCst);
-	}
-}
+use crate::{Closed, Lock, Producer, Queue, Ref, Shared, WaiterList, wait};
 
 /// Ready once the value equals `n`.
 fn equals(n: u32) -> impl FnMut(&Ref<'_, u32>) -> Poll<()> + Unpin {
@@ -193,6 +177,42 @@ fn consumer_churn_resolves_unused() {
 	});
 }
 
+/// The invariant `write_unused` exists for: a consumer and a teardown racing must
+/// never both win. Either the consumer is minted and the teardown is declined, or
+/// the teardown closes the channel and the weak handle mints nothing.
+///
+/// Without the count moving under the state lock, the "closed and minted" corner
+/// is reachable: the bump lands after the teardown read zero, and the consumer is
+/// left holding a channel that was torn down for being unused.
+#[test]
+fn a_teardown_and_a_consumer_never_both_win() {
+	loom::model(|| {
+		let producer = Producer::new(0u32);
+		let weak = producer.weak();
+
+		let consumer = thread::spawn(move || weak.try_consume());
+
+		let committed = match producer.write_unused() {
+			crate::Unused::Idle(guard) => {
+				guard.close();
+				true
+			}
+			crate::Unused::Used => false,
+			crate::Unused::Closed => unreachable!("nothing else closes this channel"),
+		};
+
+		let consumer = consumer.join().unwrap();
+		assert!(
+			!(committed && consumer.is_some()),
+			"the teardown cancelled a consumer that had already been handed out"
+		);
+		assert!(
+			committed || consumer.is_some(),
+			"the consumer was refused by a teardown that never happened"
+		);
+	});
+}
+
 /// `Shared` has no producer/consumer split: any handle can mutate, and every
 /// mutation must wake every other handle parked on a predicate.
 #[test]
@@ -253,20 +273,20 @@ fn queue_close_wakes_a_parked_pop() {
 	});
 }
 
-/// A poll parked on two lists is re-woken by one while still registered with the
-/// other. The re-poll reuses the parked waiter, so re-registering into the drained
-/// list must actually land (not be skipped as a false duplicate), and re-registering
-/// into the still-parked list must dedup rather than stack.
-///
-/// The terminal wake is on the *drained* list, so an execution whose re-poll fails
-/// to re-register there parks forever, which loom reports as a deadlock. `parked` is
-/// never woken at all: it exists to keep the waiter's registrations live across
-/// re-polls, which is exactly the state the old code retired on.
+/// Drain the list under its lock, then wake it outside, as the channels do.
+fn wake(list: &Lock<WaiterList>) {
+	let mut waiters = list.lock().take();
+	waiters.wake();
+}
+
+/// A partial wake re-polls a waiter still parked on the quiet list. Its registration
+/// on the drained list must be real, not skipped as a duplicate, or the terminal
+/// wake is lost and the task hangs.
 #[test]
-fn a_reused_waiter_hears_the_drained_list_again() {
+fn a_replaced_waiter_hears_the_drained_list_again() {
 	loom::model(|| {
-		let woken = Fan::new();
-		let parked = Fan::new();
+		let woken = Lock::new(WaiterList::new());
+		let parked = Lock::new(WaiterList::new());
 		let done = Arc::new(AtomicBool::new(false));
 
 		let waker = {
@@ -276,69 +296,19 @@ fn a_reused_waiter_hears_the_drained_list_again() {
 			thread::spawn(move || {
 				// Drains `woken`; a re-poll now re-registers while still parked on
 				// `parked`.
-				woken.wake();
+				wake(&woken);
 				done.store(true, Ordering::SeqCst);
 				// Must reach the re-registered waiter, or the model deadlocks.
-				woken.wake();
+				wake(&woken);
 			})
 		};
 
-		// Register before reading `done`, as in `a_held_wake_is_never_lost`: the
-		// other order has a window where the store and both wakes land between the
-		// read and the registration.
-		//
-		// The closure holds its own waiter rather than using the parked one: loom's
-		// `block_on` waker fails `will_wake` between polls (its vtable is a
-		// const-promoted static, duplicated across codegen units in release builds),
-		// so `Park` retires every poll under loom and would never model the reuse
-		// this test exists for. Waking the first poll's waker still unparks the
-		// task, so a stable identity is safe here.
-		block_on({
-			let mut stable = None;
-			wait(move |parked_waiter| {
-				let waiter = stable.get_or_insert_with(|| Waiter::new(parked_waiter.waker().clone()));
-				woken.register(waiter);
-				parked.register(waiter);
-
-				match done.load(Ordering::SeqCst) {
-					true => Poll::Ready(()),
-					false => Poll::Pending,
-				}
-			})
-		});
-
-		waker.join().unwrap();
-	});
-}
-
-/// `Fan` holds wakes back while a guard is out and delivers them when the last
-/// one drops. A wake racing that window must still reach the parked waiter, whichever
-/// side of the hold it lands on.
-#[test]
-fn a_held_wake_is_never_lost() {
-	loom::model(|| {
-		let fan = Fan::new();
-		let ready = Arc::new(AtomicBool::new(false));
-
-		let waker = {
-			let fan = fan.clone();
-			let ready = ready.clone();
-
-			thread::spawn(move || {
-				let hold = fan.hold();
-				ready.store(true, Ordering::SeqCst);
-				fan.wake();
-				// The deferred wake is delivered here.
-				drop(hold);
-			})
-		};
-
-		// Register before reading `ready`: the other order has a window where the store
-		// and the wake both land between the read and the registration.
+		// Register before reading `done`: the other order has a window where the
+		// store and both wakes land between the read and the registration.
 		block_on(wait(|waiter| {
-			fan.register(waiter);
-
-			match ready.load(Ordering::SeqCst) {
+			waiter.register(&mut woken.lock());
+			waiter.register(&mut parked.lock());
+			match done.load(Ordering::SeqCst) {
 				true => Poll::Ready(()),
 				false => Poll::Pending,
 			}
@@ -348,52 +318,60 @@ fn a_held_wake_is_never_lost() {
 	});
 }
 
-/// A wake blocked on the projected list must recheck the hold after it acquires the
-/// list lock. Otherwise it can pass the deferral check, stall on the list, and deliver
-/// while a hold created in that window is still live.
 #[test]
-fn a_hold_covers_a_wake_waiting_for_the_list() {
+fn consumer_creation_cannot_cross_an_idle_guard() {
 	loom::model(|| {
-		let state = Lock::new(WaiterList::new());
-		let fan = Fan::project(&state, |waiters| waiters);
-		let flag = StdArc::new(Flag(AtomicBool::new(false)));
-		let waiter = Waiter::new(std::task::Waker::from(flag.clone()));
-		waiter.register(&mut state.lock());
-
-		let state_guard = state.lock();
-		let waking = thread::spawn({
-			let fan = fan.clone();
-			move || fan.wake()
-		});
-
-		let hold = fan.hold();
-		drop(state_guard);
-		waking.join().unwrap();
-		assert!(!flag.0.load(Ordering::SeqCst), "wake escaped a live hold");
-
-		drop(hold);
-		assert!(flag.0.load(Ordering::SeqCst), "deferred wake never arrived");
+		let producer = Producer::new(0u32);
+		let existing = producer.consume();
+		let weak = producer.weak();
+		let minting = thread::spawn(move || weak.consume());
+		drop(existing);
+		if let crate::Unused::Idle(guard) = producer.write_unused() {
+			thread::yield_now();
+			assert!(!producer.is_used(), "consumer appeared while idle guard was held");
+			guard.close();
+		}
+		drop(minting.join().unwrap());
 	});
 }
 
-/// A projected fan must see a hold before it tries to reacquire the projected state.
-/// An inline wake runs on the thread already holding that state lock.
+/// Ready once the gate opens.
+fn gated(gate: crate::Consumer<bool>) -> impl FnMut(&crate::Waiter) -> Poll<()> + Unpin {
+	move |waiter| match gate.poll(waiter, |open| if **open { Poll::Ready(()) } else { Poll::Pending }) {
+		Poll::Ready(_) => Poll::Ready(()),
+		Poll::Pending => Poll::Pending,
+	}
+}
+
+/// The owner's poll wakes one of its own tasks, holding that wake of itself until it returns,
+/// while another thread wakes the other task. Neither wake may be lost, whether the
+/// owner's poll takes its own wake in the same pass or returns first.
 #[test]
-fn a_projected_hold_defers_before_relocking() {
-	loom::model(|| {
-		let state = Lock::new(WaiterList::new());
-		let fan = Fan::project(&state, |waiters| waiters);
-		let flag = StdArc::new(Flag(AtomicBool::new(false)));
-		let waiter = Waiter::new(std::task::Waker::from(flag.clone()));
-		waiter.register(&mut state.lock());
+fn a_held_wake_never_hides_a_remote_wake() {
+	for same_pass in [false, true] {
+		loom::model(move || {
+			let local = Producer::new(false);
+			let remote = Producer::new(false);
+			let mut tasks = crate::Tasks::new();
+			tasks.push(gated(local.consume()));
+			tasks.push(gated(remote.consume()));
 
-		let state_guard = state.lock();
-		let hold = fan.hold();
-		fan.wake();
-		assert!(!flag.0.load(Ordering::SeqCst), "wake escaped a live hold");
+			let opener = thread::spawn(move || *remote.write().ok().expect("open") = true);
 
-		drop(state_guard);
-		drop(hold);
-		assert!(flag.0.load(Ordering::SeqCst), "deferred wake never arrived");
-	});
+			let mut first = true;
+			block_on(wait(move |waiter| {
+				waiter.batch(|| {
+					if std::mem::take(&mut first) {
+						let _ = tasks.poll(waiter);
+						*local.write().ok().expect("open") = true;
+						if !same_pass {
+							return Poll::Pending;
+						}
+					}
+					tasks.poll(waiter)
+				})
+			}));
+			opener.join().unwrap();
+		});
+	}
 }

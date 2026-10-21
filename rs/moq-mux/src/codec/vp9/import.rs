@@ -10,39 +10,32 @@ use super::FrameHeader;
 /// key frame's header supplies the catalog config, so the rendition isn't published
 /// until then. Build it with [`new`](Self::new), passing the track producer and the
 /// [`catalog::Reserved`](crate::catalog::Reserved) it reserves its rendition from.
-pub struct Import<E: CatalogExt = ()> {
+pub struct Import {
 	// The track being produced.
-	track: crate::container::Producer<crate::catalog::hang::Container>,
-
-	// This importer's catalog rendition, published on the first key frame.
-	rendition: crate::catalog::VideoTrack<E>,
+	track: crate::container::Producer<crate::catalog::hang::Container, hang::catalog::VideoConfig>,
 
 	catalog: crate::codec::video::Catalog,
 }
 
-impl<E: CatalogExt> Import<E> {
+impl Import {
 	/// Publish on an existing track producer, seeding the rendition from `hint` (pass
 	/// [`VideoHint::default`](crate::catalog::VideoHint) for none).
 	///
 	/// VP9 carries no out-of-band config, so a hint carrying a codec publishes the catalog rendition
 	/// up front instead of waiting for the first key frame.
-	pub fn new(
+	pub fn new<E: CatalogExt>(
 		track: moq_net::track::Producer,
 		reserved: crate::catalog::Reserved<E>,
 		hint: crate::catalog::VideoHint,
 	) -> crate::Result<Self> {
-		let rendition = reserved.video(track.name());
 		// The hint names the container; the writer is built from that same value so the wire
 		// cannot disagree with what the rendition advertises.
-		let wire = crate::catalog::hang::Container::try_from(&hint.container)?;
-		let catalog = crate::codec::video::Catalog::new(&reserved, track.name(), hint)?;
-		let mut import = Self {
-			track: reserved.producer().media_producer(track, wire)?,
-			rendition,
-			catalog,
-		};
+		let wire = crate::catalog::hang::Container::try_from(&hint)?;
+		let catalog = crate::codec::video::Catalog::new(hint);
+		let track = reserved.video(track, wire, None)?;
+		let mut import = Self { track, catalog };
 		if let Some(config) = import.catalog.initial_config() {
-			import.apply_config(config);
+			import.apply_config(config)?;
 		}
 		Ok(import)
 	}
@@ -61,11 +54,12 @@ impl<E: CatalogExt> Import<E> {
 	}
 
 	fn init(&mut self, vp9: hang::catalog::VP9, width: u16, height: u16) -> crate::Result<()> {
-		let mut config = hang::catalog::VideoConfig::new(vp9);
+		let mut config = hang::catalog::VideoConfig::new(vp9.clone());
+		config.color = super::color(&vp9);
 		config.coded_width = Some(width as u32);
 		config.coded_height = Some(height as u32);
 
-		self.apply_config(config);
+		self.apply_config(config)?;
 		Ok(())
 	}
 
@@ -73,8 +67,8 @@ impl<E: CatalogExt> Import<E> {
 	///
 	/// A changed config just re-mirrors the rendition; there are no fixed tracks to reject a
 	/// reconfiguration.
-	fn apply_config(&mut self, config: hang::catalog::VideoConfig) {
-		self.catalog.publish(&mut self.rendition, config);
+	fn apply_config(&mut self, config: hang::catalog::VideoConfig) -> crate::Result<()> {
+		self.catalog.publish(&mut self.track, config)
 	}
 
 	/// Decode a single VP9 frame (or superframe).
@@ -88,14 +82,13 @@ impl<E: CatalogExt> Import<E> {
 			self.init(key.to_catalog(), key.width, key.height)?;
 		}
 
-		let pts = self.rendition.timestamp(pts)?;
+		let pts = self.track.timestamp(pts)?;
 		self.track.write(Frame {
 			timestamp: pts,
 			payload: frame.into_bytes(),
 			keyframe: header.keyframe,
 			duration: None,
 		})?;
-		self.estimate();
 
 		Ok(())
 	}
@@ -105,10 +98,14 @@ impl<E: CatalogExt> Import<E> {
 		self.track.track().demand()
 	}
 
+	/// Record a locally encoded frame's transport handoff for catalog jitter measurement.
+	pub fn flush(&mut self, timestamp: moq_net::Timestamp, now: moq_clock::Instant) -> crate::Result<()> {
+		self.track.flush(timestamp, now)
+	}
+
 	/// Finish the track, flushing the current group.
 	pub fn finish(&mut self) -> crate::Result<()> {
 		self.track.finish()?;
-		self.estimate();
 		Ok(())
 	}
 
@@ -120,21 +117,20 @@ impl<E: CatalogExt> Import<E> {
 
 	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
 	/// the fields its config didn't supply.
-	fn estimate(&mut self) {
-		self.rendition.estimate(self.track.estimate());
-	}
-
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
 		self.track.cut(end)?;
-		self.estimate();
 		Ok(())
+	}
+
+	/// Mark a timeline break and restart measurement without lowering advertised values.
+	pub fn discontinuity(&mut self) -> crate::Result<()> {
+		self.track.discontinuity()
 	}
 
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> crate::Result<()> {
 		self.track.seek(sequence)?;
-		self.estimate();
 		Ok(())
 	}
 }
@@ -150,8 +146,10 @@ mod tests {
 
 	fn setup() -> (moq_net::track::Producer, crate::catalog::Producer) {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
-		let track = broadcast.create_track("0.vp9", hang::container::track_info()).unwrap();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let track = broadcast
+			.create_track("0.vp9", hang::container::track_info(hang::catalog::PRIORITY.video))
+			.unwrap();
 		(track, catalog)
 	}
 

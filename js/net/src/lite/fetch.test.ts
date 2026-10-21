@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { Milli } from "@moq/clock";
 import * as Path from "../path.ts";
 import { Reader, Writer } from "../stream.ts";
 import { Fetch } from "./fetch.ts";
@@ -19,6 +20,7 @@ async function encode(version: Version, fetch: Fetch): Promise<Uint8Array> {
 	const written: Uint8Array[] = [];
 	const writer = new Writer(
 		new WritableStream<Uint8Array>({ write: (chunk) => void written.push(new Uint8Array(chunk)) }),
+		version,
 	);
 	await fetch.encode(writer, version);
 	writer.close();
@@ -27,12 +29,12 @@ async function encode(version: Version, fetch: Fetch): Promise<Uint8Array> {
 }
 
 async function roundtrip(version: Version, fetch: Fetch): Promise<Fetch> {
-	const reader = new Reader(undefined, await encode(version, fetch));
+	const reader = new Reader(undefined, await encode(version, fetch), version);
 	return Fetch.decode(reader, version);
 }
 
 function sample(): Fetch {
-	return new Fetch(Path.from("room/1"), "video", 3, 42);
+	return new Fetch({ broadcast: Path.from("room/1"), track: "video", priority: 3, group: 42 });
 }
 
 test("Fetch round-trips on draft-03/04/05", async () => {
@@ -43,4 +45,29 @@ test("Fetch round-trips on draft-03/04/05", async () => {
 		expect(got.priority).toBe(3);
 		expect(got.group).toBe(42);
 	}
+});
+
+test("Fetch carries omitted and explicit maxDelay on draft-07", async () => {
+	expect((await roundtrip(Version.DRAFT_07, sample())).maxDelay).toBeUndefined();
+
+	for (const maxDelay of [Milli(0), Milli(250)]) {
+		const got = await roundtrip(
+			Version.DRAFT_07,
+			new Fetch({ broadcast: Path.from("room/1"), track: "video", priority: 3, maxDelay, group: 42 }),
+		);
+		expect(got.maxDelay).toBe(maxDelay);
+	}
+
+	await expect(
+		encode(
+			Version.DRAFT_06,
+			new Fetch({
+				broadcast: Path.from("room/1"),
+				track: "video",
+				priority: 3,
+				maxDelay: Milli(250),
+				group: 42,
+			}),
+		),
+	).rejects.toThrow("maxDelay");
 });

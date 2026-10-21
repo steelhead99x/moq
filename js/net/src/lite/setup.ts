@@ -1,16 +1,22 @@
 /**
- * The lite-05 SETUP message: each endpoint advertises its capabilities once, as the
+ * The lite-05+ SETUP message: each endpoint advertises its capabilities once, as the
  * sole message on a unidirectional Setup Stream ({@link DataType.Setup}), then closes it.
  *
  * @module
  */
 
-import { type Origin, OriginSchema } from "../origin.ts";
-import type { Reader, Writer } from "../stream.ts";
+import { type Hop, HopSchema } from "../hop.ts";
+import { encodeVarint, Reader, type Writer } from "../stream.ts";
 import { decodeUtf8 } from "../util/utf8.ts";
-import * as Varint from "../varint.ts";
 import * as Message from "./message.ts";
 import { hasSetupStream, type Version } from "./version.ts";
+
+const clientParameters = new WeakSet<Setup>();
+
+/** Whether the peer's SETUP carried Path or Role; raw presence matters even when an unknown Role decodes as Both. */
+export function hasClientParameters(setup: Setup): boolean {
+	return clientParameters.has(setup);
+}
 
 /** Setup Parameter id for the Probe capability level. */
 const PARAM_PROBE = 0x1n;
@@ -18,11 +24,14 @@ const PARAM_PROBE = 0x1n;
 const PARAM_PATH = 0x2n;
 /** Setup Parameter id for the client's intended {@link Role} (client-only). */
 const PARAM_ROLE = 0x3n;
-/** Setup Parameter id for the endpoint's origin (hop) id. */
-const PARAM_ORIGIN = 0x5n;
+/** Setup Parameter id for the endpoint's Hop ID. */
+const PARAM_HOP = 0x5n;
 
 /** Cap on the number of parameters in a bag, matching the Rust decoder. */
 const MAX_PARAMS = 64;
+
+/** SETUP only carries negotiation parameters, so it gets a far smaller cap than other messages. */
+const MAX_SETUP_SIZE = 0xffff;
 
 /**
  * The probe capability an endpoint advertises in SETUP.
@@ -111,20 +120,21 @@ class Parameters {
 		return this.#entries.get(id);
 	}
 
-	/** Set a parameter to a varint value, replacing any existing entry. */
-	setVarint(id: bigint, value: number | bigint) {
-		this.#entries.set(id, Varint.encode(Number(value)));
+	/** Set a parameter to a varint value in `version`'s encoding, replacing any existing entry. */
+	setVarint(id: bigint, value: number | bigint, version: Version) {
+		this.#entries.set(id, encodeVarint(value, version));
 	}
 
-	/** Decode a parameter as a single varint, if present. Throws if trailing bytes remain. */
-	getVarint(id: bigint): bigint | undefined {
+	/** Decode a parameter as a single varint in `version`'s encoding, if present. Throws if trailing bytes remain. */
+	async getVarint(id: bigint, version: Version): Promise<bigint | undefined> {
 		const bytes = this.#entries.get(id);
 		if (bytes === undefined) return undefined;
-		const [value, remain] = Varint.decode(bytes);
-		if (remain.byteLength !== 0) {
+		const r = new Reader(undefined, bytes, version);
+		const value = await r.u62();
+		if (!(await r.done())) {
 			throw new Error("trailing bytes after varint parameter");
 		}
-		return BigInt(value);
+		return value;
 	}
 
 	async encode(w: Writer) {
@@ -170,8 +180,8 @@ export interface SetupProps {
 	path?: string;
 	/** See {@link Setup.role}. Defaults to {@link Role.Both}. */
 	role?: Role;
-	/** See {@link Setup.origin}. Omitted by default. */
-	origin?: Origin;
+	/** See {@link Setup.hop}. Omitted by default. */
+	hop?: Hop;
 }
 
 /**
@@ -202,18 +212,18 @@ export class Setup {
 	role: Role;
 
 	/**
-	 * This endpoint's origin (hop) id. The peer uses it to filter announcements and
+	 * This endpoint's Hop ID. The peer uses it to filter announcements and
 	 * subscriptions whose route flows through this endpoint (lite-06 removed the
 	 * per-stream `exclude_hop` in its favor). `undefined` when the endpoint declares
 	 * no identity; a wire value of 0 decodes the same way.
 	 */
-	origin?: Origin;
+	hop?: Hop;
 
-	constructor({ probe, path, role, origin }: SetupProps = {}) {
+	constructor({ probe, path, role, hop }: SetupProps = {}) {
 		this.probe = probe ?? ProbeLevel.None;
 		this.path = path;
 		this.role = role ?? Role.Both;
-		this.origin = origin;
+		this.hop = hop;
 	}
 
 	static #guard(version: Version) {
@@ -222,29 +232,29 @@ export class Setup {
 		}
 	}
 
-	async #encode(w: Writer) {
+	async #encode(w: Writer, version: Version) {
 		const params = new Parameters();
 		// None is the wire default, so omit it to keep the message empty when nothing is set.
 		if (this.probe !== ProbeLevel.None) {
-			params.setVarint(PARAM_PROBE, this.probe);
+			params.setVarint(PARAM_PROBE, this.probe, version);
 		}
 		if (this.path !== undefined) {
 			params.setBytes(PARAM_PATH, new TextEncoder().encode(this.path));
 		}
 		// Both is the wire default, sent as the absence of the parameter.
 		if (this.role !== Role.Both) {
-			params.setVarint(PARAM_ROLE, this.role);
+			params.setVarint(PARAM_ROLE, this.role, version);
 		}
-		if (this.origin !== undefined && this.origin !== 0n) {
-			params.setVarint(PARAM_ORIGIN, this.origin);
+		if (this.hop !== undefined && this.hop !== 0n) {
+			params.setVarint(PARAM_HOP, this.hop, version);
 		}
 		await params.encode(w);
 	}
 
-	static async #decode(r: Reader): Promise<Setup> {
+	static async #decode(r: Reader, version: Version): Promise<Setup> {
 		const params = await Parameters.decode(r);
 
-		const probeCode = params.getVarint(PARAM_PROBE);
+		const probeCode = await params.getVarint(PARAM_PROBE, version);
 		const probe = probeCode === undefined ? ProbeLevel.None : probeFromCode(probeCode);
 
 		// An empty path is valid and means the same as omitting the parameter, so a
@@ -252,25 +262,27 @@ export class Setup {
 		const pathBytes = params.getBytes(PARAM_PATH);
 		const path = pathBytes === undefined ? undefined : decodeUtf8(pathBytes);
 
-		const roleCode = params.getVarint(PARAM_ROLE);
+		const roleCode = await params.getVarint(PARAM_ROLE, version);
 		const role = roleCode === undefined ? Role.Both : roleFromCode(roleCode);
 
 		// 0 carries no identity (it cannot be excluded), so it decodes as absent.
-		const originRaw = params.getVarint(PARAM_ORIGIN);
-		const origin = originRaw === undefined || originRaw === 0n ? undefined : OriginSchema.parse(originRaw);
+		const hopRaw = await params.getVarint(PARAM_HOP, version);
+		const hop = hopRaw === undefined || hopRaw === 0n ? undefined : HopSchema.parse(hopRaw);
 
-		return new Setup({ probe, path, role, origin });
+		const setup = new Setup({ probe, path, role, hop });
+		if (pathBytes !== undefined || roleCode !== undefined) clientParameters.add(setup);
+		return setup;
 	}
 
 	/** Encode the SETUP message with its size prefix. Throws on pre-lite-05 versions. */
 	async encode(w: Writer, version: Version): Promise<void> {
 		Setup.#guard(version);
-		return Message.encode(w, this.#encode.bind(this));
+		return Message.encode(w, (w) => this.#encode(w, version), { max: MAX_SETUP_SIZE });
 	}
 
 	/** Decode a SETUP message with its size prefix. Throws on pre-lite-05 versions. */
 	static async decode(r: Reader, version: Version): Promise<Setup> {
 		Setup.#guard(version);
-		return Message.decode(r, Setup.#decode);
+		return Message.decode(r, (r) => Setup.#decode(r, version), MAX_SETUP_SIZE);
 	}
 }

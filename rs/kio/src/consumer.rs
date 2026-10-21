@@ -14,6 +14,57 @@ pub struct Consumer<T> {
 	pub(crate) counts: Arc<Counts>,
 }
 
+/// Mint a consumer, or `None` if `only_open` and the channel has closed.
+///
+/// Zero-to-one transitions share the state lock with idle teardown. Existing
+/// demand can be incremented without relocking when closed-channel reads are allowed.
+fn mint<T>(state: &Lock<State<T>>, counts: &Arc<Counts>, only_open: bool) -> Option<Consumer<T>> {
+	let waiters = if !only_open
+		&& counts
+			.consumers
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+				(count > 0).then(|| count + 1)
+			})
+			.is_ok()
+	{
+		// The successful increment keeps the count above zero, so an idle teardown
+		// cannot commit. Callers may already hold the state lock on this path.
+		None
+	} else {
+		let mut guard = state.lock();
+		if only_open && guard.closed {
+			return None;
+		}
+
+		// Wake `used()` waiters when the first consumer appears, after the lock is
+		// released.
+		match counts.consumers.fetch_add(1, Ordering::AcqRel) {
+			0 => Some(guard.waiters_consumer.take()),
+			_ => None,
+		}
+	};
+
+	if let Some(mut waiters) = waiters {
+		waiters.wake();
+	}
+
+	Some(Consumer {
+		state: state.clone(),
+		counts: counts.clone(),
+	})
+}
+
+/// Mint a consumer, whether or not the channel is still open. A closed channel's
+/// consumer reads its final value and then reports the closure.
+pub(crate) fn consume<T>(state: &Lock<State<T>>, counts: &Arc<Counts>) -> Consumer<T> {
+	mint(state, counts, false).expect("minting is infallible for an open-or-closed channel")
+}
+
+/// Mint a consumer only while the channel is open.
+pub(crate) fn consume_open<T>(state: &Lock<State<T>>, counts: &Arc<Counts>) -> Option<Consumer<T>> {
+	mint(state, counts, true)
+}
+
 impl<T> Consumer<T> {
 	/// Poll the shared state with a closure.
 	///
@@ -21,19 +72,20 @@ impl<T> Consumer<T> {
 	/// channel is still open, registers the [`Waiter`] for notification.
 	/// Returns `Err(`[`Ref`]`)` if the channel has been closed while the
 	/// condition returned by `f` is still pending.
-	pub fn poll<F, R>(&self, waiter: &Waiter, mut f: F) -> Poll<Result<R, Ref<'_, T>>>
+	#[cfg_attr(feature = "sim", track_caller)]
+	pub fn poll<F, R>(&self, waiter: &Waiter, f: F) -> Poll<Result<R, Ref<'_, T>>>
 	where
-		F: FnMut(&Ref<'_, T>) -> Poll<R>,
+		F: FnOnce(&Ref<'_, T>) -> Poll<R>,
 	{
 		let state = self.state.lock();
 		let consumer_state = Ref { state };
 
 		if let Poll::Ready(res) = f(&consumer_state) {
-			return Poll::Ready(Ok(res));
+			return crate::coop::ready(Ok(res));
 		}
 
 		if consumer_state.state.closed {
-			return Poll::Ready(Err(consumer_state));
+			return crate::coop::ready(Err(consumer_state));
 		}
 
 		// Re-extract state from consumer_state to register
@@ -44,10 +96,11 @@ impl<T> Consumer<T> {
 	}
 
 	/// Poll for channel closure, registering the waiter if still open.
+	#[cfg_attr(feature = "sim", track_caller)]
 	pub fn poll_closed(&self, waiter: &Waiter) -> Poll<()> {
 		let mut state = self.state.lock();
 		if state.closed {
-			return Poll::Ready(());
+			return crate::coop::ready(());
 		}
 
 		waiter.register(&mut state.waiters_closed);
@@ -126,6 +179,9 @@ impl<T> Drop for Consumer<T> {
 
 impl<T> Clone for Consumer<T> {
 	fn clone(&self) -> Self {
+		// Unlike minting one from scratch, this needs no lock: `self` is already
+		// counted, so the count runs 1 -> 2 and a teardown holding the lock can never
+		// read the zero that would let it commit.
 		self.counts.consumers.fetch_add(1, Ordering::Relaxed);
 
 		Self {

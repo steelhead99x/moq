@@ -16,9 +16,10 @@ import moq
 
 async def main():
     async with moq.Client("https://cdn.moq.dev/anon") as client:
-        async for announcement in client.announced():
-            catalog = await announcement.broadcast.catalog()
-            print(catalog)
+        async for event in client.announced():
+            if isinstance(event, moq.AnnounceEventStart):
+                broadcast = await client.request_broadcast(event.announce.prefix)
+                print(await moq.media.catalog(broadcast))
 
 
 asyncio.run(main())
@@ -54,16 +55,12 @@ asyncio.run(main())
    BroadcastDynamic
    BroadcastRequest
    TrackProducer
+   TrackDemand
    TrackDynamic
    TrackRequest
    GroupProducer
    GroupRequest
-   MediaProducer
-   MediaStreamProducer
-   AudioProducer
-   VideoProducer
-   JsonSnapshotProducer
-   JsonStreamProducer
+   GroupDemand
 ```
 
 ## Subscribing
@@ -76,14 +73,93 @@ asyncio.run(main())
    :nosignatures:
 
    BroadcastConsumer
-   RouteWatch
    TrackConsumer
    GroupConsumer
-   MediaConsumer
-   AudioConsumer
+```
+
+## Native codecs
+
+```{eval-rst}
+.. currentmodule:: moq.audio
+
+.. autosummary::
+   :toctree: api
+   :nosignatures:
+
+   Producer
+   Encoder
+   Consumer
+```
+
+```{eval-rst}
+.. currentmodule:: moq.video
+
+.. autosummary::
+   :toctree: api
+   :nosignatures:
+
+   Producer
+   Encoder
+   Consumer
+```
+
+## Media
+
+`moq.media` owns catalogs, encoded-media importers, and container consumers.
+Every importer takes a broadcast; single-track imports choose a `Named` or `Requested` target.
+
+```{eval-rst}
+.. currentmodule:: moq.media
+
+.. autosummary::
+   :toctree: api
+   :nosignatures:
+
+   CatalogProducer
    CatalogConsumer
-   JsonSnapshotConsumer
-   JsonStreamConsumer
+   TrackProducer
+   TrackStreamProducer
+   ContainerProducer
+   ContainerInit
+   Timebase
+   TrackConsumer
+   GroupConsumer
+   Named
+   Requested
+   MediaFrame
+   catalog
+```
+
+## JSON tracks
+
+`moq.json` mirrors the `moq-json` crate: each type wraps a track from the
+broadcast, and producers advertise it in the catalog.
+
+```{eval-rst}
+.. currentmodule:: moq.json
+
+.. autosummary::
+   :toctree: api
+   :nosignatures:
+
+   SnapshotProducer
+   StreamProducer
+   SnapshotConsumer
+   StreamConsumer
+   Timed
+```
+
+## Opaque data
+
+```{eval-rst}
+.. currentmodule:: moq.flate
+
+.. autosummary::
+   :toctree: api
+   :nosignatures:
+
+   SnapshotProducer
+   StreamProducer
 ```
 
 ## Origin and announcements
@@ -98,15 +174,20 @@ asyncio.run(main())
    OriginProducer
    OriginConsumer
    OriginDynamic
-   Announced
+   AnnounceConsumer
    AnnouncedBroadcast
-   Announcement
+   Announce
+   AnnounceEvent
+   AnnounceEventStart
+   AnnounceEventUpdate
+   AnnounceEventEnd
+   AnnounceEventRestart
 ```
 
 ## Data types
 
-These records and enums are re-exported from the native `moq_ffi` bindings; the
-wrapper surfaces them under `moq` unchanged. Their fields are defined on the
+These records, enums, and objects are re-exported from the native `moq_ffi` bindings; the
+wrapper groups them under `moq` and `moq.media`, with owned duration records at the boundary. Their fields are defined on the
 Rust side ([`moq-ffi`](https://crates.io/crates/moq-ffi)).
 
 ```{eval-rst}
@@ -116,28 +197,24 @@ Rust side ([`moq-ffi`](https://crates.io/crates/moq-ffi)).
    :toctree: api
    :nosignatures:
 
-   Catalog
-   Container
+   media.Catalog
+   media.Container
    Frame
-   MediaFrame
+   media.MediaFrame
    Datagram
-   Video
-   VideoHint
-   VideoProperties
-   VideoFrame
+   media.Video
+   media.VideoHint
+   media.VideoProperties
    VideoCodec
    VideoPixelFormat
    VideoEncoderInput
    VideoEncoderOutput
    VideoEncoderKind
-   Dimensions
-   Audio
-   AudioFrame
+   media.Dimensions
+   media.Audio
    AudioCodec
-   AudioFormat
-   AudioDecoderOutput
+   media.AudioFormat
    AudioEncoderInput
-   AudioEncoderOutput
    Subscription
    TrackInfo
    FetchGroupOptions
@@ -157,7 +234,10 @@ Rust side ([`moq-ffi`](https://crates.io/crates/moq-ffi)).
    Error
    is_auth
    is_shutdown
+   protocol_error
    log_level
+   mint_epoch
+   epoch_time
 ```
 
 ```{toctree}

@@ -1,11 +1,11 @@
 //! [`Frame`]: one raw picture, and [`Surface`]: its pixels and where they live.
 //!
 //! Representations chosen so the common path stays zero-copy:
-//! - `Surface::PixelBuffer` is a macOS `CVPixelBuffer` (IOSurface-backed NV12).
+//! - `Surface::PixelBuffer` is an Apple `CVPixelBuffer` (IOSurface-backed NV12).
 //!   Capture and the VideoToolbox decoder both produce it, and the VideoToolbox
 //!   encoder consumes it directly, no copy and no color conversion.
 //! - `Surface::Texture` is a Windows Direct3D11 NV12 texture, produced by Media
-//!   Foundation capture and decode one GPU blit removed from their own pools
+//!   Foundation capture/decode and Windows.Graphics.Capture, one GPU blit removed from their pools
 //!   (which they recycle, so a frame has to be lifted out of them), and consumed
 //!   by the hardware encoder MFT on the same device with no copy at all, so a
 //!   camera or a decoder reaches an encoder without touching the CPU. Drawing one
@@ -16,6 +16,9 @@
 //! - `Surface::DmaBuf` is a Linux DRM allocation, produced by PipeWire capture.
 //!   The Vulkan renderer imports supported packed formats directly, while CPU
 //!   consumers map linear allocations only.
+//! - `Surface::Vulkan` is an external Linux Vulkan image with an explicit
+//!   timeline semaphore. Encoders import and convert it on its device, with
+//!   no CPU download fallback, then return its producer slot after GPU completion.
 //! - `Surface::HardwareBuffer` is an Android `AHardwareBuffer`, produced by the
 //!   MediaCodec decoder rendering into an `ImageReader`. A GPU consumer imports
 //!   it as a GL or Vulkan image; `into_i420` reads the planes back instead.
@@ -23,8 +26,8 @@
 //!   platforms without a zero-copy capture.
 //!
 //! A backend that consumes a GPU surface takes the frame as-is; a CPU encoder
-//! asks for I420 via [`Surface::into_i420`], which downloads the GPU frame only when
-//! needed.
+//! asks for I420 via [`Surface::into_i420`], which downloads GPU frames that
+//! permit readback. External Vulkan surfaces intentionally refuse that fallback.
 
 use std::borrow::Cow;
 
@@ -33,12 +36,14 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 #[cfg(all(target_os = "linux", feature = "dmabuf"))]
 use std::sync::Arc;
 
-use bytes::Bytes;
 use moq_net::Timestamp;
 
 use yuv::{YuvChromaSubsampling, YuvConversionMode, YuvPlanarImageMut, rgba_to_yuv420};
 
 use crate::{Color, Error, Size};
+
+#[cfg(any(target_os = "windows", test))]
+mod processor;
 
 /// One raw (uncompressed) video frame: the pixels plus when they are shown.
 ///
@@ -46,10 +51,12 @@ use crate::{Color, Error, Size};
 /// [`decode`](crate::decode) produce these, and
 /// [`encode::Encoder::encode`](crate::encode::Encoder::encode) consumes them,
 /// handing back the compressed [`encode::Encoded`](crate::encode::Encoded).
+#[non_exhaustive]
 pub struct Frame {
 	/// Presentation timestamp. It rides through the encoder with the picture, so a
 	/// backend that buffers or reorders still stamps each packet with the time of
-	/// the frame it actually encoded.
+	/// the frame it actually encoded. Capture streams use a monotonic timeline
+	/// private to that stream; turnkey publishing maps it to the broadcast clock.
 	pub timestamp: Timestamp,
 	/// The pixels, and where they currently live.
 	pub surface: Surface,
@@ -66,21 +73,15 @@ impl Frame {
 		Size::new(self.surface.width(), self.surface.height())
 	}
 
-	/// A copy of this frame scaled to `size` (both dimensions even and non-zero),
-	/// preserving the timestamp. GPU-backed surfaces scale on the GPU and stay
-	/// there. When one output size is enough, prefer decoding straight to it
-	/// ([`decode::Config::resize`](crate::decode::Config)), which is free on
-	/// decoders with a hardware scaler; this method is for fanning one decoded
-	/// stream out to several sizes.
-	pub fn resize(&self, size: Size) -> Result<Frame, Error> {
-		self.resize_with(size, &crate::resize::Config::default())
-	}
-
-	/// A copy of this frame scaled with explicit platform options.
-	pub fn resize_with(&self, size: Size, config: &crate::resize::Config) -> Result<Frame, Error> {
+	/// A copy of this frame scaled to exactly `size` (both dimensions even and
+	/// non-zero), preserving the timestamp. GPU-backed surfaces scale on the GPU
+	/// and stay there unless `config` says otherwise. The exact-size operation;
+	/// [`decode::Config::scale_hint`](crate::decode::Config::scale_hint) is the
+	/// best-effort request that lets a decoder with a hardware scaler skip it.
+	pub fn resize(&self, size: Size, config: &crate::resize::Config) -> Result<Frame, Error> {
 		Ok(Frame {
 			timestamp: self.timestamp,
-			surface: self.surface.resize_with(size, config)?,
+			surface: self.surface.resize(size, config)?,
 		})
 	}
 }
@@ -95,8 +96,10 @@ pub struct DrmFormat(u32);
 
 #[cfg(all(target_os = "linux", feature = "dmabuf"))]
 impl DrmFormat {
-	/// Semi-planar 8-bit 4:2:0 YUV.
+	/// Semi-planar 8-bit 4:2:0 YUV: one luma plane, one interleaved Cb/Cr plane.
 	pub const NV12: Self = Self::from_bytes(*b"NV12");
+	/// Fully planar 8-bit 4:2:0 YUV as named by DRM (`YU12`): luma, then Cb, then Cr.
+	pub const YUV420: Self = Self::from_bytes(*b"YU12");
 	/// Packed BGRx8888 as named by DRM (`XR24`).
 	pub const XRGB8888: Self = Self::from_bytes(*b"XR24");
 	/// Packed BGRA8888 as named by DRM (`AR24`).
@@ -127,8 +130,8 @@ pub struct DmaBufPlane {
 
 #[cfg(all(target_os = "linux", feature = "dmabuf"))]
 impl DmaBufPlane {
-	#[cfg(feature = "pipewire")]
-	pub(crate) const fn new(offset: u32, stride: u32) -> Self {
+	/// Describe a plane's byte offset and row stride.
+	pub const fn new(offset: u32, stride: u32) -> Self {
 		Self { offset, stride }
 	}
 
@@ -152,7 +155,9 @@ impl DmaBufPlane {
 pub struct DmaBufExport {
 	fd: OwnedFd,
 	// The producer's lease, held so its buffer outlives the descriptor. Only the
-	// renderer ever reads it back out, through `into_parts`.
+	// renderer ever reads it back out, through `into_parts`, so without that feature
+	// the field is pure keepalive rather than dead.
+	#[cfg_attr(not(feature = "render"), allow(dead_code))]
 	inner: Arc<dyn DmaBufFrame>,
 }
 
@@ -218,7 +223,7 @@ impl DmaBufExport {
 
 	/// Split the descriptor from the lease that keeps the producer's buffer alive,
 	/// for a consumer that has to own the two separately. Only the renderer does.
-	#[cfg_attr(not(feature = "render"), expect(dead_code))]
+	#[cfg(feature = "render")]
 	pub(crate) fn into_parts(self) -> (OwnedFd, Arc<dyn DmaBufFrame>) {
 		(self.fd, self.inner)
 	}
@@ -272,25 +277,33 @@ impl std::fmt::Debug for DmaBuf {
 
 #[cfg(all(target_os = "linux", feature = "dmabuf"))]
 impl DmaBuf {
-	#[cfg(feature = "pipewire")]
-	pub(crate) fn new(
-		format: DrmFormat,
-		modifier: u64,
-		width: u32,
-		height: u32,
-		planes: Vec<DmaBufPlane>,
-		color: Option<Color>,
-		inner: Arc<dyn DmaBufFrame>,
-	) -> Result<Self, Error> {
-		Size::new(width, height).validate("DMA-BUF")?;
-		if planes.is_empty() {
-			return Err(Error::Codec(anyhow::anyhow!("DMA-BUF has no planes")));
+	/// Retain an external DMA-BUF and its producer's release guard.
+	///
+	/// Clones share the descriptor and guard; exports duplicate the FD as needed.
+	/// External buffers refuse CPU download, including linear allocations.
+	pub fn new<T: Send + Sync + 'static>(fd: OwnedFd, layout: DmaBufLayout, owner: T) -> Result<Self, Error> {
+		Self::adopt(layout, Arc::new(ExternalDmaBuf { fd, _owner: owner }))
+	}
+
+	pub(crate) fn adopt(layout: DmaBufLayout, inner: Arc<dyn DmaBufFrame>) -> Result<Self, Error> {
+		let DmaBufLayout {
+			format,
+			modifier,
+			size,
+			planes,
+			color,
+		} = layout;
+		size.validate("DMA-BUF")?;
+		if planes.is_empty() || planes.len() > 4 || planes.iter().any(|plane| plane.stride == 0) {
+			return Err(Error::Unsupported(
+				"DMA-BUF requires one to four planes with non-zero strides".into(),
+			));
 		}
 		Ok(Self {
 			format,
 			modifier,
-			width,
-			height,
+			width: size.width,
+			height: size.height,
 			planes,
 			color,
 			inner,
@@ -317,12 +330,17 @@ impl DmaBuf {
 		self.modifier
 	}
 
-	/// Width of the coded allocation in pixels.
+	/// Visible width in pixels.
+	///
+	/// Not the extent the producer allocated, which is padded: the padding is in
+	/// each plane's [`stride`](DmaBufPlane::stride) and in where the next plane
+	/// [`starts`](DmaBufPlane::offset), and neither follows from this.
 	pub const fn width(&self) -> u32 {
 		self.width
 	}
 
-	/// Height of the coded allocation in pixels.
+	/// Visible height in pixels. As [`width`](Self::width), this is not the
+	/// allocated extent.
 	pub const fn height(&self) -> u32 {
 		self.height
 	}
@@ -330,6 +348,64 @@ impl DmaBuf {
 	/// Plane offsets and row strides, in format order.
 	pub fn planes(&self) -> &[DmaBufPlane] {
 		&self.planes
+	}
+
+	/// The color space of these samples where the producer named one.
+	///
+	/// `None` for the usual case of a producer that says nothing, which for YUV
+	/// pixels means the consumer falls back to [`Color::infer`]. Packed RGB
+	/// needs no answer at all.
+	pub const fn color(&self) -> Option<Color> {
+		self.color
+	}
+}
+
+/// The format, tiling, and plane layout of an external DMA-BUF.
+#[cfg(all(target_os = "linux", feature = "dmabuf"))]
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct DmaBufLayout {
+	/// DRM fourcc describing the pixel format.
+	pub format: DrmFormat,
+	/// DRM modifier describing memory tiling; defaults to linear.
+	pub modifier: u64,
+	/// Visible image dimensions.
+	pub size: Size,
+	/// Plane offsets and row strides, in format order.
+	pub planes: Vec<DmaBufPlane>,
+	/// Color space of YUV samples, when the producer knows it.
+	pub color: Option<Color>,
+}
+
+#[cfg(all(target_os = "linux", feature = "dmabuf"))]
+impl DmaBufLayout {
+	/// Describe linear planes and set optional tiling and color fields afterward.
+	pub fn new(format: DrmFormat, size: Size, planes: Vec<DmaBufPlane>) -> Self {
+		Self {
+			format,
+			modifier: 0,
+			size,
+			planes,
+			color: None,
+		}
+	}
+}
+
+#[cfg(all(target_os = "linux", feature = "dmabuf"))]
+struct ExternalDmaBuf<T: Send + Sync + 'static> {
+	fd: OwnedFd,
+	_owner: T,
+}
+
+#[cfg(all(target_os = "linux", feature = "dmabuf"))]
+impl<T: Send + Sync + 'static> DmaBufFrame for ExternalDmaBuf<T> {
+	fn export(&self) -> std::io::Result<OwnedFd> {
+		self.fd.try_clone()
+	}
+	fn download_i420(&self) -> Result<I420, Error> {
+		Err(Error::Unsupported(
+			"external DMA-BUF surfaces have no CPU download fallback".into(),
+		))
 	}
 }
 
@@ -347,12 +423,12 @@ pub(crate) trait DmaBufFrame: Send + Sync {
 ///
 /// Decoders and capture sources hand these out; encoders and renderers consume
 /// them. Match to take a zero-copy fast path for the representation you can use,
-/// and fall back to [`into_i420`](Self::into_i420) for everything else, which is
-/// always available:
+/// and fall back to [`into_i420`](Self::into_i420) for representations that
+/// permit CPU readback. `Surface::Vulkan` intentionally refuses that fallback:
 ///
 /// ```ignore
 /// match surface {
-///     #[cfg(target_os = "macos")]
+///     #[cfg(any(target_os = "macos", target_os = "ios"))]
 ///     Surface::PixelBuffer(buffer) => draw_metal(buffer),
 ///     other => upload(other.into_i420()?),
 /// }
@@ -363,17 +439,20 @@ pub(crate) trait DmaBufFrame: Send + Sync {
 /// building everywhere.
 #[non_exhaustive]
 pub enum Surface {
-	/// Zero-copy GPU surface (macOS `CVPixelBuffer`), from capture or a
+	/// Zero-copy GPU surface (Apple `CVPixelBuffer`), from capture or a
 	/// VideoToolbox decode.
-	#[cfg(target_os = "macos")]
-	PixelBuffer(macos::PixelBuffer),
+	#[cfg(apple)]
+	PixelBuffer(apple::PixelBuffer),
 	/// Zero-copy GPU texture (Windows Direct3D11 NV12).
 	#[cfg(target_os = "windows")]
 	Texture(d3d11::Texture),
-	/// Zero-copy GPU buffer (Linux CUDA NV12). Produced only by the NVDEC
-	/// decoder, consumed in place by the NVENC encoder.
+	/// Zero-copy GPU buffer (Linux CUDA NV12). Produced by the NVDEC decoder or
+	/// the GPU color converter, consumed in place by the NVENC encoder.
 	#[cfg(all(target_os = "linux", feature = "nvidia"))]
 	Cuda(cuda::Frame),
+	/// External Vulkan RGBA8 / BGRA8 image with explicit GPU synchronization.
+	#[cfg(target_os = "linux")]
+	Vulkan(vulkan::Frame),
 	/// Linux DMA-BUF, exported on access and retained until the last clone drops.
 	#[cfg(all(target_os = "linux", feature = "dmabuf"))]
 	DmaBuf(DmaBuf),
@@ -389,12 +468,14 @@ impl Surface {
 	/// The frame width in pixels.
 	pub fn width(&self) -> u32 {
 		match self {
-			#[cfg(target_os = "macos")]
+			#[cfg(apple)]
 			Surface::PixelBuffer(s) => s.width,
 			#[cfg(target_os = "windows")]
 			Surface::Texture(t) => t.width,
 			#[cfg(all(target_os = "linux", feature = "nvidia"))]
 			Surface::Cuda(c) => c.width,
+			#[cfg(target_os = "linux")]
+			Surface::Vulkan(v) => v.width(),
 			#[cfg(all(target_os = "linux", feature = "dmabuf"))]
 			Surface::DmaBuf(d) => d.width,
 			#[cfg(all(target_os = "android", feature = "mediacodec"))]
@@ -406,12 +487,14 @@ impl Surface {
 	/// The frame height in pixels.
 	pub fn height(&self) -> u32 {
 		match self {
-			#[cfg(target_os = "macos")]
+			#[cfg(apple)]
 			Surface::PixelBuffer(s) => s.height,
 			#[cfg(target_os = "windows")]
 			Surface::Texture(t) => t.height,
 			#[cfg(all(target_os = "linux", feature = "nvidia"))]
 			Surface::Cuda(c) => c.height,
+			#[cfg(target_os = "linux")]
+			Surface::Vulkan(v) => v.height(),
 			#[cfg(all(target_os = "linux", feature = "dmabuf"))]
 			Surface::DmaBuf(d) => d.height,
 			#[cfg(all(target_os = "android", feature = "mediacodec"))]
@@ -430,7 +513,7 @@ impl Surface {
 	/// GPU one, so don't route those through here.
 	pub fn rgba(rgba: &[u8], size: Size) -> Result<Self, Error> {
 		size.validate("RGBA frame")?;
-		let expected = size.pixels() as usize * 4;
+		let expected = size.byte_len(4, "RGBA frame")?;
 		if rgba.len() != expected {
 			return Err(Error::Codec(anyhow::anyhow!(
 				"RGBA buffer is {} bytes, expected {expected} for {size}",
@@ -439,9 +522,12 @@ impl Surface {
 		}
 		Ok(Surface::I420(I420::from_rgba(
 			rgba,
-			size.width * 4,
-			size.width,
-			size.height,
+			size.width.checked_mul(4).ok_or_else(|| {
+				Error::Codec(anyhow::anyhow!(
+					"RGBA frame {size}: row stride is too large to represent"
+				))
+			})?,
+			size,
 		)?))
 	}
 
@@ -450,56 +536,63 @@ impl Surface {
 	/// which is what you usually want since it carries the timestamp across too.
 	///
 	/// A GPU scaler that a driver refuses falls back to downloading and scaling
-	/// on the CPU, warning once, rather than failing the frame.
-	pub fn resize(&self, size: Size) -> Result<Surface, Error> {
-		self.resize_with(size, &crate::resize::Config::default())
-	}
-
-	/// A copy scaled with explicit platform options.
-	pub fn resize_with(&self, size: Size, config: &crate::resize::Config) -> Result<Surface, Error> {
+	/// on the CPU where the surface permits readback. External Vulkan surfaces fail
+	/// instead because their contract forbids CPU pixel access.
+	///
+	/// The result keeps the source's [`color`](Self::color). An unlabelled source
+	/// means what [`Color::infer`] guesses for its own size, so the result is
+	/// labelled with that: scaling across 576 lines would otherwise change the
+	/// guess without changing the samples.
+	pub fn resize(&self, size: Size, config: &crate::resize::Config) -> Result<Surface, Error> {
 		// Counts as a use on builds where every GPU arm is compiled out.
 		let _ = config;
 		size.validate("resize to")?;
-		let Size { width, height } = size;
 
-		Ok(match self {
-			Surface::I420(i420) => Surface::I420(i420.resize(width, height)?),
-			#[cfg(target_os = "macos")]
-			Surface::PixelBuffer(pixels) if config.acceleration == crate::resize::Acceleration::Cpu => {
-				Surface::I420(pixels.download_i420()?.resize(width, height)?)
+		let implied = self
+			.color()
+			.unwrap_or_else(|| Color::infer(Size::new(self.width(), self.height())));
+		let mut resized = match self {
+			Surface::I420(i420) => Surface::I420(i420.resize(size)?),
+			#[cfg(apple)]
+			Surface::PixelBuffer(pixels) if config.output == crate::Output::Cpu => {
+				Surface::I420(pixels.download_i420()?.resize(size)?)
 			}
-			#[cfg(target_os = "macos")]
-			Surface::PixelBuffer(pixels) => match pixels.resize(width, height) {
+			#[cfg(apple)]
+			Surface::PixelBuffer(pixels) => match pixels.resize(size.width, size.height) {
 				Ok(scaled) => Surface::PixelBuffer(scaled),
 				// A transfer session or pool can fail on older hardware. Keep the
 				// stream alive with the universal CPU path.
 				Err(err) => {
 					static WARN_ONCE: std::sync::Once = std::sync::Once::new();
 					WARN_ONCE.call_once(|| tracing::warn!(%err, "GPU resize failed; falling back to the CPU"));
-					Surface::I420(pixels.download_i420()?.resize(width, height)?)
+					Surface::I420(pixels.download_i420()?.resize(size)?)
 				}
 			},
 			#[cfg(all(target_os = "linux", feature = "nvidia"))]
-			Surface::Cuda(cuda) if config.acceleration == crate::resize::Acceleration::Cpu => {
-				Surface::I420(cuda.download_i420()?.resize(width, height)?)
-			}
+			Surface::Cuda(cuda) if config.output == crate::Output::Cpu => Surface::I420(cuda.download_i420()?.resize(size)?),
 			#[cfg(all(target_os = "linux", feature = "nvidia"))]
-			Surface::Cuda(cuda) => match cuda.resize(width, height) {
+			Surface::Cuda(cuda) => match cuda.resize(size) {
 				Ok(scaled) => Surface::Cuda(scaled),
 				// E.g. the driver rejected the vendored PTX: degrade to a CPU
 				// resize (download once) instead of killing the stream.
 				Err(err) => {
 					static WARN_ONCE: std::sync::Once = std::sync::Once::new();
 					WARN_ONCE.call_once(|| tracing::warn!(%err, "GPU resize failed; falling back to the CPU"));
-					Surface::I420(cuda.download_i420()?.resize(width, height)?)
+					Surface::I420(cuda.download_i420()?.resize(size)?)
 				}
 			},
-			#[cfg(target_os = "windows")]
-			Surface::Texture(texture) if config.acceleration == crate::resize::Acceleration::Cpu => {
-				Surface::I420(texture.download_i420()?.resize(width, height)?)
+			#[cfg(target_os = "linux")]
+			Surface::Vulkan(_) => {
+				return Err(Error::Unsupported(
+					"External Vulkan surfaces require a GPU consumer and cannot be resized or downloaded".into(),
+				));
 			}
 			#[cfg(target_os = "windows")]
-			Surface::Texture(texture) => match texture.resize(width, height) {
+			Surface::Texture(texture) if config.output == crate::Output::Cpu => {
+				Surface::I420(texture.download_i420()?.resize(size)?)
+			}
+			#[cfg(target_os = "windows")]
+			Surface::Texture(texture) => match texture.resize(size.width, size.height) {
 				Ok(scaled) => Surface::Texture(scaled),
 				// A driver that won't render to NV12 has no video-processor path
 				// at all: degrade to a CPU resize (download once) instead of
@@ -507,43 +600,63 @@ impl Surface {
 				Err(err) => {
 					static WARN_ONCE: std::sync::Once = std::sync::Once::new();
 					WARN_ONCE.call_once(|| tracing::warn!(%err, "GPU resize failed; falling back to the CPU"));
-					Surface::I420(texture.download_i420()?.resize(width, height)?)
+					Surface::I420(texture.download_i420()?.resize(size)?)
+				}
+			},
+			// Scaled by the VA-API video processor, which also converts packed
+			// RGB to NV12 on the way, so the result is ready for the VAAPI
+			// encoder to import. If VA-API is missing or refuses the buffer,
+			// download and resize on the CPU.
+			#[cfg(all(target_os = "linux", feature = "vaapi"))]
+			Surface::DmaBuf(buffer) if config.output == crate::Output::Native => match vaapi::resize(buffer, size) {
+				Ok(scaled) => Surface::DmaBuf(scaled),
+				Err(err) => {
+					static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+					WARN_ONCE.call_once(|| tracing::warn!(%err, "GPU resize failed; falling back to the CPU"));
+					Surface::I420(buffer.inner.download_i420()?.resize(size)?)
 				}
 			},
 			#[allow(unreachable_patterns)]
-			other => Surface::I420(other.to_i420()?.into_owned().resize(width, height)?),
-		})
+			other => Surface::I420(other.to_i420()?.into_owned().resize(size)?),
+		};
+		resized.label(implied);
+		Ok(resized)
 	}
 
 	/// The pixels as tightly-packed I420 (YUV 4:2:0): Y (`width * height` bytes),
 	/// then U, then V (`width/2 * height/2` each), no row padding.
 	///
-	/// Bytes only, so the color space does not come along. Take it from
-	/// [`I420::color`] first if you need to interpret these samples, since this
-	/// consumes the surface.
-	///
-	/// Always available, whichever variant you hold, so it is the universal arm of
-	/// a `match`. Free for `Surface::I420`; downloads any GPU surface.
-	pub fn into_i420(self) -> Result<Bytes, Error> {
+	/// Free for `Surface::I420`; downloads native GPU surfaces that permit
+	/// readback, so it is the universal arm of a `match` on every other
+	/// platform. A external Vulkan surface returns [`Error::Unsupported`] because
+	/// its contract deliberately exposes no CPU pixel path.
+	pub fn into_i420(self) -> Result<I420, Error> {
 		match self {
-			Surface::I420(i420) => Ok(Bytes::from(i420.data)),
+			Surface::I420(i420) => Ok(i420),
 			#[allow(unreachable_patterns)]
-			other => Ok(Bytes::from(other.to_i420()?.into_owned().data)),
+			other => Ok(other.to_i420()?.into_owned()),
 		}
 	}
 
 	/// Convert to owned, tightly packed RGBA8 pixels on the CPU.
 	///
-	/// Always available, whichever variant you hold. Native GPU surfaces are
-	/// downloaded first; CPU I420 is converted directly. The conversion honors
-	/// [`color`](Self::color) and otherwise falls back to [`Color::infer`].
-	pub fn into_rgba(self) -> Result<crate::convert::Rgba, Error> {
-		self.into_rgba_with(&crate::convert::Config::default())
+	/// Native GPU surfaces that permit readback are downloaded first; CPU I420 is
+	/// converted directly. External Vulkan surfaces return [`Error::Unsupported`].
+	/// The conversion honors [`color`](Self::color) and otherwise falls back to
+	/// [`Color::infer`].
+	pub fn to_rgba(&self, config: &crate::convert::Config) -> Result<crate::convert::Rgba, Error> {
+		crate::convert::rgba(self, config)
 	}
 
-	/// Convert to owned RGBA8 pixels with explicit CPU conversion options.
-	pub fn into_rgba_with(self, config: &crate::convert::Config) -> Result<crate::convert::Rgba, Error> {
-		crate::convert::rgba(self, config)
+	/// Convert to owned, tightly packed BGRA8 pixels on the CPU.
+	///
+	/// The same conversion as [`to_rgba`](Self::to_rgba) with red and blue
+	/// exchanged. Reach for it when the destination wants that order, which is
+	/// most of them: GPUI's `RenderImage`, Direct2D, and Win32 generally. Doing
+	/// it here is one pass over the frame; converting to RGBA and swapping the
+	/// channels afterwards is two.
+	pub fn to_bgra(&self, config: &crate::convert::Config) -> Result<crate::convert::Bgra, Error> {
+		crate::convert::bgra(self, config)
 	}
 
 	/// The pixels as a CoreVideo pixel buffer, the mirror of
@@ -559,50 +672,89 @@ impl Surface {
 	///
 	/// A decoded buffer comes from the decoder's pool, so holding many frames holds
 	/// pool slots and eventually stalls decoding. Draw and drop.
-	#[cfg(target_os = "macos")]
+	#[cfg(apple)]
 	pub fn into_pixel_buffer(
 		self,
 	) -> Result<objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>, Error> {
 		match self {
 			Surface::PixelBuffer(pixels) => Ok(pixels.buffer),
-			Surface::I420(i420) => macos::upload_i420(&i420),
+			Surface::I420(i420) => apple::upload_i420(&i420),
 		}
 	}
 
 	/// The color space these samples are in, when it is known rather than
-	/// guessed. `None` for a GPU surface whose format names none, and for pixels
-	/// that merely passed through without anything naming their space.
+	/// guessed. A decoded frame carries its stream's; `None` for pixels that
+	/// merely passed through without anything naming their space, a camera's raw
+	/// YUYV among them.
 	///
-	/// Worth reading before encoding pixels you resized: [`resize`](Self::resize)
-	/// carries the space across, so a frame scaled past 576 lines no longer
-	/// matches what an encoder sized for the result would infer. Pass this to
+	/// Worth reading before encoding pixels you resized or decoded: they keep
+	/// their source's space, which need not match what an encoder sized for them
+	/// would infer. Pass this to
 	/// [`encode::Config::color`](crate::encode::Config::color) to keep the label
-	/// honest.
+	/// honest; the encoder refuses a frame that disagrees with it.
 	pub fn color(&self) -> Option<Color> {
 		match self {
-			#[cfg(target_os = "macos")]
+			#[cfg(apple)]
 			Surface::PixelBuffer(s) => s.color(),
 			#[cfg(target_os = "windows")]
-			Surface::Texture(_) => None,
+			Surface::Texture(texture) => texture.color,
 			#[cfg(all(target_os = "linux", feature = "nvidia"))]
-			Surface::Cuda(_) => None,
+			Surface::Cuda(c) => c.color(),
+			#[cfg(target_os = "linux")]
+			Surface::Vulkan(_) => None,
 			#[cfg(all(target_os = "linux", feature = "dmabuf"))]
 			Surface::DmaBuf(d) => d.color,
 			#[cfg(all(target_os = "android", feature = "mediacodec"))]
-			Surface::HardwareBuffer(_) => None,
+			Surface::HardwareBuffer(b) => b.color,
 			Surface::I420(i) => i.color(),
 		}
 	}
 
+	/// Name the space of a surface that names none, leaving one that does alone.
+	///
+	/// For what the crate knows and the surface cannot carry on its own: the
+	/// stream a decoder read, or the size a frame had before a resize. A CoreVideo
+	/// buffer's attachment names only the matrix, so a label overrides it; an
+	/// external Vulkan image is RGB and takes none.
+	pub(crate) fn label(&mut self, color: Color) {
+		let slot = match self {
+			#[cfg(apple)]
+			Surface::PixelBuffer(buffer) => &mut buffer.color,
+			#[cfg(target_os = "windows")]
+			Surface::Texture(texture) => &mut texture.color,
+			#[cfg(all(target_os = "linux", feature = "nvidia"))]
+			Surface::Cuda(cuda) => &mut cuda.color,
+			#[cfg(target_os = "linux")]
+			Surface::Vulkan(_) => return,
+			#[cfg(all(target_os = "linux", feature = "dmabuf"))]
+			Surface::DmaBuf(buffer) => &mut buffer.color,
+			#[cfg(all(target_os = "android", feature = "mediacodec"))]
+			Surface::HardwareBuffer(buffer) => &mut buffer.color,
+			Surface::I420(i420) => &mut i420.color,
+		};
+		slot.get_or_insert(color);
+	}
+
 	/// A CPU I420 view, downloading a GPU frame only if necessary.
-	pub(crate) fn to_i420(&self) -> Result<Cow<'_, I420>, Error> {
+	///
+	/// Borrowed for `Surface::I420`, owned for a GPU surface that permits
+	/// readback, and unsupported for external Vulkan. The borrowing counterpart to
+	/// [`into_i420`](Self::into_i420), for a
+	/// caller that cannot give up the surface: a publisher's preview frame is
+	/// shared with every rendition's encoder, so its `Arc` never has a refcount
+	/// of one and no consuming exit is reachable from it.
+	pub fn to_i420(&self) -> Result<Cow<'_, I420>, Error> {
 		match self {
-			#[cfg(target_os = "macos")]
+			#[cfg(apple)]
 			Surface::PixelBuffer(s) => Ok(Cow::Owned(s.download_i420()?)),
 			#[cfg(target_os = "windows")]
 			Surface::Texture(t) => Ok(Cow::Owned(t.download_i420()?)),
 			#[cfg(all(target_os = "linux", feature = "nvidia"))]
 			Surface::Cuda(c) => Ok(Cow::Owned(c.download_i420()?)),
+			#[cfg(target_os = "linux")]
+			Surface::Vulkan(_) => Err(Error::Unsupported(
+				"External Vulkan surfaces have no CPU mapping or download fallback".into(),
+			)),
 			#[cfg(all(target_os = "linux", feature = "dmabuf"))]
 			Surface::DmaBuf(d) => Ok(Cow::Owned(d.inner.download_i420()?)),
 			#[cfg(all(target_os = "android", feature = "mediacodec"))]
@@ -634,21 +786,26 @@ impl I420 {
 	/// Both dimensions must be even and non-zero (4:2:0 chroma is 2x2), and `data`
 	/// must be exactly [`I420::len`] bytes. Checked here so a short buffer can't
 	/// reach a plane split and panic downstream.
-	pub fn new(width: u32, height: u32, data: Vec<u8>) -> Result<Self, Error> {
-		crate::Size::new(width, height).validate("I420")?;
-		let expected = Self::len(width, height);
+	pub fn new(size: Size, data: Vec<u8>) -> Result<Self, Error> {
+		size.validate("I420")?;
+		let expected = Self::len(size)?;
 		if data.len() != expected {
 			return Err(Error::Codec(anyhow::anyhow!(
-				"I420 {width}x{height} needs {expected} bytes, got {}",
+				"I420 {size} needs {expected} bytes, got {}",
 				data.len()
 			)));
 		}
 		Ok(Self {
-			width,
-			height,
+			width: size.width,
+			height: size.height,
 			data,
 			color: None,
 		})
+	}
+
+	/// The frame resolution.
+	pub fn size(&self) -> Size {
+		Size::new(self.width, self.height)
 	}
 
 	/// The frame width in pixels.
@@ -664,6 +821,11 @@ impl I420 {
 	/// The packed planes, Y then U then V.
 	pub fn data(&self) -> &[u8] {
 		&self.data
+	}
+
+	/// Consume the image and return its packed planes.
+	pub fn into_data(self) -> Vec<u8> {
+		self.data
 	}
 
 	/// The color space these samples are in, or `None` when the crate does not
@@ -685,22 +847,26 @@ impl I420 {
 	}
 
 	/// Tightly-packed I420 byte length for the given even dimensions.
-	pub fn len(width: u32, height: u32) -> usize {
-		let luma = width as usize * height as usize;
-		luma + luma / 2
+	pub fn len(size: Size) -> Result<usize, Error> {
+		size.validate("I420")?;
+		let luma = size.byte_len(1, "I420")?;
+		luma.checked_add(luma / 2)
+			.ok_or_else(|| Error::Codec(anyhow::anyhow!("I420 {size}: byte length is too large to represent")))
 	}
 
 	/// Convert RGBA (`stride` bytes per row, >= `width * 4`) to I420 in
 	/// [`Color::infer`]'s color space for this size, limited range. Used by
 	/// [`Surface::rgba`] (tightly packed) and the screen-capture paths, whose
 	/// surfaces carry a driver-chosen row pitch.
-	pub(crate) fn from_rgba(rgba: &[u8], stride: u32, width: u32, height: u32) -> Result<Self, Error> {
-		let color = Color::infer(Size::new(width, height));
+	pub(crate) fn from_rgba(rgba: &[u8], stride: u32, size: Size) -> Result<Self, Error> {
+		size.validate("RGBA frame")?;
+		let Size { width, height } = size;
+		let color = Color::infer(size);
 		let (range, matrix) = color.yuv();
 		let mut planar = YuvPlanarImageMut::alloc(width, height, YuvChromaSubsampling::Yuv420);
 		rgba_to_yuv420(&mut planar, rgba, stride, range, matrix, YuvConversionMode::Balanced)
 			.map_err(|e| Error::Codec(anyhow::anyhow!("rgba_to_yuv420 failed for {width}x{height}: {e}")))?;
-		Ok(Self::pack(&planar, width, height, Some(color)))
+		Self::pack(&planar, size, Some(color))
 	}
 
 	/// Convert BGRA to I420 in [`Color::infer`]'s color space for this size.
@@ -709,15 +875,17 @@ impl I420 {
 	/// Duplication (BGRA staging texture) and Linux PipeWire (BGRx/BGRA
 	/// shared-memory buffers).
 	#[cfg(any(target_os = "windows", all(target_os = "linux", feature = "pipewire")))]
-	pub(crate) fn from_bgra(bgra: &[u8], stride: u32, width: u32, height: u32) -> Result<Self, Error> {
+	pub(crate) fn from_bgra(bgra: &[u8], stride: u32, size: Size) -> Result<Self, Error> {
 		use yuv::bgra_to_yuv420;
 
-		let color = Color::infer(Size::new(width, height));
+		size.validate("BGRA frame")?;
+		let Size { width, height } = size;
+		let color = Color::infer(size);
 		let (range, matrix) = color.yuv();
 		let mut planar = YuvPlanarImageMut::alloc(width, height, YuvChromaSubsampling::Yuv420);
 		bgra_to_yuv420(&mut planar, bgra, stride, range, matrix, YuvConversionMode::Balanced)
 			.map_err(|e| Error::Codec(anyhow::anyhow!("bgra_to_yuv420 failed for {width}x{height}: {e}")))?;
-		Ok(Self::pack(&planar, width, height, Some(color)))
+		Self::pack(&planar, size, Some(color))
 	}
 
 	/// Pack strided Y/U/V planes (4:2:0, full-size luma, half-size chroma) into a
@@ -725,19 +893,37 @@ impl I420 {
 	/// strides, which a decoder may pad wider than the visible width. Used by the
 	/// software H.264 decode backend, whose `DecodedYUV` exposes strided planes.
 	/// Width and height must be even (4:2:0 chroma).
+	#[cfg_attr(not(feature = "openh264"), allow(dead_code))]
 	pub(crate) fn from_planes(
 		y: &[u8],
 		u: &[u8],
 		v: &[u8],
 		y_stride: usize,
 		uv_stride: usize,
-		width: u32,
-		height: u32,
-	) -> Self {
+		size: Size,
+	) -> Result<Self, Error> {
+		size.validate("I420 planes")?;
+		let Size { width, height } = size;
 		let (w, h) = (width as usize, height as usize);
 		let (cw, ch) = (w / 2, h / 2);
+		if y_stride < w || uv_stride < cw {
+			return Err(Error::Codec(anyhow::anyhow!(
+				"I420 {size}: strides {y_stride}/{uv_stride} are smaller than plane widths {w}/{cw}"
+			)));
+		}
+		let y_need = y_stride
+			.checked_mul(h)
+			.ok_or_else(|| Error::Codec(anyhow::anyhow!("I420 {size}: luma plane length overflows")))?;
+		let uv_need = uv_stride
+			.checked_mul(ch)
+			.ok_or_else(|| Error::Codec(anyhow::anyhow!("I420 {size}: chroma plane length overflows")))?;
+		if y.len() < y_need || u.len() < uv_need || v.len() < uv_need {
+			return Err(Error::Codec(anyhow::anyhow!(
+				"I420 {size}: source planes are shorter than their declared strides"
+			)));
+		}
 
-		let mut data = vec![0u8; Self::len(width, height)];
+		let mut data = vec![0u8; Self::len(size)?];
 		let (luma, chroma) = data.split_at_mut(w * h);
 		let (u_dst, v_dst) = chroma.split_at_mut(cw * ch);
 
@@ -749,36 +935,70 @@ impl I420 {
 			v_dst[row * cw..row * cw + cw].copy_from_slice(&v[row * uv_stride..row * uv_stride + cw]);
 		}
 
-		Self {
+		Ok(Self {
 			width,
 			height,
 			data,
 			color: None,
-		}
+		})
 	}
 
 	/// Convert tightly-packed RGB (`width * height * 3` bytes) to I420 in
-	/// [`Color::infer`]'s color space for this size. Used for MJPEG capture
-	/// (Linux V4L2), which decodes to RGB.
+	/// [`Color::infer`]'s color space for this size. Used by [`Self::from_mjpeg`].
 	#[cfg(all(target_os = "linux", feature = "capture"))]
-	pub(crate) fn from_rgb(rgb: &[u8], width: u32, height: u32) -> Result<Self, Error> {
+	pub(crate) fn from_rgb(rgb: &[u8], size: Size) -> Result<Self, Error> {
 		use yuv::rgb_to_yuv420;
 
-		let color = Color::infer(Size::new(width, height));
+		size.validate("RGB frame")?;
+		let Size { width, height } = size;
+		let stride = width.checked_mul(3).ok_or_else(|| {
+			Error::Codec(anyhow::anyhow!(
+				"RGB frame {size}: row stride is too large to represent"
+			))
+		})?;
+		let color = Color::infer(size);
 		let (range, matrix) = color.yuv();
 		let mut planar = YuvPlanarImageMut::alloc(width, height, YuvChromaSubsampling::Yuv420);
-		rgb_to_yuv420(&mut planar, rgb, width * 3, range, matrix, YuvConversionMode::Balanced)
+		rgb_to_yuv420(&mut planar, rgb, stride, range, matrix, YuvConversionMode::Balanced)
 			.map_err(|e| Error::Codec(anyhow::anyhow!("rgb_to_yuv420 failed for {width}x{height}: {e}")))?;
-		Ok(Self::pack(&planar, width, height, Some(color)))
+		Self::pack(&planar, size, Some(color))
+	}
+
+	/// Decode one Motion-JPEG frame to I420 in [`Color::infer`]'s color space.
+	/// Used by the Linux V4L2 and PipeWire camera paths.
+	///
+	/// The stream reports the negotiated size and the encoder is built from it,
+	/// so a frame that decodes to another size is an error rather than a frame
+	/// published as this stream's.
+	#[cfg(all(target_os = "linux", feature = "capture"))]
+	pub(crate) fn from_mjpeg(jpeg: &[u8], size: Size) -> Result<Self, Error> {
+		use zune_jpeg::zune_core::bytestream::ZCursor;
+
+		// zune-jpeg 0.5 reads through a seekable cursor, not a bare slice.
+		let mut decoder = zune_jpeg::JpegDecoder::new(ZCursor::new(jpeg));
+		let rgb = decoder
+			.decode()
+			.map_err(|e| Error::Codec(anyhow::anyhow!("MJPEG decode: {e:?}")))?;
+		let (w, h) = decoder
+			.dimensions()
+			.ok_or_else(|| Error::Codec(anyhow::anyhow!("MJPEG frame had no dimensions")))?;
+		if w as u32 != size.width || h as u32 != size.height {
+			return Err(Error::Codec(anyhow::anyhow!(
+				"MJPEG frame is {w}x{h}, not the negotiated {size}"
+			)));
+		}
+		Self::from_rgb(&rgb, size)
 	}
 
 	/// Convert packed YUYV (YUV 4:2:2, `stride` bytes per row) to I420. A chroma
 	/// resample (4:2:2 -> 4:2:0), no color-space conversion. Used for the raw
-	/// V4L2 capture path (Linux).
+	/// V4L2 and PipeWire camera capture paths (Linux).
 	#[cfg(all(target_os = "linux", feature = "capture"))]
-	pub(crate) fn from_yuyv(yuyv: &[u8], stride: u32, width: u32, height: u32) -> Result<Self, Error> {
+	pub(crate) fn from_yuyv(yuyv: &[u8], stride: u32, size: Size) -> Result<Self, Error> {
 		use yuv::{YuvPackedImage, yuyv422_to_yuv420};
 
+		size.validate("YUYV frame")?;
+		let Size { width, height } = size;
 		let mut planar = YuvPlanarImageMut::alloc(width, height, YuvChromaSubsampling::Yuv420);
 		let packed = YuvPackedImage {
 			yuy: yuyv,
@@ -789,20 +1009,24 @@ impl I420 {
 		yuyv422_to_yuv420(&mut planar, &packed)
 			.map_err(|e| Error::Codec(anyhow::anyhow!("yuyv422_to_yuv420 failed for {width}x{height}: {e}")))?;
 		// A chroma resample, not a color conversion: these samples are in
-		// whatever space the camera produced, which nothing here names.
-		Ok(Self::pack(&planar, width, height, None))
+		// whatever space the camera produced, which the caller names if it can.
+		Self::pack(&planar, size, None)
 	}
 
 	/// Split tightly-packed NV12 (Y plane `width * height`, then interleaved UV
 	/// `width/2 * height/2` pairs) into planar I420. A chroma deinterleave, no
 	/// color-space conversion. Used by the Windows Media Foundation and Linux
-	/// PipeWire capture paths.
-	#[cfg(any(target_os = "windows", all(target_os = "linux", feature = "pipewire")))]
-	pub(crate) fn from_nv12(nv12: &[u8], width: u32, height: u32) -> Result<Self, Error> {
-		let (w, h) = (width as usize, height as usize);
-		let luma = w * h;
+	/// PipeWire capture paths, and by the VAAPI decoder.
+	#[cfg(any(
+		target_os = "windows",
+		all(target_os = "linux", any(feature = "pipewire", feature = "vaapi"))
+	))]
+	pub(crate) fn from_nv12(nv12: &[u8], size: Size) -> Result<Self, Error> {
+		size.validate("NV12 frame")?;
+		let Size { width, height } = size;
+		let luma = size.byte_len(1, "NV12 frame")?;
 		let chroma = luma / 4;
-		let need = luma + 2 * chroma;
+		let need = Self::len(size)?;
 		if nv12.len() < need {
 			return Err(Error::Codec(anyhow::anyhow!(
 				"NV12 buffer too small: {} < {need} for {width}x{height}",
@@ -810,7 +1034,7 @@ impl I420 {
 			)));
 		}
 
-		let mut data = vec![0u8; Self::len(width, height)];
+		let mut data = vec![0u8; need];
 		data[..luma].copy_from_slice(&nv12[..luma]);
 		let (u_dst, v_dst) = data[luma..].split_at_mut(chroma);
 		deinterleave_uv(&nv12[luma..need], u_dst, v_dst);
@@ -825,7 +1049,7 @@ impl I420 {
 	/// Resize to `width` x `height` (both even) with a per-plane SIMD bilinear
 	/// convolution: Y at full size, U/V at quarter size. The CPU half of
 	/// [`Frame::resize`].
-	pub(crate) fn resize(&self, width: u32, height: u32) -> Result<Self, Error> {
+	pub(crate) fn resize(&self, size: Size) -> Result<Self, Error> {
 		use std::cell::RefCell;
 
 		use fast_image_resize::images::{Image, ImageRef};
@@ -859,8 +1083,9 @@ impl I420 {
 				.map_err(|e| Error::Codec(anyhow::anyhow!("resize: {e}")))
 		};
 
-		let luma = width as usize * height as usize;
-		let mut data = vec![0u8; Self::len(width, height)];
+		let Size { width, height } = size;
+		let luma = size.byte_len(1, "I420 resize")?;
+		let mut data = vec![0u8; Self::len(size)?];
 		let (y_dst, chroma) = data.split_at_mut(luma);
 		let (u_dst, v_dst) = chroma.split_at_mut(luma / 4);
 
@@ -886,17 +1111,14 @@ impl I420 {
 	/// `color` is what the caller's conversion produced: the RGB conversions pick
 	/// a matrix, so they know it outright, while a caller that only resamples
 	/// chroma passes `None` and leaves the samples' space open.
-	fn pack(planar: &YuvPlanarImageMut<u8>, width: u32, height: u32, color: Option<Color>) -> Self {
-		let mut data = Vec::with_capacity(Self::len(width, height));
+	fn pack(planar: &YuvPlanarImageMut<u8>, size: Size, color: Option<Color>) -> Result<Self, Error> {
+		let mut data = Vec::with_capacity(Self::len(size)?);
 		data.extend_from_slice(planar.y_plane.borrow());
 		data.extend_from_slice(planar.u_plane.borrow());
 		data.extend_from_slice(planar.v_plane.borrow());
-		Self {
-			width,
-			height,
-			data,
-			color,
-		}
+		let mut packed = Self::new(size, data)?;
+		packed.color = color;
+		Ok(packed)
 	}
 
 	fn luma_len(&self) -> usize {
@@ -929,7 +1151,7 @@ impl I420 {
 /// (`u[i], v[i]` -> `uv[2i], uv[2i+1]`). `uv` must be twice the length of `u`.
 #[cfg(any(target_os = "windows", all(target_os = "linux", feature = "nvidia")))]
 pub(crate) fn interleave_uv(u: &[u8], v: &[u8], uv: &mut [u8]) {
-	for (pair, (u, v)) in uv.chunks_exact_mut(2).zip(u.iter().zip(v)) {
+	for (pair, (u, v)) in uv.as_chunks_mut::<2>().0.iter_mut().zip(u.iter().zip(v)) {
 		pair[0] = *u;
 		pair[1] = *v;
 	}
@@ -937,9 +1159,12 @@ pub(crate) fn interleave_uv(u: &[u8], v: &[u8], uv: &mut [u8]) {
 
 /// Split a packed NV12 chroma plane into separate U and V planes, the inverse of
 /// [`interleave_uv`].
-#[cfg(any(target_os = "windows", all(target_os = "linux", feature = "pipewire")))]
+#[cfg(any(
+	target_os = "windows",
+	all(target_os = "linux", any(feature = "pipewire", feature = "vaapi"))
+))]
 pub(crate) fn deinterleave_uv(uv: &[u8], u: &mut [u8], v: &mut [u8]) {
-	for (pair, (u, v)) in uv.chunks_exact(2).zip(u.iter_mut().zip(v)) {
+	for (pair, (u, v)) in uv.as_chunks::<2>().0.iter().zip(u.iter_mut().zip(v)) {
 		*u = pair[0];
 		*v = pair[1];
 	}
@@ -952,14 +1177,14 @@ pub(crate) fn deinterleave_uv(uv: &[u8], u: &mut [u8], v: &mut [u8]) {
 /// once, while a rendition ladder resizes on a thread per rung. So each key owns
 /// a serialized value, rungs share rather than contend, and a long-lived process
 /// does not retain every size it has ever seen.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(apple, target_os = "windows"))]
 struct Cache<K, T> {
 	values: std::collections::HashMap<K, std::sync::Arc<std::sync::Mutex<T>>>,
 	order: std::collections::VecDeque<K>,
 	capacity: usize,
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(apple, target_os = "windows"))]
 impl<K: Clone + Eq + std::hash::Hash, T> Cache<K, T> {
 	fn new(capacity: usize) -> Self {
 		Self {
@@ -1009,7 +1234,7 @@ impl<K: Clone + Eq + std::hash::Hash, T> Cache<K, T> {
 	}
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+#[cfg(all(test, any(apple, target_os = "windows")))]
 mod cache_tests {
 	use super::Cache;
 
@@ -1084,7 +1309,7 @@ pub mod android {
 	use ndk::media::image_reader::{Image, ImageReader};
 
 	use super::I420;
-	use crate::Error;
+	use crate::{Color, Error, Size};
 
 	// Plane indices of an `AIMAGE_FORMAT_YUV_420_888` image. The format always
 	// reports three planes in this order, whether the device laid the picture out
@@ -1141,6 +1366,8 @@ pub mod android {
 		pub(crate) top: u32,
 		pub(crate) width: u32,
 		pub(crate) height: u32,
+		/// The space the samples are in, from the stream the decoder read.
+		pub(crate) color: Option<Color>,
 	}
 
 	// SAFETY: an `AImage` is an owned handle to one buffer-queue slot, so it is not
@@ -1148,7 +1375,7 @@ pub mod android {
 	// (`AImage_getPlane*`, `AImage_getHardwareBuffer`) of an image nothing else can
 	// reach: the decoder acquires it and hands ownership straight out, and it is
 	// never re-acquired. The reader alongside it carries its own assertion. `Sync`
-	// is load-bearing the same way it is for the macOS pixel buffer, since
+	// is load-bearing the same way it is for the CoreVideo pixel buffer, since
 	// moq-transcode fans decoded frames out as `Arc<Frame>`.
 	unsafe impl Send for HardwareBuffer {}
 	unsafe impl Sync for HardwareBuffer {}
@@ -1162,6 +1389,7 @@ pub mod android {
 				top,
 				width,
 				height,
+				color: None,
 			}
 		}
 
@@ -1220,7 +1448,7 @@ pub mod android {
 			let (w, h) = (self.width as usize, self.height as usize);
 			let (cw, ch) = (w / 2, h / 2);
 
-			let mut data = vec![0u8; I420::len(self.width, self.height)];
+			let mut data = vec![0u8; I420::len(Size::new(self.width, self.height))?];
 			let (luma, chroma) = data.split_at_mut(w * h);
 			let (u_dst, v_dst) = chroma.split_at_mut(cw * ch);
 
@@ -1235,7 +1463,7 @@ pub mod android {
 				width: self.width,
 				height: self.height,
 				data,
-				color: None,
+				color: self.color,
 			})
 		}
 
@@ -1327,9 +1555,9 @@ pub mod android {
 	}
 }
 
-#[cfg(target_os = "macos")]
-pub mod macos {
-	//! macOS CoreVideo surfaces: the [`PixelBuffer`] behind
+#[cfg(apple)]
+pub mod apple {
+	//! CoreVideo surfaces on macOS and iOS: the [`PixelBuffer`] behind
 	//! `Surface::PixelBuffer`, GPU resize, and download/upload between it and CPU
 	//! I420.
 
@@ -1350,7 +1578,7 @@ pub mod macos {
 	use objc2_video_toolbox::VTPixelTransferSession;
 
 	use super::{Cache, I420};
-	use crate::{Color, Error};
+	use crate::{Color, Error, Size};
 
 	/// Read-only lock flag (`kCVPixelBufferLock_ReadOnly`).
 	const LOCK_READ_ONLY: CVPixelBufferLockFlags = CVPixelBufferLockFlags(1);
@@ -1371,6 +1599,9 @@ pub mod macos {
 		pub(crate) buffer: CFRetained<CVPixelBuffer>,
 		pub(crate) width: u32,
 		pub(crate) height: u32,
+		/// The space the decoder read from the stream's VUI, which names the
+		/// primaries and transfer the matrix attachment leaves out.
+		pub(crate) color: Option<Color>,
 	}
 
 	// SAFETY: CVPixelBuffer is a reference-counted CoreFoundation wrapper around
@@ -1403,7 +1634,12 @@ pub mod macos {
 		}
 
 		pub(crate) fn new(buffer: CFRetained<CVPixelBuffer>, width: u32, height: u32) -> Self {
-			Self { buffer, width, height }
+			Self {
+				buffer,
+				width,
+				height,
+				color: None,
+			}
 		}
 
 		/// Scale into an NV12 buffer owned by the destination-size pool.
@@ -1434,7 +1670,7 @@ pub mod macos {
 		/// The range is not in this attachment; the caller pairs it with the one the
 		/// pixel format names.
 		fn matrix(&self) -> Color {
-			let inferred = Color::infer(crate::Size::new(self.width, self.height));
+			let inferred = Color::infer(Size::new(self.width, self.height));
 			// SAFETY: a null attachment mode is documented as "don't report it".
 			let Some(value) = (unsafe { self.buffer.attachment(kCVImageBufferYCbCrMatrixKey, ptr::null_mut()) }) else {
 				return inferred;
@@ -1446,29 +1682,30 @@ pub mod macos {
 			// Compare against the constants rather than the string literals: these
 			// are CFString identities Apple owns, not values we should spell out.
 			if name == unsafe { kCVImageBufferYCbCrMatrix_ITU_R_709_2 } {
-				Color::Bt709Limited
+				Color::BT709
 			} else if name == unsafe { kCVImageBufferYCbCrMatrix_ITU_R_601_4 } {
-				Color::Bt601Limited
+				Color::BT601
 			} else {
-				// BT.2020 and the P3 matrices land here. We have no variant for them,
-				// so the size guess is the least wrong answer available.
+				// BT.2020 and the P3 matrices land here. A decoded buffer carries the
+				// decoder's label instead, so only an unlabelled one guesses.
 				inferred
 			}
 		}
 
-		/// The color space these samples are in: the matrix from the buffer's
-		/// attachment paired with the range its pixel format names. `None` for a
-		/// format that names neither.
+		/// The color space these samples are in: the decoder's label, or else the
+		/// matrix from the buffer's attachment, paired with the range its pixel
+		/// format names (VideoToolbox converts to the format it was asked for).
+		/// `None` for a format that names no range.
 		pub(crate) fn color(&self) -> Option<Color> {
 			let format = CVPixelBufferGetPixelFormatType(&self.buffer);
-			let limited = if format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
-				true
+			let range = if format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
+				crate::color::Range::Limited
 			} else if format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
-				false
+				crate::color::Range::Full
 			} else {
 				return None;
 			};
-			Some(self.matrix().with_range(limited))
+			Some(self.color.unwrap_or_else(|| self.matrix()).with_range(range))
 		}
 
 		/// Download an NV12 surface to packed I420 (the CPU encode path).
@@ -1500,7 +1737,7 @@ pub mod macos {
 			}
 			let _guard = UnlockGuard(&self.buffer);
 
-			let mut data = vec![0u8; I420::len(self.width, self.height)];
+			let mut data = vec![0u8; I420::len(Size::new(self.width, self.height))?];
 			let (luma, chroma) = data.split_at_mut(w * h);
 			let (u_plane, v_plane) = chroma.split_at_mut(cw * ch);
 
@@ -1672,6 +1909,63 @@ pub mod macos {
 		}
 	}
 
+	/// Upload a packed I420 test picture as NV12, including CoreVideo row
+	/// padding, so a test starts from the decoder's surface format rather than
+	/// the planar layout [`upload_i420`] produces.
+	#[cfg(test)]
+	pub(crate) fn nv12_surface(frame: &I420) -> PixelBuffer {
+		use std::ptr::{self, NonNull};
+
+		use objc2_core_foundation::CFRetained;
+		use objc2_core_video::{
+			CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
+			CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+			kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+		};
+
+		let mut raw: *mut CVPixelBuffer = ptr::null_mut();
+		let status = unsafe {
+			CVPixelBufferCreate(
+				None,
+				frame.width as usize,
+				frame.height as usize,
+				kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+				None,
+				NonNull::new(&mut raw).expect("stack pointer is non-null"),
+			)
+		};
+		assert_eq!(status, 0, "CVPixelBufferCreate failed");
+		let buffer = unsafe { CFRetained::from_raw(NonNull::new(raw).expect("CoreVideo returned a buffer")) };
+
+		let flags = CVPixelBufferLockFlags(0);
+		assert_eq!(unsafe { CVPixelBufferLockBaseAddress(&buffer, flags) }, 0);
+		let width = frame.width as usize;
+		let height = frame.height as usize;
+		let y_base = CVPixelBufferGetBaseAddressOfPlane(&buffer, 0) as *mut u8;
+		let y_stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer, 0);
+		for row in 0..height {
+			unsafe {
+				ptr::copy_nonoverlapping(frame.y()[row * width..].as_ptr(), y_base.add(row * y_stride), width);
+			}
+		}
+
+		let (chroma_width, chroma_height) = (width / 2, height / 2);
+		let uv_base = CVPixelBufferGetBaseAddressOfPlane(&buffer, 1) as *mut u8;
+		let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer, 1);
+		for row in 0..chroma_height {
+			let output = unsafe { uv_base.add(row * uv_stride) };
+			for col in 0..chroma_width {
+				unsafe {
+					*output.add(col * 2) = frame.u()[row * chroma_width + col];
+					*output.add(col * 2 + 1) = frame.v()[row * chroma_width + col];
+				}
+			}
+		}
+		unsafe { CVPixelBufferUnlockBaseAddress(&buffer, flags) };
+
+		PixelBuffer::new(buffer, frame.width, frame.height)
+	}
+
 	/// Allocate a planar I420 `CVPixelBuffer` and copy the frame into it: the
 	/// upload half of [`Surface::into_i420`], for when the pixels are on the
 	/// CPU but a CoreVideo consumer (the VideoToolbox encoder, a renderer) needs a
@@ -1727,234 +2021,26 @@ pub mod macos {
 	}
 }
 
+#[cfg(target_os = "linux")]
+#[path = "frame/vulkan.rs"]
+pub mod vulkan;
+
 #[cfg(all(target_os = "linux", feature = "nvidia"))]
-pub mod cuda {
-	//! Linux CUDA device memory: the NV12 [`Frame`] behind `Surface::Cuda`, which
-	//! NVDEC produces and NVENC consumes in place.
+#[path = "frame/cuda_vulkan.rs"]
+mod cuda_vulkan;
 
-	use std::sync::{Arc, OnceLock};
+#[cfg(all(target_os = "linux", feature = "nvidia"))]
+#[path = "frame/cuda.rs"]
+pub mod cuda;
 
-	use cudarc::driver::{CudaContext, CudaFunction, LaunchConfig, PushKernelArg, result};
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
+#[path = "frame/vaapi.rs"]
+pub(crate) mod vaapi;
 
-	use super::I420;
-	use crate::Error;
-
-	/// The NV12 box-filter resize kernels, vendored as PTX (see nv12_resize.cu)
-	/// and JIT-compiled by the driver, so building needs no CUDA toolkit.
-	const RESIZE_PTX: &str = include_str!("frame/nv12_resize.ptx");
-
-	/// The loaded resize kernels, one per process (everything runs in the
-	/// device's primary context, so one module serves every frame).
-	struct Kernels {
-		luma: CudaFunction,
-		chroma: CudaFunction,
-	}
-
-	fn kernels(ctx: &Arc<CudaContext>) -> Result<&'static Kernels, Error> {
-		static KERNELS: OnceLock<Result<Kernels, String>> = OnceLock::new();
-		KERNELS
-			.get_or_init(|| {
-				let module = ctx
-					.load_module(cudarc::nvrtc::Ptx::from_src(RESIZE_PTX))
-					.map_err(|e| format!("load nv12_resize PTX: {e:?}"))?;
-				Ok(Kernels {
-					luma: module
-						.load_function("resize_luma")
-						.map_err(|e| format!("load resize_luma: {e:?}"))?,
-					chroma: module
-						.load_function("resize_chroma")
-						.map_err(|e| format!("load resize_chroma: {e:?}"))?,
-				})
-			})
-			.as_ref()
-			.map_err(|e| Error::Codec(anyhow::anyhow!("CUDA resize unavailable: {e}")))
-	}
-
-	/// An owned device allocation. Plain `cuMemAlloc` on purpose: NVENC's
-	/// resource registration rejects stream-ordered pool memory
-	/// (`cuMemAllocAsync`), which is what cudarc's `CudaSlice` uses on any GPU
-	/// with memory-pool support.
-	struct Buffer {
-		ctx: Arc<CudaContext>,
-		ptr: cudarc::driver::sys::CUdeviceptr,
-		len: usize,
-	}
-
-	impl Drop for Buffer {
-		fn drop(&mut self) {
-			// Drop may run on any thread; freeing needs the context current.
-			if self.ctx.bind_to_thread().is_ok() {
-				// SAFETY: the pointer came from `malloc_sync` and is freed once.
-				let _ = unsafe { result::free_sync(self.ptr) };
-			}
-		}
-	}
-
-	/// A GPU NV12 frame in CUDA device memory: NVDEC's output and NVENC's
-	/// zero-copy input. One buffer holds both planes at a shared row `pitch`:
-	/// `height` luma rows, then `height / 2` interleaved-UV rows. Cloning bumps
-	/// refcounts (no pixel copy), which keeps decode -> encode on the GPU.
-	///
-	/// Both codecs use the device's primary CUDA context (`CudaContext::new`
-	/// retains it), so a frame decoded by NVDEC is directly addressable by NVENC.
-	#[derive(Clone)]
-	pub struct Frame {
-		buf: Arc<Buffer>,
-		pub(crate) width: u32,
-		pub(crate) height: u32,
-		/// Row pitch in bytes of both planes (>= `width`).
-		pub(crate) pitch: u32,
-	}
-
-	impl Frame {
-		/// Allocate an NV12 buffer for `width` x `height` (both even) at row
-		/// pitch `pitch`. Uninitialized: the caller copies the full extent in.
-		pub(crate) fn alloc(ctx: &Arc<CudaContext>, width: u32, height: u32, pitch: u32) -> Result<Self, Error> {
-			debug_assert!(pitch >= width && width.is_multiple_of(2) && height.is_multiple_of(2));
-			let len = pitch as usize * height as usize * 3 / 2;
-			ctx.bind_to_thread()
-				.map_err(|e| Error::Codec(anyhow::anyhow!("CUDA bind: {e:?}")))?;
-			// SAFETY: a plain device allocation; ownership lands in `Buffer`,
-			// whose Drop frees it exactly once.
-			let ptr = unsafe { result::malloc_sync(len) }
-				.map_err(|e| Error::Codec(anyhow::anyhow!("CUDA alloc of {len} bytes: {e:?}")))?;
-			Ok(Self {
-				buf: Arc::new(Buffer {
-					ctx: ctx.clone(),
-					ptr,
-					len,
-				}),
-				width,
-				height,
-				pitch,
-			})
-		}
-
-		/// The raw device pointer, for FFI (the NVDEC copy destination, the
-		/// NVENC resource registration). Valid while `self` is alive.
-		pub(crate) fn device_ptr(&self) -> u64 {
-			self.buf.ptr
-		}
-
-		/// Download and de-pitch to packed I420 (the CPU fallback: a software
-		/// encoder, or a caller that wants bytes).
-		pub(crate) fn download_i420(&self) -> Result<I420, Error> {
-			self.buf
-				.ctx
-				.bind_to_thread()
-				.map_err(|e| Error::Codec(anyhow::anyhow!("CUDA bind: {e:?}")))?;
-			let mut host = vec![0u8; self.buf.len];
-			// SAFETY: the buffer is `len` bytes of device memory and stays alive
-			// for the synchronous copy.
-			unsafe { result::memcpy_dtoh_sync(&mut host, self.buf.ptr) }
-				.map_err(|e| Error::Codec(anyhow::anyhow!("CUDA download: {e:?}")))?;
-
-			let (w, h) = (self.width as usize, self.height as usize);
-			let (cw, ch) = (w / 2, h / 2);
-			let pitch = self.pitch as usize;
-
-			let mut data = vec![0u8; I420::len(self.width, self.height)];
-			let (luma, chroma) = data.split_at_mut(w * h);
-			let (u_dst, v_dst) = chroma.split_at_mut(cw * ch);
-
-			for row in 0..h {
-				luma[row * w..row * w + w].copy_from_slice(&host[row * pitch..row * pitch + w]);
-			}
-			let uv_base = pitch * h;
-			for row in 0..ch {
-				let src = &host[uv_base + row * pitch..uv_base + row * pitch + w];
-				for col in 0..cw {
-					u_dst[row * cw + col] = src[col * 2];
-					v_dst[row * cw + col] = src[col * 2 + 1];
-				}
-			}
-
-			Ok(I420 {
-				width: self.width,
-				height: self.height,
-				data,
-				// A deinterleave, not a color conversion, and nothing here names
-				// the space these samples are in. Left unknown to be inferred.
-				color: None,
-			})
-		}
-
-		/// Resize to `width` x `height` (both even) with the box-filter kernel,
-		/// staying in device memory. The GPU half of
-		/// [`Frame::resize`].
-		pub(crate) fn resize(&self, width: u32, height: u32) -> Result<Self, Error> {
-			let ctx = &self.buf.ctx;
-			let kernels = kernels(ctx)?;
-
-			// Destination row pitch aligned to 256 bytes: comfortable coalescing
-			// and a multiple of 4 as NVENC registration requires.
-			let pitch = width.next_multiple_of(256);
-			let dst = Self::alloc(ctx, width, height, pitch)?;
-
-			let stream = ctx.default_stream();
-			let block = (16u32, 16, 1);
-			let grid = |w: u32, h: u32| (w.div_ceil(16), h.div_ceil(16), 1);
-			let launch_err = |plane: &str, e| Error::Codec(anyhow::anyhow!("CUDA resize {plane}: {e:?}"));
-
-			// Luma plane: one thread per destination pixel.
-			//
-			// SAFETY: both buffers are live NV12 allocations of pitch * height *
-			// 3 / 2 bytes, and the kernels bound every access by the dimensions
-			// passed alongside the pointers.
-			unsafe {
-				stream
-					.launch_builder(&kernels.luma)
-					.arg(&self.buf.ptr)
-					.arg(&self.pitch)
-					.arg(&self.width)
-					.arg(&self.height)
-					.arg(&dst.buf.ptr)
-					.arg(&pitch)
-					.arg(&width)
-					.arg(&height)
-					.launch(LaunchConfig {
-						grid_dim: grid(width, height),
-						block_dim: block,
-						shared_mem_bytes: 0,
-					})
-			}
-			.map_err(|e| launch_err("luma", e))?;
-
-			// Chroma plane: one thread per destination UV pair, offset past the
-			// luma rows in both buffers.
-			let src_uv = self.buf.ptr + u64::from(self.pitch) * u64::from(self.height);
-			let dst_uv = dst.buf.ptr + u64::from(pitch) * u64::from(height);
-			let (src_pw, src_ph) = (self.width / 2, self.height / 2);
-			let (dst_pw, dst_ph) = (width / 2, height / 2);
-			// SAFETY: as above; the UV offsets stay inside the same allocations.
-			unsafe {
-				stream
-					.launch_builder(&kernels.chroma)
-					.arg(&src_uv)
-					.arg(&self.pitch)
-					.arg(&src_pw)
-					.arg(&src_ph)
-					.arg(&dst_uv)
-					.arg(&pitch)
-					.arg(&dst_pw)
-					.arg(&dst_ph)
-					.launch(LaunchConfig {
-						grid_dim: grid(dst_pw, dst_ph),
-						block_dim: block,
-						shared_mem_bytes: 0,
-					})
-			}
-			.map_err(|e| launch_err("chroma", e))?;
-
-			// The frame may head straight to NVENC (which does not order against
-			// our stream), so wait for the kernels rather than queueing.
-			stream
-				.synchronize()
-				.map_err(|e| Error::Codec(anyhow::anyhow!("CUDA resize sync: {e:?}")))?;
-			Ok(dst)
-		}
-	}
-}
+// Compiled for every test build so its policy tests run without a GPU.
+#[cfg(any(test, all(target_os = "linux", feature = "nvidia")))]
+#[path = "frame/pool.rs"]
+mod pool;
 
 #[cfg(target_os = "windows")]
 pub mod d3d11 {
@@ -1975,6 +2061,7 @@ pub mod d3d11 {
 		D3D11_FORMAT_SUPPORT_VIDEO_ENCODER, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
 		D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 		D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+		D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT,
 		D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
 		D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
 		D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
@@ -1982,23 +2069,23 @@ pub mod d3d11 {
 		ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
 		ID3D11VideoProcessorOutputView,
 	};
-	#[cfg(test)]
-	use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
 	use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
+	use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12};
 	use windows::Win32::Media::MediaFoundation::{IMFDXGIBuffer, IMFSample};
 	use windows::core::Interface;
 
+	use super::processor::Plan;
 	use super::{Cache, I420};
-	use crate::{Error, Size};
+	use crate::{Color, Error, Size};
 
 	fn err(ctx: &str, e: windows::core::Error) -> Error {
 		Error::Codec(anyhow::anyhow!("{ctx}: {e}"))
 	}
 
 	/// Create a hardware Direct3D11 device, multithread-protected (Media
-	/// Foundation's internal threads or DXGI duplication and our capture thread
+	/// Foundation's internal threads or WGC and our capture thread
 	/// both touch it). The shared low-level constructor behind the Media
-	/// Foundation device manager and the Desktop Duplication capture path.
+	/// Foundation device manager and Windows.Graphics.Capture.
 	pub(crate) fn create_device() -> Result<ID3D11Device, Error> {
 		let mut device: Option<ID3D11Device> = None;
 		unsafe {
@@ -2026,8 +2113,8 @@ pub mod d3d11 {
 		Ok(device)
 	}
 
-	/// A GPU texture (NV12) on the Direct3D11 device of whichever Media Foundation
-	/// object produced it: the capture source reader, or the DXVA decoder. Holds
+	/// A GPU texture (NV12) on its producer's Direct3D11 device: a Media Foundation
+	/// source reader, DXVA decoder, or Windows.Graphics.Capture session. Holds
 	/// that device so the download fallback and the hardware encoder run on the
 	/// device that owns the texture. Cloning the COM handles is a cheap `AddRef`,
 	/// which is what keeps capture -> encode and decode -> encode zero-copy.
@@ -2036,6 +2123,7 @@ pub mod d3d11 {
 		pub(crate) texture: ID3D11Texture2D,
 		pub(crate) width: u32,
 		pub(crate) height: u32,
+		pub(crate) color: Option<Color>,
 	}
 
 	impl Texture {
@@ -2094,6 +2182,27 @@ pub mod d3d11 {
 				texture,
 				width,
 				height,
+				color: None,
+			})
+		}
+
+		/// Convert a recycled WGC BGRA surface to an owned, even-sized NV12 texture.
+		#[cfg(feature = "capture")]
+		pub(crate) fn capture(device: &ID3D11Device, source: &ID3D11Texture2D, size: Size) -> Result<Self, Error> {
+			let plan = Plan::capture(size)?;
+			let mut desc = D3D11_TEXTURE2D_DESC::default();
+			unsafe { source.GetDesc(&mut desc) };
+			if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || desc.Width < size.width || desc.Height < size.height {
+				return Err(Error::Codec(anyhow::anyhow!(
+					"invalid WGC BGRA surface geometry or format"
+				)));
+			}
+			Ok(Self {
+				device: device.clone(),
+				texture: process(device, source, plan)?,
+				width: plan.target.width,
+				height: plan.target.height,
+				color: Some(Color::infer(plan.target)),
 			})
 		}
 
@@ -2175,7 +2284,7 @@ pub mod d3d11 {
 			// still-luma padding rows and produce garbage color.
 			let tex_height = desc.Height as usize;
 
-			let mut data = vec![0u8; I420::len(self.width, self.height)];
+			let mut data = vec![0u8; I420::len(Size::new(self.width, self.height))?];
 			let (luma, chroma) = data.split_at_mut(w * h);
 			let (u_plane, v_plane) = chroma.split_at_mut(cw * ch);
 
@@ -2201,15 +2310,13 @@ pub mod d3d11 {
 				width: self.width,
 				height: self.height,
 				data,
-				// A deinterleave, not a color conversion, and nothing here names
-				// the space these samples are in. Left unknown to be inferred.
-				color: None,
+				color: self.color,
 			})
 		}
 
 		/// Scale to `width` x `height` on the GPU, staying on this texture's device.
 		/// The Windows GPU path used by
-		/// [`Frame::resize_with`](crate::Frame::resize_with).
+		/// [`Frame::resize`](crate::Frame::resize).
 		///
 		/// Errors rather than falling back, so the caller decides. Two things a
 		/// driver can refuse: rendering to NV12 at all (no output view, so no
@@ -2219,51 +2326,58 @@ pub mod d3d11 {
 		pub(crate) fn resize(&self, width: u32, height: u32) -> Result<Self, Error> {
 			let source = Size::new(self.width, self.height);
 			let target = Size::new(width, height);
-			let key = ScalerKey::new(&self.device, source, target);
-
-			let scaler = {
-				let mut scalers = SCALERS
-					.lock()
-					.map_err(|_| Error::Codec(anyhow::anyhow!("video-processor cache lock poisoned")))?;
-				scalers
-					.get_or_insert_with(key, || {
-						Ok::<_, std::convert::Infallible>(ScalerState::discover(&self.device, source, target))
-					})
-					.expect("scaler discovery is infallible")
-			};
-			let mut state = scaler
-				.lock()
-				.map_err(|_| Error::Codec(anyhow::anyhow!("video processor lock poisoned")))?;
-			let result = match &*state {
-				ScalerState::Ready(scaler) => scaler.scale(&self.texture),
-				ScalerState::Unsupported { reason, .. } => {
-					return Err(Error::Codec(anyhow::anyhow!("GPU resize is unsupported: {reason}")));
-				}
-			};
-			let texture = match result {
-				Ok(texture) => texture,
-				Err(ScaleError::Unsupported(err)) => {
-					*state = ScalerState::Unsupported {
-						_device: self.device.clone(),
-						reason: err.to_string(),
-					};
-					return Err(err);
-				}
-				Err(ScaleError::Transient(err)) => return Err(err),
-			};
-			drop(state);
-			drop(scaler);
-			if let Ok(mut scalers) = SCALERS.lock() {
-				scalers.prune();
-			}
-
+			let texture = process(&self.device, &self.texture, Plan::resize(source, target, self.color)?)?;
 			Ok(Self {
 				device: self.device.clone(),
 				texture,
 				width,
 				height,
+				color: self.color,
 			})
 		}
+	}
+
+	fn process(device: &ID3D11Device, source: &ID3D11Texture2D, plan: Plan) -> Result<ID3D11Texture2D, Error> {
+		let key = ScalerKey {
+			device: device.as_raw() as usize,
+			plan,
+		};
+		let scaler = {
+			let mut scalers = SCALERS
+				.lock()
+				.map_err(|_| Error::Codec(anyhow::anyhow!("video-processor cache lock poisoned")))?;
+			scalers
+				.get_or_insert_with(key, || {
+					Ok::<_, std::convert::Infallible>(ScalerState::discover(device, plan))
+				})
+				.expect("processor discovery is infallible")
+		};
+		let mut state = scaler
+			.lock()
+			.map_err(|_| Error::Codec(anyhow::anyhow!("video processor lock poisoned")))?;
+		let result = match &*state {
+			ScalerState::Ready(scaler) => scaler.scale(source),
+			ScalerState::Unsupported { reason, .. } => {
+				return Err(Error::Codec(anyhow::anyhow!("GPU processing is unsupported: {reason}")));
+			}
+		};
+		let texture = match result {
+			Ok(texture) => texture,
+			Err(ScaleError::Unsupported(err)) => {
+				*state = ScalerState::Unsupported {
+					_device: device.clone(),
+					reason: err.to_string(),
+				};
+				return Err(err);
+			}
+			Err(ScaleError::Transient(err)) => return Err(err),
+		};
+		drop(state);
+		drop(scaler);
+		if let Ok(mut scalers) = SCALERS.lock() {
+			scalers.prune();
+		}
+		Ok(texture)
 	}
 
 	/// Enough reusable video processors for a large rendition ladder without
@@ -2288,8 +2402,8 @@ pub mod d3d11 {
 	}
 
 	impl ScalerState {
-		fn discover(device: &ID3D11Device, source: Size, target: Size) -> Self {
-			match Scaler::new(device, source, target) {
+		fn discover(device: &ID3D11Device, plan: Plan) -> Self {
+			match Scaler::new(device, plan) {
 				Ok(scaler) => Self::Ready(scaler),
 				Err(err) => Self::Unsupported {
 					_device: device.clone(),
@@ -2308,22 +2422,11 @@ pub mod d3d11 {
 	#[derive(Clone, PartialEq, Eq, Hash)]
 	struct ScalerKey {
 		device: usize,
-		source: Size,
-		target: Size,
-	}
-
-	impl ScalerKey {
-		fn new(device: &ID3D11Device, source: Size, target: Size) -> Self {
-			Self {
-				device: device.as_raw() as usize,
-				source,
-				target,
-			}
-		}
+		plan: Plan,
 	}
 
 	/// One Direct3D11 video processor, configured for a single source and target
-	/// size. The GPU scaler behind [`Texture::resize`].
+	/// size, crop, format and color conversion. Shared by resize and WGC capture.
 	struct Scaler {
 		/// Keeps the device keying this entry alive, so its address stays unique.
 		device: ID3D11Device,
@@ -2332,6 +2435,7 @@ pub mod d3d11 {
 		enumerator: ID3D11VideoProcessorEnumerator,
 		processor: ID3D11VideoProcessor,
 		target: Size,
+		input_format: DXGI_FORMAT,
 	}
 
 	/// Whether a failed scale proves this key unsupported or can succeed later.
@@ -2341,7 +2445,8 @@ pub mod d3d11 {
 	}
 
 	impl Scaler {
-		fn new(device: &ID3D11Device, source: Size, target: Size) -> Result<Self, Error> {
+		fn new(device: &ID3D11Device, plan: Plan) -> Result<Self, Error> {
+			let (source, target) = (plan.source, plan.target);
 			let video = device
 				.cast::<ID3D11VideoDevice>()
 				.map_err(|e| err("query ID3D11VideoDevice", e))?;
@@ -2369,14 +2474,31 @@ pub mod d3d11 {
 
 			let enumerator = unsafe { video.CreateVideoProcessorEnumerator(&desc) }
 				.map_err(|e| err("CreateVideoProcessorEnumerator", e))?;
+			let input_format = if plan.bgra {
+				DXGI_FORMAT_B8G8R8A8_UNORM
+			} else {
+				DXGI_FORMAT_NV12
+			};
+			for (format, required) in [
+				(input_format, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT),
+				(DXGI_FORMAT_NV12, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT),
+			] {
+				let support = unsafe { enumerator.CheckVideoProcessorFormat(format) }
+					.map_err(|e| err("CheckVideoProcessorFormat", e))?;
+				if support & required.0 as u32 == 0 {
+					return Err(Error::Codec(anyhow::anyhow!(
+						"video processor does not support {format:?} as {required:?}"
+					)));
+				}
+			}
 			let processor =
 				unsafe { video.CreateVideoProcessor(&enumerator, 0) }.map_err(|e| err("CreateVideoProcessor", e))?;
 
 			let full = RECT {
 				left: 0,
 				top: 0,
-				right: source.width as i32,
-				bottom: source.height as i32,
+				right: plan.picture.width as i32,
+				bottom: plan.picture.height as i32,
 			};
 			let scaled = RECT {
 				left: 0,
@@ -2386,19 +2508,20 @@ pub mod d3d11 {
 			};
 			unsafe {
 				context.VideoProcessorSetStreamFrameFormat(&processor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-				// The whole picture into the whole destination: the scale itself.
+				// Capture crops odd edges; resize maps the entire input picture.
 				context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&full));
 				context.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&scaled));
 				// Drivers ship denoise and edge enhancement on by default here.
 				// This is a resize, not a filter chain, so a rung must not come out
 				// looking different from the frame it was scaled from.
 				context.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
-				// One space in, the same space out. Resampling moves samples
-				// around, it must not reinterpret them, and a processor left to
-				// its own devices will happily convert between ranges.
-				let space = D3D11_VIDEO_PROCESSOR_COLOR_SPACE::default();
-				context.VideoProcessorSetStreamColorSpace(&processor, 0, &space);
-				context.VideoProcessorSetOutputColorSpace(&processor, &space);
+				let input = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
+					_bitfield: plan.input_space(),
+				};
+				let output = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: plan.space };
+				context.VideoProcessorSetStreamColorSpace(&processor, 0, &input);
+				context.VideoProcessorSetOutputColorSpace(&processor, &output);
+				context.VideoProcessorSetOutputTargetRect(&processor, true, Some(&scaled));
 			}
 
 			Ok(Self {
@@ -2408,6 +2531,7 @@ pub mod d3d11 {
 				enumerator,
 				processor,
 				target,
+				input_format,
 			})
 		}
 
@@ -2415,7 +2539,12 @@ pub mod d3d11 {
 		fn scale(&self, source: &ID3D11Texture2D) -> Result<ID3D11Texture2D, ScaleError> {
 			let mut desc = D3D11_TEXTURE2D_DESC::default();
 			unsafe { source.GetDesc(&mut desc) };
-			let output = alloc(&self.device, self.target.width, self.target.height, desc.Format)
+			if desc.Format != self.input_format {
+				return Err(ScaleError::Transient(Error::Codec(anyhow::anyhow!(
+					"video processor input format changed"
+				))));
+			}
+			let output = alloc(&self.device, self.target.width, self.target.height, DXGI_FORMAT_NV12)
 				.map_err(ScaleError::Transient)?;
 
 			let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
@@ -2536,7 +2665,27 @@ pub mod d3d11 {
 			texture,
 			width,
 			height,
+			color: frame.color,
 		})
+	}
+
+	/// A synthetic pool surface for the opt-in WGC conversion/encoding tests.
+	#[cfg(all(test, feature = "capture"))]
+	pub(crate) fn upload_bgra(device: &ID3D11Device, size: Size, pixels: &[u8]) -> ID3D11Texture2D {
+		assert_eq!(pixels.len(), size.pixels() as usize * 4);
+		let texture = alloc(device, size.width, size.height, DXGI_FORMAT_B8G8R8A8_UNORM).unwrap();
+		let context = unsafe { device.GetImmediateContext() }.unwrap();
+		unsafe {
+			context.UpdateSubresource(
+				&texture,
+				0,
+				None,
+				pixels.as_ptr().cast(),
+				size.width * 4,
+				pixels.len() as u32,
+			);
+		}
+		texture
 	}
 
 	/// The Direct3D11 texture behind a Media Foundation sample, and which slice of
@@ -2601,6 +2750,94 @@ pub mod d3d11 {
 			unsafe { self.context.Unmap(self.resource, 0) };
 		}
 	}
+
+	#[cfg(all(test, feature = "capture"))]
+	mod tests {
+		use super::*;
+
+		#[test]
+		#[ignore = "requires a Windows GPU with BGRA-to-NV12 video processing"]
+		fn wgc_conversion_crops_odd_edges_and_preserves_color() {
+			let device = create_device().expect("D3D11 hardware device");
+			for size in [Size::new(641, 481), Size::new(1281, 721)] {
+				let mut pixels = Vec::with_capacity(size.pixels() as usize * 4);
+				for y in 0..size.height {
+					for x in 0..size.width {
+						// A green odd edge must be cropped, not scaled into the red picture.
+						pixels.extend_from_slice(if x + 1 == size.width || y + 1 == size.height {
+							&[0, 255, 0, 255]
+						} else {
+							&[0, 0, 255, 255]
+						});
+					}
+				}
+				let source = upload_bgra(&device, size, &pixels);
+				let output = Texture::capture(&device, &source, size).expect("BGRA to NV12");
+				let expected_size = Size::new(size.width & !1, size.height & !1);
+				let color = Color::infer(expected_size);
+				assert_eq!(Size::new(output.width, output.height), expected_size);
+				assert_eq!(output.color, Some(color));
+				assert_eq!(output.device.as_raw(), device.as_raw());
+				assert_ne!(output.texture.as_raw(), source.as_raw(), "must own the output");
+
+				// Simulate immediate reuse of a WGC pool frame after conversion.
+				pixels.fill(0);
+				unsafe {
+					device.GetImmediateContext().unwrap().UpdateSubresource(
+						&source,
+						0,
+						None,
+						pixels.as_ptr().cast(),
+						size.width * 4,
+						pixels.len() as u32,
+					);
+				}
+				drop(source);
+				assert_red(&output.download_i420().unwrap(), color);
+				// HD -> SD scaling must keep 709, not infer 601 from the new height.
+				let scaled = output.resize(320, 240).expect("NV12 GPU resize");
+				assert_eq!(scaled.color, Some(color));
+				assert_red(&scaled.download_i420().unwrap(), color);
+			}
+		}
+
+		fn assert_red(frame: &I420, color: Color) {
+			assert_eq!(frame.color(), Some(color));
+			let expected = color.coefficients().apply([255, 0, 0]);
+			for (plane, value) in [frame.y(), frame.u(), frame.v()].into_iter().zip(expected) {
+				assert!(
+					plane.iter().all(|sample| sample.abs_diff(value) <= 3),
+					"{color:?}: expected {value}"
+				);
+			}
+		}
+
+		#[test]
+		#[ignore = "Windows GPU workload; reports submission and batch completion, not capture latency"]
+		fn wgc_conversion_workload() {
+			let device = create_device().expect("D3D11 hardware device");
+			for size in [Size::new(640, 480), Size::new(1280, 720), Size::new(1920, 1080)] {
+				let pixels = [0, 0, 255, 255].repeat(size.pixels() as usize);
+				let source = upload_bgra(&device, size, &pixels);
+				Texture::capture(&device, &source, size)
+					.unwrap()
+					.download_i420()
+					.unwrap();
+				let start = std::time::Instant::now();
+				let mut output = None;
+				for _ in 0..32 {
+					output = Some(Texture::capture(&device, &source, size).unwrap());
+				}
+				let submitted = start.elapsed();
+				// Mapping the final result fences the preceding ordered GPU blits.
+				output.unwrap().download_i420().unwrap();
+				eprintln!(
+					"WGC {size}: 32 frames, submit={submitted:?}, complete_with_one_readback={:?}",
+					start.elapsed()
+				);
+			}
+		}
+	}
 }
 
 #[cfg(test)]
@@ -2620,21 +2857,54 @@ mod tests {
 
 		let size = Size::new(64, 64);
 		let rgba = vec![0u8; size.pixels() as usize * 4];
-		let converted = I420::from_rgba(&rgba, size.width * 4, size.width, size.height).expect("rgba to i420");
+		let converted = I420::from_rgba(&rgba, size.width * 4, size).expect("rgba to i420");
 		assert_eq!(
 			converted.color(),
-			Some(Color::Bt601Limited),
+			Some(Color::BT601),
 			"an RGB conversion knows the matrix it used"
 		);
 
 		// Resampling moves samples around; it does not reinterpret them.
-		let resized = converted.resize(32, 32).expect("resize");
-		assert_eq!(resized.color(), Some(Color::Bt601Limited), "resize preserves the space");
+		let resized = converted.resize(Size::new(32, 32)).expect("resize");
+		assert_eq!(resized.color(), Some(Color::BT601), "resize preserves the space");
 
 		// A passthrough leaves it open for the consumer to infer.
-		let raw = I420::new(64, 64, vec![0; I420::len(64, 64)]).expect("i420");
+		let size = Size::new(64, 64);
+		let raw = I420::new(size, vec![0; I420::len(size).unwrap()]).expect("i420");
 		assert_eq!(raw.color(), None);
-		assert_eq!(raw.with_color(Color::Bt709Full).color(), Some(Color::Bt709Full));
+		assert_eq!(
+			raw.with_color(Color::BT709.with_range(crate::color::Range::Full))
+				.color(),
+			Some(Color::BT709.with_range(crate::color::Range::Full))
+		);
+	}
+
+	/// An unlabelled 720p frame means BT.709 to every player. Scaled to 480p it
+	/// would read as BT.601, so the resize names the space it came from.
+	#[test]
+	fn resize_labels_the_space_an_unlabelled_source_implied() {
+		use super::{I420, Surface};
+		use crate::{Color, Size};
+
+		let hd = Size::new(1280, 720);
+		let sd = Size::new(640, 480);
+		let raw = Surface::I420(I420::new(hd, vec![0x80; I420::len(hd).unwrap()]).unwrap());
+		assert_eq!(raw.color(), None);
+
+		let config = crate::resize::Config::default();
+		let scaled = raw.resize(sd, &config).unwrap();
+		assert_eq!(scaled.color(), Some(Color::BT709));
+
+		// A labelled source keeps its own label, not the size guess.
+		let full = Surface::I420(
+			I420::new(hd, vec![0x80; I420::len(hd).unwrap()])
+				.unwrap()
+				.with_color(Color::BT601.with_range(crate::color::Range::Full)),
+		);
+		assert_eq!(
+			full.resize(sd, &config).unwrap().color(),
+			Some(Color::BT601.with_range(crate::color::Range::Full))
+		);
 	}
 
 	/// V4L2 hands back YUYV already in the camera's color space, so the 4:2:2 ->
@@ -2647,7 +2917,7 @@ mod tests {
 		let (width, height) = (1280, 720);
 		// YUYV packs two pixels into four bytes.
 		let yuyv = vec![0u8; width as usize * height as usize * 2];
-		let frame = super::I420::from_yuyv(&yuyv, width * 2, width, height).expect("yuyv to i420");
+		let frame = super::I420::from_yuyv(&yuyv, width * 2, Size::new(width, height)).expect("yuyv to i420");
 		assert_eq!(frame.color(), None, "a chroma resample names no color space");
 	}
 
@@ -2658,12 +2928,26 @@ mod tests {
 	fn i420_new_rejects_a_short_buffer() {
 		use super::I420;
 
-		assert!(I420::new(64, 32, vec![0; I420::len(64, 32)]).is_ok());
-		assert!(I420::new(64, 32, vec![0; I420::len(64, 32) - 1]).is_err());
-		assert!(I420::new(64, 32, Vec::new()).is_err());
+		let size = crate::Size::new(64, 32);
+		let len = I420::len(size).unwrap();
+		assert!(I420::new(size, vec![0; len]).is_ok());
+		assert!(I420::new(size, vec![0; len - 1]).is_err());
+		assert!(I420::new(size, Vec::new()).is_err());
 		// Odd and zero dimensions have no valid 4:2:0 chroma.
-		assert!(I420::new(63, 32, vec![0; I420::len(63, 32)]).is_err());
-		assert!(I420::new(0, 32, Vec::new()).is_err());
+		assert!(I420::len(crate::Size::new(63, 32)).is_err());
+		assert!(I420::new(crate::Size::new(0, 32), Vec::new()).is_err());
+	}
+
+	/// Derived byte counts must fail before allocation when the declared image is
+	/// too large for the host address space.
+	#[test]
+	fn public_pixel_boundaries_reject_overflow() {
+		use super::{I420, Surface};
+
+		let huge = crate::Size::new(u32::MAX - 1, u32::MAX - 1);
+		assert!(I420::len(huge).is_err());
+		assert!(I420::new(huge, Vec::new()).is_err());
+		assert!(Surface::rgba(&[], huge).is_err());
 	}
 
 	use super::{Frame, I420, Surface};
@@ -2680,6 +2964,77 @@ mod tests {
 		assert!(Surface::rgba(&ok, Size::new(0, 32)).is_err());
 	}
 
+	/// Consuming a CPU surface moves its allocation without dropping the size or
+	/// color. A transposed image has the same byte count, so bytes alone could not
+	/// preserve which geometry the caller declared.
+	#[test]
+	fn consuming_i420_preserves_type_metadata_and_allocation() {
+		use crate::Color;
+
+		let size = Size::new(64, 32);
+		let transposed = Size::new(32, 64);
+		assert_eq!(I420::len(size).unwrap(), I420::len(transposed).unwrap());
+
+		let pixels = I420::new(size, vec![0x80; I420::len(size).unwrap()])
+			.unwrap()
+			.with_color(Color::BT709.with_range(crate::color::Range::Full));
+		let allocation = pixels.data().as_ptr();
+		let pixels = Surface::I420(pixels).into_i420().unwrap();
+
+		assert_eq!(pixels.size(), size);
+		assert_ne!(pixels.size(), transposed);
+		assert_eq!(pixels.color(), Some(Color::BT709.with_range(crate::color::Range::Full)));
+		assert_eq!(pixels.data().as_ptr(), allocation);
+		assert_eq!(pixels.into_data().len(), I420::len(size).unwrap());
+	}
+
+	/// CPU I420 is borrowed in place, while a native allocation is downloaded
+	/// into owned pixels. Callers can delay either result without confusing the
+	/// ownership model.
+	#[test]
+	fn to_i420_distinguishes_borrowed_and_owned_pixels() {
+		use std::borrow::Cow;
+
+		let size = Size::new(64, 32);
+		let surface = Surface::I420(I420::new(size, vec![0x80; I420::len(size).unwrap()]).unwrap());
+		assert!(matches!(surface.to_i420().unwrap(), Cow::Borrowed(_)));
+	}
+
+	#[cfg(all(target_os = "linux", feature = "dmabuf"))]
+	#[test]
+	fn to_i420_owns_downloaded_native_pixels() {
+		use std::borrow::Cow;
+		use std::sync::Arc;
+
+		use super::{DmaBuf, DmaBufFrame, DmaBufPlane, DrmFormat};
+
+		struct Native(I420);
+
+		impl DmaBufFrame for Native {
+			fn export(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+				Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+			}
+
+			fn download_i420(&self) -> Result<I420, crate::Error> {
+				Ok(self.0.clone())
+			}
+		}
+
+		let size = Size::new(64, 32);
+		let pixels = I420::new(size, vec![0x80; I420::len(size).unwrap()]).unwrap();
+		let surface = Surface::DmaBuf(DmaBuf {
+			format: DrmFormat::YUV420,
+			modifier: 0,
+			width: size.width,
+			height: size.height,
+			planes: vec![DmaBufPlane::new(0, size.width)],
+			color: None,
+			inner: Arc::new(Native(pixels)),
+		});
+
+		assert!(matches!(surface.to_i420().unwrap(), Cow::Owned(_)));
+	}
+
 	/// Software decoders may align each plane beyond its visible width. Padding
 	/// must not leak into the packed fallback or shift a later row.
 	#[test]
@@ -2691,7 +3046,7 @@ mod tests {
 		let u = [21, 22, 220, 221, 23, 24, 222, 223];
 		let v = [31, 32, 230, 231, 33, 34, 232, 233];
 
-		let frame = I420::from_planes(&y, &u, &v, 7, 4, 4, 4);
+		let frame = I420::from_planes(&y, &u, &v, 7, 4, Size::new(4, 4)).unwrap();
 		assert_eq!(frame.y(), &(1..=16).collect::<Vec<_>>());
 		assert_eq!(frame.u(), &[21, 22, 23, 24]);
 		assert_eq!(frame.v(), &[31, 32, 33, 34]);
@@ -2712,7 +3067,7 @@ mod tests {
 
 		let red = |size: Size| {
 			let rgba = [255u8, 0, 0, 255].repeat(size.pixels() as usize);
-			I420::from_rgba(&rgba, size.width * 4, size.width, size.height).unwrap()
+			I420::from_rgba(&rgba, size.width * 4, size).unwrap()
 		};
 
 		// Decode with the matrix a player picks for an untagged stream of this
@@ -2737,10 +3092,10 @@ mod tests {
 		};
 
 		for (size, expected) in [
-			(Size::new(720, 480), Color::Bt601Limited),
-			(Size::new(720, 576), Color::Bt601Limited),
-			(Size::new(1280, 720), Color::Bt709Limited),
-			(Size::new(1920, 1080), Color::Bt709Limited),
+			(Size::new(720, 480), Color::BT601),
+			(Size::new(720, 576), Color::BT601),
+			(Size::new(1280, 720), Color::BT709),
+			(Size::new(1920, 1080), Color::BT709),
 		] {
 			let i420 = red(size);
 			assert_eq!(i420.color(), Some(expected), "{size} reported color");
@@ -2765,7 +3120,9 @@ mod tests {
 		let frame = Frame::new(surface, moq_net::Timestamp::from_micros(1234).unwrap());
 		assert_eq!(frame.size(), Size::new(64, 32));
 
-		let scaled = frame.resize(Size::new(32, 16)).unwrap();
+		let scaled = frame
+			.resize(Size::new(32, 16), &crate::resize::Config::default())
+			.unwrap();
 		assert_eq!(scaled.size(), Size::new(32, 16));
 		assert_eq!(scaled.timestamp, frame.timestamp);
 	}
@@ -2773,12 +3130,13 @@ mod tests {
 	/// `into_pixel_buffer` is total: a CPU frame uploads rather than failing, so a
 	/// renderer never has to write the upload itself. Software-decoded frames take
 	/// this path.
-	#[cfg(target_os = "macos")]
+	#[cfg(apple)]
 	#[test]
 	fn into_pixel_buffer_uploads_a_cpu_frame() {
 		use objc2_core_video::{CVPixelBufferGetHeight, CVPixelBufferGetWidth};
 
-		let i420 = I420::new(64, 32, vec![0x80; I420::len(64, 32)]).unwrap();
+		let size = Size::new(64, 32);
+		let i420 = I420::new(size, vec![0x80; I420::len(size).unwrap()]).unwrap();
 		let frame = Frame::new(Surface::I420(i420), moq_net::Timestamp::from_micros(0).unwrap());
 
 		let buffer = frame.surface.into_pixel_buffer().expect("upload a CPU frame");
@@ -2791,7 +3149,7 @@ mod tests {
 	fn gradient_i420(width: u32, height: u32) -> I420 {
 		let (w, h) = (width as usize, height as usize);
 		let (cw, ch) = (w / 2, h / 2);
-		let mut data = vec![0u8; I420::len(width, height)];
+		let mut data = vec![0u8; I420::len(Size::new(width, height)).unwrap()];
 		let (y, chroma) = data.split_at_mut(w * h);
 		let (u, v) = chroma.split_at_mut(cw * ch);
 		for row in 0..h {
@@ -2824,7 +3182,7 @@ mod tests {
 	#[test]
 	fn i420_resize_follows_gradients() {
 		let src = gradient_i420(320, 240);
-		let dst = src.resize(128, 96).unwrap();
+		let dst = src.resize(Size::new(128, 96)).unwrap();
 		assert_eq!((dst.width, dst.height), (128, 96));
 
 		// Reference: the same gradients sampled at the destination geometry.
@@ -2836,18 +3194,20 @@ mod tests {
 
 	/// VideoToolbox and the CPU convolution agree on a smooth NV12 gradient.
 	/// The result remains a pixel buffer, pinning the residency regression.
-	#[cfg(target_os = "macos")]
+	#[cfg(apple)]
 	#[test]
 	fn pixel_buffer_resize_matches_cpu() {
 		let src_i420 = gradient_i420(320, 240);
 		let src = Surface::PixelBuffer(nv12_surface(&src_i420));
-		let scaled = src.resize(Size::new(160, 120)).unwrap();
+		let scaled = src
+			.resize(Size::new(160, 120), &crate::resize::Config::default())
+			.unwrap();
 		let Surface::PixelBuffer(scaled) = scaled else {
 			panic!("VideoToolbox resize downloaded to the CPU");
 		};
 
 		let gpu = scaled.download_i420().unwrap();
-		let cpu = src_i420.resize(160, 120).unwrap();
+		let cpu = src_i420.resize(Size::new(160, 120)).unwrap();
 
 		assert_eq!((gpu.width, gpu.height), (160, 120));
 		assert!(mae(gpu.y(), cpu.y()) < 4, "GPU and CPU luma disagree");
@@ -2855,28 +3215,32 @@ mod tests {
 		assert!(mae(gpu.v(), cpu.v()) < 4, "GPU and CPU v disagree");
 	}
 
-	/// Explicit CPU acceleration downloads a macOS pixel buffer before scaling.
-	#[cfg(target_os = "macos")]
+	/// CPU output downloads a CoreVideo pixel buffer before scaling.
+	#[cfg(apple)]
 	#[test]
 	fn pixel_buffer_resize_can_force_the_cpu() {
 		let config = crate::resize::Config {
-			acceleration: crate::resize::Acceleration::Cpu,
+			output: crate::Output::Cpu,
 			..Default::default()
 		};
 		let source = Surface::PixelBuffer(nv12_surface(&gradient_i420(320, 240)));
-		let scaled = source.resize_with(Size::new(160, 120), &config).unwrap();
+		let scaled = source.resize(Size::new(160, 120), &config).unwrap();
 
 		assert!(matches!(scaled, Surface::I420(_)), "CPU resize stayed on the GPU");
 	}
 
 	/// The packed-pixel exit is total for a hardware surface and produces the
 	/// same image as its CPU representation, including padded CoreVideo rows.
-	#[cfg(target_os = "macos")]
+	#[cfg(apple)]
 	#[test]
 	fn pixel_buffer_converts_to_rgba() {
 		let source = gradient_i420(322, 242);
-		let expected = Surface::I420(source.clone()).into_rgba().unwrap();
-		let actual = Surface::PixelBuffer(nv12_surface(&source)).into_rgba().unwrap();
+		let expected = Surface::I420(source.clone())
+			.to_rgba(&crate::convert::Config::default())
+			.unwrap();
+		let actual = Surface::PixelBuffer(nv12_surface(&source))
+			.to_rgba(&crate::convert::Config::default())
+			.unwrap();
 
 		assert_eq!(actual.width(), 322);
 		assert_eq!(actual.height(), 242);
@@ -2884,61 +3248,8 @@ mod tests {
 		assert_eq!(actual.data(), expected.data());
 	}
 
-	/// Upload a packed I420 test picture as NV12, including CoreVideo row
-	/// padding, so the transfer test starts from the decoder's surface format.
-	#[cfg(target_os = "macos")]
-	fn nv12_surface(frame: &I420) -> super::macos::PixelBuffer {
-		use std::ptr::{self, NonNull};
-
-		use objc2_core_foundation::CFRetained;
-		use objc2_core_video::{
-			CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
-			CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
-			kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-		};
-
-		let mut raw: *mut CVPixelBuffer = ptr::null_mut();
-		let status = unsafe {
-			CVPixelBufferCreate(
-				None,
-				frame.width as usize,
-				frame.height as usize,
-				kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-				None,
-				NonNull::new(&mut raw).expect("stack pointer is non-null"),
-			)
-		};
-		assert_eq!(status, 0, "CVPixelBufferCreate failed");
-		let buffer = unsafe { CFRetained::from_raw(NonNull::new(raw).expect("CoreVideo returned a buffer")) };
-
-		let flags = CVPixelBufferLockFlags(0);
-		assert_eq!(unsafe { CVPixelBufferLockBaseAddress(&buffer, flags) }, 0);
-		let width = frame.width as usize;
-		let height = frame.height as usize;
-		let y_base = CVPixelBufferGetBaseAddressOfPlane(&buffer, 0) as *mut u8;
-		let y_stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer, 0);
-		for row in 0..height {
-			unsafe {
-				ptr::copy_nonoverlapping(frame.y()[row * width..].as_ptr(), y_base.add(row * y_stride), width);
-			}
-		}
-
-		let (chroma_width, chroma_height) = (width / 2, height / 2);
-		let uv_base = CVPixelBufferGetBaseAddressOfPlane(&buffer, 1) as *mut u8;
-		let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer, 1);
-		for row in 0..chroma_height {
-			let output = unsafe { uv_base.add(row * uv_stride) };
-			for col in 0..chroma_width {
-				unsafe {
-					*output.add(col * 2) = frame.u()[row * chroma_width + col];
-					*output.add(col * 2 + 1) = frame.v()[row * chroma_width + col];
-				}
-			}
-		}
-		unsafe { CVPixelBufferUnlockBaseAddress(&buffer, flags) };
-
-		super::macos::PixelBuffer::new(buffer, frame.width, frame.height)
-	}
+	#[cfg(apple)]
+	use super::apple::nv12_surface;
 
 	/// A Direct3D11 texture stays on the GPU by default.
 	#[cfg(target_os = "windows")]
@@ -2958,7 +3269,9 @@ mod tests {
 			return;
 		}
 
-		let scaled = Surface::Texture(texture).resize(crate::Size::new(160, 120)).unwrap();
+		let scaled = Surface::Texture(texture)
+			.resize(crate::Size::new(160, 120), &crate::resize::Config::default())
+			.unwrap();
 		assert!(
 			matches!(scaled, Surface::Texture(_)),
 			"Direct3D11 resize downloaded to the CPU"
@@ -2980,11 +3293,11 @@ mod tests {
 		};
 
 		let config = crate::resize::Config {
-			acceleration: crate::resize::Acceleration::Cpu,
+			output: crate::Output::Cpu,
 			..Default::default()
 		};
 		let scaled = Surface::Texture(texture)
-			.resize_with(crate::Size::new(160, 120), &config)
+			.resize(crate::Size::new(160, 120), &config)
 			.unwrap();
 		assert!(matches!(scaled, Surface::I420(_)), "Direct3D11 resize ignored CPU mode");
 	}
@@ -3011,7 +3324,7 @@ mod tests {
 		}
 
 		let gpu = texture.resize(160, 120).unwrap().download_i420().unwrap();
-		let cpu = source.resize(160, 120).unwrap();
+		let cpu = source.resize(crate::Size::new(160, 120)).unwrap();
 
 		assert_eq!((gpu.width, gpu.height), (160, 120));
 		assert!(mae(gpu.y(), cpu.y()) < 4, "GPU and CPU luma disagree");
@@ -3060,13 +3373,55 @@ mod tests {
 		// SAFETY: the frame's buffer is exactly host.len() bytes.
 		unsafe { result::memcpy_htod_sync(frame.device_ptr(), &host) }.unwrap();
 
-		let scaled = frame.resize(160, 120).unwrap();
+		let scaled = frame.resize(Size::new(160, 120)).unwrap();
 		let gpu = scaled.download_i420().unwrap();
-		let cpu = src_i420.resize(160, 120).unwrap();
+		let cpu = src_i420.resize(crate::Size::new(160, 120)).unwrap();
 
 		assert_eq!((gpu.width, gpu.height), (160, 120));
 		assert!(mae(gpu.y(), cpu.y()) < 4, "GPU and CPU luma disagree");
 		assert!(mae(gpu.u(), cpu.u()) < 4, "GPU and CPU u disagree");
 		assert!(mae(gpu.v(), cpu.v()) < 4, "GPU and CPU v disagree");
+	}
+}
+
+#[cfg(all(test, target_os = "linux", feature = "dmabuf"))]
+mod external_dmabuf_tests {
+	use super::*;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	#[test]
+	fn external_buffer_retains_lease_and_refuses_cpu_download() {
+		struct Guard(Arc<AtomicUsize>);
+		impl Drop for Guard {
+			fn drop(&mut self) {
+				self.0.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+		let released = Arc::new(AtomicUsize::new(0));
+		let layout = DmaBufLayout::new(
+			DrmFormat::NV12,
+			Size::new(4, 2),
+			vec![DmaBufPlane::new(0, 4), DmaBufPlane::new(8, 4)],
+		);
+		let buffer = DmaBuf::new(
+			std::fs::File::open("/dev/zero").unwrap().into(),
+			layout,
+			Guard(released.clone()),
+		)
+		.unwrap();
+		assert!(Surface::DmaBuf(buffer.clone()).to_i420().is_err());
+		let export = buffer.export().unwrap();
+		drop(buffer);
+		assert_eq!(released.load(Ordering::SeqCst), 0);
+		drop(export);
+		assert_eq!(released.load(Ordering::SeqCst), 1);
+	}
+
+	#[test]
+	fn external_buffer_refuses_empty_or_zero_stride_planes() {
+		for planes in [vec![], vec![DmaBufPlane::new(0, 0)]] {
+			let layout = DmaBufLayout::new(DrmFormat::NV12, Size::new(4, 2), planes);
+			assert!(DmaBuf::new(std::fs::File::open("/dev/zero").unwrap().into(), layout, ()).is_err());
+		}
 	}
 }

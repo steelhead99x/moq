@@ -1,6 +1,9 @@
 import { Decoder as Flate } from "@moq/flate";
 
+import { isDeflate } from "../compression.ts";
 import { merge } from "../diff.ts";
+import { MissingSnapshot } from "../error.ts";
+import { parse } from "../parse.ts";
 import type { Config } from "./encoder.ts";
 
 /**
@@ -25,9 +28,9 @@ export class Decoder<T> {
 	// The reconstructed value, `undefined` until the first snapshot.
 	#current?: unknown;
 
-	constructor(config: Config<T> = {}) {
+	constructor(config: Pick<Config<T>, "schema" | "compression"> = {}) {
 		this.#schema = config.schema;
-		this.#decompress = config.compression ?? false;
+		this.#decompress = isDeflate(config.compression);
 	}
 
 	/**
@@ -48,7 +51,7 @@ export class Decoder<T> {
 	 * Throws when no snapshot has been applied yet, since a patch has nothing to apply to.
 	 */
 	delta(payload: Uint8Array): void {
-		if (this.#current === undefined) throw new Error("delta before snapshot");
+		if (this.#current === undefined) throw new MissingSnapshot();
 		this.#current = merge(this.#current, this.#parse(payload));
 	}
 
@@ -76,7 +79,6 @@ export class Decoder<T> {
 
 	// Decompress a frame against the group's window when compressing, then parse it as JSON.
 	#parse(payload: Uint8Array): unknown {
-		const plain = this.#flate ? this.#flate.frame(payload) : payload;
-		return JSON.parse(new TextDecoder().decode(plain));
+		return parse(this.#flate ? this.#flate.frame(payload) : payload);
 	}
 }

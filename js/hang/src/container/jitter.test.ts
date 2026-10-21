@@ -1,0 +1,116 @@
+import { describe, expect, it } from "bun:test";
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { Milli } from "@moq/clock";
+import { Jitter } from "./jitter";
+
+// The conformance corpus beside doc/concept/audio-jitter.md, read directly so this is graded
+// against the document rather than against another implementation.
+const CORPUS = join(dirname(fileURLToPath(import.meta.url)), "../../../../doc/concept/audio-jitter");
+
+interface Case {
+	name: string;
+	frame: number;
+	advertised?: number;
+	delay?: number;
+	arrival: number[];
+	media: number[];
+	target: [number, number][];
+}
+
+const cases: Case[] = readdirSync(CORPUS)
+	.filter((file) => file.endsWith(".json"))
+	.map((file) => JSON.parse(readFileSync(join(CORPUS, file), "utf8")));
+
+// The composition the document specifies on top of the measured term. `@moq/watch` owns it in
+// production (`audio/latency.ts`); it is repeated here so the whole target series is checked.
+function target(jitter: Jitter, c: Case): number {
+	if (c.delay !== undefined) return c.delay;
+	return Math.max(jitter.measured, c.advertised ?? 0) + c.frame;
+}
+
+describe("audio jitter conformance", () => {
+	it("reads the whole corpus", () => {
+		expect(cases.map((c) => c.name).sort()).toEqual([
+			"advertised",
+			"backlog",
+			"buildup",
+			"fixed",
+			"flush",
+			"idle",
+			"paced",
+			"reorder",
+			"spike",
+			"tunein",
+		]);
+	});
+
+	for (const c of cases) {
+		it(c.name, () => {
+			const jitter = new Jitter();
+			const expected = new Map(c.target);
+			let current: number | undefined;
+			for (let i = 0; i < c.arrival.length; i++) {
+				jitter.observe(c.arrival[i] as Milli, c.media[i] as Milli);
+				const value = target(jitter, c);
+				const listed = expected.get(i);
+				if (listed !== undefined) {
+					expect(value).toBeCloseTo(listed, 6);
+				} else if (current !== undefined) {
+					// Unlisted frames hold the previous target.
+					expect(value).toBeCloseTo(current, 6);
+				}
+				current = value;
+			}
+		});
+	}
+});
+
+describe("Jitter", () => {
+	it("starts at the prior's 95th percentile", () => {
+		expect(new Jitter().measured).toBe(100 as Milli);
+	});
+
+	it("is not moved by a stale frame ahead of the live edge", () => {
+		// The #3517 regression: one frame from a stale group, then the live edge 14.5s of media later,
+		// then evenly paced audio with no real jitter. The jump must not read as a delay or a frame.
+		const jitter = new Jitter();
+		jitter.observe(0 as Milli, 0 as Milli);
+		for (let i = 0; i < 500; i++) {
+			jitter.observe((10 + i * 20) as Milli, (14_500 + i * 20) as Milli);
+		}
+		expect(jitter.measured).toBe(20 as Milli);
+	});
+
+	it("does not follow the absolute delay", () => {
+		// Only the spread of arrivals matters, not how far away the sender is.
+		const near = new Jitter();
+		const far = new Jitter();
+		for (let i = 0; i < 500; i++) {
+			near.observe((10 + i * 20) as Milli, (i * 20) as Milli);
+			far.observe((2000 + i * 20) as Milli, (i * 20) as Milli);
+		}
+		expect(far.measured).toBe(near.measured);
+	});
+
+	it("forks what it learned, but measures the replacement's arrivals against their own", () => {
+		// A path where every tenth frame lands 300ms late.
+		const warm = new Jitter();
+		for (let i = 0; i < 500; i++) {
+			warm.observe((i * 20 + (i % 10 === 0 ? 300 : 0)) as Milli, (i * 20) as Milli);
+		}
+		const learned = warm.measured;
+		expect(learned).toBeGreaterThan(100 as Milli);
+
+		const fork = warm.fork();
+		expect(fork.measured).toBe(learned);
+
+		// The replacement opens with a backlog: older media arriving at once, long after the warm
+		// track's frames. Measured against the warm track's arrivals it would read as seconds late.
+		for (let i = 0; i < 100; i++)
+			fork.observe((20_000 + Math.floor(i / 50) * 1000) as Milli, (8000 + i * 20) as Milli);
+		expect(fork.measured).toBeLessThanOrEqual(learned);
+		expect(warm.measured).toBe(learned);
+	});
+});

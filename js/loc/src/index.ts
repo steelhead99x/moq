@@ -5,6 +5,7 @@
  * @module
  */
 
+import type { Micro } from "@moq/clock";
 import * as Moq from "@moq/net";
 import { Time } from "@moq/net";
 
@@ -13,7 +14,7 @@ export interface Frame {
 	/** The codec bitstream payload, with the LOC property block stripped. */
 	payload: Uint8Array;
 	/** Presentation timestamp in microseconds. */
-	timestamp: Time.Micro;
+	timestamp: Micro;
 	/** True if this frame can be decoded without any preceding frames. */
 	keyframe: boolean;
 }
@@ -38,8 +39,22 @@ const DEFAULT_TIMESCALE = 1_000_000;
  * timescale property are interpreted as microseconds.
  */
 export class Format {
-	/** Decode one moq-net frame into its LOC frames. Throws on malformed input. */
+	/** The kind of content carried by the track. */
+	readonly kind: "audio" | "video" | "data";
+
+	/** Configure endpoint metadata for audio or video; opaque data is the default. */
+	constructor(kind: "audio" | "video" | "data" = "data") {
+		this.kind = kind;
+	}
+
+	/** Return the video-frame or audio-source endpoint for an empty codec payload. */
+	end(frame: Frame): Micro | undefined {
+		return this.kind !== "data" && frame.payload.byteLength === 0 ? frame.timestamp : undefined;
+	}
+
+	/** Decode one moq-net frame into its LOC frames. On a data track an object with no bytes is the discontinuity marker, so it decodes to no frame. Throws on malformed input. */
 	decode(frame: Uint8Array): Frame[] {
+		if (this.kind === "data" && frame.byteLength === 0) return [];
 		const [propsLen, afterLen] = Moq.Varint.decode(frame);
 		if (afterLen.byteLength < propsLen) {
 			throw new Error("loc: properties_length exceeds frame size");
@@ -60,17 +75,18 @@ export class Format {
 			prevType = abs;
 			cursor = afterDelta;
 
-			if (abs % 2 === 0) {
-				const [value, afterValue] = Moq.Varint.decode(cursor);
-				cursor = afterValue;
-				if (abs === PROP_TIMESTAMP || abs === PROP_TIMESTAMP_DRAFT03) {
-					timestamp = value;
-				} else if (abs === PROP_TIMESCALE) {
-					if (value === 0) {
-						throw new Error("loc: timescale property must be non-zero");
-					}
-					timescale = value;
+			if (abs === PROP_TIMESTAMP || abs === PROP_TIMESTAMP_DRAFT03) {
+				[timestamp, cursor] = Moq.Varint.decode(cursor);
+			} else if (abs === PROP_TIMESCALE) {
+				let value: number;
+				[value, cursor] = Moq.Varint.decode(cursor);
+				if (value === 0) {
+					throw new Error("loc: timescale property must be non-zero");
 				}
+				timescale = value;
+			} else if (abs % 2 === 0) {
+				// An unknown varint property may use all 62 bits, which a number can't hold; skip it.
+				cursor = Moq.Varint.decodeBigInt(cursor)[1];
 			} else {
 				const [len, afterLenInner] = Moq.Varint.decode(cursor);
 				if (afterLenInner.byteLength < len) {
@@ -85,7 +101,7 @@ export class Format {
 		}
 
 		const activeTimescale = timescale ?? DEFAULT_TIMESCALE;
-		const micros = Math.round((timestamp * DEFAULT_TIMESCALE) / activeTimescale) as Time.Micro;
+		const micros = Math.round((timestamp * DEFAULT_TIMESCALE) / activeTimescale) as Micro;
 
 		return [{ payload, timestamp: micros, keyframe: false }];
 	}
@@ -104,20 +120,37 @@ export interface Source {
  *
  * Each call to {@link encode} produces one moq-net frame containing a
  * property block with the 0x10 timestamp (in microseconds) and the codec
- * bitstream payload.
+ * bitstream payload. A keyframe starts a group. The group it closes, and the
+ * group still open at {@link close}, ends with an empty frame at the exclusive
+ * end of the last sample: the same duration marker `moq-mux` writes.
+ * Use it for video only: a data reader would see the marker as an empty object.
  */
 export class Producer {
 	#track: Moq.Track.Producer;
 	#group?: Moq.Group.Producer;
+	// Last timestamp in the open group. The next keyframe is this group's end unless it lands earlier.
+	#previous?: Micro;
+	// Furthest timestamp in the open group. The tail marker estimates from this, not decode order.
+	#end?: Micro;
+	// Gap between the last two increasing timestamps. Kept across groups so a clean close can bound the tail.
+	#interval?: Micro;
+	// A frame's timestamp preceded the one before it. That group's presentation end does not bound its tail.
+	#reordered = false;
 
 	constructor(track: Moq.Track.Producer) {
 		this.#track = track;
 	}
 
-	/** Encode one frame and write it to the track. Keyframes start a new group. */
-	encode(data: Uint8Array | Source, timestamp: Time.Micro, keyframe: boolean) {
+	/**
+	 * Encode one frame and write it to the track.
+	 * A keyframe ends the open group with a duration marker, then starts the next.
+	 */
+	encode(data: Uint8Array | Source, timestamp: Micro, keyframe: boolean) {
 		if (keyframe) {
-			this.#group?.close();
+			// A keyframe before the previous frame overlaps that frame, so it is not the group's end.
+			const overlaps = this.#previous !== undefined && timestamp < this.#previous;
+			this.#closeGroup(overlaps ? undefined : timestamp);
+			if (overlaps) this.#interval = undefined;
 			this.#group = this.#track.appendGroup();
 		} else if (!this.#group) {
 			throw new Error("must start with a keyframe");
@@ -127,9 +160,16 @@ export class Producer {
 			payload: this.#encode(data, timestamp),
 			timestamp: Time.Timestamp.fromMicros(timestamp),
 		});
+
+		this.#reordered ||= this.#previous !== undefined && timestamp < this.#previous;
+		if (this.#previous !== undefined && timestamp > this.#previous) {
+			this.#interval = (timestamp - this.#previous) as Micro;
+		}
+		this.#previous = timestamp;
+		if (this.#end === undefined || timestamp > this.#end) this.#end = timestamp;
 	}
 
-	#encode(source: Uint8Array | Source, timestamp: Time.Micro): Uint8Array {
+	#encode(source: Uint8Array | Source, timestamp: Micro): Uint8Array {
 		const propTypeBytes = Moq.Varint.encode(PROP_TIMESTAMP);
 		const propValueBytes = Moq.Varint.encode(timestamp);
 		const propsLen = propTypeBytes.byteLength + propValueBytes.byteLength;
@@ -158,8 +198,36 @@ export class Producer {
 		return out;
 	}
 
-	/** Close the current group and the underlying track, optionally with an error. */
+	// End the open group. `end` is the next keyframe when one is already in hand; otherwise the
+	// last gap estimates where the tail stops. A reordered group omits the marker: its presentation
+	// end does not bound the last frame in decode order.
+	#closeGroup(end?: Micro) {
+		const group = this.#group;
+		if (!group) return;
+
+		let marker = this.#reordered ? undefined : end;
+		if (marker === undefined && !this.#reordered && this.#end !== undefined && this.#interval !== undefined) {
+			marker = (this.#end + this.#interval) as Micro;
+		}
+		if (marker !== undefined) {
+			group.writeFrame({
+				payload: this.#encode(new Uint8Array(), marker),
+				timestamp: Time.Timestamp.fromMicros(marker),
+			});
+		}
+		group.close();
+		this.#group = undefined;
+		this.#previous = undefined;
+		this.#end = undefined;
+		this.#reordered = false;
+	}
+
+	/**
+	 * Close the current group and the underlying track.
+	 * A clean close writes the duration marker; an error does not.
+	 */
 	close(err?: Error) {
+		if (!err) this.#closeGroup();
 		this.#group?.close();
 		this.#track.close(err);
 	}

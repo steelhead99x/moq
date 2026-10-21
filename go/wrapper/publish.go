@@ -1,0 +1,395 @@
+package moq
+
+import (
+	"context"
+	"iter"
+
+	ffi "moq.dev/moq-ffi/moq"
+	"moq.dev/moq/internal/bridge"
+)
+
+// BroadcastProducer publishes a collection of tracks. Create one at a path with
+// [OriginProducer.CreateBroadcast] (or [Client.CreateBroadcast]), then publish
+// tracks onto it.
+type BroadcastProducer struct {
+	inner *ffi.MoqBroadcastProducer
+}
+
+// NewBroadcastProducer creates a standalone broadcast, not attached to any
+// origin: use it to serve a dynamic request ([BroadcastRequest.Accept]) or for
+// local pub/sub. To publish at a path, use [OriginProducer.CreateBroadcast].
+func NewBroadcastProducer() (*BroadcastProducer, error) {
+	inner, err := ffi.NewMoqBroadcastProducer()
+	if err != nil {
+		return nil, err
+	}
+	return &BroadcastProducer{inner: inner}, nil
+}
+
+// Dynamic accepts requests for tracks that are not published yet.
+func (b *BroadcastProducer) Dynamic() (*BroadcastDynamic, error) {
+	inner, err := b.inner.Dynamic()
+	if err != nil {
+		return nil, err
+	}
+	return &BroadcastDynamic{inner: inner}, nil
+}
+
+// Announce advertises this broadcast's exact path as a route.
+//
+// Announcing again re-prices the route in place. Until announced, the
+// broadcast is invisible and unroutable for local consumers and peers alike.
+func (b *BroadcastProducer) Announce(route Route) error {
+	return b.inner.Announce(route)
+}
+
+// Unannounce retracts this broadcast's exact-path advertisement, if any, from
+// local consumers and peers alike. Tracks already in flight carry on.
+func (b *BroadcastProducer) Unannounce() error {
+	return b.inner.Unannounce()
+}
+
+// PublishTrack creates a track that carries arbitrary byte payloads with no
+// codec validation. info sets track properties (priority, cache, timescale);
+// pass nil for defaults.
+func (b *BroadcastProducer) PublishTrack(name string, info *TrackInfo) (*TrackProducer, error) {
+	ffiInfo, err := trackInfoFFI(info)
+	if err != nil {
+		return nil, err
+	}
+	inner, err := b.inner.PublishTrack(name, ffiInfo)
+	if err != nil {
+		return nil, err
+	}
+	return &TrackProducer{inner: inner}, nil
+}
+
+// Consume returns a consumer that reads from this broadcast's tracks.
+func (b *BroadcastProducer) Consume() (*BroadcastConsumer, error) {
+	inner, err := b.inner.Consume()
+	if err != nil {
+		return nil, err
+	}
+	return &BroadcastConsumer{inner: inner}, nil
+}
+
+// Close ends the broadcast for good: it retracts and serves no new tracks.
+// Tracks already subscribed carry on to their own end. Closing again is a no-op.
+func (b *BroadcastProducer) Close() error {
+	return b.inner.Close()
+}
+
+// BroadcastDynamic is a stream of subscriber-requested tracks.
+type BroadcastDynamic struct {
+	inner *ffi.MoqBroadcastDynamic
+}
+
+// RequestedTrack waits for the next subscriber-requested track.
+func (d *BroadcastDynamic) RequestedTrack(ctx context.Context) (*TrackRequest, error) {
+	inner, err := bridge.CallHandle(ctx, d.inner.Cancel, d.inner.RequestedTrack)
+	if err != nil {
+		return nil, err
+	}
+	return &TrackRequest{inner: inner}, nil
+}
+
+// All ranges over subscriber-requested tracks until the dynamic source ends.
+func (d *BroadcastDynamic) All(ctx context.Context) iter.Seq2[*TrackRequest, error] {
+	return bridge.Seq(ctx, d.RequestedTrack)
+}
+
+// Cancel stops the dynamic request stream.
+func (d *BroadcastDynamic) Cancel() {
+	d.inner.Cancel()
+}
+
+// TrackRequest is a subscriber-requested track that has not been accepted yet.
+type TrackRequest struct {
+	inner *ffi.MoqTrackRequest
+}
+
+// Name is the requested track name.
+func (r *TrackRequest) Name() (string, error) {
+	return r.inner.Name()
+}
+
+// Demand watches this track's subscribers, including after accepting it.
+func (r *TrackRequest) Demand() (*TrackDemand, error) {
+	inner, err := r.inner.Demand()
+	if err != nil {
+		return nil, err
+	}
+	return &TrackDemand{inner: inner}, nil
+}
+
+// Dynamic creates a fetch handler before accepting this requested track.
+func (r *TrackRequest) Dynamic() (*TrackDynamic, error) {
+	inner, err := r.inner.Dynamic()
+	if err != nil {
+		return nil, err
+	}
+	return &TrackDynamic{inner: inner}, nil
+}
+
+// Accept accepts the request as a raw track. For media, pass the request as media.Requested to an importer constructor.
+func (r *TrackRequest) Accept(info *TrackInfo) (*TrackProducer, error) {
+	ffiInfo, err := trackInfoFFI(info)
+	if err != nil {
+		return nil, err
+	}
+	inner, err := r.inner.Accept(ffiInfo)
+	if err != nil {
+		return nil, err
+	}
+	return &TrackProducer{inner: inner}, nil
+}
+
+// Abort rejects the request with an application error code.
+func (r *TrackRequest) Abort(errorCode uint16) error {
+	return r.inner.Abort(errorCode)
+}
+
+// TrackDemand watches the group a published track's subscribers want next.
+//
+// It is weak: holding it neither keeps the track open nor locks the producer, so
+// a wait can park here while the producer keeps publishing. Waits return
+// ErrClosed once the track is released.
+type TrackDemand struct {
+	inner *ffi.MoqTrackDemand
+}
+
+// Name is the name of the track this watches.
+func (d *TrackDemand) Name() string {
+	return d.inner.Name()
+}
+
+// Wanted is the group subscribers want next, or nil while nobody subscribes. A
+// value past the newest group asks for a new group now, typically a keyframe.
+func (d *TrackDemand) Wanted() *uint64 {
+	return d.inner.Wanted()
+}
+
+// WantedChanged blocks until Wanted changes and returns it. The first call returns at once.
+func (d *TrackDemand) WantedChanged(ctx context.Context) (*uint64, error) {
+	return d.inner.WantedChanged(ctx)
+}
+
+// TrackProducer writes arbitrary byte payloads with no codec required.
+type TrackProducer struct {
+	inner *ffi.MoqTrackProducer
+}
+
+// Demand returns a watch-only handle to the track's name and the group its subscribers want.
+func (t *TrackProducer) Demand() (*TrackDemand, error) {
+	inner, err := t.inner.Demand()
+	if err != nil {
+		return nil, err
+	}
+	return &TrackDemand{inner: inner}, nil
+}
+
+// Dynamic serves fetches for groups that are not currently cached.
+func (t *TrackProducer) Dynamic() (*TrackDynamic, error) {
+	inner, err := t.inner.Dynamic()
+	if err != nil {
+		return nil, err
+	}
+	return &TrackDynamic{inner: inner}, nil
+}
+
+// AppendGroup starts a new group; write frames into it, then Finish.
+func (t *TrackProducer) AppendGroup() (*GroupProducer, error) {
+	inner, err := t.inner.AppendGroup()
+	if err != nil {
+		return nil, err
+	}
+	return &GroupProducer{inner: inner}, nil
+}
+
+// CreateGroup creates a group with an explicit sequence number.
+func (t *TrackProducer) CreateGroup(sequence uint64) (*GroupProducer, error) {
+	inner, err := t.inner.CreateGroup(sequence)
+	if err != nil {
+		return nil, err
+	}
+	return &GroupProducer{inner: inner}, nil
+}
+
+// WriteFrame writes frame as a single-frame group.
+func (t *TrackProducer) WriteFrame(frame Frame) error {
+	f, err := frame.ffi()
+	if err != nil {
+		return err
+	}
+	return t.inner.WriteFrame(f)
+}
+
+// AppendDatagram sends frame as a best-effort datagram and returns the sequence number
+// assigned to it. Payloads are capped at 1200 bytes. There is no stream fallback.
+func (t *TrackProducer) AppendDatagram(frame Frame) (uint64, error) {
+	f, err := frame.ffi()
+	if err != nil {
+		return 0, err
+	}
+	return t.inner.AppendDatagram(f)
+}
+
+// Abort closes the track with an application error code.
+func (t *TrackProducer) Abort(errorCode uint16) error {
+	return t.inner.Abort(errorCode)
+}
+
+// Consume reads directly from this producer's track. subscription tunes delivery
+// (delivery priority, group range); pass nil for defaults.
+func (t *TrackProducer) Consume(subscription *Subscription) (*TrackConsumer, error) {
+	sub, err := subscriptionFFI(subscription)
+	if err != nil {
+		return nil, err
+	}
+	inner, err := t.inner.Consume(sub)
+	if err != nil {
+		return nil, err
+	}
+	return &TrackConsumer{inner: inner}, nil
+}
+
+// Finish ends the track at the live edge. The handle remains so Abort can still run.
+func (t *TrackProducer) Finish() error {
+	return t.inner.Finish()
+}
+
+// FinishAt declares the exclusive final group sequence ahead of the live edge.
+// The producer remains open for groups below the boundary.
+func (t *TrackProducer) FinishAt(finalSequence uint64) error {
+	return t.inner.FinishAt(finalSequence)
+}
+
+// GroupProducer writes frames into a single group on a track.
+type GroupProducer struct {
+	inner *ffi.MoqGroupProducer
+}
+
+// Sequence is this group's sequence number within the track.
+func (g *GroupProducer) Sequence() uint64 {
+	return g.inner.Sequence()
+}
+
+// Consume reads frames from this group.
+func (g *GroupProducer) Consume() (*GroupConsumer, error) {
+	inner, err := g.inner.Consume()
+	if err != nil {
+		return nil, err
+	}
+	return &GroupConsumer{inner: inner}, nil
+}
+
+// WriteFrame appends frame to the group.
+func (g *GroupProducer) WriteFrame(frame Frame) error {
+	f, err := frame.ffi()
+	if err != nil {
+		return err
+	}
+	return g.inner.WriteFrame(f)
+}
+
+// Finish marks the group complete. The handle remains so Abort can still run.
+func (g *GroupProducer) Finish() error {
+	return g.inner.Finish()
+}
+
+// Abort terminates the group with an application error code.
+func (g *GroupProducer) Abort(errorCode uint16) error {
+	return g.inner.Abort(errorCode)
+}
+
+// TrackDynamic yields uncached groups requested by fetch consumers.
+type TrackDynamic struct {
+	inner *ffi.MoqTrackDynamic
+}
+
+// RequestedGroup waits for the next uncached group request.
+func (d *TrackDynamic) RequestedGroup(ctx context.Context) (*GroupRequest, error) {
+	inner, err := bridge.CallHandle(ctx, d.inner.Cancel, d.inner.RequestedGroup)
+	if err != nil {
+		return nil, err
+	}
+	return &GroupRequest{inner: inner}, nil
+}
+
+// All ranges over uncached group requests until the dynamic source ends.
+func (d *TrackDynamic) All(ctx context.Context) iter.Seq2[*GroupRequest, error] {
+	return bridge.Seq(ctx, d.RequestedGroup)
+}
+
+// Cancel stops current and future requested-group waits.
+func (d *TrackDynamic) Cancel() {
+	d.inner.Cancel()
+}
+
+// GroupRequest requests one uncached group from a track producer.
+type GroupRequest struct {
+	inner *ffi.MoqGroupRequest
+}
+
+// Sequence is the requested group sequence within the track.
+func (r *GroupRequest) Sequence() uint64 {
+	return r.inner.Sequence()
+}
+
+// Priority is the consumer's delivery priority for this fetch.
+func (r *GroupRequest) Priority() uint8 {
+	return r.inner.Priority()
+}
+
+// Demand returns a watch-only handle to whether any caller still wants the group.
+func (r *GroupRequest) Demand() (*GroupDemand, error) {
+	inner, err := r.inner.Demand()
+	if err != nil {
+		return nil, err
+	}
+	return &GroupDemand{inner: inner}, nil
+}
+
+// Accept accepts the request and returns a producer for the group.
+func (r *GroupRequest) Accept() (*GroupProducer, error) {
+	inner, err := r.inner.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &GroupProducer{inner: inner}, nil
+}
+
+// Abort rejects the fetch with an application error code.
+func (r *GroupRequest) Abort(errorCode uint16) error {
+	return r.inner.Abort(errorCode)
+}
+
+// GroupDemand watches the callers waiting on a requested group.
+//
+// It is weak: holding it does not keep the request alive. The last caller to
+// leave withdraws the request, so once unused, demand never returns: drop the
+// request. Waits fail with ErrClosed after the request is accepted or dropped,
+// and keep the rejection reason after it is rejected.
+type GroupDemand struct {
+	inner *ffi.MoqGroupDemand
+}
+
+// Sequence is the sequence of the group this watches.
+func (d *GroupDemand) Sequence() uint64 {
+	return d.inner.Sequence()
+}
+
+// IsUsed reports whether the group has at least one waiting caller right now.
+func (d *GroupDemand) IsUsed() bool {
+	return d.inner.IsUsed()
+}
+
+// Used blocks until the group has at least one waiting caller.
+func (d *GroupDemand) Used(ctx context.Context) error {
+	return d.inner.Used(ctx)
+}
+
+// Unused blocks until the group has no waiting callers.
+func (d *GroupDemand) Unused(ctx context.Context) error {
+	return d.inner.Unused(ctx)
+}

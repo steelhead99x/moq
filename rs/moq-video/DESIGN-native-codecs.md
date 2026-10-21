@@ -3,9 +3,9 @@
 Status: **phases 2-6 implemented** (openh264, VideoToolbox, NVENC, VAAPI, capture
 swap + ffmpeg removal). Capture is now native on all three platforms (AVFoundation
 / ScreenCaptureKit on macOS, V4L2 on Linux, Media Foundation on Windows), so
-**nokhwa is fully removed**. VAAPI is back via discord/cros-codecs with an NV12
-surface-upload input path; the zero-copy dmabuf capture is a follow-up. See "As
-built" at the bottom for where the implementation diverged from this plan.
+**nokhwa is fully removed**. VAAPI is back via moq-vaapi, which encodes DMA-BUFs
+on the GPU and uploads CPU frames as NV12. See "As built" at the bottom for where
+the implementation diverged from this plan.
 
 ## Goal
 
@@ -34,14 +34,14 @@ capture still pulls in `libav*`. This proposal replaces encode **and** capture.
 
 ### Scope (agreed)
 
-- Platforms: macOS (VideoToolbox), Linux NVIDIA (NVENC), Linux Intel/AMD (VAAPI).
+- Platforms: macOS and iOS (VideoToolbox), Linux NVIDIA (NVENC), Linux Intel/AMD (VAAPI).
 - Out of scope: Windows (AMF/QSV), iOS, HEVC/AV1. H.264 only.
 
 ## Crate selection
 
 | Backend | Crate | Role | Linking model |
 |---|---|---|---|
-| VideoToolbox (macOS) | [`objc2-video-toolbox`](https://docs.rs/objc2-video-toolbox/) + `objc2-core-media` / `objc2-core-video` | Raw FFI. We hand-write the `VTCompressionSession` glue. | System frameworks, always present. Zero external runtime deps. |
+| VideoToolbox (macOS, iOS) | [`objc2-video-toolbox`](https://docs.rs/objc2-video-toolbox/) + `objc2-core-media` / `objc2-core-video` | Raw FFI. We hand-write the `VTCompressionSession` glue. | System frameworks, always present. Zero external runtime deps. |
 | NVENC (NVIDIA) | `moq-nvenc` (in-tree `rs/moq-nvenc`; fork of [`nvidia-video-codec-sdk`](https://crates.io/crates/nvidia-video-codec-sdk) 0.4 trimmed to dlopen-only) | Safe `Encoder` wrapper. | NVENC API lives in the driver (`libnvidia-encode.so`), `dlopen`'d at runtime. No build-time SDK linking. |
 | VAAPI (Intel/AMD) | [`moq-vaapi`](https://crates.io/crates/moq-vaapi) `0.0.2` (published; vendored+trimmed from cros-libva + discord/cros-codecs) | VAAPI H.264 encoder (Google/ChromeOS, ships in crosvm). | As of 0.0.2 *links* `libva` (`NEEDED libva.so.2`), build needs libva-dev; `dlopen` (no NEEDED, no build dep) is intended but not yet realized, see #1837. |
 | Software fallback | [`openh264`](https://crates.io/crates/openh264) | Pure fallback when no GPU. | Vendored build -> static, zero runtime deps. |
@@ -103,7 +103,7 @@ encode/
                     # converter, exposes the unchanged encode_rgba / encode API
   backend/
     mod.rs          # Backend trait + open_backend(kind, config) fallback chain
-    videotoolbox.rs # cfg(target_os = "macos")
+    videotoolbox.rs # cfg(apple): macOS and iOS
     nvenc.rs        # cfg(target_os = "linux")
     vaapi.rs        # cfg(target_os = "linux")
     openh264.rs     # software fallback, all platforms
@@ -224,21 +224,22 @@ objc2-core-media = "..."
 objc2-core-video = "..."
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Hardware encoders are always-on for Linux (cfg-gated, no feature). Both
-# dlopen their drivers at runtime, so they link on a GPU-less builder.
-moq-nvenc = { path = "../moq-nvenc" }  # in-tree fork, dlopen-only
-moq-vaapi = "0.0.2"                 # standalone; vendored cros-libva + cros-codecs
+# NVENC rides the default-on `nvidia` feature and VAAPI the opt-in `vaapi`
+# feature. Both dlopen their drivers at runtime, so they link on a GPU-less builder.
+moq-nvenc = { path = "../moq-nvenc", optional = true }  # in-tree fork, dlopen-only
+moq-vaapi = { version = "0.0.2", optional = true }      # standalone; vendored cros-libva + cros-codecs
 
 [dependencies]
-openh264 = "..."   # always-on software fallback
+openh264 = { version = "...", optional = true } # default software fallback
 ```
 
-Hardware encoders are always-on (VideoToolbox on macOS, Media Foundation on
-Windows, NVENC + VAAPI on Linux); the runtime fallback chain skips whichever
+Hardware encoders are cfg-gated on macOS, iOS, and Windows (VideoToolbox, Media
+Foundation) and feature-gated on Linux (NVENC behind the default-on `nvidia`,
+VAAPI behind the opt-in `vaapi`); the runtime fallback chain skips whichever
 driver is absent. None is a build-time hard dep on the driver, so the binary
-still builds and runs on a box with no GPU. openh264 is always compiled in as
-the software fallback, so a GPU-less box still encodes (it's also what moq-boy
-uses for its tiny 160x144 frames, which hardware encoders may reject).
+still builds and runs on a box with no GPU. The default `openh264` feature
+provides the software fallback, so a GPU-less box still encodes (it's also what
+moq-boy uses for its tiny 160x144 frames, which hardware encoders may reject).
 
 ### Selection / fallback (`Kind` mapping)
 
@@ -264,7 +265,7 @@ A backend "fails to open" (driver missing, no device) the same way an ffmpeg
   - `dlopen`s `libva` for Intel/AMD (no build dep on libva-dev) — *intended*;
     moq-vaapi 0.0.2 currently links libva instead, so this isn't realized yet
     (see #1837),
-  - falls back to the always-compiled-in openh264 when no GPU encoder is usable.
+  - falls back to OpenH264 when its default feature is enabled and no GPU encoder is usable.
 
   That single artifact runs across Ubuntu 20.04 -> 24.04, Debian, Fedora, etc.,
   which is the whole reason for the change.
@@ -282,16 +283,16 @@ A backend "fails to open" (driver missing, no device) the same way an ffmpeg
    hardware).
 4. **NVENC backend** on Linux behind its feature.
 5. **Capture swap to nokhwa; drop `ffmpeg-next`.** Delete the ffmpeg capture +
-   scaler, remove the dep from `Cargo.toml`, update \[CLAUDE.md cross-package
+   scaler, remove the dep from `Cargo.toml`, update \[AGENTS.md cross-package
    notes], `doc/bin/cli.md`, the `capture` feature wiring in `moq-cli`, and the
    packaging recipes. After this ffmpeg is gone and the binary is GPU-accelerated
    on macOS/NVIDIA, software (openh264) elsewhere.
 6. **VAAPI backend** (cros-codecs) last, behind its feature -- the GBM/DMA-buf
    plumbing is isolated and non-blocking once openh264 covers the fallback.
 
-This work (including the capture swap and ffmpeg removal) ships to `dev`, since
-it's a breaking change to `moq-video`'s public API and a dependency overhaul.
-It reaches `main` on the next `dev` -> `main` merge.
+This work (including the capture swap and ffmpeg removal) is a breaking change
+to `moq-video`'s public API and a dependency overhaul, so it ships in the next
+release cut.
 
 ## Risks / open questions
 
@@ -337,16 +338,17 @@ Where the implementation differs from the plan above:
   This dropped swscale entirely.
 - **One raw frame type, one encoded one.** The plan's `Nv12` input and `Vec<Bytes>`
   output became `moq_video::Frame` (timestamp + `Surface`) in and
-  `moq_video::encode::Encoded` (timestamp + payload) out, with the pixel
+  `moq_video::encode::Encoded` (timestamp + payload + keyframe flag) out, with the pixel
   representations public in `Surface` so a caller can render or re-encode without a
   CPU round trip. Timestamps ride through the codec rather than being attached at
   publish time, so a buffering backend and the `finish()` tail stay in step. The
   separate `encode_rgba` / `encode_i420` entry points collapsed into
   `Surface::rgba` plus the single `Encoder::encode`.
-- **Keyframes are the encoder's, not the application's.** `Config::gop` keys the
-  stream on its own and `encode` takes no per-frame flag; `Encoder::keyframe()`
-  requests one at the next frame for the callers that genuinely need a decodable
-  starting point (a new output group, a resume after idle).
+- **Group boundaries are the encoder's, not the application's.** `Config::gop`
+  (a `Gop` enum, keyframes at an interval today) places them on its own and
+  `encode` takes no per-frame flag; `Encoder::cut()` opens one at the next frame
+  for the callers that genuinely need a decodable starting point (a new output
+  group), and refuses on a backend that cannot force one.
 - **Capture is per-platform native (nokhwa fully removed).** Each platform's
   `Camera::read` yields a `Frame` the encoder can take: macOS hands VideoToolbox a
   zero-copy `CVPixelBuffer` surface, Linux V4L2 and Windows Media Foundation hand
@@ -410,32 +412,31 @@ software (see `backend::open`).
 > libva and vendors the libva headers its bindgen reads, so VAAPI costs the build
 > nothing: no libva-dev, no `NEEDED libva.so.2`, no entry in the nix devShell.
 
-**Input is an NV12 surface upload, not zero-copy dmabuf.** The encoder wants an
-NV12 VA surface, but UVC webcams deliver YUYV/MJPEG (decoded to CPU I420); they
-rarely expose NV12 to import zero-copy. So `backend/vaapi.rs` drives
-`new_native_vaapi` with a `VaSurfacePool`: each frame uploads I420 into a pooled
-surface as NV12 (`libva::Image`, honoring plane pitches) and encodes the surface.
-This works with the existing CPU V4L2 capture, no new capture code.
+**Input: DMA-BUFs stay on the GPU, CPU frames are uploaded.** A
+`Surface::DmaBuf` is encoded without a download. An NV12 buffer at the encoder's
+size (a VA-API decode, or one `Surface::resize` already scaled through VPP) is
+imported and encoded in place when that size is a whole number of macroblocks;
+anything else the driver imports, packed RGB from a PipeWire screen capture in
+particular, goes through VPP into the encoder's own surface. A layout the driver
+refuses falls back to the CPU path and is not tried again. Every other surface
+is converted to I420, interleaved to NV12, and uploaded into the encoder's input
+surface, which is the path a UVC webcam's YUYV or MJPEG frames take. A V4L2 capture that exports DMA-BUFs (`VIDIOC_EXPBUF`) would let an
+NV12-capable camera skip the upload too; it is not built.
 
-Follow-up (not in this PR): the **zero-copy dmabuf path** for the rare NV12-capable
-V4L2 source. Re-add `Frame::DmaBuf`, a V4L2 `VIDIOC_EXPBUF` capture (the `v4l`
-crate exposes the raw ioctl but no dmabuf stream), and a `requires_dmabuf` capture
-coupling, then import the dmabuf into a VA surface (`MemoryType::DrmPrime2`).
-
-**NOT YET VALIDATED ON HARDWARE.** Compiles on Linux with libva headers; written
-against discord/cros-codecs `discord-0.0.5` with type/field names checked against
-source. Needs a Linux + Intel/AMD GPU to confirm: (1) the `low_power` entrypoint
-(recent Intel iHD often requires the low-power encode entrypoint, AMD the full
-one; we request full and let `Kind::Auto` fall back); (2) the NV12 upload
-pitch/offset handling round-trips; (3) `cargo deny` accepts the new transitive
-licenses (drm, drm-fourcc, etc.) once the vaapi graph resolves.
+**Validated on Intel Meteor Lake** (iHD 26.1.5) by the tests in
+`encode/backend/vaapi.rs`: they encode CPU frames, VA-API decodes handed over as
+DMA-BUFs, and packed RGB buffers at and above the encoder's size, decode each
+stream with openh264, and compare pixels. They skip without a VA-API device.
+moq-vaapi opens the full encode entrypoint and falls back to the low-power one
+(`VAEntrypointEncSliceLP`) that some Intel parts expose alone; no part that
+needs the fallback has run it yet.
 
 ### NVENC ships via dlopen (no driver dependency at build or load)
 
 For the "single binary reaches the GPU at runtime" goal, NVENC must not hard-link
 the driver. The stock `nvidia-video-codec-sdk` emits
 `cargo:rustc-link-lib=nvidia-encode` / `nvcuvid`, which would make an
-`--features nvenc` binary (a) impossible to link on a GPU-less builder and (b)
+`--features nvidia` binary (a) impossible to link on a GPU-less builder and (b)
 fail to even load on a machine without the NVIDIA driver (`DT_NEEDED
 libnvidia-encode.so.1`), before `backend::open`'s software fallback could run.
 
@@ -449,7 +450,7 @@ So `nvenc` dlopens everything at runtime, like `cudarc` does for CUDA:
   `GetMaxSupportedVersion`), and the fork resolves those two via `dlopen` instead
   of linking them (there is no `build.rs`, so nothing links).
 
-Result, verified on a GPU-less Linux box: `--features nvenc` builds, links, and the
+Result, verified on a GPU-less Linux box: `--features nvidia` builds, links, and the
 test suite runs and passes (NVENC unavailable -> falls back to openh264), and the
 binary has no `libnvidia-encode` / `libcuda` `DT_NEEDED`. So one portable `moq-cli`
 can carry NVENC and use it only where the driver is present.

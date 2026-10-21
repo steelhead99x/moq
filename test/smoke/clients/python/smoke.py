@@ -1,4 +1,4 @@
-"""Cross-language interop client for the smoke test (workspace py/moq-rs, import `moq`).
+"""Cross-language interop client for the smoke test (PyPI `moq-rs`, import `moq`).
 
 publish:   read raw Annex-B H.264 from stdin (e.g. piped from ffmpeg) and feed
            it to a streaming importer, which infers frame boundaries.
@@ -16,14 +16,19 @@ import sys
 import moq
 
 READ_CHUNK = 64 * 1024
-LATENCY_MAX_MS = 1_000  # subscribe_media congestion-control / lookahead window
 
 
 async def publish(url: str, broadcast: str) -> None:
     async with moq.Client(url, tls_verify=False) as client:
-        # Hold the producer for the lifetime of the publish loop; finish() unpublishes.
+        # create_broadcast registers the broadcast and hands back its producer
+        # (the old client.publish(broadcast, producer) split was removed in the
+        # ergonomic moq-rs API). publish_video_stream feeds a raw Annex-B pipe to
+        # the streaming importer, which infers frame boundaries.
         producer = client.create_broadcast(broadcast)
-        media = producer.publish_media_stream("avc3")
+        media = producer.publish_video_stream(moq.VideoFormat.AVC3)
+        # create_broadcast only registers the path locally; announce advertises it
+        # to the relay, once its tracks exist.
+        producer.announce()
         print(f"publishing {broadcast!r} (Annex-B H.264 from stdin) to {url}")
 
         loop = asyncio.get_running_loop()
@@ -46,35 +51,39 @@ async def _catalog_with_video(consumer: moq.BroadcastConsumer) -> moq.Catalog:
     # The catalog is a live track. A lazy publisher (e.g. the browser, which only
     # encodes on demand) may announce video in a *later* update, not the first
     # snapshot, so wait for a catalog that actually has a video track.
-    catalog_consumer = await consumer.subscribe_catalog()
-    async for catalog in catalog_consumer:
-        if catalog.video:
-            return catalog
+    # These live consumers are async context managers. Cancel them explicitly
+    # before the parent client shuts down; otherwise an in-flight FFI task can
+    # race teardown after this helper returns from the async iterator.
+    async with await consumer.subscribe_catalog() as catalog_consumer:
+        async for catalog in catalog_consumer:
+            if catalog.video:
+                return catalog
     raise RuntimeError("catalog stream ended without a video track")
 
 
 async def subscribe(url: str, broadcast: str, timeout: float) -> None:
     async with moq.Client(url, tls_verify=False) as client:
-        consumer = await asyncio.wait_for(client.announced_broadcast(broadcast), timeout)
+        # announced_broadcast yields a handle; available() resolves it to a live
+        # consumer once the broadcast is announced. subscribe_catalog/_media are
+        # coroutines in the ergonomic API, so they're awaited (below and above).
+        async with client.announced_broadcast(broadcast) as announced:
+            consumer = await asyncio.wait_for(announced.available(), timeout)
         catalog = await asyncio.wait_for(_catalog_with_video(consumer), timeout)
 
         track_name = next(iter(catalog.video))
         video = catalog.video[track_name]
 
-        media = await consumer.subscribe_media(
-            track_name, video.container, moq.Subscription(latency_max_ms=LATENCY_MAX_MS)
-        )
-
         total = 0
+        async with await consumer.subscribe_media(track_name, video.container) as media:
 
-        async def drain() -> None:
-            nonlocal total
-            async for frame in media:
-                total += len(frame.payload)
-                if total > 0:
-                    return
+            async def drain() -> None:
+                nonlocal total
+                async for frame in media:
+                    total += len(frame.payload)
+                    if total > 0:
+                        return
 
-        await asyncio.wait_for(drain(), timeout)
+            await asyncio.wait_for(drain(), timeout)
 
     if total <= 0:
         raise RuntimeError("no frame data received")

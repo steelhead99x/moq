@@ -11,55 +11,66 @@ Most apps want `dev.moq:moq`. Reach for `dev.moq:moq-ffi` directly only if you w
 
 ## Install
 
-```kotlin
+```kotlin ignore
 // build.gradle.kts
 dependencies {
-    implementation("dev.moq:moq:0.4.5")
+    implementation("dev.moq:moq:0.5.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
 }
 ```
 
-The wrapper's POM declares `dev.moq:moq-ffi:[0.3,0.4)`, so Gradle resolves the latest `0.3.x` bindings automatically. Pin `dev.moq:moq-ffi` yourself if you need a reproducible bindings version.
+The wrapper's POM declares `dev.moq:moq-ffi:[0.4.3,0.5)`, so Gradle resolves the latest `0.4.x` bindings automatically. Pin `dev.moq:moq-ffi` yourself if you need a reproducible bindings version.
 
 ## Quick start
 
 ```kotlin
 import dev.moq.*
+import dev.moq.media.*
 import kotlinx.coroutines.flow.collect
 
 // connect() wires up an internal origin and returns a live connection.
 Moq.connect("https://relay.example.com").use { moq ->
-    moq.announcements("demos/").collect { announcement ->
-        println("got broadcast ${announcement.path()}")
+    moq.announced(AnnounceConfig(prefix = "demos/", filter = "*/camera")).updates().collect { event ->
+        // A restart is a new publisher run at the same path: request it again.
+        val announce = when (event) {
+            is AnnounceEventStart -> event.announce
+            is AnnounceEventRestart -> event.announce
+            else -> return@collect // Update or End
+        }
+        // Prefix stays origin-relative; captures reports what * matched.
+        println("got broadcast ${announce.prefix}")
+        println("captures ${announce.captures}")
 
-        val catalog = announcement.broadcast().catalog()
+        val catalog = dev.moq.media.catalog(moq.requestBroadcast(announce.prefix))
         println("catalog: $catalog")
     }
 }
 ```
 
-`Moq.connect` builds the `MoqClient`, applies TLS / bind options, wires the publish + subscribe origins, and hands back a `Moq` you can `use {}`. Cancelling the surrounding coroutine scope propagates through the Flow extensions to the native consumer's `cancel()` via their `onCompletion` hook.
+`Moq.connect(url, ClientConfig(...))` builds the `MoqClient` from the config record, wires the publish + consume origins, and hands back a `Moq` you can `use {}`. Cancelling the surrounding coroutine scope propagates through the Flow extensions to the native consumer's `cancel()` via their `onCompletion` hook.
 
 ### What the wrapper adds
 
 The `dev.moq` package is intentionally thin: Kotlin has extension functions, so we keep the FFI objects and decorate them rather than re-wrapping every type.
 
 - **`Moq.connect(...)`**: a connection facade (`Moq.kt`), so you never hand-wire a `MoqClient`.
-- **Typealiases** (`Aliases.kt`): re-export the `Moq*`-prefixed FFI types under clean `dev.moq` names (`OriginProducer`, `BroadcastConsumer`, `Catalog`, `Frame`, ...), so you import `dev.moq.*` only. A couple of sealed types (`Container`, `MoqException`) are not aliased because Kotlin can't resolve their subtypes through a typealias; use `uniffi.moq.*` for those.
-- **Flow extensions** (`Flows.kt`): `updates()`, `groups()`, `frames()`, `announcements()`, `catalog()` turn the pull-based consumers into coroutine `Flow`s with cancellation wired through.
-- **Fetched media**: `fetchMediaGroup(...).frames()` streams the decoded frames of one retained group, then completes.
+- **Typealiases** (`Aliases.kt`): re-export the `Moq*`-prefixed FFI types under clean `dev.moq` names (`OriginProducer`, `BroadcastConsumer`, `Frame`, ...), so you import `dev.moq.*` only. `MoqException` is not aliased because Kotlin can't resolve its subtypes through a typealias; use `uniffi.moq.*` for it.
+- **Flow extensions** (`Flows.kt`): `updates()`, `groups()`, and `frames()` turn the pull-based consumers into coroutine `Flow`s with cancellation wired through.
+- **Media** (`dev.moq.media`): catalog, importers, and container consumers, with `catalog(broadcast)` for a one-shot catalog read and `frames()` for container-decoded media.
+- **Fetched media**: `dev.moq.media.GroupConsumer.fetch(...).frames()` streams the decoded frames of one retained group, then completes. `dev.moq.media.GroupConsumer(group, container)` decodes a raw group instead, such as one from `recvGroup()` for arrival-order reads.
+- **Duration extensions** (`Durations.kt`): the FFI carries microseconds as integers, so `stats.rtt`, `backoff.initial`, `frame.timestamp`, and their siblings read back as a `kotlin.time.Duration`.
 - **`logLevel(...)`**: configures native Rust tracing without importing the raw bindings package.
-- **Raw datagrams**: `TrackProducer.appendDatagram(Frame(payload, timestampUs))` sends one best-effort frame and returns its sequence; `TrackConsumer.recvDatagram()` and `datagrams()` receive them. Payloads are capped at 1200 bytes, require a datagram-capable transport plus lite-05 or newer moq-lite, and have no stream fallback.
+- **Raw datagrams**: `TrackProducer.appendDatagram(Frame(payload, timestampUs))` sends one best-effort frame and returns its sequence; `TrackConsumer.recvDatagram()` and `datagrams()` receive them. Payloads are capped at 1200 bytes, require a datagram-capable transport plus lite-05 or newer moq-lite or moq-transport, and have no stream fallback.
 - **`MoqException.isShutdown`** (`Errors.kt`): true for the graceful `Cancelled`/`Closed` cases.
 
 ## Versioning
 
 - `moqffi.version` (gradle.properties): the bindings version. CI overrides it from the `moq-ffi-v*` tag; only used for local dev otherwise.
-- `moq.version` (gradle.properties): the wrapper version, the source of truth. **Bump this by hand** to ship a new wrapper. `release-kt-lib.yml` reads it, checks whether `dev.moq:moq:<version>` is already on Maven Central, and publishes only if it isn't. Must stay `>= 0.3.0` (the line continues from the pre-split `dev.moq:moq` releases).
+- `moq.version` (gradle.properties): the wrapper version, the source of truth. **Bump this by hand** to ship a new wrapper. `release-kt-lib.yml` reads it, checks whether `dev.moq:moq:<version>` is already on Maven Central, and publishes only if it isn't. If `rs/moq-ffi` changed since its last `moq-ffi-v*` tag, it waits and publishes after its Kotlin publisher succeeds in the next Release FFI run. Must stay `>= 0.3.0` (the line continues from the pre-split `dev.moq:moq` releases).
 
 ## Local development
 
-`just kt check` builds `moq-ffi` for the host, regenerates the UniFFI Kotlin bindings, drops the host cdylib into the `:moq-ffi` JNA-resource layout, and runs `gradle :moq-ffi:jvmTest :moq:jvmTest`. It needs `cargo`, a JDK, and Gradle, all provided by the `nix develop` shell. A missing toolchain is an error so Kotlin wrapper drift cannot slip past a green check.
+`just kt check` builds `moq-ffi` for the host, regenerates the UniFFI Kotlin bindings, drops the host cdylib into the `:moq-ffi` JNA-resource layout, and runs `gradle :moq-ffi:jvmTest :moq:jvmTest`. The tests compile every Kotlin sample in this README and `doc/lib/kt` too, extracted by `doc/lib/samples.sh`. It needs `cargo`, a JDK, and Gradle, all provided by the `nix develop` shell. A missing toolchain is an error so Kotlin wrapper drift cannot slip past a green check.
 
 The wrapper resolves `moq-ffi` from the sibling project (a Gradle `dependencySubstitution` in `kt/moq/build.gradle.kts`), so tests run against freshly-built bindings; the published metadata still carries the floating range.
 
@@ -84,9 +95,8 @@ kt/
   moq/
     build.gradle.kts        Pure-Kotlin wrapper; coordinates dev.moq:moq
     src/
-      jvmAndAndroidMain/kotlin/dev/moq/ Wrapper sources (Moq, Aliases, Flows, Errors)
+      jvmAndAndroidMain/kotlin/dev/moq/ Wrapper sources (Moq, Server, Aliases, Flows, Durations, Errors)
       jvmAndAndroidTest/                Facade smoke test
-  scripts/                  check.sh, package.sh
 ```
 
 The native/UniFFI layer stays in a single `dev.moq:moq-ffi` artifact because uniffi-linked libraries can't be split across separately packaged artifacts (the Python `moq-rs` wheel is one umbrella for the same reason). That constraint is about the *native* layer; the pure-Kotlin `dev.moq:moq` wrapper sits cleanly on top of it as its own artifact because it ships no native code.

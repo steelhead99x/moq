@@ -3,6 +3,7 @@
 //! `POST /<broadcast-path>` accepts a WHEP SDP offer and returns an SDP
 //! answer sourced from the matching MoQ broadcast on the subscribe origin.
 
+#[cfg(feature = "server")]
 use axum::{
 	Router,
 	body::Bytes,
@@ -19,33 +20,43 @@ use crate::{Error, Result, egress::EgressSource, sdp, server::Server, session};
 
 pub use crate::server::Response;
 
+#[cfg(feature = "server")]
+#[derive(Clone)]
+struct RouterState {
+	server: Server,
+	subscriber: moq_net::origin::Consumer,
+}
+
 /// How long WHEP negotiation waits for the broadcast's first catalog snapshot
 /// before failing the request. A broadcast can be announced (or served by a
 /// dynamic origin fallback) yet never publish a catalog; without a bound the
 /// `accept` future parks forever inside the HTTP handler, leaking the request.
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Build the WHEP axum router.
-pub fn router(server: Server) -> Router {
+/// Build the WHEP axum router. Only with the `server` feature.
+#[cfg(feature = "server")]
+pub fn router(server: Server, subscriber: moq_net::origin::Consumer) -> Router {
 	Router::new()
-		.route("/{*path}", post(handle).delete(crate::server::delete))
-		.with_state(server)
+		.route("/{*path}", post(handle).delete(delete))
+		.with_state(RouterState { server, subscriber })
 }
 
+#[cfg(feature = "server")]
 async fn handle(
-	server: State<Server>,
+	state: State<RouterState>,
 	path: Path<String>,
 	OriginalUri(uri): OriginalUri,
 	headers: HeaderMap,
 	body: Bytes,
 ) -> HttpResponse {
-	let (server, path) = (server.0, path.0);
-	match accept_offer(&server, &path, &headers, body).await {
+	let (state, path) = (state.0, path.0);
+	match accept_offer(&state.server, &state.subscriber, &path, &headers, body).await {
 		Ok(response) => {
 			let Response {
 				resource_id,
 				answer,
 				session,
+				..
 			} = response;
 			let mut response_headers = HeaderMap::new();
 			response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/sdp"));
@@ -66,12 +77,24 @@ async fn handle(
 
 /// Router glue: enforce the WHEP `Content-Type` then hand the raw offer to
 /// [`accept`], using the request path as the (unauthenticated) broadcast name.
-async fn accept_offer(server: &Server, path: &str, headers: &HeaderMap, body: Bytes) -> Result<Response> {
+#[cfg(feature = "server")]
+async fn accept_offer(
+	server: &Server,
+	subscriber: &moq_net::origin::Consumer,
+	path: &str,
+	headers: &HeaderMap,
+	body: Bytes,
+) -> Result<Response> {
 	if !is_sdp(headers) {
 		return Err(Error::InvalidSdp("expected Content-Type: application/sdp".into()));
 	}
 	let offer = std::str::from_utf8(&body).map_err(|err| Error::InvalidSdp(err.to_string()))?;
-	accept(server, server.subscriber(), path, offer).await
+	accept(server, subscriber, path, offer).await
+}
+
+#[cfg(feature = "server")]
+async fn delete(State(state): State<RouterState>, Path(path): Path<String>) -> StatusCode {
+	crate::server::delete(&state.server, &path)
 }
 
 /// Accept a WHEP SDP offer and egress the MoQ broadcast `broadcast` (a path
@@ -93,7 +116,7 @@ async fn accept_offer(server: &Server, path: &str, headers: &HeaderMap, body: By
 /// `offer` is the raw SDP body; the caller is responsible for checking the
 /// `Content-Type: application/sdp` request header. Fails with [`Error::InvalidSdp`]
 /// on a malformed offer, and surfaces a not-announced broadcast (or one outside
-/// `subscriber`'s scope) as [`Error::Other`].
+/// `subscriber`'s scope) as [`Error::Moq`].
 pub async fn accept(
 	server: &Server,
 	subscriber: &moq_net::origin::Consumer,
@@ -102,27 +125,22 @@ pub async fn accept(
 ) -> Result<Response> {
 	let offer = sdp::parse_offer(offer)?;
 
-	// Resolve the broadcast on the subscribe origin by path. The `Source` fetches it (and any
-	// sibling broadcast a rendition's catalog `broadcast` field references, e.g. `./source`)
-	// via `request_broadcast`, which resolves an announced broadcast immediately and falls back
-	// to a dynamic handler; with neither it errors and the WHEP client retries (typical).
-	let broadcast = broadcast.as_path().to_string();
-	let source = moq_mux::Source::new(subscriber.clone(), &broadcast);
-
+	// Resolve the broadcast on the subscribe origin by path. `request_broadcast` resolves an
+	// announced broadcast immediately and falls back to a dynamic handler; with neither it
+	// errors and the WHEP client retries (typical). The `Source` resolves any sibling broadcast
+	// a rendition's catalog `broadcast` field references (e.g. `./source`) the same way.
+	//
 	// Bound the wait for resolution + the first catalog: an unannounced broadcast, or an
 	// announced-but-catalog-less one, would otherwise park this handler forever.
-	let source = tokio::time::timeout(CATALOG_TIMEOUT, EgressSource::new(source))
-		.await
-		.map_err(|_| {
-			Error::Other(anyhow::anyhow!(
-				"broadcast {broadcast} did not resolve with a catalog within {CATALOG_TIMEOUT:?}"
-			))
-		})??;
+	let source = tokio::time::timeout(CATALOG_TIMEOUT, async {
+		let broadcast = subscriber.request_broadcast(broadcast.as_path(), None).await?;
+		EgressSource::new(moq_mux::Source::new(subscriber.clone(), broadcast)).await
+	})
+	.await
+	.map_err(|_| Error::CatalogTimeout)??;
 	let codecs = source.catalog_codecs();
 	if codecs.is_empty() {
-		return Err(Error::Other(anyhow::anyhow!(
-			"catalog has no codecs we can egress (Opus / H.264 / H.265 / VP8 / VP9 / AV1)"
-		)));
+		return Err(Error::NoRenditions);
 	}
 
 	// Register a session on the shared media mux (see whip::accept). Restrict our
@@ -135,13 +153,18 @@ pub async fn accept(
 		.set_local_ice_credentials(creds)
 		.build(std::time::Instant::now());
 	for addr in mux.candidates() {
-		let cand = Candidate::host(*addr, "udp").map_err(str0m::RtcError::from)?;
+		let cand = Candidate::host(*addr, "udp").map_err(Error::rtc)?;
 		rtc.add_local_candidate(cand);
 	}
 
-	let answer = rtc.sdp_api().accept_offer(offer).map_err(Error::Rtc)?;
+	let answer = rtc.sdp_api().accept_offer(offer).map_err(Error::rtc)?;
 	let resource_id = sdp::new_resource_id();
-	let session = session::Session::egress(rtc, mux.socket(), mux.candidates().to_vec(), inbound, source);
+	let socket = moq_ice::Socket {
+		udp: mux.socket(),
+		locals: mux.candidates().to_vec(),
+		inbound,
+	};
+	let session = session::Session::egress(rtc, socket, source)?;
 
 	// Register before returning so a DELETE that races startup still finds the
 	// session; Response::run unregisters itself when it ends.
@@ -150,6 +173,7 @@ pub async fn accept(
 	Ok(Response {
 		resource_id: resource_id.clone(),
 		answer: sdp::render_answer(&answer),
+		wire: session.wire(),
 		session: crate::server::AcceptedSession {
 			server: server.clone(),
 			resource_id,
@@ -162,6 +186,7 @@ pub async fn accept(
 	})
 }
 
+#[cfg(feature = "server")]
 fn is_sdp(headers: &HeaderMap) -> bool {
 	headers
 		.get(header::CONTENT_TYPE)
@@ -170,11 +195,14 @@ fn is_sdp(headers: &HeaderMap) -> bool {
 		.unwrap_or(false)
 }
 
+#[cfg(feature = "server")]
 fn status_for(err: &Error) -> StatusCode {
 	match err {
 		Error::InvalidSdp(_) => StatusCode::BAD_REQUEST,
 		Error::UnsupportedCodec(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
 		Error::SessionNotFound => StatusCode::NOT_FOUND,
+		Error::Moq(moq_net::Error::Unauthorized) => StatusCode::UNAUTHORIZED,
+		Error::Moq(moq_net::Error::NotFound | moq_net::Error::Unroutable) => StatusCode::NOT_FOUND,
 		_ => StatusCode::INTERNAL_SERVER_ERROR,
 	}
 }

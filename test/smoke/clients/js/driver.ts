@@ -1,168 +1,52 @@
-/**
- * Drives a headless Chromium (channel "chromium" for WebTransport + WebCodecs)
- * against the vite-built page (dist/). publish streams fake camera/microphone
- * input until killed; subscribe verifies rendered playback, pause/resume, and
- * optionally browser-to-browser audio.
- *
- *     bun driver.ts publish   --url http://127.0.0.1:4443 --broadcast b.hang
- *     bun driver.ts subscribe --url http://127.0.0.1:4443 --broadcast b.hang --timeout 20 [--expect-audio]
- *
- * @module
- */
+// Drives a headless Chromium (channel "chromium" for WebTransport + WebCodecs)
+// against a prebuilt page. publish streams a fake camera until killed; subscribe
+// exits 0 once the watch element decodes a frame.
+//
+// --variant selects how the published packages are delivered to the page:
+//   vite      bundled by vite           -> dist-vite/
+//   esbuild   bundled by esbuild        -> dist-esbuild/
+//   jsdelivr  imported from the CDN      -> jsdelivr/ (no build)
+// The smoke harness builds the bundler variants first; jsdelivr needs no build.
+//
+//   bun driver.ts publish   --variant vite --url http://127.0.0.1:4443 --broadcast b.hang
+//   bun driver.ts subscribe --variant jsdelivr --url http://127.0.0.1:4443 --broadcast b.hang --timeout 20
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { chromium, type Page } from "playwright";
+import { chromium } from "playwright";
+import { Diagnostics } from "./diagnostics";
 
 const { positionals, values } = parseArgs({
 	allowPositionals: true,
 	options: {
 		url: { type: "string" },
 		broadcast: { type: "string" },
+		variant: { type: "string", default: "vite" },
 		timeout: { type: "string", default: "20" },
-		"expect-audio": { type: "boolean", default: false },
 	},
 });
 
 const role = positionals[0];
 const url = values.url;
 const broadcast = values.broadcast;
-const timeoutMs = Number.parseFloat(values.timeout ?? "20") * 1000;
-const expectAudio = values["expect-audio"] ?? false;
-if (
-	(role !== "publish" && role !== "subscribe") ||
-	!url ||
-	!broadcast ||
-	!Number.isFinite(timeoutMs) ||
-	timeoutMs <= 0 ||
-	(expectAudio && role !== "subscribe")
-) {
-	console.error("usage: driver.ts publish|subscribe --url U --broadcast B [--timeout S>0] [--expect-audio]");
+const variant = values.variant ?? "vite";
+const dirByVariant: Record<string, string> = {
+	vite: "dist-vite",
+	esbuild: "dist-esbuild",
+	jsdelivr: "jsdelivr",
+};
+const dir = dirByVariant[variant];
+if ((role !== "publish" && role !== "subscribe") || !url || !broadcast || !dir) {
+	console.error(
+		"usage: driver.ts publish|subscribe --variant vite|esbuild|jsdelivr --url U --broadcast B [--timeout S]",
+	);
 	process.exit(2);
 }
-
-type PlayerState = {
-	videoFrames: number;
-	videoTimestamp?: number;
-	painted: boolean;
-	audioBytes: number;
-	audioContext?: string;
-	hasAudio: boolean;
-	paused: boolean;
-	pausedAttribute: boolean;
-	controlLabel?: string;
-	centerPlayVisible: boolean;
-};
-
-type BrowserErrors = {
-	page: string[];
-	console: string[];
-};
-
-type WaitForStateProps = {
-	deadline: number;
-	description: string;
-	predicate: (state: PlayerState) => boolean;
-};
-
-// Keep the UI contract in one place so player markup changes fail clearly.
-const SELECTORS = {
-	watch: "moq-watch",
-	ui: "moq-watch-ui",
-	control: "button.control[aria-label]",
-	pauseControl: 'button.control[aria-label="Pause"]',
-	centerPlay: "button.center-play",
-} as const;
-const POLL_INTERVAL_MS = 100;
-const PAUSE_STABILITY_MS = 750;
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function waitForWatch(page: Page): Promise<void> {
-	await page.evaluate((tag) => customElements.whenDefined(tag), SELECTORS.watch);
-	await page.locator(`${SELECTORS.watch}[data-smoke-ready]`).waitFor({ state: "attached" });
-}
-
-function throwPageErrors(errors: BrowserErrors): void {
-	const messages = [
-		...errors.page.map((error) => `page: ${error}`),
-		...errors.console.map((error) => `console: ${error}`),
-	];
-	if (messages.length > 0) throw new Error(messages.join("\n"));
-}
-
-async function readPlayerState(page: Page): Promise<PlayerState> {
-	return page.evaluate((selectors) => {
-		const watch = document.querySelector<HTMLElement>(selectors.watch);
-		const canvas = watch?.querySelector("canvas");
-		let painted = false;
-		if (canvas && canvas.width > 0 && canvas.height > 0) {
-			const pixels = canvas.getContext("2d")?.getImageData(0, 0, canvas.width, canvas.height).data;
-			if (pixels) {
-				// The smoke sources are test patterns. Sample at most about 1,000
-				// pixels and require actual color rather than the renderer's black fill.
-				const stride = Math.max(4, Math.floor(pixels.length / 4000) * 4);
-				for (let i = 0; i < pixels.length; i += stride) {
-					if (pixels[i] + pixels[i + 1] + pixels[i + 2] > 12) {
-						painted = true;
-						break;
-					}
-				}
-			}
-		}
-
-		const ui = document.querySelector(selectors.ui);
-		const control = ui?.shadowRoot?.querySelector<HTMLButtonElement>(selectors.control);
-		const centerPlay = ui?.shadowRoot?.querySelector<HTMLButtonElement>(selectors.centerPlay);
-
-		return {
-			videoFrames: Number(watch?.dataset.smokeVideoFrames ?? 0),
-			videoTimestamp: Number(watch?.dataset.smokeVideoTimestamp) || undefined,
-			painted,
-			audioBytes: Number(watch?.dataset.smokeAudioBytes ?? 0),
-			audioContext: watch?.dataset.smokeAudioContext || undefined,
-			hasAudio: watch?.dataset.smokeHasAudio === "true",
-			paused: watch?.dataset.smokePaused === "true",
-			pausedAttribute: watch?.hasAttribute("paused") ?? false,
-			controlLabel: control?.getAttribute("aria-label") ?? undefined,
-			centerPlayVisible: centerPlay ? getComputedStyle(centerPlay).display !== "none" : false,
-		};
-	}, SELECTORS);
-}
-
-async function waitForState(page: Page, errors: BrowserErrors, props: WaitForStateProps): Promise<PlayerState> {
-	let last = await readPlayerState(page);
-	while (Date.now() < props.deadline) {
-		throwPageErrors(errors);
-		if (props.predicate(last)) return last;
-		await sleep(POLL_INTERVAL_MS);
-		last = await readPlayerState(page);
-	}
-	throwPageErrors(errors);
-	throw new Error(`timed out waiting for ${props.description}: ${JSON.stringify(last)}`);
-}
-
-async function waitForStablePause(page: Page, errors: BrowserErrors, deadline: number): Promise<PlayerState> {
-	let previous = await readPlayerState(page);
-	let stableSince = Date.now();
-	while (Date.now() < deadline) {
-		throwPageErrors(errors);
-		await sleep(POLL_INTERVAL_MS);
-		const current = await readPlayerState(page);
-		const stable =
-			current.videoFrames === previous.videoFrames &&
-			current.videoTimestamp === previous.videoTimestamp &&
-			(!expectAudio || current.audioBytes === previous.audioBytes);
-		if (!stable) stableSince = Date.now();
-		if (stable && Date.now() - stableSince >= PAUSE_STABILITY_MS) return current;
-		previous = current;
-	}
-	throwPageErrors(errors);
-	throw new Error(`playback did not stop after pause: ${JSON.stringify(previous)}`);
-}
+const timeoutMs = Number.parseFloat(values.timeout ?? "20") * 1000;
 
 // Serve the prebuilt page on localhost (a secure context, so WebTransport /
-// WebCodecs are enabled).
-const root = join(new URL(".", import.meta.url).pathname, "dist");
+// WebCodecs are enabled). A plain static server avoids running concurrent Vite
+// dev servers, which deadlock on the shared dep-optimizer cache.
+const root = join(new URL(".", import.meta.url).pathname, dir);
 const server = Bun.serve({
 	port: 0,
 	async fetch(req) {
@@ -186,95 +70,83 @@ const browser = await chromium.launch({
 });
 
 let code = 1;
+let error: unknown;
 try {
-	const page = await browser.newPage();
-	const errors: BrowserErrors = { page: [], console: [] };
-	page.on("console", (message) => {
-		console.error(`[page] ${message.text()}`);
-		if (message.type() === "error") errors.console.push(message.text());
-	});
-	page.on("pageerror", (error) => {
-		console.error(`[page error] ${error.message}`);
-		errors.page.push(error.message);
-	});
-	await page.goto(pageUrl, { waitUntil: "load" });
-	if (role === "subscribe") await waitForWatch(page);
-
-	if (role === "publish") {
-		console.error(`publishing ${broadcast} (fake camera + microphone) to ${url}`);
-		await new Promise(() => {}); // stream until the orchestrator kills us
-	} else {
-		const start = Date.now();
-		const startupDeadline = start + timeoutMs;
-		let reloaded = false;
-		let playing: PlayerState | undefined;
-		while (Date.now() < startupDeadline) {
-			throwPageErrors(errors);
-			const state = await readPlayerState(page);
-			if (state.videoTimestamp !== undefined && state.painted && state.controlLabel === "Pause") {
-				playing = state;
-				break;
-			}
-			// Retry once after the publisher has had time to announce. This preserves
-			// the existing startup tolerance while the interaction checks below stay strict.
-			if (!reloaded && Date.now() - start > timeoutMs / 2) {
-				reloaded = true;
-				await page.reload({ waitUntil: "load" });
-				await waitForWatch(page);
-			}
-			await sleep(POLL_INTERVAL_MS);
-		}
-		if (!playing) {
-			const state = await readPlayerState(page);
-			throw new Error(`timed out waiting for rendered video: ${JSON.stringify(state)}`);
-		}
-
-		const interactionDeadline = Date.now() + timeoutMs;
-		if (expectAudio) {
-			playing = await waitForState(page, errors, {
-				deadline: interactionDeadline,
-				description: "browser audio",
-				predicate: (state) => state.hasAudio && state.audioBytes > 0 && state.audioContext === "running",
-			});
-		}
-
-		// The chrome auto-hides while playing. Pointer activity reveals the real
-		// control, then the click must flow through the public player API.
-		await page.dispatchEvent(SELECTORS.ui, "pointermove");
-		await page.locator(SELECTORS.ui).locator(SELECTORS.pauseControl).click();
-		await waitForState(page, errors, {
-			deadline: interactionDeadline,
-			description: "paused player UI",
-			predicate: (state) =>
-				state.paused && state.pausedAttribute && state.controlLabel === "Play" && state.centerPlayVisible,
+	const context = await browser.newContext();
+	const page = await context.newPage();
+	const diagnostics = new Diagnostics(page, role, variant, pageUrl);
+	const artifactDir = process.env.SMOKE_BROWSER_ARTIFACTS;
+	const artifactName = [role, variant, broadcast].join("-").replaceAll(/[^A-Za-z0-9._-]/g, "_");
+	if (artifactDir) await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+	// The published elements race a WebSocket fallback and expose no switch for it.
+	// smoke.sh sets this on external relays that are not the WebSocket column, so
+	// the page cannot open one. A ws(s) URL leaves the constructor alone.
+	if (process.env.SMOKE_WEBSOCKET === "0") {
+		await page.addInitScript(`
+			const dead = function WebSocket() {
+				throw new Error("WebSocket is disabled for this relay");
+			};
+			globalThis.WebSocket = dead;
+			globalThis.WebSocketStream = dead;
+		`);
+	}
+	page.on("console", (m) => console.error(`[page] ${m.text()}`));
+	page.on("pageerror", (e) => console.error(`[page error] ${e.message}`));
+	// smoke.sh SIGKILLs a publisher, which skips the artifact writes below, so a
+	// publisher whose scripts fail to load exits here instead of streaming nothing.
+	const scriptFailed = new Promise<never>((_, reject) => {
+		page.on("requestfailed", (r) => {
+			if (r.resourceType() === "script")
+				reject(new Error(`script failed: ${r.url()}: ${r.failure()?.errorText}`));
 		});
-		const paused = await waitForStablePause(page, errors, interactionDeadline);
-		if (!paused.painted) throw new Error(`pause cleared the preview frame: ${JSON.stringify(paused)}`);
-
-		await page.locator(SELECTORS.ui).locator(SELECTORS.centerPlay).click();
-		const resumed = await waitForState(page, errors, {
-			deadline: interactionDeadline,
-			description: "resumed playback",
-			predicate: (state) =>
-				!state.paused &&
-				!state.pausedAttribute &&
-				state.controlLabel === "Pause" &&
-				!state.centerPlayVisible &&
-				state.videoFrames > paused.videoFrames &&
-				state.videoTimestamp !== undefined &&
-				state.videoTimestamp > (paused.videoTimestamp ?? -1) &&
-				(!expectAudio || state.audioBytes > paused.audioBytes),
+		page.on("response", (r) => {
+			if (r.request().resourceType() === "script" && r.status() >= 400) {
+				reject(new Error(`script failed: ${r.url()}: HTTP ${r.status()}`));
+			}
 		});
+	});
+	scriptFailed.catch(() => {}); // only the publisher awaits it
+	try {
+		await page.goto(pageUrl, { waitUntil: "load" });
 
-		throwPageErrors(errors);
-		console.error(
-			`rendered, paused, and resumed ${broadcast}: video=${resumed.videoFrames} frames` +
-				(expectAudio ? ` audio=${resumed.audioBytes} bytes` : ""),
-		);
-		code = 0;
+		if (role === "publish") {
+			console.error(`publishing ${broadcast} (fake camera, ${variant}) to ${url}`);
+			await scriptFailed; // otherwise stream until the orchestrator kills us
+		} else {
+			const deadline = Date.now() + timeoutMs;
+			let frames = 0;
+			while (Date.now() < deadline) {
+				frames = await page.evaluate(() => {
+					const w = document.querySelector("moq-watch") as unknown as {
+						video?: { out?: { stats?: { peek(): { frameCount?: number } | undefined } } };
+					} | null;
+					return w?.video?.out?.stats?.peek()?.frameCount ?? 0;
+				});
+				if (frames > 0) break;
+				await new Promise((r) => setTimeout(r, 250));
+			}
+			console.error(`decoded ${frames} frames from ${broadcast} (${variant})`);
+			code = frames > 0 ? 0 : 1;
+		}
+	} catch (caught) {
+		error = caught;
+	} finally {
+		if (artifactDir) {
+			if (code === 0) await context.tracing.stop();
+			else {
+				// Save both artifacts even if one fails, and keep the run error as the cause.
+				await diagnostics
+					.write(artifactDir, artifactName, error)
+					.catch((e) => console.error("diagnostics write failed:", e));
+				await context.tracing
+					.stop({ path: join(artifactDir, `${artifactName}.zip`) })
+					.catch((e) => console.error("trace save failed:", e));
+			}
+		}
 	}
 } finally {
 	await browser.close().catch(() => {});
 	server.stop(true);
 }
+if (error) throw error;
 process.exit(code);

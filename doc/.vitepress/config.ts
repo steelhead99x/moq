@@ -1,4 +1,5 @@
 import { defineConfig } from "vitepress";
+import llmstxt from "vitepress-plugin-llms";
 import { syncDrafts } from "./drafts";
 
 // Generated before VitePress enumerates routes, so the pages and this sidebar
@@ -21,9 +22,9 @@ export default defineConfig({
 				content: "Real-time latency at massive scale",
 			},
 		],
-		["meta", { property: "og:image", content: "https://doc.moq.dev/icon.png" }],
-		["meta", { property: "og:image:width", content: "163" }],
-		["meta", { property: "og:image:height", content: "150" }],
+		["meta", { property: "og:image", content: "https://doc.moq.dev/og.png" }],
+		["meta", { property: "og:image:width", content: "2400" }],
+		["meta", { property: "og:image:height", content: "1350" }],
 		["meta", { property: "og:url", content: "https://doc.moq.dev" }],
 		["meta", { property: "og:site_name", content: "Media over QUIC" }],
 		["meta", { name: "twitter:card", content: "summary_large_image" }],
@@ -35,7 +36,7 @@ export default defineConfig({
 				content: "Real-time latency at massive scale",
 			},
 		],
-		["meta", { name: "twitter:image", content: "https://doc.moq.dev/icon.png" }],
+		["meta", { name: "twitter:image", content: "https://doc.moq.dev/og.png" }],
 		["meta", { name: "theme-color", content: "#0f172a" }],
 	],
 
@@ -59,6 +60,7 @@ export default defineConfig({
 					{ text: "Python", link: "/lib/py/" },
 					{ text: "Go", link: "/lib/go/" },
 					{ text: "Dart", link: "/lib/dart/" },
+					{ text: "C++", link: "/lib/cpp/" },
 					{ text: "C", link: "/lib/c/" },
 				],
 			},
@@ -75,6 +77,7 @@ export default defineConfig({
 						{ text: "Install", link: "/setup/install" },
 						{ text: "Development", link: "/setup/dev" },
 						{ text: "Production", link: "/setup/prod" },
+						{ text: "Upgrade", link: "/setup/upgrade" },
 						{ text: "Coding agents", link: "/setup/agent" },
 					],
 				},
@@ -89,6 +92,8 @@ export default defineConfig({
 						{ text: "Transport", link: "/concept/transport" },
 						{ text: "moq-lite", link: "/concept/moq-lite" },
 						{ text: "hang", link: "/concept/hang" },
+						{ text: "Audio jitter", link: "/concept/audio-jitter" },
+						{ text: "Stats", link: "/concept/stats" },
 						{ text: "Standards", link: "/concept/standard" },
 						{
 							text: "Use cases",
@@ -98,6 +103,7 @@ export default defineConfig({
 								{ text: "vs RTMP/SRT", link: "/concept/use-case/contribution" },
 								{ text: "vs WebRTC", link: "/concept/use-case/conferencing" },
 								{ text: "For AI", link: "/concept/use-case/ai" },
+								{ text: "For teleoperation", link: "/concept/use-case/teleoperation" },
 							],
 						},
 					],
@@ -128,7 +134,11 @@ export default defineConfig({
 								{ text: "Deployment", link: "/setup/prod" },
 							],
 						},
-						{ text: "moq-cli", link: "/bin/cli" },
+						{
+							text: "moq-cli",
+							link: "/bin/cli",
+							items: [{ text: "Inspect a relay", link: "/bin/inspect" }],
+						},
 						{
 							text: "Gateways",
 							items: [
@@ -164,7 +174,11 @@ export default defineConfig({
 								{ text: "moq-mux", link: "/lib/rs/moq-mux" },
 								{ text: "moq-video", link: "/lib/rs/moq-video" },
 								{ text: "moq-audio", link: "/lib/rs/moq-audio" },
-								{ text: "moq-token", link: "/lib/rs/moq-token" },
+								{ text: "moq-auth", link: "/lib/rs/moq-auth" },
+								{ text: "moq-room", link: "/lib/rs/moq-room" },
+								{ text: "moq-json", link: "/lib/rs/moq-json" },
+								{ text: "moq-flate", link: "/lib/rs/moq-flate" },
+								{ text: "moq-clock", link: "/lib/rs/moq-clock" },
 							],
 						},
 						{
@@ -175,8 +189,13 @@ export default defineConfig({
 								{ text: "@moq/hang", link: "/lib/js/hang" },
 								{ text: "@moq/watch", link: "/lib/js/watch" },
 								{ text: "@moq/publish", link: "/lib/js/publish" },
-								{ text: "@moq/token", link: "/lib/js/token" },
+								{ text: "@moq/video", link: "/lib/js/video" },
+								{ text: "@moq/room", link: "/lib/js/room" },
+								{ text: "@moq/auth", link: "/lib/js/auth" },
 								{ text: "@moq/signals", link: "/lib/js/signals" },
+								{ text: "@moq/clock", link: "/lib/js/clock" },
+								{ text: "@moq/json", link: "/lib/js/json" },
+								{ text: "@moq/flate", link: "/lib/js/flate" },
 							],
 						},
 						{ text: "Swift", link: "/lib/swift/" },
@@ -184,15 +203,24 @@ export default defineConfig({
 						{ text: "Python", link: "/lib/py/" },
 						{ text: "Go", link: "/lib/go/" },
 						{ text: "Dart", link: "/lib/dart/" },
+						{ text: "C++", link: "/lib/cpp/" },
 						{ text: "C", link: "/lib/c/" },
+						{ text: "Layers", link: "/lib/layers" },
 					],
 				},
 			],
 		},
 
+		// GitHub and Discord stay here so the mobile overlay still has them.
+		// theme/Community.vue is the desktop pair, with live counts and the
+		// hand-drawn icons from moq.dev; custom.css hides these two in the
+		// navbar so they do not duplicate.
 		socialLinks: [
 			{ icon: "github", link: "https://github.com/moq-dev/moq" },
 			{ icon: "discord", link: "https://discord.gg/FCYF3p99mr" },
+			{ icon: "x", link: "https://x.com/kixelated" },
+			{ icon: "bluesky", link: "https://bsky.app/profile/kixel.me" },
+			{ icon: "linkedin", link: "https://www.linkedin.com/in/luke-curley-635a457/" },
 		],
 
 		editLink: {
@@ -229,6 +257,21 @@ export default defineConfig({
 		theme: "github-dark",
 		lineNumbers: true,
 	},
+
+	// Serves /llms.txt (an index), /llms-full.txt (every page inline), and a
+	// .md twin of every page so agents can read the docs without the HTML.
+	vite: {
+		plugins: [
+			llmstxt({
+				domain: "https://doc.moq.dev",
+				// Static files are already served verbatim.
+				ignoreFiles: ["public/**"],
+			}),
+		],
+	},
+
+	// Agent instructions, not a page.
+	srcExclude: ["AGENTS.md"],
 
 	ignoreDeadLinks: [
 		// Localhost URLs are intentional for development examples and aren't

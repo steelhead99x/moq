@@ -9,8 +9,11 @@ cargo install --locked cargo-fuzz
 just rs fuzz lite
 ```
 
-The targets are `lite`, `ietf`, `varint`, and `path`. Extra arguments pass through to
+The targets are `lite`, `announce`, `ietf`, `varint`, `path`, and `pattern`. Extra arguments pass through to
 libFuzzer, so `just rs fuzz lite -- -max_total_time=300` bounds a run.
+
+The Nightly workflow runs every target for five minutes and uploads failure inputs
+as workflow artifacts.
 
 ## How it fits together
 
@@ -19,7 +22,7 @@ module (`src/fuzz.rs`), and the files here are one-line shims. Two reasons:
 
 - `lite` and `ietf` are private modules, so an outside crate cannot reach a single
   decoder.
-- `just test` replays the same bodies on the pinned stable toolchain, so a crash found
+- `just check` replays the same bodies on the pinned stable toolchain, so a crash found
   here becomes a regression test that CI runs without anyone installing cargo-fuzz.
 
 `just rs fuzz` regenerates `seeds/` from `moq_net::fuzz::seeds()` before each run, so
@@ -27,6 +30,11 @@ the corpus follows the dispatch instead of rotting beside it. libFuzzer writes w
 discovers to `corpus/<target>/`, which is kept across runs and gitignored along with
 `seeds/` and `artifacts/`. `cargo +nightly fuzz cmin --fuzz-dir rs/moq-net/fuzz <target>`
 shrinks the corpus once it has grown.
+
+Calling `cargo fuzz` directly skips `just rs fuzz`, which turns off the release
+profile's fat LTO (it drops the sanitizer-coverage globals, so the link fails) and
+symbol stripping. Prefix direct calls with
+`CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_STRIP=none`.
 
 ## What the targets assert
 
@@ -38,6 +46,8 @@ Beyond "does not panic":
   where a parameter map reaches the wire, since those encoders walk a `HashMap` and its
   iteration order differs per instance (moq-lite SETUP, and draft-14/15, which unlike
   draft-16+ do not sort by key first).
+- A lite-07 announce stream our decoder accepts, recompressed by our encoder, resolves
+  to the same announcements.
 - `Path::relative` inverts `Path::resolve`, and never produces a reference that walks
   above the root.
 
@@ -46,8 +56,8 @@ decode at a version that cannot express it again.
 
 ## When something crashes
 
-libFuzzer writes the input to `artifacts/<target>/crash-<hash>` and prints the command
-to reproduce it. Fix the bug, then commit the input:
+libFuzzer writes the input to `artifacts/<target>/crash-<hash>` and prints the `cargo fuzz`
+command to reproduce it (add the prefix above). Fix the bug, then commit the input:
 
 ```bash
 cp rs/moq-net/fuzz/artifacts/lite/crash-<hash> rs/moq-net/fuzz/regressions/lite/

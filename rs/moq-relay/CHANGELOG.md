@@ -7,6 +7,237 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- [**breaking**] Auth token roles now carry `moq_auth::Access`. Every capped grant is refused until its transport enforces caps, including in-band additions and revalidation. HTTP fetch and announcement endpoints always refuse per-connection caps. Gateway embedders must enforce caps or refuse them.
+
+- Auth requests distinguish `webtransport` from native `quic`. Upgrade auth servers before relays: older servers reject the new value. Rust and JavaScript auth parsers now map future transport names to `unknown`.
+
+## [0.17.2](https://github.com/moq-dev/moq/compare/moq-relay-v0.17.1...moq-relay-v0.17.2) - 2026-10-06
+
+### Added
+
+- *(stats)* linger an empty group broadcast before unannouncing it (backport #4871)
+
+## [0.17.1](https://github.com/moq-dev/moq/compare/moq-relay-v0.17.0...moq-relay-v0.17.1) - 2026-10-05
+
+### Fixed
+
+- *(relay)* serialize the SIGINT tests in shutdown_signal
+
+## [0.17.0](https://github.com/moq-dev/moq/compare/moq-relay-v0.16.0...moq-relay-v0.17.0) - 2026-10-03
+
+### Added
+
+- *(relay)* drain sessions gracefully over GOAWAY ([#4132](https://github.com/moq-dev/moq/pull/4132))
+- *(tokio)* default QUIC idle timeout to 10s ([#4606](https://github.com/moq-dev/moq/pull/4606))
+- *(tokio)* deadline accepted handshakes and relay HTTP headers ([#4612](https://github.com/moq-dev/moq/pull/4612))
+
+### Fixed
+
+- *(net)* a subscriber hands its cursors off to a park's cache ([#4698](https://github.com/moq-dev/moq/pull/4698))
+- *(relay)* [**breaking**] remove cluster gossip discovery ([#4601](https://github.com/moq-dev/moq/pull/4601))
+
+## [0.16.0](https://github.com/moq-dev/moq/compare/moq-relay-v0.15.8...moq-relay-v0.16.0) - 2026-09-30
+
+### Added
+
+- *(net)* relays stamp an unknown publisher with a per-connection hop
+- *(net)* read a subtree through an origin mount ([#4271](https://github.com/moq-dev/moq/pull/4271))
+
+### Fixed
+
+- *(relay)* pass packaged service config positionally ([#4469](https://github.com/moq-dev/moq/pull/4469))
+- *(sock)* resolve an ephemeral reuseport group's port with a plain bind ([#4409](https://github.com/moq-dev/moq/pull/4409))
+- *(auth)* make grant expiry exact, dropping the clock-skew grace ([#4368](https://github.com/moq-dev/moq/pull/4368))
+- *(cli)* refuse a client CA under --auth-public on a listener ([#4364](https://github.com/moq-dev/moq/pull/4364))
+- *(net)* refuse chained and wildcard origin mounts in any order ([#4362](https://github.com/moq-dev/moq/pull/4362))
+- *(auth)* [**breaking**] restore 0.14 auth parity ([#4319](https://github.com/moq-dev/moq/pull/4319))
+
+### Other
+
+- one rpm repo command that works on DNF4 and DNF5 ([#4567](https://github.com/moq-dev/moq/pull/4567))
+- Merge remote-tracking branch 'origin/main' into quest/m1/cluster-publisher-in-place
+- prove stopped relays and worker groups closed their sockets instead of racing a rebind ([#4408](https://github.com/moq-dev/moq/pull/4408))
+
+## [0.15.8](https://github.com/moq-dev/moq/compare/moq-relay-v0.15.7...moq-relay-v0.15.8) - 2026-09-27
+
+### Added
+
+- *(net)* the SETUP AUTHORIZATION TOKEN option reaches the verifier ([#4278](https://github.com/moq-dev/moq/pull/4278))
+
+### Fixed
+
+- *(auth)* root public and mTLS rules at / ([#4318](https://github.com/moq-dev/moq/pull/4318))
+
+## [0.15.7](https://github.com/moq-dev/moq/compare/moq-relay-v0.15.6...moq-relay-v0.15.7) - 2026-09-26
+
+### Added
+
+- end a broadcast with close() in every language ([#4031](https://github.com/moq-dev/moq/pull/4031))
+
+### Fixed
+
+- *(auth)* keep accepted grants on fixed expiry deadlines ([#4237](https://github.com/moq-dev/moq/pull/4237))
+
+### Other
+
+- origin narrowing joins auth, drop relay peer set, plan hop-list routing ([#4158](https://github.com/moq-dev/moq/pull/4158))
+- rename CLAUDE.md to AGENTS.md ([#4235](https://github.com/moq-dev/moq/pull/4235))
+- *(relay)* run the outage lease test on the real clock ([#4244](https://github.com/moq-dev/moq/pull/4244))
+
+## [0.15.6](https://github.com/moq-dev/moq/compare/moq-relay-v0.15.5...moq-relay-v0.15.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-auth, moq-tokio, moq-uring, moq-stats
+
+## [0.15.5](https://github.com/moq-dev/moq/compare/moq-relay-v0.15.4...moq-relay-v0.15.5) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-tokio, moq-auth, moq-uring, moq-stats
+
+## [0.15.4](https://github.com/moq-dev/moq/compare/moq-relay-v0.15.3...moq-relay-v0.15.4) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-tokio, moq-uring, moq-stats
+
+## [0.15.3](https://github.com/moq-dev/moq/compare/moq-relay-v0.15.2...moq-relay-v0.15.3) - 2026-09-25
+
+### Added
+
+- *(net)* hide dot-named broadcasts from discovery (moq-lite-07) ([#4060](https://github.com/moq-dev/moq/pull/4060))
+- *(relay)* retag a live session's stats when a re-check moves its tier ([#4057](https://github.com/moq-dev/moq/pull/4057))
+- *(net)* an announce says whether its route entered here or from a peer ([#3972](https://github.com/moq-dev/moq/pull/3972))
+- *(cli)* add `moq fetch` to read one group of a track ([#3965](https://github.com/moq-dev/moq/pull/3965))
+- *(moq-uring)* report a session's peer address and SNI to auth ([#4056](https://github.com/moq-dev/moq/pull/4056))
+
+### Other
+
+- *(relay)* run the drills over a seeded, impaired UDP path ([#4054](https://github.com/moq-dev/moq/pull/4054))
+
+## [0.15.2](https://github.com/moq-dev/moq/compare/moq-relay-v0.15.1...moq-relay-v0.15.2) - 2026-09-24
+
+### Fixed
+
+- *(relay)* fix the lease deadline on tokio's clock and pause the outage test ([#3969](https://github.com/moq-dev/moq/pull/3969))
+
+## [0.15.1](https://github.com/moq-dev/moq/compare/moq-relay-v0.15.0...moq-relay-v0.15.1) - 2026-09-23
+
+### Fixed
+
+- *(ci)* repair nightly builds hidden behind the first failure ([#3956](https://github.com/moq-dev/moq/pull/3956))
+- *(relay)* follow usage-rs 6.11.1 moving env aliases under FlagMeta::extra ([#4006](https://github.com/moq-dev/moq/pull/4006))
+- *(relay)* gate the per-worker accept loop on _quic ([#3968](https://github.com/moq-dev/moq/pull/3968))
+
+### Other
+
+- *(drill)* retarget mutations after the dev merge ([#3953](https://github.com/moq-dev/moq/pull/3953))
+- *(quest)* return to milestones ([#3962](https://github.com/moq-dev/moq/pull/3962))
+
+## [0.15.0](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.18...moq-relay-v0.15.0) - 2026-09-23
+
+### Added
+
+- *(relay)* expose reusable embedding lifecycle and test fixture ([#3927](https://github.com/moq-dev/moq/pull/3927))
+- *(moq-net)* add moq-transport draft-22 (moqt-22) ([#3858](https://github.com/moq-dev/moq/pull/3858))
+- *(gateway)* [**breaking**] align embedding APIs ([#3818](https://github.com/moq-dev/moq/pull/3818))
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(net)* [**breaking**] scope origins with any pattern union and report announce matches ([#3746](https://github.com/moq-dev/moq/pull/3746))
+- *(relay)* push a re-check to live sessions ([#3778](https://github.com/moq-dev/moq/pull/3778))
+- *(auth)* [**breaking**] one type per contract concept ([#3776](https://github.com/moq-dev/moq/pull/3776))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- *(net)* [**breaking**] announce prefixes on every wire; consumers read paths ([#3770](https://github.com/moq-dev/moq/pull/3770))
+- *(tokio)* [**breaking**] settle moq-tokio names under their modules ([#3745](https://github.com/moq-dev/moq/pull/3745))
+- *(native)* default the QUIC backend to noq ([#3757](https://github.com/moq-dev/moq/pull/3757))
+
+### Fixed
+
+- tighten release APIs and preserve Lite compatibility ([#3933](https://github.com/moq-dev/moq/pull/3933))
+- *(relay)* match the uring driver's terminal error ([#3860](https://github.com/moq-dev/moq/pull/3860))
+- *(ci)* repair nightly and meta-review failures ([#3799](https://github.com/moq-dev/moq/pull/3799))
+- *(auth)* end a session when a re-check no longer grants ([#3774](https://github.com/moq-dev/moq/pull/3774))
+- *(net)* drop origin source track when last reader leaves
+
+### Other
+
+- *(rs)* report the crate version, drop the git-describe build scripts ([#3912](https://github.com/moq-dev/moq/pull/3912))
+- pin rust 1.98.1 so macOS 27 loads our stripped dylibs ([#3904](https://github.com/moq-dev/moq/pull/3904))
+- *(uring)* [**breaking**] derive worker and steering identity from the socket ([#3865](https://github.com/moq-dev/moq/pull/3865))
+- *(quest)* mirror branches in the quest tree ([#3855](https://github.com/moq-dev/moq/pull/3855))
+- *(moq-sock)* [**breaking**] complete groups before serving ([#3832](https://github.com/moq-dev/moq/pull/3832))
+- *(net)* [**breaking**] name path roles without new types ([#3826](https://github.com/moq-dev/moq/pull/3826))
+- *(net)* [**breaking**] return the next deadline from driver polls ([#3828](https://github.com/moq-dev/moq/pull/3828))
+- *(net)* [**breaking**] drive time and cache cleanup explicitly ([#3825](https://github.com/moq-dev/moq/pull/3825))
+- *(quic)* [**breaking**] keep only the noq backend ([#3811](https://github.com/moq-dev/moq/pull/3811))
+- *(tokio)* make API shapes type-safe ([#3816](https://github.com/moq-dev/moq/pull/3816))
+- *(relay)* route auth through admissions ([#3800](https://github.com/moq-dev/moq/pull/3800))
+- *(relay)* port the drills to moq-tokio and the closed-with-source semantics
+- Merge origin/main into dev
+
+### Breaking
+
+- `serve` takes the node's `session::Registry`; `supervise` takes an optional `session::Registration` so a push can re-check the lease.
+- `Auth::admit(request)` no longer takes byte counters; `Admission` no longer carries them; `supervise(session, lease, shutdown)` and `Lease::close(reason, bytes)` take the totals at close.
+- Every session is admitted through a `moq_auth` lease: `--auth-url` asks an auth server per session event, `--auth-public` grants anonymous patterns, and exactly one must be set. `--auth-key`, `--auth-key-dir`, `--auth-public-api`, `--auth-domain`, `--auth-api`, `--auth-api-mode`, `--auth-mtls-tier`, and `--auth-tls-*` are gone, along with the `Cache-Control` driven cache and the unrestricted mTLS grant: a verified client certificate is reported in the request and admits what the server grants.
+- `--auth-public` and its `-subscribe`/`-publish` forms take patterns (`anon/**`), not prefixes.
+- Embedding: `Connection` holds a `Lease` per session and `supervise` follows it; `AuthToken` is built from a `moq_auth::Grant`; `MtlsPeer` carries the `PeerIdentity`.
+
+### Added
+
+- `session::{Registry, Filter}` and `Relay::sessions()`: live sessions on this node, listed at `GET /sessions` and nudged at `POST /sessions/revalidate` on the internal listener. A push is a re-check, not an authority.
+- *(relay)* `ClusterOptions` so the origin is constructed with its cache settings
+- `[cluster.lan] app` / `--cluster-lan-app` names the DNS-SD application the LAN mesh advertises under
+- *(relay)* `Cluster::with_advertise` / `Cluster::with_connect` so a LAN mesh can advertise a generated certificate and pin it when dialing
+- *(relay)* `/.cluster/<credential>` authenticates a LAN peer without `cluster.token`
+- *(relay)* `Relay::with_web` / `Relay::with_internal` and borrowed handles (`cluster`, `auth`, `client`, `stats`, `shutdown`, `shutdown_trigger`, `web`, `internal`, `addr`) so an embedder mounts routes without taking the sockets
+- *(relay)* `ShutdownTrigger` is `Clone`, and `Relay::run` returns once a trigger fired from an embedder's task has drained the sessions
+
+### Changed
+
+- `[cluster.lan] secret` is optional; without it the LAN mesh is open to anyone who can reach the listener
+- `--cluster-lan` no longer requires `--cluster-node`; a generated certificate's fingerprint is advertised instead
+- *(relay)* [**breaking**] `Relay` owns listeners, workers, and shutdown joins. Fields are private; destructuring and driving `serve` yourself can no longer drop a newly added socket owner. Clone the handles you need, mount routes, then call `run`.
+
+### Fixed
+
+- LAN mesh advertises an in-memory listener identity's fingerprint
+- LAN mesh refuses a client/listener version set with no shared path-capable version
+
+### Removed
+
+- *(relay)* `Cluster::with_cache`; pass the cache to `Cluster::new` via `ClusterOptions`
+- *(relay)* [**breaking**] public `Relay` fields (`server`, `workers`, `uring`, and the rest). Use the accessors and `run`.
+
+## [0.14.18](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.17...moq-relay-v0.14.18) - 2026-09-17
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.14.17](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.16...moq-relay-v0.14.17) - 2026-09-13
+
+### Added
+
+- *(moq-net)* add moq-transport draft-21 (moqt-21) ([#3574](https://github.com/moq-dev/moq/pull/3574))
+
+## [0.14.16](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.15...moq-relay-v0.14.16) - 2026-09-09
+
+### Fixed
+
+- *(relay)* stop the cache headroom governor with its pool ([#3487](https://github.com/moq-dev/moq/pull/3487))
+- *(moq-native)* stop logging credentials in relay URLs and RTMP stream keys ([#3379](https://github.com/moq-dev/moq/pull/3379))
+
+### Other
+
+- *(relay)* drill cancellation, relay death, and republish over real QUIC ([#3525](https://github.com/moq-dev/moq/pull/3525))
+- give each harness run its own directory, ports, and process groups ([#3509](https://github.com/moq-dev/moq/pull/3509))
+- make the agent guides minimal and situational ([#3469](https://github.com/moq-dev/moq/pull/3469))
+- *(quest)* plan the abort guard, an advisory quest gate, and what the echo-delay test already establishes ([#3466](https://github.com/moq-dev/moq/pull/3466))
+- reorganize the site around what a reader can do ([#3426](https://github.com/moq-dev/moq/pull/3426))
+
 ## [0.14.15](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.14...moq-relay-v0.14.15) - 2026-09-02
 
 ### Other

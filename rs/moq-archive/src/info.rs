@@ -1,0 +1,164 @@
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+
+use crate::path::check_id;
+use crate::{Error, Result, VERSION};
+
+/// Immutable track properties stored at `<encoded-track>/.info`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Info {
+	/// Recording format version; must be [`VERSION`].
+	pub version: u64,
+	/// Publisher tie-break priority, 0 through 255.
+	pub priority: u8,
+	/// Units per second for this track's timestamps, 1 through 2^53 - 1, or `None` when the track
+	/// is untimed and its frames store no timestamps.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub timescale: Option<u64>,
+	/// The source's publisher epoch, when its route had one. A resume from another refuses.
+	#[serde(default, skip_serializing_if = "Option::is_none", with = "epoch")]
+	pub epoch: Option<moq_net::Epoch>,
+}
+
+impl Info {
+	/// The current format version with `priority` and `timescale`, `None` for an untimed track.
+	pub fn new(priority: u8, timescale: Option<u64>) -> Result<Self> {
+		let info = Self {
+			version: VERSION,
+			priority,
+			timescale,
+			epoch: None,
+		};
+		info.validate()?;
+		Ok(info)
+	}
+
+	/// Record `epoch` as the source's publisher epoch.
+	pub fn with_epoch(mut self, epoch: Option<moq_net::Epoch>) -> Self {
+		self.epoch = epoch;
+		self
+	}
+
+	/// Encode as compact JSON.
+	pub fn encode(&self) -> Result<Bytes> {
+		self.validate()?;
+		Ok(Bytes::from(serde_json::to_vec(self)?))
+	}
+
+	/// Decode JSON and refuse an unknown version or invalid timescale.
+	pub fn decode(bytes: &[u8]) -> Result<Self> {
+		let info: Self = serde_json::from_slice(bytes)?;
+		info.validate()?;
+		Ok(info)
+	}
+
+	fn validate(&self) -> Result<()> {
+		if self.version != VERSION {
+			return Err(Error::Version(self.version));
+		}
+		if let Some(timescale) = self.timescale {
+			if timescale == 0 {
+				return Err(Error::Timescale(timescale));
+			}
+			check_id(timescale).map_err(|_| Error::Timescale(timescale))?;
+		}
+		Ok(())
+	}
+}
+
+/// The epoch as its UUID text.
+mod epoch {
+	use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+	pub fn serialize<S: Serializer>(epoch: &Option<moq_net::Epoch>, serializer: S) -> Result<S::Ok, S::Error> {
+		match epoch {
+			Some(epoch) => serializer.serialize_str(epoch.as_str()),
+			None => serializer.serialize_none(),
+		}
+	}
+
+	pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<moq_net::Epoch>, D::Error> {
+		let Some(text) = Option::<String>::deserialize(deserializer)? else {
+			return Ok(None);
+		};
+		text.parse().map(Some).map_err(D::Error::custom)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::ID_MAX;
+
+	#[test]
+	fn roundtrip() {
+		let info = Info::new(0, Some(1_000_000)).unwrap();
+		let bytes = info.encode().unwrap();
+		assert_eq!(bytes.as_ref(), br#"{"version":2,"priority":0,"timescale":1000000}"#);
+		assert_eq!(Info::decode(&bytes).unwrap(), info);
+	}
+
+	#[test]
+	fn an_untimed_track_omits_its_timescale() {
+		let info = Info::new(3, None).unwrap();
+		let bytes = info.encode().unwrap();
+		assert_eq!(bytes.as_ref(), br#"{"version":2,"priority":3}"#);
+		assert_eq!(Info::decode(&bytes).unwrap(), info);
+	}
+
+	#[test]
+	fn whitespace_and_member_order_do_not_affect_equality() {
+		let info = Info::decode(br#"{"timescale":1000,"priority":7,"version":2}"#).unwrap();
+		assert_eq!(
+			info,
+			Info::decode(br#"{ "version": 2, "priority": 7, "timescale": 1000 }"#).unwrap()
+		);
+		assert_eq!(info.priority, 7);
+		assert_eq!(info.timescale, Some(1000));
+	}
+
+	#[test]
+	fn unknown_version_is_refused() {
+		for version in [1, 3] {
+			let json = format!(r#"{{"version":{version},"priority":0,"timescale":1000}}"#);
+			assert!(matches!(Info::decode(json.as_bytes()), Err(Error::Version(v)) if v == version));
+		}
+	}
+
+	#[test]
+	fn epoch_roundtrip() {
+		let epoch: moq_net::Epoch = "01900000-0000-7000-8000-000000000001".parse().unwrap();
+		let info = Info::new(0, Some(1000)).unwrap().with_epoch(Some(epoch));
+		let bytes = info.encode().unwrap();
+		assert_eq!(
+			bytes.as_ref(),
+			br#"{"version":2,"priority":0,"timescale":1000,"epoch":"01900000-0000-7000-8000-000000000001"}"#
+		);
+		assert_eq!(Info::decode(&bytes).unwrap(), info);
+		assert!(matches!(
+			Info::decode(br#"{"version":2,"priority":0,"timescale":1000,"epoch":"not-a-uuid"}"#),
+			Err(Error::Json(_))
+		));
+	}
+
+	#[test]
+	fn timescale_bounds() {
+		assert!(Info::new(0, Some(1)).is_ok());
+		assert!(Info::new(0, Some(ID_MAX)).is_ok());
+		assert!(matches!(Info::new(0, Some(0)), Err(Error::Timescale(0))));
+		assert!(matches!(Info::new(0, Some(ID_MAX + 1)), Err(Error::Timescale(_))));
+	}
+
+	#[test]
+	fn unknown_members_and_missing_fields_are_refused() {
+		assert!(matches!(
+			Info::decode(br#"{"version":2,"priority":0,"timescale":1,"extra":true}"#),
+			Err(Error::Json(_))
+		));
+		assert!(matches!(
+			Info::decode(br#"{"version":2,"timescale":1}"#),
+			Err(Error::Json(_))
+		));
+	}
+}

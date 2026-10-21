@@ -1,21 +1,27 @@
 import type { Effect } from "@moq/signals";
 import type MoqWatch from "../../element";
 
-/** Shows why video cannot start when every catalog rendition is unsupported. */
+/** Shows when the player needs an update or cannot decode any video rendition. */
 export function unsupportedIndicator(parent: Effect, watch: MoqWatch): HTMLElement {
 	const container = document.createElement("div");
-	container.className = "watch-ui__unsupported-indicator";
+	container.className = "watch-ui__notice watch-ui__unsupported-indicator";
 	container.setAttribute("role", "status");
 	container.setAttribute("aria-live", "polite");
 
 	const text = document.createElement("span");
-	text.className = "watch-ui__unsupported-text";
+	text.className = "watch-ui__notice-text";
 	container.appendChild(text);
 
 	parent.run((effect) => {
+		const status = effect.get(watch.broadcast.out.status);
+		if (status === "unsupported") {
+			container.style.display = "";
+			text.textContent = "Update your player to watch this broadcast";
+			return;
+		}
+
 		const unsupported = effect.get(watch.video.source.out.error) === "unsupported";
-		const offline = effect.get(watch.broadcast.out.status) === "offline";
-		const show = unsupported && !offline;
+		const show = unsupported && (status === "loading" || status === "live");
 		container.style.display = show ? "" : "none";
 		if (!show) return;
 

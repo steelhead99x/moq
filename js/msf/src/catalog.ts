@@ -23,11 +23,17 @@ export type Role = z.infer<typeof RoleSchema>;
 // is exposed inline via `initData`, regardless of how it was carried on the wire.
 const trackShape = {
 	name: z.string(),
+	/** The track's absolute namespace; absent inherits the catalog's namespace. */
+	namespace: z.optional(z.string()),
 	packaging: PackagingSchema,
 	// draft-00 marks isLive required but omits it on mediatimeline/eventtimeline
 	// tracks, so accept its absence rather than reject the whole catalog.
 	isLive: z.optional(z.boolean()),
 	role: z.optional(RoleSchema),
+	/** A human-readable label for the track. */
+	label: z.optional(z.string()),
+	/** The BCP-47 language tag of the track. */
+	lang: z.optional(z.string()),
 	codec: z.optional(z.string()),
 	width: z.optional(z.number()),
 	height: z.optional(z.number()),
@@ -35,8 +41,6 @@ const trackShape = {
 	samplerate: z.optional(z.number()),
 	channelConfig: z.optional(z.string()),
 	bitrate: z.optional(z.number()),
-	// Non-standard: whether the publisher recommends temporarily avoiding this track.
-	stalled: z.optional(z.boolean()),
 	/** Resolved base64 initialization data (draft-01's initRef indirection is resolved away). */
 	initData: z.optional(z.string()),
 	renderGroup: z.optional(z.number()),
@@ -48,6 +52,10 @@ const trackShape = {
 	// The player's buffer must be at least this large to avoid underruns.
 	// Mirrors the `jitter` field in the hang catalog.
 	jitter: z.optional(z.number()),
+
+	// Non-standard: how far this rendition trails the broadcast's earliest, in milliseconds.
+	// Mirrors hang `delay`. A player holds `delay + jitter` and does not subtract across renditions.
+	delay: z.optional(z.number()),
 };
 
 /** Zod schema describing a single track entry in an MSF catalog. */
@@ -59,10 +67,19 @@ export type Track = z.infer<typeof TrackSchema>;
 /** Zod schema for the top-level MSF catalog: a version-agnostic snapshot of tracks. */
 export const CatalogSchema = z.object({
 	tracks: z.array(TrackSchema),
+	// The application extension: root members beyond the ones MSF defines, kept
+	// verbatim. An extension adds a section here, e.g. the `mpegts` section of
+	// draft-lcurley-moq-mpegts. Mirrors `Catalog::ext` in `moq-msf`, which is typed;
+	// here it stays an untyped map, so members this build has never seen survive a
+	// decode/encode round trip unchanged.
+	ext: z.optional(z.record(z.string(), z.unknown())),
 });
 
 /** The MSF catalog: a snapshot of the available tracks. */
 export type Catalog = z.infer<typeof CatalogSchema>;
+
+/** Root member names MSF itself defines, which an extension section must not reuse. */
+const RESERVED_ROOT = ["version", "generatedAt", "isComplete", "tracks", "initDataList"];
 
 /** The newest MSF draft version string this package emits on the wire. */
 export const VERSION = "draft-01";
@@ -112,8 +129,21 @@ export function encode(catalog: Catalog): Uint8Array {
 		return { ...wireTrack, initRef: id };
 	});
 
-	const wire: Record<string, unknown> = { version: VERSION, tracks };
+	// Null prototype: a `__proto__` member of the extension must land as an own property.
+	// Assigning it to an ordinary object would invoke the prototype setter instead, dropping
+	// the member from the encoded catalog.
+	const wire: Record<string, unknown> = Object.assign(Object.create(null), { version: VERSION, tracks });
 	if (initDataList.length > 0) wire.initDataList = initDataList;
+
+	// Extension members are written flat, so one named after a field MSF defines would
+	// emit a duplicate key and lose one of the two on re-parse. Refuse instead. The Rust
+	// side needs no such check: there the extension is a struct, not a map.
+	for (const [name, value] of Object.entries(catalog.ext ?? {})) {
+		if (RESERVED_ROOT.includes(name)) {
+			throw new Error(`MSF catalog section "${name}" collides with a reserved root field`);
+		}
+		wire[name] = value;
+	}
 
 	return new TextEncoder().encode(JSON.stringify(wire));
 }
@@ -122,7 +152,16 @@ export function encode(catalog: Catalog): Uint8Array {
 export function decode(raw: Uint8Array): Catalog {
 	const str = new TextDecoder().decode(raw);
 	try {
-		const wire = WireCatalogSchema.parse(JSON.parse(str));
+		const root = JSON.parse(str);
+		const wire = WireCatalogSchema.parse(root);
+
+		// Every root member MSF itself does not define belongs to the extension, kept verbatim.
+		// Null prototype for the same reason as `encode`, and so a `__proto__` member of an
+		// untrusted catalog cannot become an inherited property of this map.
+		const ext: Record<string, unknown> = Object.create(null);
+		for (const [name, value] of Object.entries(root as Record<string, unknown>)) {
+			if (!RESERVED_ROOT.includes(name)) ext[name] = value;
+		}
 
 		// id -> inline payload, built once so resolution is linear in the number
 		// of tracks rather than tracks x entries.
@@ -141,7 +180,7 @@ export function decode(raw: Uint8Array): Catalog {
 			return track;
 		});
 
-		return { tracks };
+		return Object.keys(ext).length > 0 ? { tracks, ext } : { tracks };
 	} catch (error) {
 		console.warn("invalid MSF catalog", str);
 		throw error;
@@ -149,7 +188,7 @@ export function decode(raw: Uint8Array): Catalog {
 }
 
 /** Read and decode the next catalog frame from a track, or undefined if the track ended. */
-export async function fetch(track: Moq.Track.Subscriber): Promise<Catalog | undefined> {
+export async function fetch(track: Moq.Track.Ordered): Promise<Catalog | undefined> {
 	const frame = await track.readFrame();
 	if (!frame) return undefined;
 	return decode(frame.payload);

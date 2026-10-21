@@ -13,14 +13,14 @@ mod tests;
 use self::active_stream::{ActiveStream, StreamState};
 use self::outstanding_requests::OutstandingRequest;
 use self::session_state::SessionState;
+use crate::rml::amf0::Amf0Value;
 use crate::rml::chunk_io::{ChunkDeserializer, ChunkSerializer, Packet};
 use crate::rml::messages::{PeerBandwidthLimitType, RtmpMessage, UserControlEventType};
 use crate::rml::sessions::StreamMetadata;
 use crate::rml::time::RtmpTimestamp;
 use bytes::Bytes;
-use rml_amf0::Amf0Value;
+use moq_clock::Instant;
 use std::collections::HashMap;
-use std::time::SystemTime;
 
 const FOURCC_CAN_DECODE: u32 = 0x01;
 
@@ -48,7 +48,7 @@ pub use self::result::ServerSessionResult;
 /// high probability of causing RTMP chunk parsing errors by the peer or by the `ServerSession`
 /// instance itself.
 pub struct ServerSession {
-	start_time: SystemTime,
+	start_time: Instant,
 	serializer: ChunkSerializer,
 	deserializer: ChunkDeserializer,
 	connected_app_name: Option<String>,
@@ -73,7 +73,7 @@ impl ServerSession {
 	/// stream id 0 (as well as other important initial information
 	pub fn new(config: ServerSessionConfig) -> Result<(ServerSession, Vec<ServerSessionResult>), ServerSessionError> {
 		let mut session = ServerSession {
-			start_time: SystemTime::now(),
+			start_time: Instant::now(),
 			serializer: ChunkSerializer::new(),
 			deserializer: ChunkDeserializer::new(),
 			connected_app_name: None,
@@ -430,7 +430,8 @@ impl ServerSession {
 		Ok(self.serializer.serialize(&payload, false, false)?)
 	}
 
-	fn handle_abort_message(&self, _stream_id: u32) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+	fn handle_abort_message(&mut self, stream_id: u32) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+		self.deserializer.abort(stream_id);
 		Ok(Vec::new())
 	}
 
@@ -497,6 +498,13 @@ impl ServerSession {
 			None => return Err(ServerSessionError::NoAppNameForConnectionRequest),
 		};
 
+		// The URL the client dialed, which is the only place plaintext RTMP carries
+		// the hostname; an embedder that routes by it reads it off the request.
+		let tc_url = match properties.remove("tcUrl") {
+			Some(Amf0Value::Utf8String(url)) if !url.is_empty() => Some(url),
+			_ => None,
+		};
+
 		self.object_encoding = match properties.remove("objectEncoding") {
 			Some(value) => match value {
 				Amf0Value::Number(number) => number,
@@ -536,6 +544,7 @@ impl ServerSession {
 		let event = ServerSessionEvent::ConnectionRequested {
 			app_name: app_name,
 			request_id: request_number,
+			tc_url,
 			caps_ex,
 			video_fourccs,
 			audio_fourccs,
@@ -973,78 +982,43 @@ impl ServerSession {
 
 	fn handle_amf0_data(
 		&mut self,
-		mut data: Vec<Amf0Value>,
+		data: Vec<Amf0Value>,
 		stream_id: u32,
 	) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
-		if data.len() == 0 {
-			// No data so just do nothing
-			return Ok(Vec::new());
-		}
-
-		let first_element = data.remove(0);
-		match first_element {
-			Amf0Value::Utf8String(ref value) if value == "@setDataFrame" => {
-				self.handle_amf0_data_set_data_frame(data, stream_id)
-			}
-			_ => Ok(Vec::new()),
-		}
-	}
-
-	fn handle_amf0_data_set_data_frame(
-		&mut self,
-		mut data: Vec<Amf0Value>,
-		stream_id: u32,
-	) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
-		if data.len() < 2 {
-			// We are expecting a "onMetaData" value and then a property with the actual metadata.  Since
-			// this wasn't provided we don't know how to deal with this message. Returning also avoids the
-			// `data[0]` index panic below on empty untrusted input.
-			return Ok(Vec::new());
-		}
-
-		match data[0] {
-			Amf0Value::Utf8String(ref value) if value == "onMetaData" => (),
-			_ => return Ok(Vec::new()),
-		}
-
-		if self.connected_app_name.is_none() {
-			return Ok(Vec::new()); // setDataFrame has no meaning until they are conneted and publishing
-		}
-
-		let app_name = match self.connected_app_name {
-			Some(ref name) => name.clone(),
-			None => return Ok(Vec::new()), // Not connected on a known app name.  Shouldn't really happen.
-		};
-
-		let publish_stream_key = match self.active_streams.get(&stream_id) {
-			Some(ref stream) => {
-				match stream.current_state {
-					StreamState::Publishing {
-						ref stream_key,
-						mode: _,
-					} => stream_key,
-					_ => return Ok(Vec::new()), // Return nothing since we aren't publishing
-				}
-			}
-
-			None => return Ok(Vec::new()), // Return nothing since this was not sent on an active stream
-		};
-
-		let mut metadata = StreamMetadata::new();
-		let object = data.remove(1);
-		let properties_option = object.get_object_properties();
-		match properties_option {
-			Some(properties) => metadata.apply_metadata_values(properties),
-			_ => (),
-		}
-
-		let event = ServerSessionEvent::StreamMetadataChanged {
-			stream_key: publish_stream_key.clone(),
-			app_name,
-			metadata,
+		// Anything that isn't stream metadata is still raised, so the caller can
+		// account for script data it doesn't carry instead of losing it silently.
+		let event = match self.stream_metadata(&data, stream_id) {
+			Some(event) => event,
+			None => ServerSessionEvent::UnhandleableAmf0Data { values: data },
 		};
 
 		Ok(vec![ServerSessionResult::RaisedEvent(event)])
+	}
+
+	/// Parse `@setDataFrame("onMetaData", {...})` sent on a stream that is publishing.
+	fn stream_metadata(&self, data: &[Amf0Value], stream_id: u32) -> Option<ServerSessionEvent> {
+		let [Amf0Value::Utf8String(command), Amf0Value::Utf8String(name), object, ..] = data else {
+			return None;
+		};
+		if command != "@setDataFrame" || name != "onMetaData" {
+			return None;
+		}
+
+		let app_name = self.connected_app_name.clone()?;
+		let StreamState::Publishing { ref stream_key, .. } = self.active_streams.get(&stream_id)?.current_state else {
+			return None;
+		};
+
+		let mut metadata = StreamMetadata::new();
+		if let Some(properties) = object.clone().get_object_properties() {
+			metadata.apply_metadata_values(properties);
+		}
+
+		Some(ServerSessionEvent::StreamMetadataChanged {
+			stream_key: stream_key.clone(),
+			app_name,
+			metadata,
+		})
 	}
 
 	fn handle_audio_data(
@@ -1386,17 +1360,8 @@ impl ServerSession {
 	}
 
 	fn get_epoch(&self) -> RtmpTimestamp {
-		match self.start_time.elapsed() {
-			Ok(duration) => {
-				let milliseconds = (duration.as_secs() * 1000) + (duration.subsec_nanos() as u64 / 1_000_000);
-
-				// Casting to u32 should auto-wrap the value as expected.  If not a stream will probably
-				// break after 49 days but testing shows it should wrap
-				RtmpTimestamp::new(milliseconds as u32)
-			}
-
-			Err(_) => RtmpTimestamp::new(0), // Time went backwards, so just consider time as at epoch
-		}
+		// RTMP timestamps wrap every 2^32 milliseconds.
+		RtmpTimestamp::new(self.start_time.elapsed().as_millis() as u32)
 	}
 
 	fn create_error_packet(
@@ -1426,4 +1391,20 @@ fn create_status_object(level: &str, code: &str, description: &str) -> HashMap<S
 		Amf0Value::Utf8String(description.to_string()),
 	);
 	properties
+}
+
+#[cfg(test)]
+mod clock_tests {
+	use super::*;
+
+	#[moq_clock::test]
+	async fn session_epoch_uses_the_timer_clock() {
+		let session = ServerSession::new(ServerSessionConfig::new()).unwrap().0;
+		moq_clock::sleep(std::time::Duration::from_millis(12_345)).await;
+		assert_eq!(session.get_epoch(), RtmpTimestamp::new(12_345));
+		moq_clock::sim::step_wall(moq_clock::Wall::UNIX_EPOCH);
+		assert_eq!(session.get_epoch(), RtmpTimestamp::new(12_345));
+		moq_clock::sleep(std::time::Duration::from_millis(1 << 32)).await;
+		assert_eq!(session.get_epoch(), RtmpTimestamp::new(12_345));
+	}
 }

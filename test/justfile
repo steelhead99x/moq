@@ -1,107 +1,225 @@
 #!/usr/bin/env just --justfile
 #
-# Tests that span more than one language. Per-language unit tests live in each
-# language's own justfile; this module aggregates them.
+# Tests that span more than one language or need a live relay. Unit tests run
+# in the root `just check`.
 #
-# Two cross-language interop smoke tests exist:
-#   - https://github.com/moq-dev/smoke installs each client from its PUBLIC
+# Two cross-language interop tests exist:
+#   - `just test smoke` (smoke/) installs each client from its PUBLIC
 #     package registry to catch packaging breakage in a release.
-#   - `just test smoke` (smoke/, below) builds every client from THIS checkout
+#   - `just test interop` (interop/, below) builds every client from THIS checkout
 #     to catch interop regressions before anything is published.
-# Fall back to the root justfile so `just js test` (etc.) resolve from here.
+# Fall back to the root justfile so `just rs test` (etc.) resolve from here.
 
 set fallback
 set working-directory := '.'
 
-# The `check` sibling: same diff scoping, same BASE resolution, and what CI runs
-# after `just check`. Only js/rs/py appear here. The kt, swift, and go wrappers
-# build, regenerate bindings, and test in a single script, so their tests run as
-# part of `just check` and there is nothing left to dispatch.
-#
-# `just _changed` resolves through `set fallback` to the root justfile, which is
-# also where it runs, so the paths it prints stay repo-relative.
-#
-# BASE has to be passed as `just test default origin/dev`. This is a module, so
-# a bare `just test origin/dev` makes just look for a recipe by that name rather
-# than reaching the default recipe's parameter.
+# List the cross-language suites.
+default:
+    @just --justfile {{ quote(justfile()) }} --list test
 
-# Run unit tests for what the branch changed since BASE, plus its dependents.
-default $BASE="":
-    #!/usr/bin/env bash
-    set -euo pipefail
+# Port isolation across private temp roots, plus Chromium checks of the watch and publish controls.
+# The browser check is not `*.test.ts`: plain `bun test` runs lack Playwright Chromium,
+# which this recipe installs, as the interop and wasm harnesses do.
+harness:
+    ./lib/harness.test.sh
+    ./interop/relay-log.test.sh
+    cd .. && bun test test/interop/compat/resolve.test.ts test/interop/compat/claims.test.ts
+    cd .. && bun install --frozen-lockfile
+    cd interop/clients/js && bunx playwright install chromium
+    cd interop/clients/js && bun test ./harness.browser.ts ./signals-dom.browser.ts ./publish-ui.browser.ts ./capture-channel-count.browser.ts ./open-gop.browser.ts ./src/contract.test.ts ./src/resume.test.ts
 
-    files=$(just _changed "$BASE")
+# Cross-language media interop test, built from this checkout. Stands up a
+# relay and runs the publisher x subscriber matrix. Default: rust only (fast
+# sanity check). `interop --all` runs the full matrix: rust + python + go +
+# browser + C++ publish; everyone subscribes (incl. native node/bun JS, the
+# moq-c C client, and the GStreamer moqsrc plugin). Other flags pass through, e.g.
+# `just test interop --publishers rust,python --subscribers rust,c`.
+# Finite track tails run too; `--tail` selects just the CLI FETCH close and Rust/Node/Bun tail checks.
+# Both runs first check js/net's varints against moq-net's encoder at every size boundary,
+# and on lite-06/07 messages (the filter also matches `lite_varint_interop`), then
+# moq-transport OBJECT_DATAGRAMs both ways and the JS answer to TRACK_STATUS on every
+# draft, and Lite AUTH_ERROR NOT_SUPPORTED after a grant in both directions.
+[positional-arguments]
+interop *args:
+    just rs test -p moq-net --lib varint_interop ietf_datagram_interop ietf_track_status_interop auth_unsupported_interop --run-ignored all
+    ./interop/interop.sh "$@"
 
-    # Mirrors the root `check`: too long for argv means test everything instead.
-    if [[ "$files" == ALL ]]; then
-    	just all
-    	exit 0
-    fi
+# Nightly main vs newest installable registry releases: tokens, moq-lite session
+# versions, decoded catalogs/containers, and group FETCH. See interop/README.md.
+# --remeasure also runs the planned breaks and rewrites them, as each release does.
+[positional-arguments]
+wire-compat *args:
+    ./interop/compat.sh "$@"
 
-    just _tools "$files"
+# Installs each client from its public registry, inside test/smoke's own Nix
+# shell rather than this repo's toolchain. The first argument picks a smoke
+# recipe and the rest pass through, e.g. `just test smoke full` or `just test
+# smoke relays --only moq-dev-rs`. With none, the Rust-only matrix. See smoke/README.md.
 
-    # Mirrors the root `check`: the dispatch below lives in these two files and
-    # matches no language scope, so a change to either has to run everything or
-    # it goes untested.
-    if grep -qE '^(justfile|test/justfile)$' <<< "$files"; then
-    	echo "test: root orchestration changed; testing everything." >&2
-    	just all
-    	exit 0
-    fi
-
-    # An empty list means "force-run" to the per-lang recipes, which is the
-    # wrong semantic here, so don't dispatch at all.
-    if [[ -n "$files" ]]; then
-    	just js test "$files"
-    	just rs test-changed "$files"
-    	just py test "$files"
-    else
-    	echo "test: nothing changed."
-    fi
-
-# Run every language's unit tests, unscoped.
-all:
-    just js test
-    just rs test --workspace
-    just py test
-
-# Cross-language media interop smoke test, built from this checkout. Stands up a
-# relay and runs the publisher x subscriber matrix. Default: rust only. Pass
-# flags through, e.g.
-
-# just test smoke --publishers rust,python,js --subscribers rust,c
+# Published-package interop smoke.
+[positional-arguments]
 smoke *args:
-    ./smoke/smoke.sh {{ args }}
+    nix develop ./smoke --command just --justfile smoke/justfile "$@"
 
-# Full interop matrix: rust + python + browser publish; everyone subscribes
-# (incl. native node/bun JS, the C libmoq client, and the GStreamer moqsrc
-
-# plugin). --timeout 30 gives headless Chromium cold-start headroom.
-smoke-full:
-    ./smoke/smoke.sh --publishers rust,python,js --subscribers rust,python,js,js-native-node,js-native-bun,c,gst --timeout 30
+# Paint a short-side transcode rung from a coded portrait through moq-watch.
+portrait:
+    ./portrait/run.sh
 
 # Negative control: no publisher, every subscriber must time out (proves the
 
 # harness can actually report failure).
-smoke-negative *args:
-    ./smoke/smoke.sh --negative {{ args }}
+[positional-arguments]
+interop-negative *args:
+    ./interop/interop.sh --negative "$@"
+
+# Browser-to-browser media QA against a deterministic fixture: presented frame progress, audible
+# tone, audio/video skew, and the publication lifecycle (cold start, pause, rejoin, detach,
+# republish, late join). Ends with negative controls that inject a frozen picture, silence, a
+# shifted tone, and a leaked session; each must fail the assertion it names. --timeout 30 gives
+
+# headless Chromium cold-start headroom. --media-engines selects player engines; the fixture stays Chromium.
+[positional-arguments]
+media *args:
+    ./interop/interop.sh --media --timeout 30 "$@"
+
+# Disrupts a real relay over real QUIC three ways: cancel a stalled reader, kill
+# the relay mid-group, and republish an interrupted publisher's name. Ordinary
+# tests, so `just check` runs them whenever moq-relay is selected; this is the
+# focused loop. Takes a filter, e.g. `just test drill relay_killed`. Includes the
+# no-publisher negative control. See drill/README.md.
+
+# Transport and lifecycle failure drills.
+[positional-arguments]
+drill *args:
+    just rs test -p moq-relay --test drills "$@"
+
+# Play through a private Linux null device using the shipped headless binary.
+native-play:
+    ./native-play/run.sh
+
+# Plays a tone in headless Chromium and the native `moq play` through moq-shaper and grades
+# what the listener heard (underruns, skip-aheads, silence, the resolved delay) against
+# audio-quality/budgets.json. The full matrix is 36 rows at 60 s; nightly runs it with
+# --enforce. Narrow it with `--profiles mild --codecs opus --rings plain --duration 20`;
+# `--rings pulse` is the native player alone.
+# `--replays` grades only the recorded traces, in seconds, as nightly and release PRs touching the player do.
+# See audio-quality/README.md.
+
+# Grade browser and native audio playout over an impaired path.
+[positional-arguments]
+audio-quality *args:
+    ./audio-quality/run.sh "$@"
+
+# Records the arrival traces under audio-quality/traces/ that the replay rows grade: the
+# public relay's bbb.hang, a local relay's AAC tone, and a browser microphone through the
+# public relay. Needs the network. Narrow it with `--lanes relay-bbb --duration 35`.
+
+# Re-record the audio quality arrival traces.
+[positional-arguments]
+audio-quality-record *args:
+    ./audio-quality/record.sh "$@"
+
+# Removes one recovery behavior at a time in a disposable copy of the tree and
+# requires the drill covering it to fail, for the reason the mutation names. The
+# checkout is never modified. `--list` shows the mutations.
+
+# Prove the drills fail without the fixes they cover.
+[positional-arguments]
+drill-sensitivity *args:
+    ./drill/sensitivity.sh "$@"
 
 # Round-trips a PCR-paced TS through a relay and checks the subscriber's `export
-# ts` output with TSDuck plus a custom analyzer (PCR jitter/repetition,
-# burstiness, instantaneous bitrate, T-STD). Flags: `--analyze-only file.ts`
+# ts` output with FFmpeg, TSDuck and a custom analyzer (the T-STD buffer model, PCR
+# spacing and byte schedule). Flags: `--analyze-only file.ts`
 # (skip the round-trip), `--strict` (fail on shape warnings), `--source file.ts`
 # (use a real capture), `--live` (grade PCR release timing and byte position off
-# the pipe instead, which a capture cannot carry; nightly runs this arm). See
+# the pipe instead, which a capture cannot carry; nightly runs this arm),
+# `--open-gop` (an open-GOP clip whose orphan leading pictures are trimmed), `--hrd`
+# (1080p video filling a broadcast-sized CPB), `--delay 2s` (the exporter's). See
 # ts/README.md.
 
 # Check the subscriber's MPEG-TS output for IRD compliance.
+[positional-arguments]
 ts *args:
-    ./ts/run.sh {{ args }}
+    python3 ./ts/fragment_pes.test.py
+    python3 ./ts/drop_nulls.test.py
+    python3 ./ts/compliance.test.py
+    python3 ./ts/pcr-timing.test.py
+    python3 ./ts/open-gop.test.py
+    python3 ./ts/holes.test.py
+    python3 ./ts/passthrough.test.py
+    python3 ./ts/klv.test.py
+    ./ts/run.sh "$@"
+
+# Carry a hardware encoder's capture, which the T-STD model passes, whole through the round-trip.
+[positional-arguments]
+ts-passthrough-capture *args:
+    ./ts/run.sh --passthrough --source ../rs/moq-mux/src/container/ts/test_data/scte35/kyrion_dirtystart.ts "$@"
+
+# Table-placement grader: acquisition, interleave, phase, drift and missing-table controls.
+ts-pair-controls:
+    python3 ./ts/table-anchor.test.py
+
+# Round-trip the EIT fixtures: the sparse schedule must survive and
+# pending-version sections must be dropped at import.
+[positional-arguments]
+ts-eit *args:
+    ./ts/eit-roundtrip.sh "$@"
+
+# The T-STD model's controls: a broadcast capture must pass, and the same capture
+# delivered too slowly, too early, or in a burst must fail. Needs TSDuck, plus
+# ffmpeg/ffprobe (libx264) for the generated references.
+ts-tstd:
+    bash ./ts/tstd-controls.sh
+
+# Prove FFmpeg decode/content and TSDuck structure/PCR assertions reject damaged TS.
+ts-controls:
+    python3 ./ts/decode.test.py
+    bash ./ts/controls.sh
+
+# A JS viewer watching a live track through a relay that drains (SIGTERM, after
+# a stand-in for DNS stops pointing at it) migrates to a second relay behind the
+# same name without a dropped group. See drain/README.md.
+
+# Relay drain migration, end to end.
+drain *args:
+    ./drain/run.sh {{ args }}
 
 # Runs the @moq/wasm bindings in headless Chromium against a real relay, one per
 # protocol flavour. The crate is `#![cfg(target_arch = "wasm32")]`, so nothing in
 # `just check` or `just rs wasm` gets past compiling it. See wasm/README.md.
 
 # Browser coverage for the @moq/wasm bindings.
+[positional-arguments]
 wasm *args:
-    ./wasm/run.sh {{ args }}
+    ./wasm/run.sh "$@"
+
+# The @moq/video renderer in headless Chromium: WebGPU, a lost device, and the Canvas2D fallback.
+video:
+    cd .. && bun install --frozen-lockfile
+    cd video && bunx playwright install chromium
+    cd video && bun test ./renderer.browser.ts
+
+# Optional publisher retention across Rust/JS sessions through a Rust relay.
+max-age:
+    cargo nextest run --locked -p moq-tokio --test integration -E 'test(/^max_age::/)' --run-ignored all
+
+# Cross-language subscription termination over in-memory transports.
+bare-fin:
+    just rs test -p moq-net --lib bare_fin_interop --run-ignored all
+
+# Explore JSON snapshot codec sequences with a fresh replayable seed.
+json-properties:
+    bash json-properties.sh
+
+# Complete MoQ SETUP and transfer a frame over a real browser data-channel pair.
+p2p:
+    cd .. && bun install --frozen-lockfile
+    cd p2p && bunx playwright install chromium
+    cd p2p && bun test ./transport.browser.ts
+
+# Retain complete backend assets, parity, and raw alternating browser samples.
+[positional-arguments]
+wasm-baseline *args:
+    MOQ_TEST_RUNS="${MOQ_TEST_RUNS:-../target/test/wasm-backend}" ./wasm/run.sh "$@"
+    MOQ_TEST_RUNS="${MOQ_TEST_RUNS:-../target/test/wasm-backend}" ./wasm/run.sh --baseline "$@"

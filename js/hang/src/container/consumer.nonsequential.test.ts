@@ -1,11 +1,20 @@
 import { expect, test } from "bun:test";
+import type { Micro, Milli } from "@moq/clock";
 import { Group, Time, Track, Varint } from "@moq/net";
 import { Consumer } from "./consumer.ts";
 import { Format as LegacyFormat } from "./legacy.ts";
 
 // Standalone from consumer.test.ts so it only pulls the Legacy format, not the CMAF decoder.
 
-function encodeLegacyFrame(timestamp: Time.Micro, payload: Uint8Array): Uint8Array {
+/** The next frame, passing over gaps and ends. */
+async function nextFrame(consumer: Consumer) {
+	for (;;) {
+		const next = await consumer.next();
+		if (!next || next.kind === "frame") return next;
+	}
+}
+
+function encodeLegacyFrame(timestamp: Micro, payload: Uint8Array): Uint8Array {
 	const tsBytes = Varint.encode(timestamp);
 	const data = new Uint8Array(tsBytes.byteLength + payload.byteLength);
 	data.set(tsBytes, 0);
@@ -18,7 +27,7 @@ test("Consumer waits on a non-sequential hang group because it has no per-frame 
 	// presentation end is unknown until the next group arrives. With non-sequential group ids we
 	// therefore cannot prove the timeline is unbroken across a jump: a large id gap is
 	// indistinguishable from a real missing segment that may still be in transit. So the consumer
-	// waits (and lets #checkLatency / #tryDurationSkip decide once the latency budget or duration
+	// waits (and lets #checkMaxDelay / #tryDurationSkip decide once the max delay budget or duration
 	// coverage proves the gap too old) rather than eagerly skipping ahead, which would drop an
 	// in-transit group and wreck audio.
 	//
@@ -26,21 +35,23 @@ test("Consumer waits on a non-sequential hang group because it has no per-frame 
 	// as a trailing frame carrying the group's end timestamp. Until the container carries that, expect
 	// the wait. The CMAF path (per-sample duration in the moof) is covered in consumer.test.ts.
 	const track = new Track.Producer("test");
-	const consumer = new Consumer(track.subscribe(), { format: new LegacyFormat(), latency: 5000 as Time.Milli });
+	const consumer = new Consumer(track.subscribe(), {
+		format: new LegacyFormat("data"),
+		maxDelay: 5000 as Milli,
+	});
 
 	// Group A at a large sequence, completed so the cursor advances past it.
 	const a = new Group.Producer(1_000_000);
 	a.writeFrame({
-		payload: encodeLegacyFrame(0 as Time.Micro, new Uint8Array([0x01])),
+		payload: encodeLegacyFrame(0 as Micro, new Uint8Array([0x01])),
 		timestamp: Time.Timestamp.now(),
 	});
 	a.close();
 	track.writeGroup(a);
 
-	// Drain A: its frame, then its group-done marker.
-	const firstFrame = await consumer.next();
-	expect(firstFrame?.frame?.payload).toEqual(new Uint8Array([0x01]));
-	await consumer.next();
+	// Drain A's frame.
+	const firstFrame = await nextFrame(consumer);
+	expect(firstFrame?.frame.payload).toEqual(new Uint8Array([0x01]));
 
 	// Park next() before the next group's frames arrive (the live streaming case).
 	const pending = consumer.next();
@@ -51,11 +62,11 @@ test("Consumer waits on a non-sequential hang group because it has no per-frame 
 	const b = new Group.Producer(1_090_000);
 	track.writeGroup(b);
 	b.writeFrame({
-		payload: encodeLegacyFrame(1_000_000 as Time.Micro, new Uint8Array([0x02])),
+		payload: encodeLegacyFrame(1_000_000 as Micro, new Uint8Array([0x02])),
 		timestamp: Time.Timestamp.now(),
 	});
 
-	// Within the latency budget (5s), the parked next() stays parked: no duration means no proof of
+	// Within the max delay budget (5s), the parked next() stays parked: no duration means no proof of
 	// contiguity, so the consumer waits instead of eagerly delivering across the gap.
 	const result = await Promise.race([
 		pending,

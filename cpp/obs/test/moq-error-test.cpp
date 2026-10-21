@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "moq-error.h"
+
+#include <cstdio>
+
+int main()
+{
+	using MoQError::Classify;
+	using MoQError::Kind;
+	for (const char *failure :
+	     {"fingerprint request failed", "failed to read fingerprint", "failed to fetch certificate fingerprint",
+	      "certificate fingerprint request failed"}) {
+		if (Classify(MoQError::Connect, failure) != Kind::Network ||
+		    Classify(MoQError::Connect, std::string("reconnect timed out: ") + failure) != Kind::Timeout)
+			return 1;
+	}
+	const char *outage = "connect error: reconnect timed out after 10s: failed to connect to server: "
+			     "QUIC failed: failed to fetch fingerprint; WebSocket failed: failed to connect WebSocket";
+	if (Classify(MoQError::Connect, outage) != Kind::Timeout ||
+	    Classify(MoQError::Connect, "failed to fetch fingerprint") != Kind::Network ||
+	    Classify(MoQError::Connect, "reconnect timed out after 10s: invalid peer certificate: UnknownIssuer") !=
+		    Kind::Certificate ||
+	    Classify(MoQError::Unauthorized, "reconnect timed out after 10s") != Kind::Unauthorized ||
+	    Classify(MoQError::Forbidden, "forbidden") != Kind::Forbidden ||
+	    Classify(MoQError::Offline, "offline") != Kind::Offline ||
+	    Classify(MoQError::TooManyRequests, "reconnect timed out") != Kind::TooManyRequests) {
+		std::fprintf(stderr, "FAIL: connection failure classification\n");
+		return 1;
+	}
+	std::printf("network outage, certificate, auth, and offline classification: ok\n");
+	return 0;
+}

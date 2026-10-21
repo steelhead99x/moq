@@ -29,44 +29,155 @@ in sync at the latency you ask for.
 | Attribute | |
 | --- | --- |
 | `url`, `name` | Relay URL (with `?jwt=` if needed) and broadcast name. |
-| `paused`, `muted`, `volume` | The usual player controls, mirrored as reactive properties. |
-| `latency` | Target latency: `"real-time"` (derived from RTT, the default), a number of ms, or `"instant"` to paint frames as they decode with no pacing at all. |
-| `latency-min`, `latency-max` | Open a range instead: buffer freely between the floor and the ceiling and only skip ahead past the ceiling. |
-| `jitter` | The jitter buffer in ms. |
-| `visible` | Only subscribe to video while the element is on screen: a margin (`"20%"` default, `"200px"`), `"always"`, or `"never"`. |
-| `reload` | Wait for the broadcast to be announced before subscribing (default on), so a player can be mounted before the stream exists. |
-| `catalog-format` | `hang` (default, from the `.hang` suffix), `hangz` (compressed), `msf`, or `manual` to supply the catalog yourself. |
+| `paused`, `muted`, `volume` | The usual player controls. |
+| `delay` | How far playback trails the live edge: `"auto"` (the default, sized from how late frames arrive; see [audio jitter](/concept/audio-jitter)), a duration like `"300ms"`, or `"instant"` to paint video as it decodes, with no audio. |
+| `buffer` | How far ahead of the live edge media may run; see [buffered playback](#buffered-playback). |
+| `captions` | The caption track to show. |
+| `visible` | Only download video while the element is on screen (or near it). |
+| `backend` | How the canvas is drawn; see [@moq/video](/lib/js/video). `auto` (default), `webgpu`, or `2d`. |
+| `announced` | Wait for the broadcast to be announced before subscribing (default on), so a player can mount before the stream exists. |
+| `catalog-format` | `hang`, `hangz`, `msf`, or `manual`; detected from the name by default. |
 
+Every attribute is also a reactive property. The
+[README](https://www.npmjs.com/package/@moq/watch) lists types and defaults.
 The overlay adds play/pause, volume, fullscreen, a quality selector, a
-buffering indicator, an unsupported-codec warning, and a stats panel.
-`<moq-watch-support>` shows what the browser can play.
+buffering indicator, and a stats panel.
+
+`el.error` (also `el.player.error`) reports a fatal audio or video decode error.
+The failing track closes its subscription and stops decoding. Select another
+source or rendition to clear the failure; the player does not resubscribe to
+broken media automatically. Individual decoder errors are available at
+`el.audio.out.error` and `el.video.out.error`.
+
+`el.broadcast.out.status` is `offline`, `loading`, `live`, `error`, or `unsupported`.
+On `unsupported`, update the player to read the broadcast's newer catalog; the overlay shows this notice.
+On `error` the origin refused the broadcast, `el.broadcast.out.error` says why,
+and the player does not ask again until it is pointed elsewhere or re-enabled.
+
+The broadcast's announcement is its online signal: the player starts when a
+route serving the name is announced, goes `offline` when none is left, and
+waits for one to return for as long as it is mounted. When the exact route
+ends while a covering prefix still serves the name, it moves to the prefix. A
+name outside the origin's scope is an `error`. A restarted publisher at the same name is followed at
+once, with a fresh catalog, and video, audio, and the clock start over on its
+timeline instead of waiting for it to catch up to the old one.
+
+## Binding from a framework
+
+`import "@moq/watch/element"` registers `<moq-watch>` when the module
+evaluates. Until then the tag is a plain `HTMLElement`, so a framework ref
+(Svelte's `bind:this`, React's `ref`) to it reads `undefined` for
+`el.broadcast` and friends. Import the element statically in browser-only
+entrypoints. With SSR, import it in a client-side mount hook and wait:
+
+```ts
+await import("@moq/watch/element");
+await customElements.whenDefined("moq-watch");
+el.broadcast.out.catalog.subscribe(handler);
+```
 
 ## Custom tracks
 
-`broadcast.subscribeTrack(name, priority, consume)` follows the active
-broadcast across reconnects for any application track, and the loose catalog
-passes your own sections through to `broadcast.catalog`. Decode JSON with
-`@moq/json`. Reach the pipeline from the element via `el.broadcast`,
-`el.video`, `el.audio`, and `el.signals`.
+The catalog schema is loose: sections `@moq/hang` doesn't recognize are passed
+through to `broadcast.out.catalog`, a read-only signal you react to like any
+other. Subscribe to the track it names off `broadcast.out.active`, the live
+broadcast consumer, and decode JSON with
+[`@moq/json`](https://www.npmjs.com/package/@moq/json).
+
+```ts
+import * as Json from "@moq/json";
+import { Hang } from "@moq/watch";
+
+// Run after the element module has loaded and the node has mounted.
+const el = document.querySelector("moq-watch");
+if (!el) throw new Error("Missing <moq-watch> element");
+
+const dispose = el.signals.run((effect) => {
+    const catalog = effect.get(el.broadcast.out.catalog) as { metadata?: unknown } | undefined;
+    const active = effect.get(el.broadcast.out.active);
+
+    const metadata = catalog?.metadata;
+    if (metadata !== undefined &&
+        (!Array.isArray(metadata) || !metadata.every((name): name is string => typeof name === "string"))) {
+        throw new Error("Expected metadata to be an array of track names");
+    }
+    const name = metadata?.[0];
+    if (!active || !name) return;
+
+    const track = active.track(name).subscribe({ priority: Hang.Catalog.PRIORITY.catalog });
+    effect.cleanup(() => track.close());
+
+    const consumer = new Json.Snapshot.Consumer<unknown>({ track });
+    effect.spawn(async () => {
+        for (;;) {
+            const state = await effect.race(consumer.latest());
+            if (state === undefined) break;
+            console.log("metadata", state.value);
+        }
+    });
+});
+```
+
+Call `dispose()` on unmount. The effect re-runs when the catalog or the
+active broadcast changes, so a reconnect resubscribes on its own: the
+broadcast's announced request moves to each start or restart, and switches only
+when that resolves another broadcast. A request ending is never the trigger, so
+following a restart needs a relay with discovery.
 
 ## Without the element
 
 ```ts
+import * as Moq from "@moq/net";
 import * as Watch from "@moq/watch";
 
-const broadcast = new Watch.Broadcast({ connection, enabled: true, name: "alice.hang" });
+// Shared with every other component pointed at the same relay; the broadcast
+// handle reads from its origin and requests again on each announcement, so it
+// follows reconnects and restarts.
+const connection = new Moq.Connection({ url: new URL("https://relay.example.com/anon") });
+const player = new Watch.Player({
+    origin: connection.origin,
+    probe: connection.probe,
+    name: Moq.Path.from("alice.hang"),
+    canvas,
+});
+// player.broadcast, player.video, player.audio, player.text, player.sync,
+// player.renderer, and player.emitter expose the pipeline.
+// Call player.close() when playback ends.
 ```
 
-`Watch.Broadcast`, `Video.Decoder`, `Video.Renderer`, `Audio.Decoder`, and
-`Audio.Emitter` are the pieces the element assembles; every input and output
-is a signal from [`@moq/signals`](/lib/js/signals). Load from a CDN
-(`https://esm.sh/@moq/watch/element`) for a no-build embed.
+Pass a signal from [`@moq/signals`](/lib/js/signals) for any control you want
+to change later, such as `muted` or `delay`. `Player` is the pipeline inside
+`<moq-watch>`; its parts are exported for custom composition.
+
+To chart when each frame arrived against when it plays, open an `arrivals()`
+handle on a decoder. It yields every frame received while it is open, stamped
+when the frame came off the transport, and a gap wherever media after an earlier
+frame will never arrive (a latency skip, a hole):
+
+```ts
+const arrivals = player.audio.arrivals();
+for await (const entry of arrivals) {
+    if (entry.kind === "gap") {
+        // Break the plotted line; nothing arrived from `timestamp` for `duration`.
+        continue;
+    }
+    const { timestamp, arrival, late } = entry;
+    // `late`: arrived after its playback deadline.
+}
+```
+
+A gap's span is an upper bound: without per-frame durations it starts at the
+last frame's timestamp, and it covers any pause the publisher declared.
+
+Unread frames queue on the handle, so keep reading and keep your own window.
+Leaving the loop or calling `arrivals.close()` stops observing and releases
+them; nothing is retained without an open handle. Video reports the rendition on screen.
 
 ## Spatial playback
 
 `Audio.Decoder` can take a shared `AudioContext` as the `context` constructor
 knob. Every remote then lives in one graph (one `AudioListener`, many
-`PannerNode`s). The decoder never closes an injected context; match its sample
+`PannerNode`s). The decoder never closes or suspends an injected context; match its sample
 rate to the decoded PCM (typically 48 kHz Opus). Connect `decoder.out.root` to
 your panner or gain node. Do not use `Audio.Emitter` for positioned sources: it
 always wires the root to `destination`. Set `enabled` false to stop downloading
@@ -74,16 +185,33 @@ a remote that is out of earshot.
 
 ## Buffered playback
 
-By default the player minimizes latency: it skips ahead whenever the buffer
-grows past the target. Content produced faster than real time, such as a TTS
+By default the player minimizes latency: it skips ahead whenever media piles
+up past the delay. Content produced faster than real time, such as a TTS
 response emitted in one burst with future timestamps, wants the opposite. Set
-`latency-max` above `latency-min` to play through at the encoded pace:
+`buffer` to how far ahead it may run and it plays through at the encoded pace:
 
 ```html
-<moq-watch url="..." name="bot/tts.hang" latency-min="100" latency-max="30000"></moq-watch>
+<moq-watch url="..." name="bot/tts.hang" delay="100ms" buffer="30s"></moq-watch>
 ```
 
-Only the floor is held as decoded PCM; the rest stays as encoded frames with
-backpressure on the decoder, so a large ceiling is cheap. `el.reset()`
-flushes and re-anchors at the next frame, which is how a producer interrupts
-an utterance.
+Durations need a unit; a bare number is rejected. Audio holds the buffer as
+encoded frames, so a large one is cheap; video waits as decoded pictures, which
+hold decoder memory, so a long video buffer is not. `el.reset()` flushes and re-anchors at the
+next frame, which is how a producer interrupts an utterance.
+
+## Strict CSP
+
+The audio worklet loads from a `blob:` URL by default, so a CSP must allow
+`blob:` in `script-src`. Otherwise, copy `node_modules/@moq/watch/assets/*`
+into a directory your origin serves and point the package at it before
+playback starts:
+
+```ts
+import * as Watch from "@moq/watch";
+
+Watch.assets("/moq/");
+```
+
+The URL must end with `/`. Copy the files again on every upgrade: the worklet
+changes with the package. `@moq/room` and `@moq/boy` play through
+`@moq/watch`, so this one call covers them.

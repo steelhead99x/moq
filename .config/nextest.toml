@@ -16,8 +16,29 @@
 slow-timeout = { period = "30s", terminate-after = 2 }
 
 # Retries hide flakes, and this repo treats an intermittent failure as a real
-# race until proven otherwise (see Root Cause First in CLAUDE.md).
+# race until proven otherwise (see Root Cause First in AGENTS.md).
 retries = 0
+
+# PR recipes build library, binary, and integration-test targets. Nightly keeps
+# the exhaustive target compile, but executes benches through cargo bench smokes.
+default-filter = "not kind(bench)"
+
+# Limit ring concurrency within one invocation. Unit-test workers use small
+# rings; integration workers keep production geometry. sh/rs/nextest.sh raises
+# hosted CI's locked-memory limit and uses the host's hard limit locally.
+# Several invocations still share that user-wide budget; see rs/moq-uring/README.md.
+[[profile.default.overrides]]
+filter = "package(moq-uring) | (binary_id(moq-relay::integration) & (test(/^runtime_uring::/) | test(/^embed::.*uring/)))"
+test-group = "io-uring"
+
+# The binding benchmark runs many `MOQ_BENCH_SECONDS` budgets back to back, so its
+# length scales with the budget. It guards each round against a wedge itself.
+[[profile.default.overrides]]
+filter = "package(moq-ffi) & test(=bench::benchmark_ffi)"
+slow-timeout = { period = "60s" }
+
+[test-groups]
+io-uring = { max-threads = 4 }
 
 # CI has noisier neighbours and cold caches, so give a test longer before
 # calling it wedged.

@@ -1,7 +1,10 @@
 use std::task::{Poll, ready};
 
+use moq_net::PathOwned;
+
 use super::{Catalog, CatalogExt};
 use crate::Result;
+use crate::catalog::CatalogFormat;
 
 /// A catalog consumer, used to receive catalog updates and discover tracks.
 ///
@@ -10,15 +13,28 @@ use crate::Result;
 ///
 /// Generic over the application extension `E` (defaulting to `()`); yields a
 /// [`Catalog<E>`](super::Catalog).
+///
+/// A rendition's `broadcast` field is relative to the path of the broadcast serving the
+/// catalog, taken from the track's [`broadcast::Info::path`](moq_net::broadcast::Info::path).
+/// A catalog that misuses that reference is rejected outright (see [`Self::poll_next`]).
 pub struct Consumer<E: CatalogExt = ()> {
-	inner: moq_json::snapshot::Consumer<Catalog<E>>,
+	// Decoded in two steps, so a catalog needing a newer reader fails with a typed error.
+	inner: moq_json::snapshot::Consumer<serde_json::Value>,
+	_ext: std::marker::PhantomData<E>,
+	format: CatalogFormat,
+	/// Path of the broadcast serving this catalog, which rendition references and the
+	/// echo prefix resolve against.
+	base: PathOwned,
 }
 
 impl<E: CatalogExt> Consumer<E> {
 	/// Create a new catalog consumer from a MoQ track subscriber (uncompressed `catalog.json`).
 	pub fn new(track: moq_net::track::Subscriber) -> Self {
 		Self {
-			inner: moq_json::snapshot::Consumer::new(track, moq_json::snapshot::ConsumerConfig::default()),
+			format: CatalogFormat::Hang,
+			base: track.broadcast().path.clone(),
+			inner: moq_json::snapshot::Consumer::new(track, moq_json::snapshot::consumer::Config::default()),
+			_ext: std::marker::PhantomData,
 		}
 	}
 
@@ -26,16 +42,37 @@ impl<E: CatalogExt> Consumer<E> {
 	///
 	/// The track must be the compressed one (see [`hang::Catalog::COMPRESSED_NAME`]).
 	pub fn compressed(track: moq_net::track::Subscriber) -> Self {
-		let mut config = moq_json::snapshot::ConsumerConfig::default();
-		config.compression = true;
+		let mut config = moq_json::snapshot::consumer::Config::default();
+		config.compression = moq_json::Compression::Deflate;
 		Self {
+			format: CatalogFormat::HangZ,
+			base: track.broadcast().path.clone(),
 			inner: moq_json::snapshot::Consumer::new(track, config),
+			_ext: std::marker::PhantomData,
 		}
 	}
 
+	pub(crate) fn format(&self) -> CatalogFormat {
+		self.format
+	}
+
 	/// Poll for the next catalog update.
+	///
+	/// Fails with [`Error::EscapingBroadcast`](crate::Error::EscapingBroadcast) if any rendition's
+	/// `broadcast` reference or echo prefix walks above the root. Such a reference names no broadcast, and the
+	/// root is the consumer's authorized subtree, so it is an attempt to reference content the
+	/// consumer cannot name. The whole catalog is rejected rather than the one rendition: a
+	/// publisher that emits one has a bug (or is hostile), and silently serving the rest hides
+	/// that from the operator while the missing rendition surfaces much later as a track that
+	/// never fills.
 	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Catalog<E>>>> {
-		Poll::Ready(Ok(ready!(self.inner.poll_next(waiter))?))
+		let value = ready!(self.inner.poll_latest(waiter))?.map(|value| value.value);
+		let catalog = value.map(Catalog::from_value).transpose()?;
+		if let Some(catalog) = catalog.as_ref() {
+			catalog.check_renditions()?;
+			check_resolvable(&self.base, catalog)?;
+		}
+		Poll::Ready(Ok(catalog))
 	}
 
 	/// Get the next catalog update.
@@ -46,7 +83,7 @@ impl<E: CatalogExt> Consumer<E> {
 	where
 		Catalog<E>: Unpin,
 	{
-		Ok(self.inner.next().await?)
+		kio::wait(|waiter| self.poll_next(waiter)).await
 	}
 }
 
@@ -54,6 +91,42 @@ impl<E: CatalogExt> From<moq_net::track::Subscriber> for Consumer<E> {
 	fn from(inner: moq_net::track::Subscriber) -> Self {
 		Self::new(inner)
 	}
+}
+
+/// Reject the catalog if a track reference or echo prefix walks above the root.
+///
+/// Every section carrying a relative broadcast path must be included here; a section left out
+/// silently exempts its paths from the containment check.
+fn check_resolvable<E: CatalogExt>(base: &PathOwned, catalog: &Catalog<E>) -> Result<()> {
+	let video = catalog.video.renditions.iter();
+	let audio = catalog.audio.renditions.iter();
+	let text = catalog.text.renditions.iter();
+	let json = catalog.json.tracks.iter();
+	let binary = catalog.binary.tracks.iter();
+
+	for (rendition, rel) in video
+		.map(|(name, config)| (name, config.broadcast.as_ref()))
+		.chain(audio.map(|(name, config)| (name, config.broadcast.as_ref())))
+		.chain(text.map(|(name, config)| (name, config.broadcast.as_ref())))
+		.chain(json.map(|(name, config)| (name, config.broadcast.as_ref())))
+		.chain(binary.map(|(name, config)| (name, config.broadcast.as_ref())))
+	{
+		let Some(rel) = rel.filter(|rel| !rel.is_empty()) else {
+			continue;
+		};
+
+		if base.try_resolve(rel).is_none() {
+			tracing::error!(rendition, %rel, catalog = %base, "rejecting catalog: broadcast reference escapes the root");
+			return Err(crate::Error::EscapingBroadcast(rel.to_string()));
+		}
+	}
+
+	if let Some(echo) = &catalog.echo
+		&& base.try_resolve(&echo.path).is_none()
+	{
+		return Err(crate::Error::EscapingBroadcast(echo.path.to_string()));
+	}
+	Ok(())
 }
 
 #[cfg(test)]
@@ -92,9 +165,280 @@ mod test {
 		}
 	}
 
+	fn opus() -> hang::catalog::AudioConfig {
+		hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, 48_000, 2)
+	}
+
+	fn referencing(rel: &str) -> hang::catalog::AudioConfig {
+		let mut config = opus();
+		config.broadcast = Some(moq_net::path::Relative::new(rel).into_owned());
+		config
+	}
+
+	/// Publish `catalog` as one snapshot on a broadcast at `a/pub` (two segments, so a
+	/// third `..` walks above the root) and return what the stream yields. The broadcast is
+	/// minted through an origin because that is what stamps
+	/// [`broadcast::Info::path`](moq_net::broadcast::Info::path), the base the consumer
+	/// resolves against.
+	fn publish_catalog(published: Catalog<()>) -> Result<Option<Catalog>> {
+		let origin = crate::source::produce_origin();
+		let broadcast = origin.create_broadcast("a/pub").expect("broadcast should create");
+		let track = broadcast
+			.create_track(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info())
+			.expect("catalog track should create");
+		let mut consumer = Consumer::new(track.subscribe(None));
+		let mut group = track.append_group().expect("catalog group should append");
+
+		let payload = serde_json::to_string(&published).expect("catalog should serialize");
+		group
+			.write_frame(moq_net::Timestamp::ZERO, payload)
+			.expect("catalog frame should write");
+		group.finish().expect("catalog group should finish");
+
+		match consumer.poll_next(&kio::Waiter::noop()) {
+			Poll::Ready(result) => result,
+			Poll::Pending => panic!("a finished catalog group should be ready"),
+		}
+	}
+
+	/// [`publish_catalog`] over audio renditions alone.
+	fn publish(renditions: Vec<(&str, hang::catalog::AudioConfig)>) -> Result<Option<Catalog>> {
+		let mut published = Catalog::<()>::default();
+		for (name, config) in renditions {
+			published.audio.renditions.insert(name.to_string(), config);
+		}
+		publish_catalog(published)
+	}
+
+	/// [`publish_catalog`] against a *standalone* broadcast (no origin, so its own path is
+	/// empty) that a dynamic handler serves at `a/pub`, read back through the requesting
+	/// origin cursor. That is the shape an FFI app takes when it answers an origin request
+	/// with a broadcast it built itself.
+	async fn publish_catalog_served(published: Catalog<()>) -> Result<Option<Catalog>> {
+		let broadcast = moq_net::broadcast::Info::new().produce();
+		let track = broadcast
+			.create_track(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info())
+			.expect("catalog track should create");
+
+		let origin = crate::source::produce_origin();
+		let dynamic = origin.dynamic("", Default::default()).unwrap();
+		let requesting = origin.consume().request_broadcast("a/pub", None);
+		let served = broadcast.consume();
+		// The handler hands its route back: dropping it would retract the route and end
+		// the broadcast it just served.
+		let handler = tokio::spawn(async move {
+			dynamic
+				.requested_broadcast()
+				.await
+				.expect("handler should be asked for the path")
+				.accept(&served);
+			dynamic
+		});
+
+		let resolved = requesting.await;
+		let _dynamic = handler.await.expect("handler task");
+		let subscriber = resolved
+			.expect("the handler served it")
+			.track(hang::Catalog::DEFAULT_NAME)
+			.expect("catalog track should resolve")
+			.subscribe(None)
+			.await
+			.expect("catalog track should subscribe");
+		let mut consumer = Consumer::new(subscriber);
+
+		let mut group = track.append_group().expect("catalog group should append");
+		let payload = serde_json::to_string(&published).expect("catalog should serialize");
+		group
+			.write_frame(moq_net::Timestamp::ZERO, payload)
+			.expect("catalog frame should write");
+		group.finish().expect("catalog group should finish");
+
+		consumer.next().await
+	}
+
+	/// [`publish_catalog_served`] over one audio rendition carrying `reference`.
+	async fn publish_served(reference: &str) -> Result<Option<Catalog>> {
+		let mut published = Catalog::<()>::default();
+		published
+			.audio
+			.renditions
+			.insert("sibling".to_string(), referencing(reference));
+		publish_catalog_served(published).await
+	}
+
+	fn soliciting(reference: &str) -> Catalog {
+		let (mut catalog, _) = catalog_payload("here");
+		catalog.echo = Some(hang::catalog::Echo::new(
+			moq_net::path::Relative::new(reference).into_owned(),
+		));
+		catalog
+	}
+
+	#[tokio::test]
+	async fn echo_prefix_is_checked_before_the_native_reader_yields() {
+		for reference in ["viewers", "../viewers", ""] {
+			assert!(publish_catalog(soliciting(reference)).unwrap().unwrap().echo.is_some());
+		}
+		for reference in ["../../viewers", "../../../elsewhere"] {
+			let result = publish_catalog(soliciting(reference));
+			assert!(
+				matches!(result, Err(crate::Error::EscapingBroadcast(_))),
+				"{reference}: {result:?}"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn echo_prefix_is_checked_against_the_dynamic_served_path() {
+		assert!(
+			publish_catalog_served(soliciting("../viewers"))
+				.await
+				.unwrap()
+				.unwrap()
+				.echo
+				.is_some()
+		);
+		let result = publish_catalog_served(soliciting("../../../elsewhere")).await;
+		assert!(matches!(result, Err(crate::Error::EscapingBroadcast(_))), "{result:?}");
+	}
+
+	#[test]
+	fn refuses_oversized_catalog_before_reconciling_renditions() {
+		let mut published = Catalog::<()>::default();
+		for i in 0..=hang::catalog::MAX_RENDITIONS {
+			published.audio.renditions.insert(format!("audio{i}"), opus());
+		}
+		assert!(matches!(
+			publish_catalog(published),
+			Err(crate::Error::Hang(hang::Error::TooManyRenditions {
+				count: 65,
+				max: 64
+			}))
+		));
+	}
+
+	/// A reference that stops at or below the root names a broadcast, so the catalog stands.
+	/// `a/pub` resolves against `a`, so `..` is what lands on the root itself.
+	#[tokio::test]
+	async fn accepts_references_within_the_root() {
+		let catalog = publish(vec![
+			("here", opus()),
+			("sibling", referencing("./source")),
+			("root", referencing("..")),
+		])
+		.expect("catalog should be accepted")
+		.expect("catalog should decode");
+
+		let mut names: Vec<&str> = catalog.audio.renditions.keys().map(String::as_str).collect();
+		names.sort_unstable();
+		assert_eq!(names, ["here", "root", "sibling"]);
+	}
+
+	/// A rendition whose `broadcast` reference walks above the root names no broadcast, and
+	/// the root is the consumer's authorized subtree. The whole catalog is rejected rather
+	/// than the one rendition, so a publisher bug is loud instead of surfacing later as a
+	/// track that never fills.
+	#[tokio::test]
+	async fn rejects_a_catalog_whose_broadcast_escapes_the_root() {
+		for reference in ["../../../elsewhere", "../../..", "../../../.."] {
+			// The escaping rendition is published alongside perfectly good ones, which do
+			// not rescue the catalog.
+			let result = publish(vec![
+				("here", opus()),
+				("sibling", referencing("../source")),
+				("escaping", referencing(reference)),
+			]);
+
+			match result {
+				Err(crate::Error::EscapingBroadcast(reported)) => assert_eq!(reported, reference),
+				Err(err) => panic!("{reference} failed with the wrong error: {err:?}"),
+				Ok(_) => panic!("{reference} should reject the catalog"),
+			}
+		}
+	}
+
+	/// A broadcast is named by where its reader found it, not by where its producer created
+	/// it: a standalone broadcast served on demand at `a/pub` resolves `../source` against
+	/// `a/pub`. Naming it by the producer's own (empty) path would make its own root the
+	/// bound, rejecting a reference the requester can perfectly well reach.
+	#[tokio::test]
+	async fn accepts_references_within_the_served_path() {
+		let catalog = publish_served("../source")
+			.await
+			.expect("catalog should be accepted")
+			.expect("catalog should decode");
+
+		let rendition = catalog
+			.audio
+			.renditions
+			.get("sibling")
+			.expect("rendition should survive");
+		assert_eq!(rendition.broadcast.as_ref().unwrap().as_str(), "../source");
+	}
+
+	/// The bound moves with the served path rather than disappearing: a reference that
+	/// walks above `a/pub` still names nothing and still rejects the catalog.
+	#[tokio::test]
+	async fn rejects_references_escaping_the_served_path() {
+		match publish_served("../../../elsewhere").await {
+			Err(crate::Error::EscapingBroadcast(reported)) => assert_eq!(reported, "../../../elsewhere"),
+			Err(err) => panic!("wrong error: {err:?}"),
+			Ok(_) => panic!("an escaping reference should reject the catalog"),
+		}
+	}
+
+	/// The containment check covers every section carrying renditions, not just audio and
+	/// video: an escaping text (caption) reference rejects the catalog the same way.
+	#[tokio::test]
+	async fn rejects_a_catalog_whose_text_broadcast_escapes_the_root() {
+		let mut published = Catalog::<()>::default();
+		published.audio.renditions.insert("here".to_string(), opus());
+
+		let mut text = hang::catalog::TextConfig::new(hang::catalog::TextFormat::Vtt);
+		text.broadcast = Some(moq_net::path::Relative::new("../../../elsewhere").into_owned());
+		published.text.renditions.insert("captions".to_string(), text);
+
+		match publish_catalog(published) {
+			Err(crate::Error::EscapingBroadcast(reported)) => assert_eq!(reported, "../../../elsewhere"),
+			Err(err) => panic!("wrong error: {err:?}"),
+			Ok(_) => panic!("an escaping text reference should reject the catalog"),
+		}
+	}
+
+	/// Data tracks carry a `broadcast` reference like any rendition, so the containment check
+	/// covers them too. Without this the catalog is accepted and the escape surfaces much later,
+	/// when the entry is subscribed.
+	#[tokio::test]
+	async fn rejects_a_catalog_whose_data_broadcast_escapes_the_root() {
+		for section in ["json", "binary"] {
+			let mut published = Catalog::<()>::default();
+			published.audio.renditions.insert("here".to_string(), opus());
+
+			let escaping = moq_net::path::Relative::new("../../../elsewhere").into_owned();
+			match section {
+				"json" => {
+					let mut config = hang::catalog::JsonConfig::new(hang::catalog::Mode::Stream);
+					config.broadcast = Some(escaping);
+					published.json.tracks.insert("chat".to_string(), config);
+				}
+				_ => {
+					let mut config = hang::catalog::BinaryConfig::new(hang::catalog::Mode::Stream);
+					config.broadcast = Some(escaping);
+					published.binary.tracks.insert("blobs".to_string(), config);
+				}
+			}
+
+			match publish_catalog(published) {
+				Err(crate::Error::EscapingBroadcast(reported)) => assert_eq!(reported, "../../../elsewhere"),
+				Err(err) => panic!("wrong error for {section}: {err:?}"),
+				Ok(_) => panic!("an escaping {section} reference should reject the catalog"),
+			}
+		}
+	}
+
 	#[test]
 	fn waits_for_pending_catalog_group_payload() {
-		let mut track = track_producer(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info());
+		let track = track_producer(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info());
 		let mut consumer = Consumer::new(track.subscribe(None));
 		let mut group = track.append_group().expect("catalog group should append");
 
@@ -111,8 +455,24 @@ mod test {
 	}
 
 	#[test]
+	fn a_newer_version_is_a_typed_refusal() {
+		let track = track_producer(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info());
+		let mut consumer: Consumer = Consumer::new(track.subscribe(None));
+		let mut group = track.append_group().expect("catalog group should append");
+		group
+			.write_frame(moq_net::Timestamp::ZERO, r#"{"version":5}"#)
+			.expect("catalog frame should write");
+		group.finish().expect("catalog group should finish");
+
+		assert!(matches!(
+			consumer.poll_next(&kio::Waiter::noop()),
+			Poll::Ready(Err(crate::Error::Hang(hang::Error::UnsupportedVersion(5))))
+		));
+	}
+
+	#[test]
 	fn waits_for_pending_catalog_group_payload_after_track_finish() {
-		let mut track = track_producer(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info());
+		let track = track_producer(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info());
 		let mut consumer = Consumer::new(track.subscribe(None));
 		let mut group = track.append_group().expect("catalog group should append");
 
@@ -132,7 +492,7 @@ mod test {
 
 	#[test]
 	fn returns_latest_complete_catalog_group() {
-		let mut track = track_producer(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info());
+		let track = track_producer(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info());
 		let mut consumer = Consumer::new(track.subscribe(None));
 		let waiter = kio::Waiter::noop();
 
@@ -158,7 +518,7 @@ mod test {
 
 	#[test]
 	fn waits_for_newer_pending_group_instead_of_returning_older_ready_group() {
-		let mut track = track_producer(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info());
+		let track = track_producer(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info());
 		let mut consumer = Consumer::new(track.subscribe(None));
 		let waiter = kio::Waiter::noop();
 
@@ -185,7 +545,7 @@ mod test {
 
 	#[test]
 	fn retained_pending_group_is_superseded_by_newer_group() {
-		let mut track = track_producer(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info());
+		let track = track_producer(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info());
 		let mut consumer = Consumer::new(track.subscribe(None));
 		let waiter = kio::Waiter::noop();
 
@@ -215,7 +575,7 @@ mod test {
 
 	#[test]
 	fn returns_none_when_empty_track_finishes() {
-		let mut track = track_producer(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info());
+		let track = track_producer(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info());
 		let mut consumer: Consumer = Consumer::new(track.subscribe(None));
 		let waiter = kio::Waiter::noop();
 

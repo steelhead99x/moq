@@ -3,31 +3,76 @@
 //! This is an experiment: rather than reimplementing the moq-lite wire protocol
 //! in TypeScript (as `@moq/net` does today), compile the real `moq-net` Rust
 //! implementation to WebAssembly and drive the browser's WebTransport from
-//! inside it. See `transport.rs` for the WebTransport adapter.
+//! inside it. See `transport.rs` for the dial.
 //!
 //! Scope: the consume path (connect -> broadcast -> track -> group -> frame),
 //! which is the highest-value target (the `@moq/watch` use case). The publish
 //! path follows the same shape and is left as the obvious next step.
 //!
-//! moq-net's timers and `Instant` go through `web_async::time` (tokio on native,
-//! wasmtimer on wasm), so the consume path runs in the browser. (`model/time.rs`
-//! has an unused wall-clock helper that isn't wasm-portable, but nothing calls
-//! it, so it never runs. See README.md.)
+//! `moq_net::time::run` drives moq-net with the browser clock and timer; this
+//! crate spawns it on the browser's microtask queue.
+//!
+//! Methods that wait return a `Promise` over cloned state rather than being an
+//! `async fn(&self)`: wasm-bindgen keeps `&self` borrowed across such a method's
+//! await, and a JS `free()` during it throws from inside Rust, which unwinds past
+//! the shadow stack and corrupts the wasm heap. Freeing a handle rejects its
+//! pending calls with a cancel instead; freeing the `Session` also closes it.
 
 // Browser-only crate. Empty on native so `cargo check --workspace` stays green.
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::RefCell;
+use std::pin::pin;
 use std::rc::Rc;
 
-use js_sys::Uint8Array;
+use futures::FutureExt;
+use futures::channel::oneshot;
+use futures::future::{Either, Shared, select};
+use js_sys::{Promise, Uint8Array};
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::future_to_promise;
 
-mod transport;
+pub mod transport;
 
 /// Map any displayable error into a JS exception.
 fn js_err(e: impl std::fmt::Display) -> JsValue {
 	JsError::new(&e.to_string()).into()
+}
+
+/// Rejects a handle's pending calls once JS frees the handle.
+///
+/// The handle owns the sender; each pending call races a clone of the receiver,
+/// which resolves when the sender drops with the handle.
+struct Freed {
+	_handle: oneshot::Sender<()>,
+	signal: Shared<oneshot::Receiver<()>>,
+}
+
+impl Freed {
+	fn new() -> Self {
+		let (handle, signal) = oneshot::channel();
+		Self {
+			_handle: handle,
+			signal: signal.shared(),
+		}
+	}
+
+	/// Run `task`, rejecting with a cancel if the handle is freed first.
+	///
+	/// The signal is polled first, so a freed handle rejects even when `task` could
+	/// finish on its first poll; dropping `task` releases whatever it had taken.
+	fn guard<F, T>(&self, task: F) -> impl Future<Output = Result<T, JsValue>> + use<F, T>
+	where
+		F: Future<Output = Result<T, JsValue>>,
+	{
+		let freed = self.signal.clone();
+		async move {
+			match select(freed, pin!(task)).await {
+				Either::Left(_) => Err(js_err(moq_net::Error::Cancel)),
+				Either::Right((result, _)) => result,
+			}
+		}
+	}
 }
 
 /// Install panic + tracing hooks for readable errors. Call once after the wasm
@@ -52,7 +97,7 @@ impl Session {
 	/// Connect to a relay over the browser's WebTransport, using the system roots.
 	pub async fn connect(url: String) -> Result<Session, JsValue> {
 		let url = url::Url::parse(&url).map_err(js_err)?;
-		let transport = transport::connect(url).await.map_err(js_err)?;
+		let transport = transport::connect(url, Default::default()).await.map_err(js_err)?;
 		Self::handshake(transport).await
 	}
 
@@ -61,22 +106,28 @@ impl Session {
 	pub async fn connect_with_hashes(url: String, hashes: Vec<Uint8Array>) -> Result<Session, JsValue> {
 		let url = url::Url::parse(&url).map_err(js_err)?;
 		let hashes = hashes.iter().map(|h| h.to_vec()).collect();
-		let transport = transport::connect_with_hashes(url, hashes).await.map_err(js_err)?;
+		let options = transport::Options {
+			server_certificate_hashes: hashes,
+			..Default::default()
+		};
+		let transport = transport::connect(url, options).await.map_err(js_err)?;
 		Self::handshake(transport).await
 	}
 
 	async fn handshake(transport: transport::Session) -> Result<Session, JsValue> {
 		// Wire a subscribe origin so the session has somewhere to insert the
 		// broadcasts the remote announces; keep a consumer to read them.
-		let origin = moq_net::Origin::random().produce();
+		let (origin, origin_driver) = moq_net::origin::Producer::new(moq_net::origin::Config::default());
+		web_async::spawn(async move {
+			moq_net::time::run(origin_driver).await;
+		});
 		let consumer = origin.consume();
 		let client = moq_net::Client::new().with_subscriber(origin);
-		let (inner, driver) = client.connect(transport).await.map_err(js_err)?;
-		// The session only makes progress while its driver runs. The driver holds no
-		// session clone, so dropping this `Session` still closes the transport, which
-		// in turn ends the spawned task.
+		// The driver holds no session clone, so dropping this `Session` still
+		// closes the transport and ends the spawned task.
+		let (inner, driver) = client.connect(moq_net::time::now(), transport).await.map_err(js_err)?;
 		web_async::spawn(async move {
-			let _ = driver.await;
+			moq_net::time::run(driver).await;
 		});
 		Ok(Session { inner, consumer })
 	}
@@ -89,14 +140,44 @@ impl Session {
 	/// Reject when the session closes, with the reason it closed.
 	///
 	/// Every close carries a reason, including a clean one, so this never resolves.
-	pub async fn closed(&self) -> Result<(), JsValue> {
-		Err(js_err(self.inner.closed().await))
+	#[wasm_bindgen(unchecked_return_type = "Promise<void>")]
+	pub fn closed(&self) -> Promise {
+		let session = self.inner.clone();
+		future_to_promise(async move { Err(js_err(session.closed().await)) })
 	}
 
-	/// Subscribe to a broadcast by path, waiting until it is announced.
-	pub async fn consume(&self, path: String) -> Result<Option<Broadcast>, JsValue> {
-		let broadcast = self.consumer.announced_broadcast(path.as_str()).await;
-		Ok(broadcast.map(|inner| Broadcast { inner }))
+	/// Subscribe to a broadcast by path, waiting until a route covers it.
+	///
+	/// Rejects with the close reason if the session closes first.
+	#[wasm_bindgen(unchecked_return_type = "Promise<Broadcast | undefined>")]
+	pub fn consume(&self, path: String) -> Promise {
+		let session = self.inner.clone();
+		let consumer = self.consumer.clone();
+		future_to_promise(async move {
+			let request = pin!(async {
+				consumer.routed(path.as_str()).await?;
+				consumer.request_broadcast(path.as_str(), None).await.ok()
+			});
+			// The origin outlives the session, so its wait alone never ends on a close.
+			let closed = pin!(session.closed());
+			match select(request, closed).await {
+				Either::Left((inner, _)) => Ok(inner.map_or(JsValue::UNDEFINED, |inner| {
+					Broadcast {
+						inner,
+						freed: Freed::new(),
+					}
+					.into()
+				})),
+				Either::Right((err, _)) => Err(js_err(err)),
+			}
+		})
+	}
+}
+
+impl Drop for Session {
+	// Pending calls hold their own clones, so the close-on-last-drop would wait for them.
+	fn drop(&mut self) {
+		self.inner.abort(moq_net::Error::Cancel);
 	}
 }
 
@@ -104,48 +185,60 @@ impl Session {
 #[wasm_bindgen]
 pub struct Broadcast {
 	inner: moq_net::broadcast::Consumer,
+	freed: Freed,
 }
 
 #[wasm_bindgen]
 impl Broadcast {
 	/// Subscribe to a track by name, resolving once the publisher accepts.
-	pub async fn subscribe(&self, name: String) -> Result<Track, JsValue> {
-		let track = self.inner.track(&name).map_err(js_err)?;
-		let subscriber = track.subscribe(None).await.map_err(js_err)?;
-		Ok(Track {
-			inner: Rc::new(RefCell::new(Some(subscriber))),
-		})
+	#[wasm_bindgen(unchecked_return_type = "Promise<Track>")]
+	pub fn subscribe(&self, name: String) -> Promise {
+		let broadcast = self.inner.clone();
+		future_to_promise(self.freed.guard(async move {
+			let track = broadcast.track(&name).map_err(js_err)?;
+			let subscriber = track.subscribe(None).await.map_err(js_err)?;
+			Ok(Track {
+				inner: Rc::new(RefCell::new(Some(subscriber))),
+				freed: Freed::new(),
+			}
+			.into())
+		}))
 	}
 }
 
 /// A subscriber to a single track, yielding groups.
 #[wasm_bindgen]
 pub struct Track {
-	// Rc<RefCell<Option<..>>> for interior mutability: wasm-bindgen async methods
-	// take `&self` and must produce 'static futures, so we move the value out of
-	// the cell for the duration of the await rather than holding a borrow across
-	// it (which would make the future self-referential). One in-flight call at a
-	// time; a re-entrant call while one is pending errors instead of aliasing.
+	// Shared with the pending read, which moves the subscriber out of the cell for
+	// the duration of the await instead of holding a borrow across it. One read in
+	// flight at a time; a concurrent call errors instead of aliasing.
 	inner: Rc<RefCell<Option<moq_net::track::Subscriber>>>,
+	freed: Freed,
 }
 
 #[wasm_bindgen]
 impl Track {
 	/// Receive the next group in arrival order, or `null` when the track ends.
-	#[wasm_bindgen(js_name = recvGroup)]
-	pub async fn recv_group(&self) -> Result<Option<Group>, JsValue> {
+	#[wasm_bindgen(js_name = recvGroup, unchecked_return_type = "Promise<Group | undefined>")]
+	pub fn recv_group(&self) -> Promise {
 		let cell = self.inner.clone();
-		let mut sub = cell
-			.borrow_mut()
-			.take()
-			.ok_or_else(|| js_err("recvGroup already in progress"))?;
-		let result = sub.recv_group().await;
-		*cell.borrow_mut() = Some(sub);
+		future_to_promise(self.freed.guard(async move {
+			let mut sub = cell
+				.borrow_mut()
+				.take()
+				.ok_or_else(|| js_err("recvGroup already in progress"))?;
+			let result = sub.recv_group().await;
+			*cell.borrow_mut() = Some(sub);
 
-		let group = result.map_err(js_err)?;
-		Ok(group.map(|g| Group {
-			sequence: g.sequence,
-			inner: Rc::new(RefCell::new(Some(g))),
+			let group = result.map_err(js_err)?;
+			Ok(group.map_or(JsValue::UNDEFINED, |g| {
+				Group {
+					sequence: g.sequence,
+					inner: Rc::new(RefCell::new(Some(g))),
+					freed: Freed::new(),
+				}
+				.into()
+			}))
 		}))
 	}
 }
@@ -154,7 +247,9 @@ impl Track {
 #[wasm_bindgen]
 pub struct Group {
 	sequence: u64,
+	// Shared with the pending read; see `Track`.
 	inner: Rc<RefCell<Option<moq_net::group::Consumer>>>,
+	freed: Freed,
 }
 
 #[wasm_bindgen]
@@ -165,17 +260,21 @@ impl Group {
 	}
 
 	/// Read the next frame in the group, or `null` at the end of the group.
-	#[wasm_bindgen(js_name = readFrame)]
-	pub async fn read_frame(&self) -> Result<Option<Uint8Array>, JsValue> {
+	#[wasm_bindgen(js_name = readFrame, unchecked_return_type = "Promise<Uint8Array | undefined>")]
+	pub fn read_frame(&self) -> Promise {
 		let cell = self.inner.clone();
-		let mut group = cell
-			.borrow_mut()
-			.take()
-			.ok_or_else(|| js_err("readFrame already in progress"))?;
-		let result = group.read_frame().await;
-		*cell.borrow_mut() = Some(group);
+		future_to_promise(self.freed.guard(async move {
+			let mut group = cell
+				.borrow_mut()
+				.take()
+				.ok_or_else(|| js_err("readFrame already in progress"))?;
+			let result = group.read_frame().await;
+			*cell.borrow_mut() = Some(group);
 
-		let frame = result.map_err(js_err)?;
-		Ok(frame.map(|frame| Uint8Array::from(frame.payload.as_ref())))
+			let frame = result.map_err(js_err)?;
+			Ok(frame.map_or(JsValue::UNDEFINED, |frame| {
+				Uint8Array::from(frame.payload.as_ref()).into()
+			}))
+		}))
 	}
 }

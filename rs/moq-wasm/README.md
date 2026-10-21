@@ -7,7 +7,7 @@ wire implementation in `@moq/net` (~10k LOC) with the canonical Rust one, so the
 protocol lives in exactly one place.
 
 This crate is the Rust half; the generated JS package is
-[`@moq/wasm`](../../js/wasm) (`just wasm` builds it). It is **not** the same as
+[`@moq/wasm`](../../js/wasm) (`just js wasm` builds it). It is **not** the same as
 `moq-ffi`: that crate uses UniFFI, which targets the C ABI (Kotlin/Swift/Python/
 Go). Browsers need `wasm-bindgen`, so this is a separate sibling crate. (For
 *React Native* JS, `uniffi-bindgen-react-native` can reuse `moq-ffi` directly;
@@ -17,13 +17,13 @@ that path is unrelated to this crate.)
 
 What works today:
 
-- **The architecture is right.** `moq-net` is generic over
-  `web_transport_trait::Session` and spawns via `web_async::spawn` (not
-  `tokio::spawn`), so it is not tied to native QUIC.
-- **The WebTransport adapter is complete** (`src/transport.rs`): a newtype
-  bridge from `web-transport-wasm` (browser WebTransport) to the
-  `web-transport-trait` abstraction `moq-net` consumes. The orphan rule forces
-  the newtypes; the shapes line up almost 1:1.
+- **Executor-independent sessions.** `moq-net` is generic over
+  `moq_net::transport::poll::Session` and returns a driver for the caller to
+  run. `moq-wasm` spawns `moq_net::time::run` via `web_async::spawn`, which
+  supplies the browser clock and sleeps until the driver's next deadline.
+- **The browser transport is adapted at the edge**: `src/transport.rs` wraps
+  `web-transport-wasm` in a newtype implementing moq-net's owned poll traits,
+  alongside the ALPN list and the browser's two trust modes.
 - **It compiles to `wasm32-unknown-unknown` and produces `@moq/wasm`**: `just
   wasm` emits a typed, importable package (`Session` / `Broadcast` / `Track` /
   `Group`, used as `Moq.Session` etc. via `import * as Moq`, `Promise`-returning
@@ -45,22 +45,18 @@ What works today:
    transport is `!Send`, but `SessionInner` used to hard-code `Send`.
    `web_async::MaybeSendBoxFuture` picks a `Send` boxed future on native and a
    local boxed future on wasm. Native behavior is unchanged.
-3. Timers and `Instant` routed through `web_async::time` instead of
-   `tokio::time` (session poll interval, subscriber linger, probe interval,
-   track-cache eviction). `web-async` re-exports `tokio::time` on native
-   and `wasmtimer` (a `performance.now()` + `setTimeout` shim) on wasm, so the
-   same code runs on both. tokio's clock is `std::time::Instant::now()`, which
-   *panics* on wasm (no clock) under `spawn_local` (no time driver); wasmtimer
-   fixes that. Native unchanged: `web_async::time::Instant` *is*
-   `tokio::time::Instant` there, so `tokio::time::pause`/`advance` test clocks
-   still work.
+3. Drivers accept `moq_net::time::Instant` and return their next deadline.
+   `moq_net::time::run` supplies the clock and one re-armable sleep through
+   `web_async::time`, backed by `performance.now()` and `setTimeout` here.
+   `moq-net` handles session sampling, linger, probes, and cache expiration
+   using the supplied time and never spawns tasks.
 
 ### Timestamp fallback
 
-`model/time.rs` uses `web_async::time::{Instant, SystemTime}` for timestamp
-generation. Native keeps the Tokio-backed instant so paused-time tests still
-work; browser wasm uses wasmtimer-backed clocks, avoiding the `std::time` and
-Tokio paths that panic or lack a driver on `wasm32-unknown-unknown`.
+`moq_net::time::Instant` is the logical `moq_clock::Instant` on every
+target. In the browser, moq-clock reads it from `performance.now()` through
+`web_async::time`, since `std::time::Instant` panics there. `model/time.rs`
+anchors its timestamps on it.
 
 ### Out of scope here: moq-mux
 
@@ -71,7 +67,7 @@ dependency is commented out in `Cargo.toml` until then.
 
 ## Building
 
-`just wasm` (from the repo root) does everything: builds for wasm and runs
+`just js wasm` (from the repo root) does everything: builds for wasm and runs
 `wasm-bindgen` (web target) into `js/wasm/dist`. The wasm target, the cfg flags
 (`getrandom` wasm backend + web-sys unstable WebTransport APIs), and the
 `wasm-bindgen-cli` tool come from `.cargo/config.toml` and the Nix dev shell.

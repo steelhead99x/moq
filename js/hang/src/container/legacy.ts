@@ -3,21 +3,37 @@ import { Time } from "@moq/net";
 
 export type { BufferedRange, BufferedRanges, Frame } from "./types";
 
+import type { Micro } from "@moq/clock";
+import type { AudioConfig, VideoConfig } from "../catalog";
 import type { Format as ContainerFormat } from "./format";
-import type { Producer as TimelineProducer } from "./timeline";
 import type { Frame } from "./types";
 
 /** The legacy hang container: a microsecond timestamp varint followed by the raw codec payload. */
 export class Format implements ContainerFormat {
-	/** Return the marker timestamp for an empty codec payload. */
-	end(frame: Frame): Time.Micro | undefined {
-		return frame.payload.byteLength === 0 ? frame.timestamp : undefined;
+	/** Configure the format for the track's media kind. */
+	readonly kind: "audio" | "video" | "data";
+
+	/** Configure the format from a catalog entry or an explicit media kind. */
+	constructor(config: AudioConfig | VideoConfig | "audio" | "video" | "data") {
+		this.kind = typeof config === "string" ? config : "sampleRate" in config ? "audio" : "video";
 	}
 
-	/** Decode one legacy frame, including an empty-payload endpoint marker. */
+	/** Write the final video frame's end timestamp before the group closes. */
+	finishGroup(group: Moq.Group.Producer, end?: Micro) {
+		if (this.kind !== "video" || end === undefined) return;
+		group.writeFrame({ payload: encodeFrame(new Uint8Array(), end), timestamp: Time.Timestamp.fromMicros(end) });
+	}
+
+	/** Return the video-frame or audio-source endpoint for an empty codec payload. */
+	end(frame: Frame): Micro | undefined {
+		return this.kind !== "data" && frame.payload.byteLength === 0 ? frame.timestamp : undefined;
+	}
+
+	/** Decode one legacy frame, including an empty-payload duration marker. On a data track an object with no bytes is the discontinuity marker, so it decodes to no frame. */
 	decode(frame: Uint8Array): Frame[] {
+		if (this.kind === "data" && frame.byteLength === 0) return [];
 		const [timestamp, data] = Moq.Varint.decode(frame);
-		return [{ payload: data, timestamp: timestamp as Time.Micro, keyframe: false }];
+		return [{ payload: data, timestamp: timestamp as Micro, keyframe: false }];
 	}
 }
 
@@ -30,7 +46,7 @@ export interface Source {
 }
 
 /** Encode a frame as a timestamp varint followed by the payload bytes. */
-export function encodeFrame(source: Uint8Array | Source, timestamp: Time.Micro): Uint8Array {
+export function encodeFrame(source: Uint8Array | Source, timestamp: Micro): Uint8Array {
 	const timestampBytes = Moq.Varint.encode(timestamp);
 	const data = new Uint8Array(timestampBytes.byteLength + source.byteLength);
 	data.set(timestampBytes, 0);
@@ -44,34 +60,45 @@ export function encodeFrame(source: Uint8Array | Source, timestamp: Time.Micro):
 	return data;
 }
 
-/** Options for a legacy-container {@link Producer}. */
-export interface ProducerProps {
-	/**
-	 * Record each group open (sequence + start timestamp) into this companion timeline track, so
-	 * consumers can index the media without downloading it.
-	 */
-	timeline?: TimelineProducer;
-}
-
 /** Writes legacy-container frames into a MoQ track, starting a new group on each keyframe. */
 export class Producer {
 	#track: Moq.Track.Producer;
+	#format: Format;
+	#previous?: Micro;
+	#reordered = false;
 	#group?: Moq.Group.Producer;
-	#timeline?: TimelineProducer;
+	// The newest timestamp written in the current group, which estimates its end.
+	#end?: Micro;
+	// Furthest timestamp in finished groups, used only for discontinuity markers.
+	#liveEdge?: Micro;
+	// The current group start and the previous group start, which bounds its frames.
+	#start?: Micro;
+	#floor?: Micro;
+	// Gap between consecutive timestamps, used to close the last group when no successor exists.
+	#interval?: Micro;
+	// A discontinuity's marker is the newest group, so another one would say nothing new.
+	#marked = false;
 
 	/** Wrap a track to publish legacy-container frames into it. */
-	constructor(track: Moq.Track.Producer, props: ProducerProps = {}) {
+	constructor(track: Moq.Track.Producer, format: Format) {
+		this.#format = format;
 		this.#track = track;
-		this.#timeline = props.timeline;
 	}
 
-	/** Encode and append a frame; a keyframe starts a new group. Throws if the first frame is not a keyframe. */
-	encode(data: Uint8Array | Source, timestamp: Time.Micro, keyframe: boolean) {
+	/** Encode and append a frame; a keyframe starts a new group. Throws if the first frame is not a keyframe, a group start goes backwards, or a frame is below the previous group start. */
+	encode(data: Uint8Array | Source, timestamp: Micro, keyframe: boolean) {
+		const floor = keyframe ? this.#start : this.#floor;
+		if (floor !== undefined && timestamp < floor) {
+			throw new Error("frame timestamp is below the previous group start");
+		}
+		this.#marked = false;
 		if (keyframe) {
-			this.#group?.close();
+			const rewound = this.#previous !== undefined && timestamp < this.#previous;
+			this.#close(rewound ? undefined : timestamp);
+			if (rewound) this.#interval = undefined;
 			this.#group = this.#track.appendGroup();
-			// Index the group the moment it opens: its start is this keyframe's timestamp.
-			this.#timeline?.record(this.#group.sequence, timestamp);
+			this.#floor = this.#start;
+			this.#start = timestamp;
 		} else if (!this.#group) {
 			throw new Error("must start with a keyframe");
 		}
@@ -80,11 +107,82 @@ export class Producer {
 			payload: encodeFrame(data, timestamp),
 			timestamp: Time.Timestamp.fromMicros(timestamp),
 		});
+
+		this.#reordered ||= this.#previous !== undefined && timestamp < this.#previous;
+		if (this.#previous !== undefined && timestamp > this.#previous) {
+			const delta = (timestamp - this.#previous) as Micro;
+			this.#interval = delta;
+		}
+		this.#previous = timestamp;
+		if (this.#end === undefined || timestamp > this.#end) this.#end = timestamp;
+	}
+
+	/**
+	 * Close the current group and mark a break in the timeline: whatever comes next does not
+	 * continue it. Call it when the timeline is about to jump, e.g. an encoder pausing for lack of
+	 * demand or switching source; the next keyframe already rolls the group over on its own.
+	 *
+	 * `end` is where the content stops. Without one the group closes with no end estimated from the
+	 * frame cadence, since whatever resumes may land sooner than one frame later and an end past it
+	 * reads as a rewind. After closing the group, this publishes a marker group of one empty frame at
+	 * `end`, or at the live edge without one. Without the marker, a group's reach runs to its
+	 * successor's first frame, so the group before a pause reads as live until whatever resumes it,
+	 * and a subscriber joining mid-break is handed that stale media. The marker bounds it, and it is
+	 * the latest group a joiner lands on. An empty payload is data on a data track, so its marker is one
+	 * object with no bytes at all. No marker is written until a frame follows the last one. Throws if
+	 * `end` precedes the last video frame.
+	 */
+	discontinuity(end?: Micro) {
+		// Nothing is measured across the break, so a missing end has no cadence to estimate from.
+		// An explicit end keeps the cadence until #close validates it, in case it throws.
+		if (end === undefined) this.#interval = undefined;
+		this.#close(end);
+		this.#interval = undefined;
+		const timestamp = end ?? this.#liveEdge;
+		if (this.#marked || timestamp === undefined) return;
+
+		const group = this.#track.appendGroup();
+		group.writeFrame({
+			payload: this.#format.kind === "data" ? new Uint8Array() : encodeFrame(new Uint8Array(), timestamp),
+			timestamp: Time.Timestamp.fromMicros(timestamp),
+		});
+		group.close();
+		this.#liveEdge = this.#liveEdge === undefined ? timestamp : (Math.max(this.#liveEdge, timestamp) as Micro);
+		this.#marked = true;
+	}
+
+	// Flush and close the current group at the supplied or estimated end timestamp.
+	#close(end?: Micro) {
+		if (!this.#group) return;
+		if (
+			this.#format.kind === "video" &&
+			!this.#reordered &&
+			end !== undefined &&
+			this.#previous !== undefined &&
+			end < this.#previous
+		) {
+			throw new Error("video group endpoint precedes its last frame");
+		}
+		end ??=
+			this.#end !== undefined && this.#interval !== undefined
+				? ((this.#end + this.#interval) as Micro)
+				: undefined;
+		// A presentation endpoint cannot bound the decode-order tail after reordering.
+		this.#format.finishGroup(this.#group, this.#reordered ? undefined : end);
+		this.#group.close();
+		this.#group = undefined;
+		if (this.#end !== undefined) {
+			this.#liveEdge = this.#liveEdge === undefined ? this.#end : (Math.max(this.#liveEdge, this.#end) as Micro);
+		}
+		this.#end = undefined;
+		this.#previous = undefined;
+		this.#reordered = false;
 	}
 
 	/** Close the track and current group, optionally with an error. */
 	close(err?: Error) {
+		if (!err) this.#close();
+		this.#group?.close(err);
 		this.#track.close(err);
-		this.#group?.close();
 	}
 }

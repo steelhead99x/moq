@@ -10,7 +10,8 @@ to their own PannerNode or GainNode.
 ## Plan
 
 - Optional constructor knob `context` (`AudioContext` or a Signal of one). When
-  unset, the decoder still creates and closes its own context.
+  unset, the decoder still creates, suspends, and closes its own context. An
+  injected context is never suspended either, since other decoders share it.
 - Load the render worklet once per context so two Decoders can share it.
 - If an injected context's sample rate disagrees with the decoded PCM rate,
   warn and keep the injected context. Do not replace or close it.
@@ -20,7 +21,3 @@ to their own PannerNode or GainNode.
 ## Closes
 
 - [#8](https://github.com/steelhead99x/moq/issues/8) - close this issue when the quest finishes
-
-## Related
-
-- [Room SDK](/quest/m2/room-sdk.md) - roster and identity; not required for the shared-context seam

@@ -19,6 +19,7 @@ import "./highlight";
 import * as Json from "@moq/json";
 import "@moq/publish/element"; // defines <moq-publish>
 import "@moq/publish/ui"; // defines <moq-publish-ui>
+import { Milli, Nano, now } from "@moq/clock";
 import { type Audio, Net, Signals, Source, type Video } from "@moq/publish";
 import type MoqPublish from "@moq/publish/element";
 import MoqPublishSupport from "@moq/publish/support/element";
@@ -104,7 +105,6 @@ const opusFrameDuration = new Signals.Signal<number | undefined>(undefined); // 
 const opusComplexity = new Signals.Signal<number | undefined>(undefined); // 0 (fast) … 10 (best)
 const opusFec = new Signals.Signal(false); // in-band forward error correction
 const opusPacketLoss = new Signals.Signal<number | undefined>(undefined); // expected loss %
-const opusDtx = new Signals.Signal(false); // discontinuous transmission (silence)
 
 const ui = new Signals.Effect();
 
@@ -140,7 +140,7 @@ function encoderConfig(effect: Signals.Effect, target: VideoTarget): Video.Confi
 		codec: effect.get(codec),
 		maxPixels: target.width && target.height ? target.width * target.height : undefined,
 		maxBitrate: br != null ? br * 1000 : undefined,
-		keyframeInterval: kf != null ? Net.Time.Milli(kf) : undefined,
+		keyframeInterval: kf != null ? Milli(kf) : undefined,
 		frameRate: target.frameRate,
 	};
 }
@@ -162,11 +162,14 @@ ui.run((effect) => {
 	effect.set(source.constraints, cameraConstraints(readVideoTarget(effect)));
 });
 
-// Audio general settings (volume gain, output sample rate, channel mix).
+// Audio general settings. Volume is per-rendition; the capture format is shared by all of them,
+// so rate and channel mix live on the capture rather than the encoder.
 ui.run((effect) => {
 	publish.audio.volume.set(effect.get(volume));
-	publish.audio.sampleRate.set(effect.get(sampleRate));
-	publish.audio.channelCount.set(effect.get(channelCount));
+
+	const capture = publish.audio.capture;
+	capture?.sampleRate.set(effect.get(sampleRate));
+	capture?.channelCount.set(effect.get(channelCount));
 });
 
 // Mic processing constraints go to the capture itself (getUserMedia re-acquires the track on
@@ -195,11 +198,10 @@ ui.run((effect) => {
 	const config: Audio.OpusConfig = {
 		mime: "opus",
 		...(bitrate != null ? { bitrate: bitrate * 1000 } : {}),
-		...(frameDuration != null ? { frameDuration: Net.Time.Milli(frameDuration) } : {}),
+		...(frameDuration != null ? { frameDuration: Milli(frameDuration) } : {}),
 		...(complexity != null ? { complexity } : {}),
 		...(packetLoss != null ? { packetlossperc: packetLoss } : {}),
 		useinbandfec: effect.get(opusFec),
-		usedtx: effect.get(opusDtx),
 	};
 	publish.audio.codec.set(config);
 });
@@ -272,7 +274,6 @@ bindOptionalSelect("opus-frame-duration", opusFrameDuration);
 bindOptionalNumber("opus-complexity", opusComplexity);
 bindOptionalNumber("opus-plc", opusPacketLoss);
 bindCheckbox("opus-fec", opusFec);
-bindCheckbox("opus-dtx", opusDtx);
 
 // Audio codec selector: drive the codec kind and show the matching options panel.
 const audioCodecEl = $<HTMLSelectElement>("audio-codec");
@@ -360,8 +361,10 @@ ui.run((effect) => {
 
 // Report the transport negotiated by the live connection.
 ui.run((effect) => {
-	const conn = effect.get(publish.connection.established);
-	$("network-transport").textContent = conn ? (conn.transport === "websocket" ? "WebSocket" : "WebTransport") : "";
+	const transport = effect.get(publish.connection.transport);
+	$("network-transport").textContent = transport
+		? { websocket: "WebSocket", webtransport: "WebTransport", webrtc: "WebRTC" }[transport]
+		: "";
 });
 
 // Audio: the resolved audio config (codec / sample rate / channels / bitrate).
@@ -391,7 +394,7 @@ let activeMeta: Json.Snapshot.Producer<unknown> | undefined;
 
 const setMeta = (value: unknown) => {
 	currentMeta = value;
-	activeMeta?.update(value);
+	activeMeta?.update({ value, at: Net.Time.Timestamp.now() });
 };
 
 const meta = new Signals.Effect();
@@ -401,11 +404,14 @@ meta.run((effect) => {
 	if (!net) return;
 
 	// A day-long cache so a viewer joining long after the last edit still replays the value.
-	const track = net.createTrack(META_TRACK, { latencyMax: 86_400_000 });
+	const track = net.createTrack(META_TRACK, {
+		timescale: Net.Time.Timescale.MILLI,
+		maxAge: Milli(86_400_000),
+	});
 	effect.cleanup(() => track.close());
 
 	const producer = new Json.Snapshot.Producer<unknown>({ track });
-	producer.update(currentMeta);
+	producer.update({ value: currentMeta, at: Net.Time.Timestamp.now() });
 	activeMeta = producer;
 	effect.cleanup(() => {
 		if (activeMeta === producer) activeMeta = undefined;
@@ -448,28 +454,57 @@ const uploadGraph = graph(viz, "Upload estimate", { color: "#34d399", format: fo
 const rttGraph = graph(viz, "Round trip", { color: "#38bdf8", format: (v) => `${Math.round(v)} ms` });
 $("publish-graphs").append(captureGraph.el, uploadGraph.el, rttGraph.el);
 
+// The RTT graph samples with peek(), which requests no estimates, so subscribe to keep them coming.
+viz.cleanup(publish.connection.probe.subscribe(() => {}));
+
 // Count captured frames; the publish API has no encoded-frame counter, so this
-// is the capture rate feeding the encoder (a good proxy for output fps).
+// is the capture rate feeding the encoder (a good proxy for output fps). Read off our own stream:
+// a signal coalesces a burst into one notification, which undercounts the rate.
 let frames = 0;
 viz.run((effect) => {
-	if (effect.get(publish.capture.out.frame)) frames++;
+	const capture = effect.get(publish.video.in.capture);
+	const fanout = capture ? effect.get(capture.out.frames) : undefined;
+	if (!fanout) return;
+
+	const reader = fanout.subscribe(effect).getReader();
+	effect.cleanup(() => {
+		reader.cancel().catch(() => {});
+	});
+
+	effect.spawn(async () => {
+		for (;;) {
+			const next = await effect.race(reader.read());
+			if (!next?.value) break;
+
+			frames++;
+			next.value.close();
+		}
+	});
 });
 
 let prevFrames = 0;
-let prevWhen = performance.now();
-viz.interval(async () => {
-	const now = performance.now();
-	const elapsed = now - prevWhen;
-	captureGraph.push(elapsed > 0 ? ((frames - prevFrames) * 1000) / elapsed : undefined);
-	prevFrames = frames;
-	prevWhen = now;
+let prevWhen = Nano.toMilli(Nano(now()));
+viz.interval(
+	() => {
+		const at = Nano.toMilli(Nano(now()));
+		const elapsed = at - prevWhen;
+		captureGraph.push(elapsed > 0 ? ((frames - prevFrames) * 1000) / elapsed : undefined);
+		prevFrames = frames;
+		prevWhen = at;
 
-	const rtt = publish.connection.probe.peek()?.rtt as unknown as number | undefined;
-	rttGraph.push(rtt && rtt > 0 ? rtt : undefined);
+		const rtt = publish.connection.probe.peek()?.rtt as unknown as number | undefined;
+		rttGraph.push(rtt && rtt > 0 ? rtt : undefined);
 
-	const up = (await publish.connection.stats())?.estimatedSendRate;
-	uploadGraph.push(up && up > 0 ? up : undefined);
-}, 250);
+		void publish.connection.stats().then(
+			(stats) => {
+				const up = stats?.estimatedSendRate;
+				uploadGraph.push(up && up > 0 ? up : undefined);
+			},
+			() => uploadGraph.push(undefined),
+		);
+	},
+	Nano.fromMilli(Milli(250)),
+);
 
 // Vite re-evaluates this module on hot reload, dropping the references to the
 // module-scoped effects above. Close them on dispose so they don't get garbage

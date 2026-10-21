@@ -1,31 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // Drives the real moq_source, reached through the obs_source_info it registers,
-// against stubbed libobs, libmoq and FFmpeg. Everything the consume path can get
-// wrong is an ordering: an announcement that arrives after the session says it
-// is connected, a delivery belonging to a connection that has already been
-// replaced, a subscription whose terminal callback is the only thing that
-// releases its lifetime reference. libmoq delivers all of those from its runtime
-// thread at a moment the plugin does not choose, so the stubs below reproduce
-// that thread and let each test pick the interleaving.
+// against stubbed libobs and FFmpeg video and the real moq-ffi, which decodes the
+// audio, over a relay in the same process. What the consume path can get wrong is mostly an ordering: an
+// announcement that arrives after the session connects, a result belonging to a
+// connection that settings or teardown have already replaced, a destroy while a
+// connect or a wait for the broadcast is still pending. The relay publishes real
+// media, so each scenario runs the whole chain from connect to decoded frame.
 //
-// Two invariants are checked after every scenario rather than per assertion:
-// every bmalloc is matched by a bfree (a lifetime reference that never comes
-// back leaves ctx leaked, so the count stays non-zero), and destruction returns
-// on the terminal callbacks rather than on its own two-second backstop.
+// Every scenario ends by checking that destroy returned promptly and that nothing
+// the source allocated outlived it.
 //
 // Run with `just obs test` (ThreadSanitizer) or `just obs ci` (plain). This is
 // not part of the plugin build.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <functional>
-#include <future>
-#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -39,19 +35,14 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
-#include "moq.h"
 }
 
-#include "moq-source.h"
+// Include the implementation so catalog-shape tests need no production test hooks.
+#include "../src/moq-source.cpp"
+#include "moq-test-relay.h"
 
 namespace {
 int g_failures = 0;
-
-// Anything a stub itself considers impossible: a frame freed twice, a catalog
-// snapshot used after it was freed. Counted rather than asserted inline, because
-// the stubs run on the fake runtime thread where a failing CHECK would race the
-// test thread.
-std::atomic<int> g_stub_errors{0};
 } // namespace
 
 #define CHECK(cond)                                                             \
@@ -62,82 +53,6 @@ std::atomic<int> g_stub_errors{0};
 		}                                                               \
 	} while (0)
 
-// ------------------------------------------------------- the fake runtime thread
-
-namespace {
-// Stands in for libmoq's runtime thread. Every plugin callback is delivered from
-// here and never inline from a close(), which is the property the source's
-// disconnect path leans on: it closes each handle while holding ctx->mutex, and
-// the terminal's reference release needs that same mutex.
-class Runtime {
-public:
-	Runtime() : thread_([this] { Loop(); }) {}
-
-	~Runtime()
-	{
-		{
-			std::lock_guard<std::mutex> lock(mutex_);
-			stop_ = true;
-		}
-		cv_.notify_all();
-		thread_.join();
-	}
-
-	Runtime(const Runtime &) = delete;
-	Runtime &operator=(const Runtime &) = delete;
-
-	// Queue work without waiting, the way a close() posts a terminal: the caller
-	// holds the source's mutex and must not block on the callback.
-	void Post(std::function<void()> fn)
-	{
-		{
-			std::lock_guard<std::mutex> lock(mutex_);
-			queue_.push_back(std::move(fn));
-		}
-		cv_.notify_one();
-	}
-
-	// Queue work and wait for it, so a test can order deliveries exactly while
-	// still running them on a thread the plugin does not own. The queue is FIFO,
-	// so this also drains everything posted before it.
-	void Run(std::function<void()> fn)
-	{
-		std::promise<void> done;
-		auto ready = done.get_future();
-		Post([&fn, &done] {
-			fn();
-			done.set_value();
-		});
-		ready.wait();
-	}
-
-private:
-	void Loop()
-	{
-		for (;;) {
-			std::function<void()> fn;
-			{
-				std::unique_lock<std::mutex> lock(mutex_);
-				cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
-				if (queue_.empty())
-					return;
-				fn = std::move(queue_.front());
-				queue_.pop_front();
-			}
-			fn();
-		}
-	}
-
-	std::mutex mutex_;
-	std::condition_variable cv_;
-	std::deque<std::function<void()>> queue_;
-	bool stop_ = false;
-	std::thread thread_;
-};
-
-Runtime *g_runtime = nullptr;
-} // namespace
-
 // ------------------------------------------------------------------ libobs stubs
 
 namespace {
@@ -146,6 +61,7 @@ namespace {
 struct Settings {
 	std::string url;
 	std::string broadcast;
+	bool keylog = false;
 };
 
 Settings g_settings;
@@ -155,23 +71,63 @@ Settings g_settings;
 struct obs_source_info g_info = {};
 bool g_registered = false;
 
-// Written from the runtime thread (the decode path outputs frames) and read from
+// Written from the source's worker (the decode path outputs frames) and read from
 // the test thread.
 std::atomic<int> g_output_frames{0};
 std::atomic<int> g_blank_calls{0};
 std::atomic<uint64_t> g_last_timestamp{0};
+// PCM buffers the audio decode path handed to OBS.
+std::atomic<int> g_output_audio{0};
+std::atomic<uint64_t> g_last_audio_timestamp{0};
 
-// The bmalloc/bfree balance. The source's whole teardown contract reduces to
-// this: ctx is freed only once every subscription has delivered its terminal, so
-// a reference that never comes back shows up here as a leak.
+// The last buffer OBS was handed, copied out: its shape, the first sample of each
+// plane, and the loudest sample in it.
+struct AudioOut {
+	uint32_t frames = 0;
+	enum speaker_layout speakers = SPEAKERS_UNKNOWN;
+	enum audio_format format = AUDIO_FORMAT_UNKNOWN;
+	uint32_t samples_per_sec = 0;
+	uint64_t timestamp = 0;
+	float first[MAX_AV_PLANES] = {};
+	float peak = 0;
+};
+std::mutex g_audio_mutex;
+AudioOut g_last_audio;
+
+AudioOut lastAudio()
+{
+	std::lock_guard<std::mutex> lock(g_audio_mutex);
+	return g_last_audio;
+}
+
+// The mixer rate obs_get_audio_info reports.
+uint32_t g_obs_sample_rate = 48000;
+
+// The bmalloc/bfree balance, so a frame buffer that outlives its decoder shows up
+// as a leak.
 std::atomic<long> g_live_allocs{0};
+
+// Candidate resolve and subscribe failures, logged under the source lock as the candidate
+// is released, so taking that lock afterwards observes the release.
+std::mutex g_candidate_mutex;
+std::condition_variable g_candidate_failed;
+int g_candidate_failures = 0;
 } // namespace
 
 extern "C" {
 
 // Deliberately silent: stdio locking would create happens-before edges between
-// the test thread and the fake runtime thread and mask the races we're after.
-void blog(int, const char *, ...) {}
+// the test thread and the source's worker and mask the races we're after. Only a
+// candidate's resolve or subscribe failure synchronizes, so a scenario can wait on it.
+void blog(int, const char *format, ...)
+{
+	if (!strstr(format, "Failed to resolve") && !strstr(format, "Failed to subscribe") &&
+	    !strstr(format, "Audio track error"))
+		return;
+	std::lock_guard<std::mutex> lock(g_candidate_mutex);
+	g_candidate_failures++;
+	g_candidate_failed.notify_all();
+}
 
 void *bmalloc(size_t size)
 {
@@ -225,6 +181,19 @@ void obs_data_set_default_string(obs_data_t *data, const char *name, const char 
 		settings->broadcast = val;
 }
 
+bool obs_data_get_bool(obs_data_t *data, const char *name)
+{
+	auto *settings = reinterpret_cast<Settings *>(data);
+	return settings && strcmp(name, "quic_keylog") == 0 && settings->keylog;
+}
+
+void obs_data_set_default_bool(obs_data_t *, const char *, bool) {}
+
+obs_property_t *obs_properties_add_bool(obs_properties_t *, const char *, const char *)
+{
+	return reinterpret_cast<obs_property_t *>(0x13);
+}
+
 obs_properties_t *obs_properties_create(void)
 {
 	return reinterpret_cast<obs_properties_t *>(0x11);
@@ -243,6 +212,39 @@ void obs_source_output_video(obs_source_t *, const struct obs_source_frame *fram
 	}
 	g_last_timestamp = frame->timestamp;
 	g_output_frames++;
+}
+
+void obs_source_output_audio(obs_source_t *, const struct obs_source_audio *audio)
+{
+	if (!audio)
+		return;
+	AudioOut out;
+	out.frames = audio->frames;
+	out.speakers = audio->speakers;
+	out.format = audio->format;
+	out.samples_per_sec = audio->samples_per_sec;
+	out.timestamp = audio->timestamp;
+	// Every plane of the layout must be there; reading each one whole lets ASan and
+	// TSan see a buffer that is short or already freed.
+	for (uint32_t i = 0; i < get_audio_planes(audio->format, audio->speakers); i++) {
+		const auto *plane = reinterpret_cast<const float *>(audio->data[i]);
+		out.first[i] = plane[0];
+		for (uint32_t j = 0; j < audio->frames; j++)
+			out.peak = std::max(out.peak, std::fabs(plane[j]));
+	}
+	{
+		std::lock_guard<std::mutex> lock(g_audio_mutex);
+		g_last_audio = out;
+	}
+	g_last_audio_timestamp = audio->timestamp;
+	g_output_audio++;
+}
+
+bool obs_get_audio_info(struct obs_audio_info *oai)
+{
+	oai->samples_per_sec = g_obs_sample_rate;
+	oai->speakers = SPEAKERS_STEREO;
+	return true;
 }
 
 void obs_register_source_s(const struct obs_source_info *info, size_t size)
@@ -264,12 +266,19 @@ namespace {
 std::atomic<long> g_av_allocs{0};
 
 // Decode knobs. Only the failure scenarios move them.
-bool g_find_decoder_ok = true;
+std::atomic<bool> g_find_decoder_ok{true};
 int g_send_result = 0;
 int g_receive_result = 0;
 int g_decoded_width = 320;
 int g_decoded_height = 240;
 std::atomic<int> g_last_decoder_extradata{-1};
+std::atomic<int> g_decoder_opens{0};
+// Only packets from the replacement use this timestamp; the old stream keeps decoding.
+std::atomic<int> g_candidate_decode{0}; // 2: receive error, 3: needs more input
+std::atomic<int> g_candidate_attempts{0};
+struct DecodeState {
+	int64_t timestamp_us = 0;
+};
 
 std::atomic<int> g_sws_scales{0};
 
@@ -281,13 +290,17 @@ extern "C" {
 
 const AVCodec *avcodec_find_decoder(enum AVCodecID id)
 {
+	g_fake_codec.id = id;
 	return (g_find_decoder_ok && id != AV_CODEC_ID_NONE) ? &g_fake_codec : nullptr;
 }
 
-AVCodecContext *avcodec_alloc_context3(const AVCodec *)
+AVCodecContext *avcodec_alloc_context3(const AVCodec *codec)
 {
 	g_av_allocs++;
-	return static_cast<AVCodecContext *>(calloc(1, sizeof(AVCodecContext)));
+	auto *ctx = static_cast<AVCodecContext *>(calloc(1, sizeof(AVCodecContext)));
+	ctx->codec_id = codec ? codec->id : AV_CODEC_ID_NONE;
+	ctx->opaque = new DecodeState{};
+	return ctx;
 }
 
 void avcodec_free_context(AVCodecContext **avctx)
@@ -298,6 +311,7 @@ void avcodec_free_context(AVCodecContext **avctx)
 		g_av_allocs--;
 		free((*avctx)->extradata);
 	}
+	delete static_cast<DecodeState *>((*avctx)->opaque);
 	g_av_allocs--;
 	free(*avctx);
 	*avctx = nullptr;
@@ -305,19 +319,31 @@ void avcodec_free_context(AVCodecContext **avctx)
 
 int avcodec_open2(AVCodecContext *, const AVCodec *, AVDictionary **)
 {
+	g_decoder_opens++;
 	return 0;
 }
 
 void avcodec_flush_buffers(AVCodecContext *) {}
 
-int avcodec_send_packet(AVCodecContext *ctx, const AVPacket *)
+int avcodec_send_packet(AVCodecContext *ctx, const AVPacket *packet)
 {
 	g_last_decoder_extradata = ctx->extradata_size > 0 ? ctx->extradata[0] : -1;
+	auto &state = *static_cast<DecodeState *>(ctx->opaque);
+	state.timestamp_us = packet->pts * 1000;
+	if (state.timestamp_us == 1'000'000'000)
+		g_candidate_attempts++;
 	return g_send_result;
 }
 
-int avcodec_receive_frame(AVCodecContext *, AVFrame *frame)
+int avcodec_receive_frame(AVCodecContext *ctx, AVFrame *frame)
 {
+	auto &state = *static_cast<DecodeState *>(ctx->opaque);
+	if (state.timestamp_us == 1'000'000'000) {
+		if (g_candidate_decode == 2)
+			return AVERROR_INVALIDDATA;
+		if (g_candidate_decode == 3)
+			return AVERROR(EAGAIN);
+	}
 	if (g_receive_result < 0)
 		return g_receive_result;
 
@@ -403,363 +429,6 @@ int sws_scale(struct SwsContext *, const uint8_t *const[], const int[], int, int
 
 } // extern "C"
 
-// ----------------------------------------------------------------- libmoq stubs
-
-namespace {
-enum class SubKind { Session, Announced, Catalog, Video };
-
-// One outstanding libmoq subscription: the callback plus the user_data the
-// plugin asked us to keep alive, and the two bits of state that make the
-// contract checkable - closed at most once, terminal delivered at most once.
-struct Sub {
-	SubKind kind = SubKind::Session;
-	void (*cb)(void *, int32_t) = nullptr;
-	void *user_data = nullptr;
-	bool closed = false;
-	bool terminated = false;
-	bool callback_complete = false;
-};
-
-// Guards every table below. Always taken *under* the source's own mutex (the
-// plugin calls these stubs from inside its locked sections), never the other way
-// round: a callback is always invoked with this released.
-std::mutex g_subs_mutex;
-std::map<int32_t, Sub> g_subs;
-std::map<int32_t, bool> g_snapshots; // live catalog snapshot ids
-std::map<int32_t, bool> g_frames;    // live frame ids -> keyframe
-
-// Disjoint ranges, so a handle misread as a snapshot or a frame id fails loudly
-// instead of resolving to something plausible.
-int32_t g_next_sub = 100;
-int32_t g_next_snapshot = 5000;
-int32_t g_next_frame = 9000;
-
-// Terminals are normally posted by close(). A test that needs a delivery to land
-// between a close and its terminal sets this and drives them by hand.
-std::atomic<bool> g_defer_terminals{false};
-std::vector<int32_t> g_deferred;
-
-// Opens the exact retirement window where libmoq has removed a task but has not
-// yet invoked its terminal callback.
-std::mutex g_terminal_gate_mutex;
-std::condition_variable g_terminal_gate_cv;
-bool g_pause_terminal = false;
-bool g_terminal_marked = false;
-bool g_release_terminal = false;
-bool g_inflight_close_seen = false;
-
-// Closing a handle after its terminal callback completed. A failed close while
-// that callback is still in flight is an expected teardown race instead.
-std::atomic<int> g_double_close{0};
-
-std::atomic<int> g_origin_creates{0};
-std::atomic<int> g_origin_closes{0};
-std::atomic<int> g_session_connects{0};
-std::atomic<int> g_announced_calls{0};
-// moq_origin_request resolves only broadcasts that are already announced. The
-// source must wait with moq_origin_consume_announced, so this stays zero.
-std::atomic<int> g_request_calls{0};
-std::atomic<int> g_catalog_calls{0};
-std::atomic<int> g_video_calls{0};
-std::atomic<int> g_snapshot_frees{0};
-std::atomic<int> g_frame_frees{0};
-std::atomic<int> g_consume_closes{0};
-std::atomic<int32_t> g_last_consume_closed{0};
-
-std::atomic<int32_t> g_last_session{0};
-std::atomic<int32_t> g_last_announced{0};
-std::atomic<int32_t> g_last_catalog{0};
-std::atomic<int32_t> g_last_video{0};
-
-// Immediate-failure injection, matching libmoq's negative return codes.
-bool g_session_connect_early = false;
-int g_origin_result = 0;
-int g_session_result = 0;
-int g_announced_result = 0;
-int g_catalog_result = 0;
-int g_video_result = 0;
-int g_video_config_result = 0;
-
-// What moq_consume_video_config hands back.
-uint32_t g_coded_width = 320;
-uint32_t g_coded_height = 240;
-const char g_codec[] = "h264";
-uint8_t g_description[] = {0x01, 0x64, 0x00, 0x1f};
-bool g_describe = false;
-
-int32_t addSub(SubKind kind, void (*cb)(void *, int32_t), void *user_data)
-{
-	std::lock_guard<std::mutex> lock(g_subs_mutex);
-	int32_t handle = g_next_sub++;
-	g_subs[handle] = Sub{kind, cb, user_data, false, false, false};
-	return handle;
-}
-
-// libmoq runs every callback on one runtime thread, so a delivery and a terminal
-// for the same subscription never overlap. The plugin's reference counting leans
-// on that, so the stub keeps the guarantee even when a test drives deliveries
-// from two threads at once.
-std::mutex g_delivery_mutex;
-
-// Invoke a subscription's callback the way libmoq does: from a thread the plugin
-// does not own, exactly once with a terminal, and never again after it. Returns
-// false when the subscription has already terminated, which is what a delivery
-// racing a close looks like.
-bool deliverStatus(int32_t handle, int32_t code)
-{
-	std::lock_guard<std::mutex> serialize(g_delivery_mutex);
-
-	void (*cb)(void *, int32_t) = nullptr;
-	void *user_data = nullptr;
-	SubKind kind = SubKind::Session;
-	{
-		std::lock_guard<std::mutex> lock(g_subs_mutex);
-		auto it = g_subs.find(handle);
-		if (it == g_subs.end() || it->second.terminated)
-			return false;
-		cb = it->second.cb;
-		user_data = it->second.user_data;
-		kind = it->second.kind;
-		if (code <= 0)
-			it->second.terminated = true;
-	}
-	if (code <= 0) {
-		std::unique_lock<std::mutex> lock(g_terminal_gate_mutex);
-		if (g_pause_terminal) {
-			g_terminal_marked = true;
-			g_terminal_gate_cv.notify_all();
-			g_terminal_gate_cv.wait(lock, [] { return g_release_terminal; });
-		}
-	}
-	cb(user_data, code);
-	if (code <= 0) {
-		std::lock_guard<std::mutex> lock(g_subs_mutex);
-		g_subs.at(handle).callback_complete = true;
-	}
-
-	// The announced wait is one-shot: after delivering its broadcast handle,
-	// libmoq immediately follows with the terminal callback on the same thread.
-	if (kind == SubKind::Announced && code > 0) {
-		{
-			std::lock_guard<std::mutex> lock(g_subs_mutex);
-			auto it = g_subs.find(handle);
-			if (it == g_subs.end() || it->second.terminated)
-				return true;
-			it->second.terminated = true;
-		}
-		cb(user_data, 0);
-		std::lock_guard<std::mutex> lock(g_subs_mutex);
-		g_subs.at(handle).callback_complete = true;
-	}
-	return true;
-}
-
-int32_t closeSub(int32_t handle)
-{
-	bool terminal_in_flight = false;
-	{
-		std::lock_guard<std::mutex> lock(g_subs_mutex);
-		auto it = g_subs.find(handle);
-		if (it == g_subs.end() || it->second.closed ||
-		    (it->second.terminated && it->second.callback_complete)) {
-			g_double_close++;
-			return -1;
-		}
-		if (it->second.terminated) {
-			terminal_in_flight = true;
-		} else {
-			it->second.closed = true;
-			if (g_defer_terminals) {
-				g_deferred.push_back(handle);
-				return 0;
-			}
-		}
-	}
-	if (terminal_in_flight) {
-		std::lock_guard<std::mutex> lock(g_terminal_gate_mutex);
-		g_inflight_close_seen = true;
-		g_terminal_gate_cv.notify_all();
-		return -1;
-	}
-	// Posted, never called inline: the plugin closes each handle while holding
-	// ctx->mutex, which the terminal's reference release also needs.
-	g_runtime->Post([handle] { deliverStatus(handle, 0); });
-	return 0;
-}
-} // namespace
-
-extern "C" {
-
-int32_t moq_origin_create(void)
-{
-	if (g_origin_result < 0)
-		return g_origin_result;
-	g_origin_creates++;
-	std::lock_guard<std::mutex> lock(g_subs_mutex);
-	return g_next_sub++;
-}
-
-int32_t moq_origin_close(uint32_t)
-{
-	g_origin_closes++;
-	return 0;
-}
-
-int32_t moq_session_connect(const char *, uintptr_t, uint32_t, uint32_t, void (*on_status)(void *, int32_t),
-			    void *user_data)
-{
-	if (g_session_result < 0)
-		return g_session_result;
-	g_session_connects++;
-	int32_t handle = addSub(SubKind::Session, on_status, user_data);
-	g_last_session = handle;
-	if (g_session_connect_early)
-		g_runtime->Run([handle] { deliverStatus(handle, 1); });
-	return handle;
-}
-
-int32_t moq_session_close(uint32_t session)
-{
-	return closeSub(static_cast<int32_t>(session));
-}
-
-int32_t moq_origin_consume_announced(uint32_t, const char *, uintptr_t, void (*on_broadcast)(void *, int32_t),
-				     void *user_data)
-{
-	if (g_announced_result < 0)
-		return g_announced_result;
-	g_announced_calls++;
-	int32_t handle = addSub(SubKind::Announced, on_broadcast, user_data);
-	g_last_announced = handle;
-	return handle;
-}
-
-int32_t moq_origin_consume_announced_close(uint32_t task)
-{
-	return closeSub(static_cast<int32_t>(task));
-}
-
-// Keep the immediate lookup stub link-complete so g_request_calls can assert that
-// the source uses the waiting API instead.
-int32_t moq_origin_request(uint32_t, const char *, uintptr_t, void (*)(void *, int32_t), void *)
-{
-	g_request_calls++;
-	return -1;
-}
-
-int32_t moq_consume_catalog(uint32_t, void (*on_catalog)(void *, int32_t), void *user_data)
-{
-	if (g_catalog_result < 0)
-		return g_catalog_result;
-	g_catalog_calls++;
-	int32_t handle = addSub(SubKind::Catalog, on_catalog, user_data);
-	g_last_catalog = handle;
-	return handle;
-}
-
-int32_t moq_consume_catalog_close(uint32_t catalog)
-{
-	return closeSub(static_cast<int32_t>(catalog));
-}
-
-int32_t moq_consume_catalog_free(uint32_t catalog)
-{
-	std::lock_guard<std::mutex> lock(g_subs_mutex);
-	auto it = g_snapshots.find(static_cast<int32_t>(catalog));
-	if (it == g_snapshots.end()) {
-		g_stub_errors++;
-		return -1;
-	}
-	g_snapshots.erase(it);
-	g_snapshot_frees++;
-	return 0;
-}
-
-int32_t moq_consume_video_config(uint32_t catalog, uint32_t, struct moq_video_config *dst)
-{
-	{
-		std::lock_guard<std::mutex> lock(g_subs_mutex);
-		if (g_snapshots.find(static_cast<int32_t>(catalog)) == g_snapshots.end()) {
-			g_stub_errors++;
-			return -1;
-		}
-	}
-	if (g_video_config_result < 0)
-		return g_video_config_result;
-
-	dst->name = "video";
-	dst->name_len = 5;
-	dst->codec = g_codec;
-	dst->codec_len = sizeof(g_codec) - 1;
-	dst->description = g_describe ? g_description : nullptr;
-	dst->description_len = g_describe ? sizeof(g_description) : 0;
-	dst->coded_width = &g_coded_width;
-	dst->coded_height = &g_coded_height;
-	dst->container.kind = MOQ_CONTAINER_KIND_LEGACY;
-	dst->container.init = nullptr;
-	dst->container.init_len = 0;
-	return 0;
-}
-
-int32_t moq_consume_video(uint32_t catalog, uint32_t, uint64_t, void (*on_frame)(void *, int32_t), void *user_data)
-{
-	{
-		std::lock_guard<std::mutex> lock(g_subs_mutex);
-		if (g_snapshots.find(static_cast<int32_t>(catalog)) == g_snapshots.end()) {
-			g_stub_errors++;
-			return -1;
-		}
-	}
-	if (g_video_result < 0)
-		return g_video_result;
-	g_video_calls++;
-	int32_t handle = addSub(SubKind::Video, on_frame, user_data);
-	g_last_video = handle;
-	return handle;
-}
-
-int32_t moq_consume_video_close(uint32_t track)
-{
-	return closeSub(static_cast<int32_t>(track));
-}
-
-int32_t moq_consume_frame(uint32_t frame, struct moq_frame *dst)
-{
-	std::lock_guard<std::mutex> lock(g_subs_mutex);
-	auto it = g_frames.find(static_cast<int32_t>(frame));
-	if (it == g_frames.end()) {
-		g_stub_errors++;
-		return -1;
-	}
-	dst->payload = g_description;
-	dst->payload_size = sizeof(g_description);
-	dst->timestamp_us = 1000 * static_cast<uint64_t>(frame);
-	dst->keyframe = it->second;
-	return 0;
-}
-
-int32_t moq_consume_frame_free(uint32_t frame)
-{
-	std::lock_guard<std::mutex> lock(g_subs_mutex);
-	auto it = g_frames.find(static_cast<int32_t>(frame));
-	if (it == g_frames.end()) {
-		g_stub_errors++;
-		return -1;
-	}
-	g_frames.erase(it);
-	g_frame_frees++;
-	return 0;
-}
-
-int32_t moq_consume_close(uint32_t consume)
-{
-	g_consume_closes++;
-	g_last_consume_closed = static_cast<int32_t>(consume);
-	return 0;
-}
-
-} // extern "C"
-
 // ---------------------------------------------------------------- test harness
 
 namespace {
@@ -774,107 +443,31 @@ obs_source_t *fakeSource()
 	return reinterpret_cast<obs_source_t *>(0x9);
 }
 
-// A broadcast handle, which libmoq draws from a different slab than the
-// subscription handles, and which carries no callback of its own.
-int32_t newBroadcast()
+void reset(std::string url, std::string broadcast = "obs/test")
 {
-	std::lock_guard<std::mutex> lock(g_subs_mutex);
-	return g_next_sub++;
-}
-
-int32_t newSnapshot()
-{
-	std::lock_guard<std::mutex> lock(g_subs_mutex);
-	int32_t id = g_next_snapshot++;
-	g_snapshots[id] = true;
-	return id;
-}
-
-int32_t newFrame(bool keyframe)
-{
-	std::lock_guard<std::mutex> lock(g_subs_mutex);
-	int32_t id = g_next_frame++;
-	g_frames[id] = keyframe;
-	return id;
-}
-
-void flushDeferred()
-{
-	std::vector<int32_t> pending;
-	{
-		std::lock_guard<std::mutex> lock(g_subs_mutex);
-		pending.swap(g_deferred);
-	}
-	for (int32_t handle : pending)
-		g_runtime->Run([handle] { deliverStatus(handle, 0); });
-}
-
-// Every subscription the plugin registered must have delivered its terminal by
-// the time a scenario ends; one that hasn't is a reference the source would
-// still be waiting on.
-bool allTerminated()
-{
-	std::lock_guard<std::mutex> lock(g_subs_mutex);
-	for (const auto &entry : g_subs) {
-		if (!entry.second.terminated)
-			return false;
-	}
-	return true;
-}
-
-void reset()
-{
-	{
-		std::lock_guard<std::mutex> lock(g_subs_mutex);
-		g_subs.clear();
-		g_snapshots.clear();
-		g_frames.clear();
-		g_deferred.clear();
-	}
-	g_settings.url = "https://relay.example/anon";
-	g_settings.broadcast = "obs/test";
-	g_defer_terminals = false;
-	{
-		std::lock_guard<std::mutex> lock(g_terminal_gate_mutex);
-		g_pause_terminal = false;
-		g_terminal_marked = false;
-		g_release_terminal = false;
-		g_inflight_close_seen = false;
-	}
-	g_double_close = 0;
-	g_stub_errors = 0;
-	g_origin_creates = 0;
-	g_origin_closes = 0;
-	g_session_connects = 0;
-	g_announced_calls = 0;
-	g_catalog_calls = 0;
-	g_video_calls = 0;
-	g_snapshot_frees = 0;
-	g_frame_frees = 0;
-	g_consume_closes = 0;
-	g_last_consume_closed = 0;
-	g_last_session = 0;
-	g_last_announced = 0;
-	g_last_catalog = 0;
-	g_last_video = 0;
+	g_settings.url = std::move(url);
+	g_settings.broadcast = std::move(broadcast);
+	g_settings.keylog = false;
 	g_output_frames = 0;
+	g_output_audio = 0;
+	g_last_timestamp = 0;
+	g_last_audio_timestamp = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_audio_mutex);
+		g_last_audio = AudioOut{};
+	}
+	g_obs_sample_rate = 48000;
 	g_blank_calls = 0;
 	g_sws_scales = 0;
-	g_session_connect_early = false;
-	g_origin_result = 0;
-	g_session_result = 0;
-	g_announced_result = 0;
-	g_catalog_result = 0;
-	g_video_result = 0;
-	g_video_config_result = 0;
 	g_find_decoder_ok = true;
 	g_send_result = 0;
 	g_receive_result = 0;
-	g_describe = false;
-	g_description[0] = 0x01;
 	g_decoded_width = 320;
 	g_decoded_height = 240;
 	g_last_decoder_extradata = -1;
+	g_decoder_opens = 0;
+	g_candidate_decode = 0;
+	g_candidate_attempts = 0;
 	g_live_allocs = 0;
 	g_av_allocs = 0;
 }
@@ -884,23 +477,24 @@ void *createSource()
 	return g_info.create(settingsData(), fakeSource());
 }
 
-// Destroy, then check the invariants every scenario shares: teardown returned on
-// the terminal callbacks rather than on its own bounded wait, every subscription
-// ended, and nothing was left allocated.
+// Destroy, then check the invariants every scenario shares: teardown returned
+// promptly, without waiting on a call that was still pending, nothing reached OBS
+// afterwards, and nothing was left allocated.
 void destroySource(void *source)
 {
 	auto start = std::chrono::steady_clock::now();
 	g_info.destroy(source);
 	auto elapsed = std::chrono::steady_clock::now() - start;
+	const int frames = g_output_frames;
+	const int audio = g_output_audio;
 
-	// The destructor's backstop is two seconds. Landing anywhere near it means a
-	// terminal never arrived, so a reference was never released.
-	CHECK(elapsed < std::chrono::milliseconds(1500));
-	CHECK(allTerminated());
+	CHECK(elapsed < std::chrono::milliseconds(500));
 	CHECK(g_live_allocs == 0);
 	CHECK(g_av_allocs == 0);
-	CHECK(g_double_close == 0);
-	CHECK(g_stub_errors == 0);
+
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	CHECK(g_output_frames == frames);
+	CHECK(g_output_audio == audio);
 }
 
 // Close out a scenario, naming it and saying whether any of its assertions
@@ -914,457 +508,802 @@ void report(const char *name)
 	g_reported = g_failures;
 }
 
-// Walk the source from "just created" to "subscribed to a video track", firing
-// each callback from the runtime thread in the order libmoq would.
-void subscribeVideo(int32_t broadcast)
-{
-	g_runtime->Run([] { deliverStatus(g_last_session, 1); });
-	g_runtime->Run([broadcast] { deliverStatus(g_last_announced, broadcast); });
+// A broadcast published on the relay, the way the MoQ output would publish it.
+class Publisher {
+public:
+	// Frames start after `start_us`, so a scenario can tell two publishers' frames apart.
+	Publisher(TestRelay &relay, const std::string &path, bool video = true, bool audio = true,
+		  uint64_t start_us = 1'000'000)
+		: timestamp_us(start_us)
 	{
-		std::lock_guard<std::mutex> lock(g_subs_mutex);
-		CHECK(g_subs.at(g_last_announced).terminated);
+		broadcast = TestOk(relay.origin->create_broadcast(path), "create_broadcast");
+		if (video) {
+			moq::VideoInit init{};
+			init.format = moq::VideoFormat::kAvc3;
+			init.data = TestH264Init();
+			this->video =
+				TestOk(moq::MediaTrackProducer::video(broadcast, moq::MediaTarget::kNamed{}, init),
+				       "video producer");
+		}
+		if (audio) {
+			moq::AudioInit init{};
+			init.format = moq::AudioFormat::kOpus;
+			init.data = TestOpusHead();
+			this->audio =
+				TestOk(moq::MediaTrackProducer::audio(broadcast, moq::MediaTarget::kNamed{}, init),
+				       "audio producer");
+		}
+		TestOk(broadcast->announce(moq::Route{}), "announce");
 	}
-	int32_t snapshot = newSnapshot();
-	g_runtime->Run([snapshot] { deliverStatus(g_last_catalog, snapshot); });
+
+	~Publisher() { (void)broadcast->close(); }
+
+	// Write one keyframe and one audio frame, each a group of its own.
+	void Write()
+	{
+		timestamp_us += 20'000;
+		if (video)
+			TestOk(video->write_frame(moq::Frame{TestH264Keyframe(), timestamp_us}), "write video");
+		if (audio) {
+			TestOk(audio->write_frame(moq::Frame{{0xfc, 0xff, 0xfe}, timestamp_us}), "write audio");
+			TestOk(audio->cut(), "cut audio");
+		}
+	}
+
+	// Keep writing until `done`, since a subscriber only sees what arrives after it subscribes.
+	bool WriteUntil(const std::function<bool()> &done, std::chrono::milliseconds timeout = std::chrono::seconds(10))
+	{
+		return WaitFor(
+			[&] {
+				Write();
+				std::this_thread::sleep_for(std::chrono::milliseconds(10));
+				return done();
+			},
+			timeout);
+	}
+
+	std::shared_ptr<moq::BroadcastProducer> broadcast;
+	std::shared_ptr<moq::MediaTrackProducer> video;
+	std::shared_ptr<moq::MediaTrackProducer> audio;
+
+private:
+	uint64_t timestamp_us;
+};
+
+// Whether OBS has been handed video and audio from a publisher that started at `start_us`.
+bool PlaysFrom(uint64_t start_us)
+{
+	return g_last_timestamp > start_us * 1000 && g_last_audio_timestamp > start_us * 1000;
+}
+
+// A URL moq-ffi rejects as soon as the connect runs, for a failure with no network in it.
+const char *const BAD_URL = "not a url";
+
+// An Opus packet libopus refuses (OPUS_INVALID_PACKET). The importer passes it through.
+const std::vector<uint8_t> BAD_OPUS = {0xff, 0xff, 0xff};
+
+// Three AAC-LC frames of a 440 Hz full-scale sine, mono at 44.1 kHz, and the
+// AudioSpecificConfig that opens them; the same fixture rs/moq-audio decodes.
+const std::vector<uint8_t> AAC_CONFIG = {0x12, 0x08};
+const std::vector<std::vector<uint8_t>> AAC_FRAMES = {
+	{0x01, 0x52, 0xf2, 0x8b, 0x1a, 0xd7, 0x8e, 0x7b, 0xfd, 0xa7, 0xef, 0xe7, 0xe3, 0x55, 0xd3,
+	 0x4d, 0x2f, 0x55, 0x2e, 0x47, 0x1c, 0x92, 0x49, 0x11, 0x20, 0x77, 0x3f, 0xbe, 0x74, 0xdd,
+	 0x99, 0xb3, 0x7b, 0xfb, 0x90, 0xc9, 0xf0, 0x61, 0x9f, 0xdc, 0x0c, 0x9f, 0x06, 0x19, 0xfd,
+	 0xe1, 0x1f, 0x1f, 0x00, 0x67, 0xf7, 0x03, 0x87, 0xc0, 0x19, 0xfd, 0xc0, 0xc9, 0xf0, 0x07},
+	{0x01, 0x1e, 0x32, 0x89, 0xe2, 0x9d, 0x6b, 0x33, 0xe7, 0xff, 0xe2, 0xfe, 0xbf, 0xfa, 0xff, 0xe7,
+	 0x2f, 0x8b, 0xd5, 0xd5, 0xe7, 0x5f, 0x3f, 0x59, 0xeb, 0xf1, 0xcb, 0xba, 0xa5, 0x5e, 0x52, 0x4a,
+	 0xbd, 0x8d, 0x74, 0x50, 0x8c, 0x08, 0xa8, 0xa0, 0xd4, 0x51, 0x40, 0xa1, 0x86, 0x5d, 0x06, 0xb4,
+	 0x6c, 0x32, 0xe6, 0x25, 0x9a, 0x66, 0x75, 0xcd, 0xf9, 0xbf, 0x6f, 0x83, 0xb7, 0x53, 0x80},
+	{0x01, 0x1e, 0x32, 0x8a, 0x22, 0x7d, 0x40, 0x87, 0x48, 0xdb, 0xdf, 0xff, 0xf9, 0x4f, 0xff, 0x87, 0xde,
+	 0xef, 0x8b, 0xeb, 0x1e, 0x77, 0x5d, 0xfc, 0x67, 0x8f, 0x8c, 0x77, 0x8a, 0xd6, 0x29, 0x96, 0x1f, 0x29,
+	 0xe7, 0x39, 0xd4, 0x53, 0xcf, 0x3c, 0xf3, 0xce, 0x79, 0xd4, 0x27, 0x9c, 0xf5, 0x65, 0x2a, 0x9b, 0xe9,
+	 0x80, 0xb7, 0xba, 0xa9, 0xf9, 0x58, 0xc7, 0x3c, 0x58, 0x27, 0x8a, 0x60, 0xa1, 0x57},
+};
+
+// A legacy-container PCM frame: the QUIC varint timestamp, then 20 ms of interleaved
+// little-endian f32 at 48 kHz, every sample of channel `c` holding (c + 1) / 10.
+std::vector<uint8_t> PcmFrame(uint64_t timestamp_us, uint32_t channels)
+{
+	std::vector<uint8_t> frame;
+	for (int shift = 24; shift >= 0; shift -= 8)
+		frame.push_back(static_cast<uint8_t>((shift == 24 ? 0x80 : 0) | (timestamp_us >> shift)));
+	for (int sample = 0; sample < 960; sample++) {
+		for (uint32_t c = 0; c < channels; c++) {
+			const float value = static_cast<float>(c + 1) / 10;
+			uint8_t bytes[sizeof(float)];
+			memcpy(bytes, &value, sizeof(float));
+			frame.insert(frame.end(), bytes, bytes + sizeof(float));
+		}
+	}
+	return frame;
+}
+
+// The catalog the source is reading, fetched over a local consumer so a scenario can
+// edit it and deliver it as if the publisher had.
+moq::Catalog CatalogSnapshot(Publisher &publisher)
+{
+	auto consumer = TestOk(publisher.broadcast->consume(), "local broadcast consumer");
+	auto catalogs = TestOk(moq::MediaCatalogConsumer::subscribe(consumer).get(), "local catalog");
+	auto snapshot = TestOk(catalogs->next().get(), "catalog snapshot");
+	CHECK(snapshot.has_value());
+	return *snapshot;
 }
 } // namespace
 
 int main()
 {
-	Runtime runtime;
-	g_runtime = &runtime;
-
 	register_moq_source();
-	if (!g_registered) {
-		fprintf(stderr, "FAIL: the source never registered\n");
-		return 1;
-	}
-	CHECK(g_info.create && g_info.destroy && g_info.update);
-	CHECK(g_info.get_defaults && g_info.get_properties && g_info.get_name);
+	CHECK(g_registered);
 
-	// The announcement arrives after the session reports connected, which is the
-	// normal order on the wire. The source waits for it, then starts the catalog
-	// subscription from the delivered broadcast.
+	// The TLS key log is off unless the toggle asks for it, and reaches the dial's QUIC config.
 	{
-		reset();
+		reset("");
 		void *source = createSource();
-		CHECK(g_session_connects == 1);
-		CHECK(g_announced_calls == 0); // nothing is asked for before connect
+		auto *ctx = static_cast<struct moq_source *>(source);
+		CHECK(!ctx->keylog);
+		CHECK(moq_source_client_config(ctx->keylog).quic.keylog != true);
 
-		g_runtime->Run([] { deliverStatus(g_last_session, 1); });
-		CHECK(g_announced_calls == 1);
-		// A wait for a future announcement, not a lookup of what is announced now.
-		CHECK(g_request_calls == 0);
-
-		int32_t broadcast = newBroadcast();
-		g_runtime->Run([broadcast] { deliverStatus(g_last_announced, broadcast); });
-		{
-			std::lock_guard<std::mutex> lock(g_subs_mutex);
-			CHECK(g_subs.at(g_last_announced).terminated);
-		}
-		CHECK(g_catalog_calls == 1);
-
-		int32_t snapshot = newSnapshot();
-		g_runtime->Run([snapshot] { deliverStatus(g_last_catalog, snapshot); });
-		CHECK(g_video_calls == 1);
-		CHECK(g_snapshot_frees == 1); // the snapshot is freed, never closed
-
-		// Only the blank from the initial connect: nothing here reported a failure.
-		CHECK(g_blank_calls == 1);
-		destroySource(source);
-		CHECK(g_consume_closes == 1);
-		CHECK(g_origin_closes == 1);
-	}
-	report("announcement after connect");
-
-	// A broadcast that is never announced leaves the wait pending forever. Destroy
-	// closes it, and that close is the only thing that makes the terminal fire and
-	// release the reference teardown is waiting on.
-	{
-		reset();
-		void *source = createSource();
-		g_runtime->Run([] { deliverStatus(g_last_session, 1); });
-		CHECK(g_announced_calls == 1);
-		CHECK(g_catalog_calls == 0); // still waiting
-		destroySource(source);
-	}
-	report("never announced, closed by destroy");
-
-	// The same pending wait, ended by settings the source cannot connect with.
-	// This is disconnect on a live source rather than on teardown, so the terminal
-	// has to fire exactly once and destroy must not close the handle again.
-	{
-		reset();
-		void *source = createSource();
-		g_runtime->Run([] { deliverStatus(g_last_session, 1); });
-
-		g_settings.url = "";
+		g_settings.keylog = true;
 		g_info.update(source, settingsData());
-		CHECK(g_blank_calls == 2); // the connect, then the disconnect
-		CHECK(g_announced_calls == 1);
-
-		destroySource(source);
-		// The update closed the origin; destroy found nothing left to close.
-		CHECK(g_origin_closes == 1);
-		CHECK(g_consume_closes == 0);
-	}
-	report("disconnect closes the pending wait");
-
-	// A reconnect bumps the generation while an older request still has a delivery
-	// in flight. The stale broadcast handle is ours the moment it is delivered, so
-	// it has to be closed rather than dropped, and it must not become the consume
-	// handle the new generation owns.
-	{
-		reset();
-		void *source = createSource();
-		g_runtime->Run([] { deliverStatus(g_last_session, 1); });
-		int32_t stale_request = g_last_announced;
-
-		// Hold the terminals back so the stale delivery lands between the close and
-		// its terminal, which is the window libmoq leaves open.
-		g_defer_terminals = true;
-		g_settings.broadcast = "obs/other";
-		g_info.update(source, settingsData()); // generation 1 -> 2
-
-		int32_t stale_broadcast = newBroadcast();
-		g_runtime->Run([stale_request, stale_broadcast] { deliverStatus(stale_request, stale_broadcast); });
-		CHECK(g_catalog_calls == 0); // the stale broadcast is not consumed
-		CHECK(g_consume_closes == 1);
-		CHECK(g_last_consume_closed == stale_broadcast);
-
-		g_defer_terminals = false;
-		flushDeferred();
-
-		// The new generation still connects and subscribes normally.
-		subscribeVideo(newBroadcast());
-		CHECK(g_session_connects == 2);
-		CHECK(g_video_calls == 1);
-
+		CHECK(ctx->keylog);
+		CHECK(moq_source_client_config(ctx->keylog).quic.keylog == true);
 		destroySource(source);
 	}
-	report("stale delivery dropped on the generation check");
+	report("key log is opt-in");
 
-	// The delivered path: frames reach OBS, and every frame id is freed exactly
-	// once.
+	// Connect, wait for the announcement, read the catalog, and decode video and
+	// audio from the tracks it names. moq-audio decodes the Opus to planar float at
+	// the OBS rate, stamped on the same broadcast timeline as the video.
 	{
-		reset();
-		g_describe = true; // exercise the extradata copy too
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
 		void *source = createSource();
-		subscribeVideo(newBroadcast());
-
-		int32_t first = newFrame(true);
-		g_runtime->Run([first] { deliverStatus(g_last_video, first); });
-		CHECK(g_output_frames == 1);
-		CHECK(g_sws_scales == 1);
-		// libmoq delivers microseconds; OBS wants nanoseconds.
-		CHECK(g_last_timestamp == 1000ull * static_cast<uint64_t>(first) * 1000ull);
-
-		int32_t second = newFrame(false);
-		g_runtime->Run([second] { deliverStatus(g_last_video, second); });
-		CHECK(g_output_frames == 2);
-
-		CHECK(g_frame_frees == 2);
+		CHECK(publisher.WriteUntil([] { return g_output_frames > 0 && g_output_audio > 0; }));
+		CHECK(g_sws_scales > 0);
+		const auto audio = lastAudio();
+		CHECK(audio.format == AUDIO_FORMAT_FLOAT_PLANAR);
+		CHECK(audio.speakers == SPEAKERS_STEREO);
+		CHECK(audio.samples_per_sec == 48000);
+		CHECK(audio.frames == 960);
+		// Both land on the publisher's 20 ms grid, unshifted: the shared timebase.
+		const auto on_grid = [](uint64_t ns) {
+			return ns % 1000 == 0 && ns / 1000 > 1'000'000 && (ns / 1000 - 1'000'000) % 20'000 == 0;
+		};
+		CHECK(on_grid(g_last_timestamp));
+		CHECK(on_grid(audio.timestamp));
 		destroySource(source);
 	}
-	report("delivered frames output and freed");
+	report("plays video and audio");
 
-	// Frames that arrive before the first keyframe, and frames the decoder
-	// rejects, take early returns out of the decode path. Each one still owns the
-	// frame id it was handed.
+	// AAC-LC from an ingest decodes through moq-audio, resampled from 44.1 kHz to the
+	// OBS rate and placed on the mono speaker.
 	{
-		reset();
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test", false, false);
+		moq::AudioInit init{};
+		init.format = moq::AudioFormat::kAac;
+		init.data = AAC_CONFIG;
+		auto aac = TestOk(moq::MediaTrackProducer::audio(publisher.broadcast, moq::MediaTarget::kNamed{}, init),
+				  "aac producer");
 		void *source = createSource();
-		subscribeVideo(newBroadcast());
-
-		int32_t skipped = newFrame(false); // no keyframe yet
-		g_runtime->Run([skipped] { deliverStatus(g_last_video, skipped); });
+		uint64_t samples = 0;
+		CHECK(WaitFor([&] {
+			for (const auto &frame : AAC_FRAMES) {
+				TestOk(aac->write_frame(moq::Frame{frame, 1'000'000 + samples * 1'000'000 / 44'100}),
+				       "write aac");
+				samples += 1024;
+			}
+			TestOk(aac->cut(), "cut aac");
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			return lastAudio().peak > 0.5f;
+		}));
+		const auto audio = lastAudio();
+		CHECK(audio.speakers == SPEAKERS_MONO);
+		CHECK(audio.samples_per_sec == 48000);
 		CHECK(g_output_frames == 0);
-
-		g_send_result = -1;
-		int32_t rejected = newFrame(true);
-		g_runtime->Run([rejected] { deliverStatus(g_last_video, rejected); });
-		CHECK(g_output_frames == 0);
-
-		g_send_result = 0;
-		g_receive_result = -1;
-		int32_t undecoded = newFrame(true);
-		g_runtime->Run([undecoded] { deliverStatus(g_last_video, undecoded); });
-		CHECK(g_output_frames == 0);
-
-		CHECK(g_frame_frees == 3);
 		destroySource(source);
 	}
-	report("dropped frames freed");
+	report("aac resampled to the obs rate");
 
-	// A second catalog replaces the video track. The old subscription is closed so
-	// its terminal releases its reference now rather than at teardown.
-	{
-		reset();
+	// PCM is placed by its WAVE-convention layout: 5.1 straight onto the OBS 5.1
+	// speakers, quad upmixed onto the 5.1 surround pair, and nine channels refused
+	// while the current audio keeps playing.
+	for (uint32_t channels : {6u, 4u, 9u}) {
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
 		void *source = createSource();
-		subscribeVideo(newBroadcast());
-		int32_t first_track = g_last_video;
-
-		int32_t snapshot = newSnapshot();
-		g_runtime->Run([snapshot] { deliverStatus(g_last_catalog, snapshot); });
-		CHECK(g_video_calls == 2);
-		CHECK(g_last_video != first_track);
-		CHECK(g_snapshot_frees == 2);
-
-		// Drain the terminal the swap posted, then confirm it landed.
-		g_runtime->Run([] {});
+		CHECK(publisher.WriteUntil([] { return g_output_frames > 0 && g_output_audio > 0; }));
+		auto pcm = TestOk(publisher.broadcast->publish_track("pcm", std::nullopt), "pcm track");
+		auto snapshot = CatalogSnapshot(publisher);
+		auto rendition = snapshot.audio.begin()->second;
+		rendition.codec = "pcm";
+		rendition.track = "pcm";
+		rendition.description.reset();
+		rendition.bitrate.reset();
+		rendition.sample_rate = 48000;
+		rendition.channel_count = channels;
+		snapshot.audio.clear();
+		snapshot.audio.emplace("pcm", rendition);
+		auto *ctx = static_cast<moq_source *>(source);
 		{
-			std::lock_guard<std::mutex> lock(g_subs_mutex);
-			CHECK(g_subs[first_track].terminated);
+			std::lock_guard<std::mutex> lock(ctx->mutex);
+			moq_source_subscribe_audio(ctx, ctx->connection, snapshot);
+			CHECK((ctx->connection->pending_audio != nullptr) == (channels != 9));
+		}
+		if (channels == 9) {
+			const int audio = g_output_audio;
+			CHECK(publisher.WriteUntil([&] { return g_output_audio >= audio + 3; }));
+		} else {
+			uint64_t timestamp_us = 2'000'000;
+			CHECK(WaitFor([&] {
+				TestOk(pcm->write_frame(moq::Frame{PcmFrame(timestamp_us, channels), std::nullopt}),
+				       "write pcm");
+				timestamp_us += 20'000;
+				std::this_thread::sleep_for(std::chrono::milliseconds(10));
+				return lastAudio().speakers == SPEAKERS_5POINT1;
+			}));
+			const auto audio = lastAudio();
+			CHECK(audio.samples_per_sec == 48000);
+			CHECK(audio.frames == 960);
+			// PCM has no codec delay, so each frame keeps its packet's timestamp.
+			CHECK(audio.timestamp % 20'000'000 == 0 && audio.timestamp >= 2'000'000'000);
+			const float six[] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f};
+			const float quad[] = {0.1f, 0.2f, 0, 0, 0.3f, 0.4f};
+			const float *expected = channels == 6 ? six : quad;
+			for (int i = 0; i < 6; i++)
+				CHECK(std::fabs(audio.first[i] - expected[i]) < 1e-6f);
+		}
+		destroySource(source);
+		report(channels == 6   ? "pcm 5.1 placed on obs 5.1"
+		       : channels == 4 ? "pcm quad upmixed to obs 5.1"
+				       : "pcm with no obs layout refused");
+	}
+
+	// A metadata-only snapshot leaves the same rendition and decoder running.
+	{
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
+		void *source = createSource();
+		CHECK(publisher.WriteUntil([] { return g_output_frames > 0 && g_output_audio > 0; }));
+		const int opens = g_decoder_opens;
+		const int frames = g_output_frames;
+		auto catalog = TestOk(moq::MediaCatalogProducer::init(publisher.broadcast), "catalog");
+		moq::VideoProperties properties{};
+		properties.rotation = 90;
+		TestOk(catalog->set_video_properties(properties), "catalog properties");
+		CHECK(publisher.WriteUntil([&] { return g_output_frames >= frames + 10; }));
+		CHECK(g_decoder_opens == opens);
+		destroySource(source);
+	}
+	report("unchanged rendition keeps decoder");
+
+	// The same track name with a new decoder configuration is a replacement; metadata alone is not.
+	{
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
+		void *source = createSource();
+		CHECK(publisher.WriteUntil([] { return g_output_frames > 0 && g_output_audio > 0; }));
+		auto consumer = TestOk(publisher.broadcast->consume(), "local broadcast consumer");
+		auto catalogs = TestOk(moq::MediaCatalogConsumer::subscribe(consumer).get(), "local catalog");
+		auto snapshot = TestOk(catalogs->next().get(), "catalog snapshot");
+		CHECK(snapshot.has_value());
+		auto &video = snapshot->video.begin()->second;
+		auto &audio = snapshot->audio.begin()->second;
+		auto *ctx = static_cast<moq_source *>(source);
+		{
+			std::lock_guard<std::mutex> lock(ctx->mutex);
+			const auto &conn = ctx->connection;
+			video.label = "relabeled";
+			video.bitrate = 1;
+			audio.label = "relabeled";
+			audio.bitrate = 1;
+			moq_source_subscribe_video(ctx, conn, *snapshot);
+			moq_source_subscribe_audio(ctx, conn, *snapshot);
+			CHECK(!conn->pending_video && !conn->pending_audio);
+			// Keyed apart from its track, the rendition still names the track already playing.
+			auto rekeyed = *snapshot;
+			auto entry = rekeyed.video.extract(rekeyed.video.begin());
+			entry.mapped().track = entry.key();
+			entry.key() = "main";
+			rekeyed.video.insert(std::move(entry));
+			moq_source_subscribe_video(ctx, conn, rekeyed);
+			CHECK(!conn->pending_video);
+			video.coded = moq::Dimensions{(video.coded ? video.coded->width : 0) + 16, 16};
+			audio.sample_rate += 1;
+			moq_source_subscribe_video(ctx, conn, *snapshot);
+			moq_source_subscribe_audio(ctx, conn, *snapshot);
+			CHECK(conn->pending_video && conn->pending_audio);
 		}
 		destroySource(source);
 	}
-	report("catalog update retires the old track");
+	report("reshaped rendition replaces decoder");
 
-	// A catalog update can advertise a replacement that libmoq rejects. The
-	// existing video subscription remains current and must keep delivering frames.
+	// A new rendition that has not delivered a frame cannot stop the old track.
 	{
-		reset();
-		g_describe = true;
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
 		void *source = createSource();
-		subscribeVideo(newBroadcast());
-		int32_t first_track = g_last_video;
-
-		g_description[0] = 0x02;
-		g_video_result = -77;
-		int32_t snapshot = newSnapshot();
-		g_runtime->Run([snapshot] { deliverStatus(g_last_catalog, snapshot); });
-		CHECK(g_video_calls == 1);
-		CHECK(g_last_video == first_track);
-		CHECK(g_snapshot_frees == 2);
-
-		int32_t frame = newFrame(true);
-		g_runtime->Run([first_track, frame] { deliverStatus(first_track, frame); });
-		CHECK(g_output_frames == 1);
-		CHECK(g_frame_frees == 1);
-		CHECK(g_last_decoder_extradata == 0x01);
-
+		CHECK(publisher.WriteUntil([] { return g_output_frames > 0; }));
+		moq::VideoInit init{};
+		init.format = moq::VideoFormat::kAvc3;
+		init.data = TestH264Init();
+		auto replacement = TestOk(
+			moq::MediaTrackProducer::video(publisher.broadcast,
+						       moq::MediaTarget::kNamed{std::string("!replacement")}, init),
+			"replacement");
+		const int frames = g_output_frames;
+		CHECK(publisher.WriteUntil([&] { return g_output_frames >= frames + 10; }));
+		CHECK(publisher.WriteUntil([&] {
+			TestOk(replacement->write_frame(moq::Frame{TestH264Keyframe(), 2'000'000}),
+			       "replacement frame");
+			return g_last_timestamp == 2'000'000'000;
+		}));
 		destroySource(source);
 	}
-	report("failed replacement keeps the old track current");
+	report("replacement waits for first frame");
 
-	// A session that fails for good tears down every subscription, not just the
-	// session, so the catalog and video references come back immediately instead
-	// of lingering until the source is destroyed.
-	{
-		reset();
+	// A keyframe flag or accepted packet is not proof that the replacement decodes.
+	for (int failure : {2, 3}) {
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
 		void *source = createSource();
-		subscribeVideo(newBroadcast());
-
-		g_runtime->Run([] { deliverStatus(g_last_session, -34); });
-		CHECK(g_blank_calls == 2); // the connect, then the error
-		CHECK(g_consume_closes == 1);
-		CHECK(g_origin_closes == 1);
-		g_runtime->Run([] {});
-		CHECK(allTerminated());
-
-		destroySource(source);
-	}
-	report("session error tears down the consume path");
-
-	// A broadcast that resolves to an error, and a catalog subscription that ends
-	// in one. Both blank the preview and leave the source disconnected.
-	{
-		reset();
-		void *source = createSource();
-		g_runtime->Run([] { deliverStatus(g_last_session, 1); });
-		g_runtime->Run([] { deliverStatus(g_last_announced, -1); });
-		CHECK(g_blank_calls == 2);
-		CHECK(g_catalog_calls == 0);
-		destroySource(source);
-	}
-	{
-		reset();
-		void *source = createSource();
-		subscribeVideo(newBroadcast());
-		g_runtime->Run([] { deliverStatus(g_last_catalog, -1); });
-		CHECK(g_blank_calls == 2);
-		g_runtime->Run([] { deliverStatus(g_last_video, -1); });
-		destroySource(source);
-	}
-	report("error terminals release their references");
-
-	// Every point where libmoq can refuse immediately. No subscription exists, so
-	// no terminal will ever fire, and the reference the plugin pre-added has to be
-	// undone by hand. A miss here is invisible until teardown hits its backstop,
-	// which is what destroySource checks.
-	{
-		reset();
-		g_origin_result = -1;
-		void *source = createSource();
-		CHECK(g_session_connects == 0);
-		destroySource(source);
-	}
-	{
-		reset();
-		g_session_result = -1;
-		void *source = createSource();
-		CHECK(g_session_connects == 0);
-		CHECK(g_origin_closes == 1); // the origin created for the attempt
-		destroySource(source);
-	}
-	{
-		reset();
-		g_announced_result = -1;
-		void *source = createSource();
-		g_runtime->Run([] { deliverStatus(g_last_session, 1); });
-		CHECK(g_announced_calls == 0);
-		CHECK(g_blank_calls == 2);
-		destroySource(source);
-	}
-	{
-		reset();
-		g_catalog_result = -1;
-		void *source = createSource();
-		g_runtime->Run([] { deliverStatus(g_last_session, 1); });
-		int32_t broadcast = newBroadcast();
-		g_runtime->Run([broadcast] { deliverStatus(g_last_announced, broadcast); });
-		CHECK(g_catalog_calls == 0);
-		CHECK(g_blank_calls == 2);
-		destroySource(source);
-	}
-	{
-		reset();
-		g_video_result = -1;
-		void *source = createSource();
-		subscribeVideo(newBroadcast());
-		CHECK(g_video_calls == 0);
-		CHECK(g_snapshot_frees == 1); // the snapshot is freed even when the track isn't
-		destroySource(source);
-	}
-	report("refused subscriptions undo their reference");
-
-	// A connected callback can finish before moq_session_connect returns. If
-	// consume setup then fails, the returned session belongs to the aborted origin
-	// and must be closed instead of becoming the source's current session.
-	{
-		reset();
-		g_session_connect_early = true;
-		g_announced_result = -1;
-		void *source = createSource();
-		CHECK(g_origin_closes == 1);
-		{
-			std::lock_guard<std::mutex> lock(g_subs_mutex);
-			CHECK(g_subs.at(g_last_session).closed);
+		CHECK(publisher.WriteUntil([] { return g_output_frames > 0 && g_output_audio > 0; }));
+		g_candidate_decode = failure;
+		moq::VideoInit init{};
+		init.format = moq::VideoFormat::kAvc3;
+		init.data = TestH264Init();
+		auto replacement = TestOk(
+			moq::MediaTrackProducer::video(publisher.broadcast,
+						       moq::MediaTarget::kNamed{std::string("!replacement")}, init),
+			"replacement video");
+		auto write = [&] {
+			TestOk(replacement->write_frame(moq::Frame{TestH264Keyframe(), 1'000'000'000}),
+			       "replacement frame");
+		};
+		CHECK(publisher.WriteUntil([&] {
+			write();
+			return g_candidate_attempts > 0;
+		}));
+		const int frames = g_output_frames;
+		CHECK(publisher.WriteUntil([&] { return g_output_frames >= frames + 3; }));
+		if (failure == 3) {
+			// Metadata-only updates must preserve the candidate's accumulated decode state.
+			auto snapshot = CatalogSnapshot(publisher);
+			auto *ctx = static_cast<moq_source *>(source);
+			{
+				std::lock_guard lock(ctx->mutex);
+				auto pending = ctx->connection->pending_video;
+				CHECK(pending != nullptr);
+				moq_source_subscribe_video(ctx, ctx->connection, snapshot);
+				CHECK(ctx->connection->pending_video == pending);
+			}
+			g_candidate_decode = 0;
+			CHECK(publisher.WriteUntil([&] {
+				write();
+				return g_last_timestamp == 1'000'000'000'000;
+			}));
 		}
-		g_runtime->Run([] {});
+		destroySource(source);
+		report(failure == 2 ? "failed video candidate preserves playback" : "video waits for decoded output");
+	}
+
+	// An audio replacement whose packets moq-audio refuses is dropped, and the current
+	// audio keeps playing.
+	{
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
+		void *source = createSource();
+		CHECK(publisher.WriteUntil([] { return g_output_audio > 0; }));
+		int failures = 0;
+		{
+			std::lock_guard<std::mutex> lock(g_candidate_mutex);
+			failures = g_candidate_failures;
+		}
+		moq::AudioInit init{};
+		init.format = moq::AudioFormat::kOpus;
+		init.data = TestOpusHead();
+		auto replacement = TestOk(
+			moq::MediaTrackProducer::audio(publisher.broadcast,
+						       moq::MediaTarget::kNamed{std::string("!replacement")}, init),
+			"replacement audio");
+		CHECK(publisher.WriteUntil([&] {
+			TestOk(replacement->write_frame(moq::Frame{BAD_OPUS, 1'000'000'000}), "replacement frame");
+			TestOk(replacement->cut(), "replacement audio cut");
+			std::lock_guard<std::mutex> lock(g_candidate_mutex);
+			return g_candidate_failures > failures;
+		}));
+		auto *ctx = static_cast<moq_source *>(source);
+		{
+			std::lock_guard<std::mutex> lock(ctx->mutex);
+			CHECK(ctx->connection->audio && !ctx->connection->pending_audio);
+		}
+		const int audio = g_output_audio;
+		CHECK(publisher.WriteUntil([&] { return g_output_audio >= audio + 3; }));
+		CHECK(g_last_audio_timestamp < 1'000'000'000'000);
 		destroySource(source);
 	}
-	report("early consume failure rejects the returned session");
+	report("failed audio candidate preserves playback");
 
-	// A decoder that cannot be built leaves the catalog subscription alone: no
-	// video track, the snapshot still freed, and nothing waiting on a terminal
-	// that will never come.
+	// A packet moq-audio refuses on the active audio track stops only that track; the
+	// pending replacement still takes over without another catalog update.
 	{
-		reset();
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
+		void *source = createSource();
+		CHECK(publisher.WriteUntil([] { return g_output_audio > 0; }));
+		moq::AudioInit init{};
+		init.format = moq::AudioFormat::kOpus;
+		init.data = TestOpusHead();
+		auto replacement = TestOk(
+			moq::MediaTrackProducer::audio(publisher.broadcast,
+						       moq::MediaTarget::kNamed{std::string("!replacement")}, init),
+			"replacement audio");
+		auto *ctx = static_cast<moq_source *>(source);
+		std::shared_ptr<Track> pending;
+		CHECK(WaitFor([&] {
+			std::lock_guard<std::mutex> lock(ctx->mutex);
+			pending = ctx->connection->pending_audio;
+			return pending && pending->audio_consumer;
+		}));
+		TestOk(publisher.audio->write_frame(moq::Frame{BAD_OPUS, 900'000'000}), "malformed frame");
+		TestOk(publisher.audio->cut(), "malformed cut");
+		CHECK(WaitFor([&] {
+			std::lock_guard<std::mutex> lock(ctx->mutex);
+			return !ctx->connection->audio;
+		}));
+		{
+			std::lock_guard<std::mutex> lock(ctx->mutex);
+			CHECK(ctx->connection->pending_audio == pending);
+		}
+		pending.reset();
+		uint64_t timestamp_us = 1'000'000'000;
+		CHECK(WaitFor([&] {
+			TestOk(replacement->write_frame(moq::Frame{{0xfc, 0xff, 0xfe}, timestamp_us}),
+			       "replacement frame");
+			TestOk(replacement->cut(), "replacement audio cut");
+			timestamp_us += 20'000;
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			return g_last_audio_timestamp >= 1'000'000'000'000;
+		}));
+		destroySource(source);
+	}
+	report("failed active audio keeps pending replacement");
+
+	// A decoded frame that is not whole samples of the track's layout stops the track
+	// rather than reaching OBS.
+	{
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
+		void *source = createSource();
+		CHECK(publisher.WriteUntil([] { return g_output_audio > 0; }));
+		auto *ctx = static_cast<moq_source *>(source);
+		{
+			std::lock_guard<std::mutex> lock(ctx->mutex);
+			auto conn = ctx->connection;
+			auto active = conn->audio;
+			CHECK(active != nullptr);
+			obs_source_audio audio = {};
+			moq::expected<std::optional<moq::AudioFrame>> misaligned(moq::AudioFrame{1, {0, 0, 0}});
+			CHECK(!moq_source_on_audio_frame(ctx, conn, active, misaligned, audio));
+			CHECK(!conn->audio);
+		}
+		destroySource(source);
+	}
+	report("misaligned audio frame stops the track");
+
+	// The public publishing wrapper cannot author a sibling-reference catalog, so deliver
+	// that snapshot directly; resolution and subscription still cross the real relay.
+	for (bool sibling : {false, true}) {
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
+		void *source = createSource();
+		CHECK(publisher.WriteUntil([] { return g_output_frames > 0; }));
+		auto consumer = TestOk(publisher.broadcast->consume(), "local broadcast consumer");
+		auto catalogs = TestOk(moq::MediaCatalogConsumer::subscribe(consumer).get(), "local catalog");
+		auto snapshot = TestOk(catalogs->next().get(), "catalog snapshot");
+		CHECK(snapshot.has_value());
+		auto config = snapshot->video.begin()->second;
+		std::shared_ptr<moq::BroadcastProducer> hidden;
+		if (sibling) {
+			hidden = TestOk(relay.origin->create_broadcast("obs/test/hidden"), "unannounced sibling");
+			config.broadcast = "./hidden";
+		}
+		snapshot->video.clear();
+		snapshot->video.emplace("!unavailable", config);
+		auto *ctx = static_cast<moq_source *>(source);
+		int failures = 0;
+		{
+			std::lock_guard<std::mutex> lock(g_candidate_mutex);
+			failures = g_candidate_failures;
+		}
+		{
+			std::lock_guard<std::mutex> lock(ctx->mutex);
+			moq_source_subscribe_video(ctx, ctx->connection, *snapshot);
+			CHECK(ctx->connection->pending_video != nullptr);
+		}
+		{
+			std::unique_lock<std::mutex> lock(g_candidate_mutex);
+			g_candidate_failed.wait(lock, [&] { return g_candidate_failures > failures; });
+		}
+		{
+			std::lock_guard<std::mutex> lock(ctx->mutex);
+			CHECK(ctx->connection && !ctx->connection->pending_video);
+		}
+		const int frames = g_output_frames;
+		CHECK(publisher.WriteUntil([&] { return g_output_frames >= frames + 3; }));
+		destroySource(source);
+		report(sibling ? "failed sibling resolution preserves playback"
+			       : "rejected subscription preserves playback");
+	}
+
+	// A replacement that cannot prepare a decoder leaves current playback alive.
+	{
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
+		void *source = createSource();
+		CHECK(publisher.WriteUntil([] { return g_output_frames > 0; }));
+		g_find_decoder_ok = false;
+		moq::VideoInit init{};
+		init.format = moq::VideoFormat::kAvc3;
+		init.data = TestH264Init();
+		auto replacement = TestOk(
+			moq::MediaTrackProducer::video(publisher.broadcast,
+						       moq::MediaTarget::kNamed{std::string("!replacement")}, init),
+			"failed replacement");
+		const int frames = g_output_frames;
+		CHECK(publisher.WriteUntil([&] { return g_output_frames >= frames + 10; }));
+		destroySource(source);
+	}
+	report("failed replacement preserves playback");
+
+	// A broadcast with no video rendition plays its audio and blanks the video.
+	{
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test", false, true);
+		void *source = createSource();
+		const int blanks = g_blank_calls;
+		CHECK(publisher.WriteUntil([] { return g_output_audio > 0; }));
+		CHECK(g_blank_calls > blanks);
+		CHECK(g_output_frames == 0);
+		destroySource(source);
+	}
+	report("audio only");
+
+	// A catalog naming a video codec FFmpeg can't open leaves the video blank, not half
+	// installed, and the audio still plays.
+	{
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
 		g_find_decoder_ok = false;
 		void *source = createSource();
-		subscribeVideo(newBroadcast());
-		CHECK(g_video_calls == 0);
-		CHECK(g_snapshot_frees == 1);
+		CHECK(publisher.WriteUntil([] { return g_output_audio > 0; }));
+		CHECK(g_output_frames == 0);
 		destroySource(source);
 	}
+	report("undecodable rendition");
+
+	// Another publisher instance taking over the path while the source plays, as a GOAWAY
+	// drain's replacement session does, plays without a blank. The old instance keeps playing
+	// until the new one delivers, and the new one keeps playing once the old one ends.
 	{
-		reset();
-		g_video_config_result = -1;
+		TestRelay relay;
+		reset(relay.Url());
+		auto first = std::make_unique<Publisher>(relay, "obs/test");
 		void *source = createSource();
-		subscribeVideo(newBroadcast());
-		CHECK(g_video_calls == 0);
-		CHECK(g_snapshot_frees == 1);
+		CHECK(first->WriteUntil([] { return g_output_frames > 0 && g_output_audio > 0; }));
+		const int blanks = g_blank_calls;
+		const int opens = g_decoder_opens;
+		Publisher second(relay, "obs/test", true, true, 1'000'000'000);
+		// The new instance's video candidate opens its own decoder while the old one still plays.
+		CHECK(first->WriteUntil([&] { return g_decoder_opens == opens + 1; }));
+		int frames = g_output_frames;
+		int audio = g_output_audio;
+		CHECK(first->WriteUntil(
+			[&] { return g_output_frames >= frames + 10 && g_output_audio >= audio + 10; }));
+		CHECK(!PlaysFrom(1'000'000'000));
+		CHECK(second.WriteUntil([] { return PlaysFrom(1'000'000'000); }));
+		first.reset();
+		frames = g_output_frames;
+		audio = g_output_audio;
+		CHECK(second.WriteUntil(
+			[&] { return g_output_frames >= frames + 10 && g_output_audio >= audio + 10; }));
+		CHECK(g_blank_calls == blanks);
+		CHECK(g_decoder_opens == opens + 1);
 		destroySource(source);
 	}
-	report("undecodable catalog leaves no dangling reference");
+	report("follows a replacement instance");
 
-	// libmoq retires a task before entering its terminal callback. Teardown can
-	// see the still-stored handle in that interval; a failed close is expected and
-	// must not be mistaken for a close after the callback already retired it.
+	// A replacement instance whose catalog subscribe fails stops the old instance too, blanks,
+	// and waits for the next instance.
 	{
-		reset();
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher first(relay, "obs/test");
 		void *source = createSource();
-		subscribeVideo(newBroadcast());
-		int32_t track = g_last_video;
+		CHECK(first.WriteUntil([] { return g_output_frames > 0 && g_output_audio > 0; }));
+		const int blanks = g_blank_calls;
+		// The relay cannot refuse a catalog, so deliver the failure once the replacement is
+		// handed out; its own catalog never arrives, since it publishes no tracks.
+		auto *ctx = static_cast<moq_source *>(source);
+		Publisher broken(relay, "obs/test", false, false);
+		CHECK(first.WriteUntil([&] {
+			std::lock_guard<std::mutex> lock(ctx->mutex);
+			return ctx->connection->instance == 2;
+		}));
 		{
-			std::lock_guard<std::mutex> lock(g_terminal_gate_mutex);
-			g_pause_terminal = true;
+			std::lock_guard<std::mutex> lock(ctx->mutex);
+			CHECK(ctx->connection->video && ctx->connection->audio);
+			moq_source_on_catalogs(ctx, ctx->connection,
+					       moq::unexpected(moq::Error(moq::Error::kInternal{"catalog refused"})));
+			CHECK(!ctx->connection->video && !ctx->connection->audio);
 		}
-
-		std::thread terminal([track] { deliverStatus(track, 0); });
-		{
-			std::unique_lock<std::mutex> lock(g_terminal_gate_mutex);
-			CHECK(g_terminal_gate_cv.wait_for(lock, std::chrono::seconds(1),
-							  [] { return g_terminal_marked; }));
-		}
-
-		std::thread teardown([source] { destroySource(source); });
-		{
-			std::unique_lock<std::mutex> lock(g_terminal_gate_mutex);
-			CHECK(g_terminal_gate_cv.wait_for(lock, std::chrono::seconds(1),
-							  [] { return g_inflight_close_seen; }));
-			g_release_terminal = true;
-			g_terminal_gate_cv.notify_all();
-		}
-		terminal.join();
-		teardown.join();
+		CHECK(g_blank_calls > blanks);
+		Publisher third(relay, "obs/test", true, true, 1'000'000'000);
+		CHECK(third.WriteUntil([] { return PlaysFrom(1'000'000'000); }));
+		destroySource(source);
 	}
-	report("teardown accepts an in-flight terminal");
+	report("failed replacement catalog waits for the next instance");
 
-	// Terminal callbacks racing destruction, repeatedly. Whichever order they land
-	// in, teardown returns on the callbacks and frees everything.
+	// A publisher that restarts, ending its broadcast before the new instance announces, plays
+	// again once it returns.
 	{
-		const int rounds = 100;
-		for (int i = 0; i < rounds; i++) {
-			reset();
-			void *source = createSource();
-			subscribeVideo(newBroadcast());
-
-			int32_t track = g_last_video;
-			int32_t catalog = g_last_catalog;
-			std::thread racer([track, catalog] {
-				deliverStatus(track, -1);
-				deliverStatus(catalog, -1);
-			});
-			destroySource(source);
-			racer.join();
+		TestRelay relay;
+		reset(relay.Url());
+		void *source = createSource();
+		{
+			Publisher first(relay, "obs/test");
+			CHECK(first.WriteUntil([] { return g_output_frames > 0 && g_output_audio > 0; }));
 		}
-		report("terminals racing destroy");
+		Publisher second(relay, "obs/test", true, true, 1'000'000'000);
+		CHECK(second.WriteUntil([] { return PlaysFrom(1'000'000'000); }));
+		destroySource(source);
 	}
+	report("follows a publisher restart");
 
-	// A frame in flight when the source is destroyed. Either it beats the close,
-	// in which case the plugin owns the frame id and must free it, or the close
-	// wins and libmoq never hands it over at all.
+	// The relay dropping the session: the client reconnects, and the broadcast announced over
+	// the new connect is another instance to play.
 	{
-		const int rounds = 100;
-		int delivered = 0;
-		for (int i = 0; i < rounds; i++) {
-			reset();
-			void *source = createSource();
-			subscribeVideo(newBroadcast());
-
-			int32_t track = g_last_video;
-			int32_t frame = newFrame(true);
-			std::atomic<bool> landed{false};
-			std::thread racer([track, frame, &landed] { landed = deliverStatus(track, frame); });
-			destroySource(source);
-			racer.join();
-			CHECK(g_frame_frees == (landed ? 1 : 0));
-			delivered += landed ? 1 : 0;
-		}
-		char label[64];
-		snprintf(label, sizeof(label), "frames racing destroy (%d of %d delivered)", delivered, rounds);
-		report(label);
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
+		void *source = createSource();
+		CHECK(publisher.WriteUntil([] { return g_output_frames > 0 && g_output_audio > 0; }));
+		relay.DropSessions();
+		CHECK(WaitFor([&] { return relay.Accepted() == 2; }));
+		const int frames = g_output_frames;
+		const int audio = g_output_audio;
+		CHECK(publisher.WriteUntil(
+			[&] { return g_output_frames >= frames + 10 && g_output_audio >= audio + 10; }));
+		destroySource(source);
 	}
+	report("follows a session reconnect");
 
-	CHECK(g_request_calls == 0);
+	// Changing the broadcast drops the old connection and plays the new one.
+	{
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher first(relay, "obs/test");
+		Publisher second(relay, "obs/other");
+		void *source = createSource();
+		CHECK(first.WriteUntil([] { return g_output_frames > 0; }));
 
-	g_runtime = nullptr;
+		g_settings.broadcast = "obs/other";
+		const int blanks = g_blank_calls;
+		g_info.update(source, settingsData());
+		CHECK(g_blank_calls > blanks);
+		g_output_frames = 0;
+		CHECK(second.WriteUntil([] { return g_output_frames > 0; }));
+		destroySource(source);
+	}
+	report("settings change reconnects");
+
+	// Invalid settings disconnect and blank without dialing.
+	{
+		TestRelay relay;
+		reset(relay.Url());
+		Publisher publisher(relay, "obs/test");
+		void *source = createSource();
+		CHECK(publisher.WriteUntil([] { return g_output_frames > 0; }));
+		g_settings.broadcast = "";
+		const int blanks = g_blank_calls;
+		g_info.update(source, settingsData());
+		CHECK(g_blank_calls == blanks + 1);
+		const int frames = g_output_frames;
+		for (int i = 0; i < 10; i++)
+			publisher.Write();
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		CHECK(g_output_frames == frames);
+		destroySource(source);
+	}
+	report("invalid settings disconnect");
+
+	// A connect that fails blanks the source and leaves nothing pending.
+	{
+		reset(BAD_URL);
+		void *source = createSource();
+		const int blanks = g_blank_calls;
+		CHECK(WaitFor([&] { return g_blank_calls > blanks; }));
+		destroySource(source);
+	}
+	report("connect failure");
+
+	// Destroy while the connect is still pending: it is cancelled, not waited on.
+	{
+		TestRelay relay(false);
+		reset(relay.Url());
+		void *source = createSource();
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		destroySource(source);
+	}
+	report("destroy during connect");
+
+	// Destroy while waiting for a broadcast that is never announced.
+	{
+		TestRelay relay;
+		reset(relay.Url(), "obs/missing");
+		void *source = createSource();
+		CHECK(WaitFor([&] { return relay.Accepted() == 1; }));
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		destroySource(source);
+	}
+	report("destroy waiting for the broadcast");
+
+	// Destroy mid-stream, repeatedly, so frames are being decoded on the worker
+	// while the source goes away.
+	{
+		TestRelay relay;
+		Publisher publisher(relay, "obs/test");
+		std::atomic<bool> writing{true};
+		std::thread writer([&] {
+			while (writing) {
+				publisher.Write();
+				std::this_thread::sleep_for(std::chrono::milliseconds(2));
+			}
+		});
+		for (int round = 0; round < 10; round++) {
+			reset(relay.Url());
+			void *source = createSource();
+			CHECK(WaitFor([] { return g_output_frames > 0; }));
+			destroySource(source);
+		}
+		writing = false;
+		writer.join();
+	}
+	report("destroy mid-stream");
+
+	// The publisher ends the broadcast; the source keeps its last state and
+	// tears down cleanly afterwards.
+	{
+		TestRelay relay;
+		reset(relay.Url());
+		void *source = createSource();
+		{
+			Publisher publisher(relay, "obs/test");
+			CHECK(publisher.WriteUntil([] { return g_output_frames > 0; }));
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		destroySource(source);
+	}
+	report("broadcast ends");
+
 	if (g_failures) {
-		printf("\nFAILURES: %d\n", g_failures);
+		fprintf(stderr, "%d failure(s)\n", g_failures);
 		return 1;
 	}
-	printf("\nall passed\n");
+	printf("all moq_source tests passed\n");
 	return 0;
 }

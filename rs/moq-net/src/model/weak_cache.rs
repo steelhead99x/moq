@@ -10,7 +10,7 @@ use std::{
 ///
 /// Implemented by the weak consumer handles cached for dynamic dedup
 /// ([`super::broadcast::WeakConsumer`], [`super::track::TrackWeak`]).
-pub(crate) trait WeakEntry {
+pub(super) trait WeakEntry {
 	/// True once the underlying channel has closed (every producer dropped).
 	fn is_closed(&self) -> bool;
 
@@ -40,7 +40,7 @@ const GC_PROBE: usize = 2;
 /// rotating cursor in kio's `WaiterList`) and drops any that have closed or been
 /// superseded. The cache stays bounded by the number of currently-live handles
 /// without ever scanning all of it.
-pub(crate) struct WeakCache<K, V> {
+pub(super) struct WeakCache<K, V> {
 	map: HashMap<K, V>,
 
 	// Rotating probe queue, one entry per key plus transient junk: keys already
@@ -102,6 +102,13 @@ where
 		None
 	}
 
+	/// Iterate every entry, closed ones included, for a teardown walk. A closed
+	/// entry may still carry side state the walk must settle (a cancelled front's
+	/// parked requesters), so nothing is filtered here.
+	pub fn values(&self) -> impl Iterator<Item = &V> {
+		self.map.values()
+	}
+
 	/// Remove and return the entry for `key`, if any.
 	pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
 	where
@@ -113,6 +120,28 @@ where
 		// rather than pin the handle (and its kio state) until one happens to arrive.
 		self.ring.retain(|(k, _)| k.borrow() != key);
 		self.map.remove(key)
+	}
+
+	/// Remove the entry for `key`, live or closed, only when it satisfies `f`, so an
+	/// owner taking out its own entry leaves a successor's alone.
+	///
+	/// Unlike [`Self::remove`], the ring sheds its copy under the bounded GC rather than
+	/// a scan, so owners leaving one by one cost O(1) each however large the cache. Each
+	/// call probes like an insert does, reclaiming junk faster than it adds it, so the
+	/// ring stays bounded by the live count plus a tail of the latest leavers.
+	pub fn remove_if<Q>(&mut self, key: &Q, f: impl FnOnce(&V) -> bool) -> Option<V>
+	where
+		K: Borrow<Q>,
+		Q: Hash + Eq + ?Sized,
+	{
+		let removed = match self.map.get(key) {
+			Some(entry) if f(entry) => self.map.remove(key),
+			_ => None,
+		};
+		if removed.is_some() {
+			self.gc();
+		}
+		removed
 	}
 
 	/// True if `key` has an entry, whether live or closed-but-not-yet-reclaimed.
@@ -234,6 +263,36 @@ mod tests {
 		assert_eq!(cache.len(), 1);
 		assert_eq!(cache.ring_len(), 1, "remove must prune the ring, not just the map");
 		assert!(cache.remove("a").is_none(), "already removed");
+	}
+
+	/// Owners leaving one by one, live or closed, with nothing inserted after them: each
+	/// removal leaves a successor's entry alone and sheds the ring without scanning it.
+	#[test]
+	fn owners_leaving_keep_the_ring_bounded() {
+		let mut cache = WeakCache::default();
+		let entries: Vec<Fake> = (0..1000).map(|_| Fake::open()).collect();
+		for (i, entry) in entries.iter().enumerate() {
+			cache.insert(i, entry.clone());
+		}
+
+		// A successor holds key 0: its predecessor's removal finds someone else's entry.
+		entries[0].close();
+		let successor = Fake::open();
+		cache.insert(0, successor.clone());
+		assert!(cache.remove_if(&0, |entry| entry.same_channel(&entries[0])).is_none());
+		assert!(cache.get(&0).expect("the successor stays").same_channel(&successor));
+
+		for (i, entry) in entries.iter().enumerate().skip(1) {
+			assert!(cache.remove_if(&i, |current| current.same_channel(entry)).is_some());
+		}
+		assert_eq!(cache.len(), 1, "only the successor is left");
+		// Each removal probes twice the junk it adds, so only a tail of the latest
+		// leavers waits for the next operation, never one entry per key.
+		assert!(
+			cache.ring_len() < 1000 / 4,
+			"ring kept the leavers: {}",
+			cache.ring_len()
+		);
 	}
 
 	#[test]

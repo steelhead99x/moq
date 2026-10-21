@@ -6,6 +6,7 @@
  *
  * @module
  */
+import { Nano, Second } from "@moq/clock";
 import * as Json from "@moq/json";
 import * as Moq from "@moq/net";
 import * as Watch from "@moq/watch";
@@ -17,7 +18,9 @@ export interface GameConfig {
 	/** Unique session identifier (e.g. the ROM name). */
 	sessionId: string;
 	/** MoQ connection to the relay. */
-	connection: Moq.Connection.Reload;
+	connection: Moq.Connection;
+	/** The origin viewer broadcasts are published into; the connection serves it. */
+	origin: Moq.Origin.Producer;
 	/** Shared signal tracking which game is currently expanded. */
 	expanded: Moq.Signals.Signal<string | undefined>;
 	/** MoQ path prefix for game broadcasts (e.g. "anon/boy/game"). */
@@ -33,7 +36,7 @@ interface Command {
 }
 
 // Stop publishing feedback after 60s of no input.
-const FEEDBACK_IDLE_MS = 60_000;
+const FEEDBACK_IDLE = Nano.fromSecond(Second(60));
 
 // Game Boy native resolution.
 const GB_WIDTH = 160;
@@ -72,7 +75,7 @@ export class Game {
 	// Reactive state exposed to UI.
 	readonly hovered = new Moq.Signals.Signal(false);
 	readonly active = new Moq.Signals.Signal(false);
-	readonly latency = new Moq.Signals.Signal<Watch.Latency>("real-time");
+	readonly delay = new Moq.Signals.Signal<Watch.Delay>("auto");
 	readonly userMuted = new Moq.Signals.Signal(false);
 	readonly volume = new Moq.Signals.Signal(0.25);
 	readonly status = new Moq.Signals.Signal<GameStatus | undefined>(undefined);
@@ -101,7 +104,6 @@ export class Game {
 	// Internal command publishing state.
 	#command = new Moq.Signals.Signal<Command | undefined>(undefined);
 	#feedbackActive = new Moq.Signals.Signal(false);
-	#feedbackTimeout: ReturnType<typeof setTimeout> | undefined;
 
 	constructor(config: GameConfig) {
 		const { sessionId, connection, expanded, gamePrefix, viewerPrefix } = config;
@@ -114,18 +116,17 @@ export class Game {
 
 		// Video pipeline.
 		this.broadcast = new Watch.Broadcast({
-			connection: connection.established,
+			origin: config.origin,
 			name: Moq.Path.from(`${gamePrefix}/${sessionId}`),
 			enabled: true,
 		});
 		this.#signals.cleanup(() => this.broadcast.close());
 
-		// Sources produce the per-rendition jitter that Sync reads, so they're created
-		// before Sync to avoid a construction cycle.
 		this.videoSource = new Watch.Video.Source({
 			broadcast: this.broadcast,
 			target: this.#target,
 			supported: Watch.Video.Decoder.supported,
+			probe: connection.probe,
 		});
 		this.#signals.cleanup(() => this.videoSource.close());
 
@@ -135,22 +136,21 @@ export class Game {
 		});
 		this.#signals.cleanup(() => this.audioSource.close());
 
-		this.sync = new Watch.Sync({
-			latency: this.latency,
-			connection: connection.established,
-			video: this.videoSource.out.jitter,
-			audio: this.audioSource.out.jitter,
-		});
+		this.sync = new Watch.Sync({ delay: this.delay });
 		this.#signals.cleanup(() => this.sync.close());
 
 		this.#signals.run(this.#runPixelBudget.bind(this));
 
 		const videoEnabled = new Moq.Signals.Signal(true);
-		this.videoDecoder = new Watch.Video.Decoder(this.videoSource, this.sync, { enabled: videoEnabled });
+		this.videoDecoder = new Watch.Video.Decoder({
+			source: this.videoSource,
+			sync: this.sync,
+			enabled: videoEnabled,
+		});
 		this.#signals.cleanup(() => this.videoDecoder.close());
 
 		// Renderer needs a canvas created by the UI layer, set via `canvas`.
-		this.videoRenderer = new Watch.Video.Renderer(this.videoDecoder, { canvas: this.canvas });
+		this.videoRenderer = new Watch.Video.Renderer({ decoder: this.videoDecoder, canvas: this.canvas });
 		this.#signals.cleanup(() => this.videoRenderer.close());
 
 		// Download on the grid or when expanded, but only while the tile is on-screen.
@@ -158,18 +158,25 @@ export class Game {
 		this.#signals.run(this.#runVideoEnabled.bind(this, videoEnabled));
 
 		// Audio pipeline. The emitter stops the download when muted or paused.
-		this.audioDecoder = new Watch.Audio.Decoder(this.audioSource, this.sync);
+		const audioEnabled = new Moq.Signals.Signal(false);
+		this.audioDecoder = new Watch.Audio.Decoder({
+			source: this.audioSource,
+			sync: this.sync,
+			enabled: audioEnabled,
+		});
 		this.#signals.cleanup(() => this.audioDecoder.close());
 
 		const audioPaused = new Moq.Signals.Signal(true);
 		this.#signals.run(this.#runAudioPaused.bind(this, audioPaused));
 
-		this.audioEmitter = new Watch.Audio.Emitter(this.audioDecoder, {
+		this.audioEmitter = new Watch.Audio.Emitter({
+			source: this.audioDecoder,
 			volume: this.volume,
 			muted: this.userMuted,
 			paused: audioPaused,
 		});
 		this.#signals.cleanup(() => this.audioEmitter.close());
+		this.#signals.proxy(audioEnabled, this.audioEmitter.out.enabled);
 
 		// Resume AudioContext on first user interaction (browser autoplay policy).
 		for (const event of ["click", "touchstart", "touchend", "mousedown", "keydown"]) {
@@ -183,7 +190,8 @@ export class Game {
 		this.#signals.run(this.#runStatus.bind(this));
 
 		// Command publishing.
-		this.#signals.run(this.#runCommands.bind(this, connection));
+		this.#signals.run(this.#runCommands.bind(this, connection, config.origin));
+		this.#signals.run(this.#runFeedbackIdle.bind(this));
 	}
 
 	/** Send a button state update. */
@@ -195,8 +203,6 @@ export class Game {
 	sendCommand(cmd: Record<string, unknown>) {
 		// Activate feedback broadcasting on input, with idle timeout.
 		this.#feedbackActive.set(true);
-		clearTimeout(this.#feedbackTimeout);
-		this.#feedbackTimeout = setTimeout(() => this.#feedbackActive.set(false), FEEDBACK_IDLE_MS);
 
 		this.#command.set({ cmd, timestamps: this.#timestamps() }, true);
 	}
@@ -214,7 +220,6 @@ export class Game {
 	}
 
 	close() {
-		clearTimeout(this.#feedbackTimeout);
 		this.#signals.close();
 	}
 
@@ -249,19 +254,19 @@ export class Game {
 		const active = effect.get(this.broadcast.out.active);
 		if (!active) return;
 
-		const statusTrack = active.subscribe("status", { priority: 10 });
+		const statusTrack = active.track("status").subscribe({ priority: 10 });
 		effect.cleanup(() => statusTrack.close());
 
 		// Reconstruct each status from snapshots and deltas, validated against the schema.
-		const consumer = new Json.Snapshot.Consumer(statusTrack, { schema: GameStatusSchema });
+		const consumer = new Json.Snapshot.Consumer({ track: statusTrack, schema: GameStatusSchema });
 
-		// Closing the track on cleanup unblocks a pending next() (it returns undefined), so the loop
-		// ends without racing effect.cancel.
+		// Closing the track on cleanup unblocks a pending latest() (it returns undefined), so the loop
+		// ends without racing the teardown.
 		effect.spawn(async () => {
 			for (;;) {
 				let status: GameStatus | undefined;
 				try {
-					status = await consumer.next();
+					status = (await consumer.latest())?.value;
 				} catch (err) {
 					console.warn("Invalid status JSON:", err);
 					continue;
@@ -273,14 +278,21 @@ export class Game {
 		});
 	}
 
-	#runCommands(connection: Moq.Connection.Reload, effect: Moq.Signals.Effect) {
-		const conn = effect.get(connection.established);
-		if (!conn) return;
+	#runFeedbackIdle(effect: Moq.Signals.Effect) {
+		if (!effect.get(this.#feedbackActive)) return;
+		// Every command restarts the idle timer.
+		effect.get(this.#command);
+		effect.timer(() => this.#feedbackActive.set(false), FEEDBACK_IDLE);
+	}
+
+	#runCommands(connection: Moq.Connection, origin: Moq.Origin.Producer, effect: Moq.Signals.Effect) {
+		// Publishing goes through the origin, but gate on a live connection anyway: a command
+		// broadcast for a game nobody is connected to is feedback into the void.
+		if (effect.get(connection.status) !== "connected") return;
 
 		if (!effect.get(this.active)) {
 			// Clear feedback state when deactivating.
 			this.#feedbackActive.set(false);
-			clearTimeout(this.#feedbackTimeout);
 			this.#command.set(undefined);
 			return;
 		}
@@ -291,27 +303,19 @@ export class Game {
 		const viewerId = Math.random().toString(36).slice(2, 8);
 		this.viewerId.set(viewerId);
 
-		const viewerBroadcast = new Moq.Broadcast.Producer();
-		conn.publish(Moq.Path.from(`${this.#viewerPrefix}/${this.sessionId}/${viewerId}`), viewerBroadcast);
+		const viewerBroadcast = origin.createBroadcast(
+			Moq.Path.from(`${this.#viewerPrefix}/${this.sessionId}/${viewerId}`),
+		);
+		viewerBroadcast.announce({ epoch: Moq.Epoch.mint() });
 		effect.cleanup(() => {
 			viewerBroadcast.close();
 			this.viewerId.set(undefined);
 		});
 
-		effect.spawn(async () => {
-			for (;;) {
-				const req = await Promise.race([effect.cancel, viewerBroadcast.requested()]);
-				if (!req) break;
-
-				if (req.name === "command") {
-					// accept() commits the track's immutable properties and returns the producer.
-					const track = req.accept();
-					const producer = new Json.Snapshot.Producer<Record<string, unknown>>({ track });
-					effect.cleanup(() => producer.finish());
-					effect.run(this.#runCommandTrack.bind(this, track, producer));
-				}
-			}
-		});
+		const track = viewerBroadcast.createTrack("command", { timescale: Moq.Time.Timescale.MILLI });
+		const producer = new Json.Snapshot.Producer<Record<string, unknown>>({ track });
+		effect.cleanup(() => producer.finish());
+		effect.run(this.#runCommandTrack.bind(this, track, producer));
 	}
 
 	#runCommandTrack(
@@ -324,6 +328,6 @@ export class Game {
 		const command = effect.get(this.#command);
 		if (!command) return;
 
-		producer.update({ ...command.cmd, timestamps: command.timestamps });
+		producer.update({ value: { ...command.cmd, timestamps: command.timestamps }, at: Moq.Time.Timestamp.now() });
 	}
 }

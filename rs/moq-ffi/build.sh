@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Build and package moq-ffi native libraries for release.
-# Usage: ./build.sh [--target TARGET] [--version VERSION] [--output DIR] [--bindings-only] [--no-default-features]
+# Usage: ./build.sh [--target TARGET] [--version VERSION] [--output DIR] [--bindings-only [--library PATH]] [--no-default-features]
 #
 # Examples:
 #   ./build.sh                                    # Build for host, detect version from Cargo.toml
@@ -14,19 +14,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE_DIR="$(cd "$RS_DIR/.." && pwd)"
 
-# Shrink the release staticlib. The Go mirror commits the native libs straight
-# into git, and GitHub's pre-receive hook hard-rejects any file over 100 MB
-# (GH001). An unstripped moq-ffi staticlib is ~110 MB on Linux, which silently
-# blocked every moq-go mirror push and pinned consumers to a stale release.
-# Thin LTO with a single codegen unit dead-strips the unused monomorphizations
-# Rust bakes into a staticlib, cutting it by ~60% (~110 MB to ~35 MB) with no
-# source or ABI changes. (Swift ships an XCFramework release asset and Kotlin a
-# Maven .so, so neither hits the git limit, but both still get smaller libs.)
-# Scoped here via env vars so a plain `cargo build --release` stays fast; a
-# caller can still override.
-export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-thin}"
-export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-1}"
-
 # Resolve cargo target directory (respects CARGO_TARGET_DIR, .cargo/config, etc.)
 TARGET_BASE_DIR=$(cargo metadata --format-version 1 --manifest-path "$WORKSPACE_DIR/Cargo.toml" --no-deps 2>/dev/null |
     sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' ||
@@ -37,6 +24,7 @@ TARGET=""
 VERSION=""
 OUTPUT_DIR="dist"
 BINDINGS_ONLY=false
+LIBRARY=""
 ARCHIVE=false
 NO_DEFAULT_FEATURES=false
 
@@ -59,6 +47,10 @@ while [[ $# -gt 0 ]]; do
             BINDINGS_ONLY=true
             shift
             ;;
+        --library)
+            LIBRARY="$2"
+            shift 2
+            ;;
         --archive)
             # Default leaves the staging dir alone for upload-artifact;
             # --archive recreates the legacy tar.gz/zip behavior.
@@ -70,7 +62,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h | --help)
-            echo "Usage: $0 [--target TARGET] [--version VERSION] [--output DIR] [--bindings-only] [--archive] [--no-default-features]"
+            echo "Usage: $0 [--target TARGET] [--version VERSION] [--output DIR] [--bindings-only [--library PATH]] [--archive] [--no-default-features]"
             exit 0
             ;;
         *)
@@ -79,6 +71,13 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -n "$LIBRARY" ]]; then
+    if [[ "$BINDINGS_ONLY" != true || ! -f "$LIBRARY" ]]; then
+        echo "Error: --library requires --bindings-only and an existing library" >&2
+        exit 1
+    fi
+fi
 
 # Get version from Cargo.toml if not specified
 if [[ -z "$VERSION" ]]; then
@@ -114,7 +113,9 @@ can_run_on_host() {
 # Build the library for a single target
 build_target() {
     local target="$1"
-    local cargo_args=(build --locked --release --package moq-ffi)
+    # Releases carry the OpenH264 software fallback, the only encoder on API-24
+    # Android and the Apple simulators; a no-op under --no-default-features.
+    local cargo_args=(build --locked --release --package moq-ffi --features openh264)
     if [[ "$NO_DEFAULT_FEATURES" == true ]]; then
         cargo_args+=(--no-default-features)
     fi
@@ -165,14 +166,14 @@ generate_bindings() {
 
     for lang in kotlin swift python; do
         echo "  Generating $lang bindings..."
-        cargo run --locked --release --package moq-ffi --bin uniffi-bindgen --manifest-path "$WORKSPACE_DIR/Cargo.toml" -- \
+        cargo run --locked --release --package uniffi-bindgen --features cli --manifest-path "$WORKSPACE_DIR/Cargo.toml" -- \
             generate --library "$lib_path" \
             --language "$lang" --out-dir "$OUTPUT_DIR/bindings/$lang"
     done
 
     # Go uses a separate, third-party bindgen. Upstream has no uniffi 0.32
     # release yet, so install the compatible generator fork with:
-    # cargo install --locked uniffi-bindgen-go --git https://github.com/kixelated/uniffi-bindgen-go --rev 4f79e52bd8f518e5fa4d7acff9e586aee21e12a0
+    # cargo install --locked uniffi-bindgen-go --git https://github.com/kixelated/uniffi-bindgen-go --rev v0.10.0-kixelated.1+v0.32.0
     if command -v uniffi-bindgen-go >/dev/null 2>&1; then
         echo "  Generating go bindings..."
         uniffi-bindgen-go --library "$lib_path" --out-dir "$OUTPUT_DIR/bindings/go"
@@ -189,8 +190,20 @@ generate_bindings() {
         echo "  Skipping dart bindings: uniffi_bindgen_dart not on PATH"
     fi
 
+    # C++ uses a third-party bindgen too: a fork carrying LiveKit's async support
+    # ported to uniffi 0.32, which upstream has not released. Install it with:
+    # cargo install --locked uniffi-bindgen-cpp --git https://github.com/kixelated/uniffi-bindgen-cpp --tag v0.11.0-kixelated.5+v0.32.2
+    if command -v uniffi-bindgen-cpp >/dev/null 2>&1; then
+        echo "  Generating cpp bindings..."
+        uniffi-bindgen-cpp --library "$lib_path" \
+            --config "$WORKSPACE_DIR/cpp/moq/uniffi.toml" \
+            --out-dir "$OUTPUT_DIR/bindings/cpp"
+    else
+        echo "  Skipping cpp bindings: uniffi-bindgen-cpp not on PATH"
+    fi
+
     if [[ "$ARCHIVE" == true ]]; then
-        for lang in kotlin swift python go dart; do
+        for lang in kotlin swift python go dart cpp; do
             if [[ -d "$OUTPUT_DIR/bindings/$lang" ]]; then
                 local archive="moq-ffi-${VERSION}-${lang}.tar.gz"
                 tar -czf "$OUTPUT_DIR/$archive" -C "$OUTPUT_DIR/bindings" "$lang"
@@ -205,8 +218,12 @@ mkdir -p "$OUTPUT_DIR"
 
 # --- Bindings-only mode ---
 if [[ "$BINDINGS_ONLY" == true ]]; then
-    build_target "$HOST_TARGET"
-    cdylib=$(find_cdylib "$HOST_TARGET")
+    if [[ -n "$LIBRARY" ]]; then
+        cdylib="$LIBRARY"
+    else
+        build_target "$HOST_TARGET"
+        cdylib=$(find_cdylib "$HOST_TARGET")
+    fi
     if [[ ! -f "$cdylib" ]]; then
         echo "Error: cdylib not found at $cdylib" >&2
         exit 1

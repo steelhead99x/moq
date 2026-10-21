@@ -29,10 +29,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use moq_net::origin;
+use moq_net::{Path, PathOwned, origin};
 
-use crate::Result;
 use crate::server::{Request, Server};
+use crate::{Program, Result};
 
 /// SRT gateway configuration.
 ///
@@ -47,21 +47,51 @@ pub struct Config {
 	/// gateway is disabled.
 	pub listen: Option<SocketAddr>,
 
-	/// Prefix prepended to every broadcast path, for both publish and request.
-	/// Lets one listener namespace all of its streams (e.g. `live/`).
-	pub prefix: String,
+	/// Path prefix prepended to every broadcast path, for both publish and request.
+	/// Lets one listener namespace all of its streams (e.g. `live`).
+	pub prefix: PathOwned,
 
 	/// SRT receive latency: the negotiated buffer that trades delay for loss
 	/// recovery.
 	pub latency: Duration,
+
+	/// How long relays keep a non-latest group of an ingested media track fetchable, or
+	/// `None` for hang's own default.
+	///
+	/// A retention budget, not a delivery one: it never makes a subscriber play further
+	/// behind live, it caps how far back a FETCH can still reach. The default suits a
+	/// segmented egress (HLS/DASH) reading the broadcast downstream, which may only
+	/// advertise segments that are still fetchable. Lower it when nothing reads history
+	/// and the memory matters. Only affects ingest (`m=publish`); egress ignores it.
+	pub max_age: Option<Duration>,
+
+	/// The programs of a multi-program feed every ingest publishes, or `None` to refuse a
+	/// multiplex. To choose per path, drive [`Server`] and call
+	/// [`Publish::with_program`](crate::Publish::with_program) on each request.
+	pub program: Option<Program>,
+
+	/// How long an egress waits for the same publisher instance to come back once its
+	/// broadcast ends, carrying on with the same stream. Zero (the default) closes the SRT
+	/// stream at the end. Only affects egress (`m=request`).
+	/// A stitched replacement must also supply its first catalog within this bound.
+	pub linger: Duration,
+
+	/// Whether an egress follows another publisher instance replacing its broadcast, as a full
+	/// program switch on the same SRT connection. Off by default, which ends the stream with
+	/// [`moq_mux::Error::Replaced`]. Only affects egress (`m=request`).
+	pub stitch: bool,
 }
 
 impl Default for Config {
 	fn default() -> Self {
 		Self {
 			listen: None,
-			prefix: String::new(),
+			prefix: Path::empty().to_owned(),
 			latency: crate::server::DEFAULT_LATENCY,
+			max_age: None,
+			program: None,
+			linger: Duration::ZERO,
+			stitch: false,
 		}
 	}
 }
@@ -97,7 +127,10 @@ pub async fn run(origin: origin::Producer, config: Config) -> Result<()> {
 	// RTMP stream key) instead of being silently parked as a backup that could
 	// take over the path when the first publisher drops.
 	let active = ActivePaths::default();
-	let prefix = Arc::new(config.prefix);
+	let prefix = config.prefix;
+	let max_age = config.max_age;
+	let program = config.program;
+	let (linger, stitch) = (config.linger, config.stitch);
 
 	while let Some(request) = server.accept().await {
 		let prefix = prefix.clone();
@@ -110,15 +143,20 @@ pub async fn run(origin: origin::Producer, config: Config) -> Result<()> {
 				// publishers.
 				tokio::spawn(async move {
 					let peer = publish.peer();
-					let path = format!("{prefix}{}", publish.resource());
+					let path = prefix.join(publish.resource());
 					// Claim the path before accepting; the guard releases it when the
 					// connection task ends (success, error, or panic).
-					let Some(_guard) = active.claim(&path) else {
+					let Some(_guard) = active.claim(path.as_str()) else {
 						tracing::warn!(%peer, %path, "rejecting SRT publish: path already being ingested");
-						let _ = publish.reject().await;
+						let _ = publish.reject(crate::Reject::Unavailable).await;
 						return;
 					};
-					if let Err(err) = publish.accept(&origin, &path).await {
+					if let Err(err) = publish
+						.with_max_age(max_age)
+						.with_program(program)
+						.accept(&origin, &path)
+						.await
+					{
 						tracing::warn!(%peer, %path, %err, "SRT ingest ended with error");
 					} else {
 						tracing::info!(%peer, %path, "SRT ingest ended");
@@ -131,7 +169,8 @@ pub async fn run(origin: origin::Producer, config: Config) -> Result<()> {
 				// don't claim an `ActivePaths` slot.
 				tokio::spawn(async move {
 					let peer = subscribe.peer();
-					let path = format!("{prefix}{}", subscribe.resource());
+					let path = prefix.join(subscribe.resource());
+					let subscribe = subscribe.with_linger(linger).with_stitch(stitch);
 					if let Err(err) = subscribe.accept(&consumer, &path).await {
 						tracing::warn!(%peer, %path, %err, "SRT request ended with error");
 					} else {
@@ -142,9 +181,7 @@ pub async fn run(origin: origin::Producer, config: Config) -> Result<()> {
 		}
 	}
 
-	Err(crate::Error::from(anyhow::anyhow!(
-		"SRT listener stopped accepting connections"
-	)))
+	Err(crate::Error::ListenerClosed)
 }
 
 /// The set of broadcast paths with a live ingest, used to reject duplicate

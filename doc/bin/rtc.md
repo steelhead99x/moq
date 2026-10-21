@@ -18,17 +18,26 @@ MoQ broadcasts.
 | `export rtc --connect <url>` | WHIP client | Push a broadcast to a remote WHIP endpoint |
 
 ```bash
-moq --client-connect https://relay.example.com/anon --broadcast cam.hang import rtc --listen '[::]:8080'
-moq --client-connect https://relay.example.com/anon --broadcast cam.hang export rtc --listen '[::]:8080'
+moq --connect https://relay.example.com/anon --broadcast cam.hang import rtc --listen '[::]:8080'
+moq --connect https://relay.example.com/anon --broadcast cam.hang export rtc --listen '[::]:8080'
 ```
 
 Peers reach the broadcast at `http://host:8080/<broadcast>`. Opus, H.264,
-H.265, VP8, VP9, and AV1 are negotiated in both directions. `--cors-origin`
+H.265, VP8, VP9, and AV1 are negotiated in both directions. A WHEP peer
+receives the largest enabled video rendition (then highest bitrate) in its negotiated codec, and
+the highest-bitrate enabled Opus rendition (then sample rate, then channels). It
+follows the catalog: a peer whose rendition is disabled moves to the next best at
+that rendition's first keyframe, a better one that re-enables wins the peer back,
+and with none enabled the peer receives nothing until one is. `--cors-origin`
 opens the endpoint to browsers on other origins, and `--udp-bind` plus
 `--public-addr` pin one media port for firewalls. The listener is plain HTTP;
 put a TLS-terminating proxy in front for WHIP clients that require HTTPS. A fresh WHEP peer joins at the current group, so it
 starts at a keyframe without waiting for the next one. `DELETE` on the
-resource URL tears a session down per the RFC.
+resource URL tears a session down per the RFC. Each WHIP session publishes
+under a fresh [epoch](/concept/moq-lite#publisher-epochs), so a publisher that
+reconnects while its stale session lingers replaces it at once.
 
 Built on [str0m](https://crates.io/crates/str0m); the library is
-[`moq-rtc`](https://docs.rs/moq-rtc).
+[`moq-rtc`](https://docs.rs/moq-rtc). Embedders can sample each peer's
+[wire source](https://github.com/moq-dev/moq/blob/main/rs/moq-ice/src/wire.rs) for UDP
+payload bytes, including media, control traffic, and retransmissions.

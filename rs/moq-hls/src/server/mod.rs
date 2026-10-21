@@ -1,16 +1,24 @@
-//! HTTP server: serves HLS for MoQ broadcasts, fetching media on demand.
+//! HTTP server: serves HLS and DASH for MoQ broadcasts, fetching media on demand.
 //!
 //! Routes are path-based, so one server can expose many broadcasts:
 //!
 //! ```text
 //! GET /{broadcast}/master.m3u8
+//! GET /{broadcast}/manifest.mpd
 //! GET /{broadcast}/{kind}/{rendition}/media.m3u8
-//! GET /{broadcast}/{kind}/{rendition}/init.mp4
-//! GET /{broadcast}/{kind}/{rendition}/seg/{group}.m4s
+//! GET /{broadcast}/{kind}/{rendition}/init.{hash}.mp4
+//! GET /{broadcast}/{kind}/{rendition}/seg/{reference}.{segment}.m4s
+//! GET /{broadcast}/{kind}/{rendition}/seg/{reference}.t{pts}.m4s
 //! ```
 //!
 //! `{kind}` is `video` or `audio`, so a video and an audio rendition that share a
-//! name address distinct resources.
+//! name address distinct resources. The two `seg/` forms name the same bytes: HLS
+//! playlists address a segment by its aligned number, the DASH manifest by its
+//! timeline `pts` (`$Time$`). `{hash}` is a hash of the init segment's bytes, so a
+//! reconfigured rendition gets a new init URL. A broadcaster given a generation
+//! ([`Broadcaster::set_generation`](crate::export::Broadcaster::set_generation))
+//! prefixes every segment file with it (`seg/{generation}.{reference}.{segment}.m4s`), and
+//! refuses segment URLs carrying any other.
 //!
 //! Every request is served. To gate access, wrap [`Server::router`] in your own
 //! [`axum`] middleware. It runs before routing, so a rejected request never reaches
@@ -19,6 +27,12 @@
 //! suffix, still percent-encoded: `/project/li%76e/master.m3u8` serves the broadcast
 //! `project/live`. Decode each segment before matching it against a policy, or a
 //! name can be encoded past the check.
+//!
+//! An embedder that authorizes each request itself (a token scoping the broadcast, a
+//! stats-metered origin per tenant) skips the router instead: parse the path with
+//! [`Route::parse`], check [`Route::broadcast`], rewrite it relative to the scope, and
+//! answer with [`Server::respond`] on a `Server` built from that scope's origin. The
+//! decoded broadcast is what a policy should check.
 //!
 //! ```no_run
 //! use axum::http::StatusCode;
@@ -39,6 +53,8 @@
 //! ```
 
 mod routes;
+
+pub use routes::{Resource, Route};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -95,19 +111,22 @@ impl Server {
 			}
 		}
 
-		// Confirm the broadcast is announced (and in scope) before building a broadcaster;
-		// `Broadcaster::new` re-resolves it through the origin, which also lets a rendition's
-		// catalog `broadcast` field reference a sibling broadcast.
-		tokio::time::timeout(RESOLVE_TIMEOUT, self.inner.origin.announced_broadcast(name))
+		// Confirm a route covers the broadcast (and it is in scope) before resolving it. The
+		// source resolves a rendition's sibling `broadcast` reference through the same origin.
+		tokio::time::timeout(RESOLVE_TIMEOUT, self.inner.origin.routed(name))
 			.await
 			.ok()
 			.flatten()?;
 
-		let source = moq_mux::Source::new(self.inner.origin.consume(), name);
-		let broadcaster = Broadcaster::new(source, self.inner.config.clone())
+		let origin = self.inner.origin.consume();
+		// A covering dynamic route may never answer, so the request is bounded too.
+		let broadcast = tokio::time::timeout(RESOLVE_TIMEOUT, origin.request_broadcast(name, None))
 			.await
-			.map_err(|err| tracing::warn!(%err, %name, "failed to resolve broadcast catalog"))
+			.map_err(|_| tracing::warn!(%name, "timed out resolving broadcast"))
+			.ok()?
+			.map_err(|err| tracing::warn!(%err, %name, "failed to resolve broadcast"))
 			.ok()?;
+		let broadcaster = Broadcaster::new(moq_mux::Source::new(origin, broadcast), self.inner.config.clone());
 
 		let mut broadcasters = self.inner.broadcasters.lock().unwrap();
 		if let Some(existing) = broadcasters.get(name) {
@@ -138,6 +157,19 @@ async fn evict_closed(inner: Arc<Inner>, name: String, broadcaster: Arc<Broadcas
 
 #[cfg(test)]
 mod tests {
+	/// Build an origin producer, spawning its driver on the ambient runtime.
+	fn produce_origin() -> moq_net::origin::Producer {
+		let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::default());
+		if tokio::runtime::Handle::try_current().is_ok() {
+			tokio::spawn(moq_net::time::run(driver));
+		} else {
+			// A sync test: nothing polls the driver, and dropping it would tear
+			// the origin down, so leak it and rely on the synchronous half.
+			std::mem::forget(driver);
+		}
+		producer
+	}
+
 	use super::*;
 
 	/// Let the origin's spawned attach/detach tasks run: a created broadcast
@@ -169,7 +201,7 @@ mod tests {
 
 		// An origin with no broadcasts: a request that reaches the handlers 404s after
 		// RESOLVE_TIMEOUT, so a 401 proves the middleware rejected it first.
-		let origin = moq_net::Origin::random().produce();
+		let origin = produce_origin();
 		let server = Server::new(origin.consume(), Config::default());
 		let app = server.router().layer(middleware::from_fn(gate));
 
@@ -203,7 +235,7 @@ mod tests {
 		use axum::http::{StatusCode, header};
 		use tower::ServiceExt;
 
-		let origin = moq_net::Origin::random().produce();
+		let origin = produce_origin();
 		let server = Server::new(origin.consume(), Config::default());
 		let app = Router::new().nest("/hls", server.router());
 
@@ -223,24 +255,20 @@ mod tests {
 	}
 
 	async fn closed_broadcaster() -> Arc<Broadcaster> {
-		let origin = moq_net::Origin::random().produce();
-		let mut producer = origin
-			.create_broadcast("gone", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let origin = produce_origin();
+		let producer = origin.create_broadcast("gone").expect("publish allowed");
+		producer.announce(Default::default()).expect("publish allowed");
 		settle().await;
-		let source = moq_mux::Source::new(origin.consume(), "gone");
-		let broadcaster = Broadcaster::new(source, Config::default())
-			.await
-			.expect("catalog broadcast resolves while announced");
-		// Finish the publisher so the resolved broadcast (and the broadcaster) reports closed.
-		producer.finish();
+		let broadcaster = Broadcaster::new(crate::resolved(&origin, "gone").await, Config::default());
+		// Close the publisher so the resolved broadcast (and the broadcaster) reports closed.
+		producer.close();
 		settle().await;
 		broadcaster
 	}
 
 	#[tokio::test]
 	async fn broadcaster_replaces_finished_cached_instance() {
-		let origin = moq_net::Origin::random().produce();
+		let origin = produce_origin();
 		let server = Server::new(origin.consume(), Config::default());
 		let stale = closed_broadcaster().await;
 
@@ -250,9 +278,8 @@ mod tests {
 			.lock()
 			.unwrap()
 			.insert("live".to_string(), stale.clone());
-		let _producer = origin
-			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let _producer = origin.create_broadcast("live").expect("publish allowed");
+		_producer.announce(Default::default()).expect("publish allowed");
 		settle().await;
 
 		let fresh = server.broadcaster("live").await.expect("broadcast announced");
@@ -263,16 +290,13 @@ mod tests {
 
 	#[tokio::test]
 	async fn eviction_keeps_newer_cached_instance() {
-		let origin = moq_net::Origin::random().produce();
+		let origin = produce_origin();
 		let server = Server::new(origin.consume(), Config::default());
 		let old = closed_broadcaster().await;
-		let mut new_producer = origin
-			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let new_producer = origin.create_broadcast("live").expect("publish allowed");
+		new_producer.announce(Default::default()).expect("publish allowed");
 		settle().await;
-		let new = Broadcaster::new(moq_mux::Source::new(origin.consume(), "live"), Config::default())
-			.await
-			.expect("catalog broadcast resolves while announced");
+		let new = Broadcaster::new(crate::resolved(&origin, "live").await, Config::default());
 
 		server
 			.inner
@@ -285,6 +309,6 @@ mod tests {
 
 		let cached = server.inner.broadcasters.lock().unwrap().get("live").cloned();
 		assert!(cached.is_some_and(|cached| Arc::ptr_eq(&cached, &new)));
-		new_producer.finish();
+		new_producer.close();
 	}
 }

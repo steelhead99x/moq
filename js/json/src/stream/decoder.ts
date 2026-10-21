@@ -1,10 +1,8 @@
 import { Decoder as Flate } from "@moq/flate";
 
-/** Options shared by a {@link Decoder} and the {@link Consumer} that wraps one. */
-export interface ConsumerConfig {
-	/** Whether the frames are `deflate-raw` compressed. Must match the encoder. Defaults to `false`. */
-	compression?: boolean;
-}
+import { isDeflate } from "../compression.ts";
+import { parse } from "../parse.ts";
+import type { Config } from "./encoder.ts";
 
 /**
  * Decodes JSON records from frame payloads, sharing one DEFLATE window across the log.
@@ -14,12 +12,14 @@ export interface ConsumerConfig {
  * Call {@link reset} at a group boundary, matching the encoder.
  */
 export class Decoder<T> {
+	#schema?: Config<T>["schema"];
 	#decompress: boolean;
 	// The DEFLATE window for the whole log, present while decompressing.
 	#flate?: Flate;
 
-	constructor(config: ConsumerConfig = {}) {
-		this.#decompress = config.compression ?? false;
+	constructor(config: Config<T> = {}) {
+		this.#schema = config.schema;
+		this.#decompress = isDeflate(config.compression);
 		this.#flate = this.#decompress ? new Flate() : undefined;
 	}
 
@@ -30,7 +30,7 @@ export class Decoder<T> {
 
 	/** Decode the next frame payload back into a record. */
 	decode(payload: Uint8Array): T {
-		const plain = this.#flate ? this.#flate.frame(payload) : payload;
-		return JSON.parse(new TextDecoder().decode(plain));
+		const value = parse(this.#flate ? this.#flate.frame(payload) : payload);
+		return this.#schema ? this.#schema.parse(value) : (value as T);
 	}
 }
