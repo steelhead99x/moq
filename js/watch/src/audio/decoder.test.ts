@@ -323,16 +323,22 @@ it("decodes an audio packet inside a group after a gap", async () => {
 });
 
 describe("Decoder with an injected AudioContext", () => {
-	it("shares one context between decoders, loads the worklet once, and never closes or suspends it", async () => {
-		const injected = new FakeContext({ sampleRate: 48_000 });
-		let loads = 0;
-		Object.assign(injected.audioWorklet, {
+	afterEach(() => jest.useRealTimers());
+
+	function injectedContext() {
+		const context = new FakeContext({ sampleRate: 48_000 });
+		const loads = { count: 0 };
+		Object.assign(context.audioWorklet, {
 			addModule: () => {
-				loads++;
+				loads.count++;
 				return Promise.resolve();
 			},
 		});
-		const shared = injected as unknown as AudioContext;
+		return { context, shared: context as unknown as AudioContext, loads };
+	}
+
+	it("shares one context between decoders, loads the worklet once, and never closes it", async () => {
+		const { context, shared, loads } = injectedContext();
 		const a = await play(Milli(100), false, false, shared);
 		const b = await play(Milli(100), false, false, shared);
 		try {
@@ -340,18 +346,39 @@ describe("Decoder with an injected AudioContext", () => {
 			expect(contexts).toHaveLength(1);
 			expect(a.context.peek()).toBe(shared);
 			expect(b.context.peek()).toBe(shared);
-			expect(loads).toBe(1);
-
-			// A drained, absent rendition suspends an owned context; a shared one keeps running.
-			a.remove();
-			await microtasks();
-			expect(injected.calls.suspend).toBe(0);
+			expect(loads.count).toBe(1);
 		} finally {
 			a.close();
 			b.close();
 			await microtasks();
 		}
-		expect(injected.calls.close).toBe(0);
+		expect(context.calls.close).toBe(0);
+	});
+
+	it("does not suspend an injected context once a removed rendition drains", async () => {
+		jest.useFakeTimers();
+		const { context, shared } = injectedContext();
+		const playback = await play(Milli(100), false, false, shared);
+		try {
+			await playback.play(12);
+			const [ring] = playback.rings();
+			jest.advanceTimersByTime(50);
+			await microtasks();
+
+			playback.remove();
+			await microtasks();
+			expect(drain(ring)).toBeGreaterThan(0);
+			jest.advanceTimersByTime(50);
+			await microtasks();
+
+			// An owned context suspends here (see "plays the tail, suspends once drained").
+			expect(context.calls.suspend).toBe(0);
+			expect(context.state).toBe("running");
+		} finally {
+			playback.close();
+			await microtasks();
+		}
+		expect(context.calls.close).toBe(0);
 	});
 });
 
