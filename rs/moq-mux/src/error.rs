@@ -1,3 +1,20 @@
+/// Renders an error and its `source()` chain into a single message.
+///
+/// Dependency errors are stored as messages so their crates stay out of this crate's public
+/// API. Several of them keep the actionable half in `source()` and nothing but a category in
+/// `Display`, so a plain `to_string()` would drop the only detail worth reporting.
+pub(crate) fn message(err: impl std::error::Error) -> String {
+	use std::fmt::Write;
+
+	let mut out = err.to_string();
+	let mut source = err.source();
+	while let Some(err) = source {
+		let _ = write!(out, ": {err}");
+		source = err.source();
+	}
+	out
+}
+
 /// Errors from moq-mux operations.
 ///
 /// Most variants are delegations to underlying layers: [`moq_net::Error`] for
@@ -18,6 +35,22 @@ pub enum Error {
 	/// Error publishing or consuming JSON over a track.
 	#[error("json: {0}")]
 	Json(#[from] moq_json::Error),
+
+	/// Error publishing or consuming opaque payloads over a track.
+	#[error("flate: {0}")]
+	Flate(#[from] moq_flate::Error),
+
+	/// A catalog entry declares a track mode this build does not implement.
+	#[error("unsupported track mode: {0}")]
+	UnsupportedMode(String),
+
+	/// A catalog entry declares a compression this build does not implement.
+	#[error("unsupported track compression: {0}")]
+	UnsupportedCompression(String),
+
+	/// A locally published track's catalog entry points at another broadcast.
+	#[error("a locally published track can't reference another broadcast")]
+	ForeignBroadcast,
 
 	/// Error parsing or building CMAF moof+mdat fragments.
 	#[error("cmaf: {0}")]
@@ -93,16 +126,50 @@ pub enum Error {
 
 	/// URL parse error.
 	#[error("url: {0}")]
-	Url(#[from] url::ParseError),
+	Url(String),
 
 	/// Unknown media format.
 	#[error("unknown format: {0}")]
 	UnknownFormat(String),
 
+	/// A video format that a raw byte stream cannot be split into.
+	///
+	/// Only the self-delimiting codecs (Annex-B H.264/H.265, AV1 OBUs) carry their own frame
+	/// boundaries. The rest need length prefixes or an out-of-band config record, so they can only
+	/// be imported as whole frames via [`Track::video`](crate::import::Track::video).
+	#[error("{0} is not self-describing, so its frame boundaries can't be inferred from a stream")]
+	NotSelfDescribing(String),
+
+	/// A format was handed to a constructor for a different kind of import.
+	///
+	/// Each entry point takes only the fields its kind can honor, so the format has to match: an
+	/// audio format carries no video hint, and a container has no single rendition to label.
+	#[error("{format} is a {actual} format, not {wanted}")]
+	WrongKind {
+		/// The format string the caller passed.
+		format: String,
+		/// The kind that actually handles it.
+		actual: &'static str,
+		/// The kind the constructor expected.
+		wanted: &'static str,
+	},
+
 	/// A non-keyframe frame was received before any keyframe opened a group.
 	/// A track joining mid-stream should skip frames until the first keyframe.
 	#[error("{0}")]
 	MissingKeyframe(#[from] crate::container::MissingKeyframe),
+
+	/// An explicit video endpoint precedes its last frame.
+	#[error("{0}")]
+	InvalidEnd(#[from] crate::container::InvalidEnd),
+
+	/// A group starts before the previous group did: the source restarted.
+	#[error("{0}")]
+	TimestampRewind(#[from] crate::container::TimestampRewind),
+
+	/// A rendition was modified before its initial config was published.
+	#[error("rendition is not published")]
+	NotPublished,
 
 	/// A FLV video frame resolved to a negative presentation timestamp.
 	#[error("negative FLV video presentation timestamp: dts={dts_ms}ms composition_time={composition_time_ms}ms")]
@@ -112,6 +179,42 @@ pub enum Error {
 		/// The signed FLV composition-time offset in milliseconds.
 		composition_time_ms: i32,
 	},
+
+	/// [`timeline::Producer::resume`](crate::timeline::Producer::resume) received a checkpoint
+	/// whose record at this window index has a different sequence.
+	#[error("timeline checkpoint record at index {0} has a different sequence")]
+	TimelineCheckpoint(u64),
+
+	/// [`timeline::Producer::push`](crate::timeline::Producer::push) received a record out of order.
+	#[error("timeline record {actual} pushed where {expected} was next")]
+	TimelineSequence {
+		/// The window's next index.
+		expected: u64,
+		/// The pushed record's sequence.
+		actual: u64,
+	},
+
+	/// A timeline frame report did not advance past the previous one.
+	#[error("timeline report at {position:?} does not advance past {last:?}")]
+	TimelinePosition {
+		/// The rejected report's position.
+		position: hang::timeline::Position,
+		/// The previous report's position.
+		last: hang::timeline::Position,
+	},
+
+	/// The catalog's `archive` entry indexes no timeline for this track.
+	#[error("no timeline for track {0}")]
+	TimelineMissing(String),
+
+	/// A timeline frame report is timed differently from the track's earlier ones: a track is all
+	/// timed or all untimed.
+	#[error("timeline report at {0:?} does not match the track's timing")]
+	TimelineTiming(hang::timeline::Position),
+
+	/// A timeline record has no `pts` or `duration` to decode, as on an untimed track.
+	#[error("timeline record {0} is untimed")]
+	TimelineUntimed(u64),
 
 	/// Error from a muxer/demuxer that reports via `anyhow` (currently MPEG-TS).
 	/// Boxed in an `Arc` so the enum stays `Clone` (`anyhow::Error` is not).
@@ -123,6 +226,11 @@ pub enum Error {
 	#[error("invalid timeline timescale: {0}")]
 	InvalidTimescale(u32),
 
+	/// A timestamp cannot be mapped between the broadcast clock and the wall: PTS zero would land
+	/// before the moq epoch (2020) or after now, the host's wall clock was unset so the clock has no
+	/// mapping, or a catalog root `clock` would change or clear the producer's fixed clock.
+	#[error("timestamp cannot be mapped onto the broadcast clock: {0}")]
+	UnmappableTimestamp(String),
 	/// Tried to set an application catalog section whose name collides with a
 	/// reserved media section (`video`/`audio`).
 	#[error("reserved catalog section: {0}")]
@@ -133,9 +241,31 @@ pub enum Error {
 	#[error("unsupported container: {0}")]
 	UnsupportedContainer(String),
 
-	/// A rendition's relative broadcast reference escaped above the origin root.
-	#[error("broadcast reference escapes above the root: {0}")]
-	InvalidBroadcastReference(String),
+	/// A rendition's `broadcast` reference walks above the root, so it names no broadcast.
+	///
+	/// The root is the consumer's authorized subtree, so such a reference is an attempt to
+	/// name content the consumer cannot reach. It rejects the whole catalog
+	/// ([`catalog::hang::Consumer`](crate::catalog::hang::Consumer)) rather than the one
+	/// rendition, and is also what a direct [`Source::resolve`](crate::Source::resolve) /
+	/// [`Source::subscribe_track`](crate::Source::subscribe_track) reports.
+	#[error("broadcast reference escapes the root: {0}")]
+	EscapingBroadcast(String),
+
+	/// A rendition tried to lower jitter already advertised to subscribers.
+	#[error("catalog jitter cannot decrease for a published rendition")]
+	JitterDecreased,
+
+	/// A rendition tried to lower delay already advertised to subscribers.
+	#[error("catalog delay cannot decrease for a published rendition")]
+	DelayDecreased,
+
+	/// A capture instant is ahead of the broadcast clock's now, or before its epoch.
+	#[error("capture time is outside the broadcast clock")]
+	InvalidCapture,
+
+	/// Another publisher instance replaced a followed broadcast, and stitching was off.
+	#[error("another publisher instance replaced broadcast `{0}`; enable stitch to follow it as a program switch")]
+	Replaced(String),
 }
 
 impl Error {
@@ -154,6 +284,13 @@ impl From<anyhow::Error> for Error {
 impl From<mp4_atom::Error> for Error {
 	fn from(err: mp4_atom::Error) -> Self {
 		Error::Mp4(std::sync::Arc::new(err))
+	}
+}
+
+// Flattened to its message so `url` stays out of this crate's public API.
+impl From<url::ParseError> for Error {
+	fn from(err: url::ParseError) -> Self {
+		Error::Url(message(err))
 	}
 }
 

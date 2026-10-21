@@ -1,5 +1,6 @@
-import { expect, test } from "bun:test";
-import type * as Catalog from "@moq/hang/catalog";
+import { afterEach, describe, expect, test } from "bun:test";
+import { Manual, Milli, Nano, Wall } from "@moq/clock";
+import * as Catalog from "@moq/hang/catalog";
 import * as Json from "@moq/json";
 import { Track } from "@moq/net";
 import { Effect } from "@moq/signals";
@@ -16,18 +17,60 @@ test("catalog producer seeds subscribers and fans out edits", async () => {
 	const effect = new Effect();
 	const track = new Track.Producer("catalog.json");
 	catalog.serve(track, effect);
-	const consumer = new Json.Snapshot.Consumer<Catalog.Root>(track.subscribe());
+	const consumer = new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() });
 
 	// A new subscriber is seeded with the current catalog.
-	expect((await consumer.next())?.video).toEqual({ renditions: {} });
+	expect((await consumer.latest())?.value.video).toEqual({ renditions: {} });
 
 	// An extension owner adds its own section; the subscriber sees the update, video untouched.
 	catalog.mutate((c) => {
 		c.scte35 = { splices: [] };
 	});
-	const update = await consumer.next();
+	const update = (await consumer.latest())?.value;
 	expect(update?.video).toEqual({ renditions: {} });
 	expect(update?.scte35).toEqual({ splices: [] });
+
+	effect.close();
+});
+
+test("catalog producer refuses an ID naming both a video and an audio rendition", () => {
+	const catalog = new CatalogProducer();
+	expect(() =>
+		catalog.mutate((c) => {
+			c.video = { renditions: { main: { codec: "avc1.64001f", container: { kind: "legacy" } } } };
+			c.audio = {
+				renditions: {
+					main: {
+						codec: "opus",
+						sampleRate: Catalog.u53(48000),
+						numberOfChannels: Catalog.u53(2),
+						container: { kind: "legacy" },
+					},
+				},
+			};
+		}),
+	).toThrow(Catalog.DuplicateRendition);
+});
+
+test("catalog producer computes the version from the fields it uses", async () => {
+	const catalog = new CatalogProducer();
+	const effect = new Effect();
+	const track = new Track.Producer("catalog.json");
+	catalog.serve(track, effect);
+	const consumer = new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() });
+	const video = { codec: "avc1.64001f", container: { kind: "legacy" as const } };
+
+	// A caller's own version is replaced by the computed one.
+	catalog.mutate((c) => {
+		c.video = { renditions: { hd: { ...video, track: "video" } } };
+		c.version = 3;
+	});
+	expect((await consumer.latest())?.value.version).toBe(4);
+
+	catalog.mutate((c) => {
+		c.video = { renditions: { hd: video } };
+	});
+	expect((await consumer.latest())?.value).not.toHaveProperty("version");
 
 	effect.close();
 });
@@ -41,11 +84,11 @@ test("catalog producer publishes every update as a snapshot group", async () => 
 	const effect = new Effect();
 	const track = new Track.Producer("catalog.json");
 	catalog.serve(track, effect);
-	const subscriber = track.subscribe();
+	const subscriber = track.subscribe().ordered();
 
 	const first = await subscriber.nextGroup();
 	expect(first?.sequence).toBe(0);
-	expect(await first?.readJson()).toEqual({ video: { renditions: {} } });
+	expect(await first?.readJson()).toEqual({ clock: expect.anything(), video: { renditions: {} } });
 	expect(first?.done).toBe(true);
 
 	catalog.mutate((c) => {
@@ -54,10 +97,71 @@ test("catalog producer publishes every update as a snapshot group", async () => 
 
 	const second = await subscriber.nextGroup();
 	expect(second?.sequence).toBe(1);
-	expect(await second?.readJson()).toEqual({ video: { renditions: {} }, scte35: { splices: [] } });
+	expect(await second?.readJson()).toEqual({
+		clock: expect.anything(),
+		video: { renditions: {} },
+		scte35: { splices: [] },
+	});
 	expect(second?.done).toBe(true);
 
 	effect.close();
+});
+
+test("catalog producer advertises the page clock from the first snapshot", async () => {
+	const clock = new Manual();
+	clock.advance(Nano.fromMilli(Milli(5000)));
+	const restore = clock.install();
+	const catalog = new CatalogProducer();
+
+	const effect = new Effect();
+	const track = new Track.Producer("catalog.json");
+	catalog.serve(track, effect);
+	const consumer = new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() });
+
+	// Before any rendition: a live-only publisher exposes its clock without an archive.
+	const first = Catalog.RootSchema.parse((await consumer.latest())?.value);
+	if (!first.clock) throw new Error("expected a root clock");
+	expect(first.archive).toBeUndefined();
+	expect(first.clock.timescale).toBe(1_000_000);
+
+	// A timestamp stamped the way capture does (the clock's instant in microseconds) maps onto the
+	// wall clock the page was reading at that instant.
+	const wall = Catalog.wallClockTime(first.clock, 5_000_000, 1_000_000).getTime();
+	expect(wall).toBe(Manual.WALL_START + 5000);
+
+	// Later edits keep the mapping, even across a system-clock adjustment: it is fixed for the broadcast.
+	clock.stepWall(Wall(Manual.WALL_START + 60_000));
+	catalog.mutate((c) => {
+		c.video = { renditions: {} };
+	});
+	const second = Catalog.RootSchema.parse((await consumer.latest())?.value);
+	expect(second.clock).toEqual(first.clock);
+
+	effect.close();
+	restore();
+});
+
+test("catalog producer omits the clock when the page's wall clock is unset", async () => {
+	// A device booted before it synced its clock: the page began in 1970.
+	const clock = new Manual();
+	clock.stepWall(Wall(86_400_000));
+	const restore = clock.install();
+	try {
+		const catalog = new CatalogProducer();
+		catalog.mutate((c) => {
+			c.video = { renditions: {} };
+		});
+
+		const effect = new Effect();
+		const track = new Track.Producer("catalog.json");
+		catalog.serve(track, effect);
+		const subscriber = track.subscribe().ordered();
+		const group = await subscriber.nextGroup();
+		expect(await group?.readJson()).toEqual({ video: { renditions: {} } });
+		effect.close();
+	} finally {
+		restore();
+	}
 });
 
 test("a reconnecting subscriber is seeded with the full current catalog", async () => {
@@ -76,9 +180,349 @@ test("a reconnecting subscriber is seeded with the full current catalog", async 
 	const effect = new Effect();
 	const track = new Track.Producer("catalog.json");
 	catalog.serve(track, effect);
-	const seeded = await new Json.Snapshot.Consumer<Catalog.Root>(track.subscribe()).next();
+	const seeded = (await new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() }).latest())?.value;
 	expect(seeded?.video).toEqual({ renditions: {} });
 	expect(seeded?.scte35).toEqual({ splices: [] });
 
 	effect.close();
+});
+
+for (const field of ["jitter", "delay"] as const) {
+	test(`catalog producer refuses zero ${field} before retaining an edit`, () => {
+		const catalog = new CatalogProducer();
+		for (const section of ["audio", "video", "text"] as const) {
+			expect(() =>
+				catalog.mutate((value) => {
+					Object.assign(value, {
+						[section]: {
+							renditions: {
+								media: {
+									codec: "opus",
+									container: { kind: "legacy" },
+									sampleRate: 48000,
+									numberOfChannels: 2,
+									[field]: 0,
+								},
+							},
+						},
+					});
+				}),
+			).toThrow(`omit ${field}`);
+		}
+		catalog.mutate((value) => {
+			expect(value.audio).toBeUndefined();
+			expect(value.video).toBeUndefined();
+		});
+	});
+
+	for (const section of ["audio", "video", "text"] as const) {
+		test(`catalog refuses ${section} ${field} decreases without retaining them`, () => {
+			const catalog = new CatalogProducer();
+			catalog.mutate((value) => {
+				Object.assign(value, {
+					[section]: {
+						renditions: {
+							media: {
+								codec: "opus",
+								container: { kind: "legacy" },
+								sampleRate: 48000,
+								numberOfChannels: 2,
+								[field]: 100,
+							},
+						},
+					},
+				});
+			});
+
+			// The section is optional on the loose root type, so re-read it through a guard.
+			const retained = (value: Catalog.Root) => {
+				const sectionValue = value[section];
+				if (!sectionValue) throw new Error(`expected a retained ${section} section`);
+				return sectionValue;
+			};
+			for (const estimate of [Catalog.u53(50), undefined]) {
+				expect(() =>
+					catalog.mutate((value) => {
+						retained(value).renditions.media[field] = estimate;
+					}),
+				).toThrow(`${field} cannot decrease`);
+				catalog.mutate((value) => {
+					expect(retained(value).renditions.media[field]).toBe(Catalog.u53(100));
+				});
+			}
+			catalog.mutate((value) => {
+				delete retained(value).renditions.media;
+			});
+			catalog.mutate((value) => {
+				Object.assign(retained(value).renditions, {
+					media: {
+						codec: "opus",
+						container: { kind: "legacy" },
+						sampleRate: 48000,
+						numberOfChannels: 2,
+						[field]: 50,
+					},
+				});
+			});
+		});
+	}
+}
+
+// Same-named tracks in different broadcasts are different tracks.
+test("catalog keeps estimates apart for same-named tracks in different broadcasts", () => {
+	const catalog = new CatalogProducer();
+	const rendition = (broadcast: string, jitter: number) => ({
+		codec: "opus",
+		container: { kind: "legacy" as const },
+		sampleRate: Catalog.u53(48000),
+		numberOfChannels: Catalog.u53(2),
+		broadcast: broadcast as Catalog.RelativeBroadcast,
+		track: "audio",
+		jitter: Catalog.u53(jitter),
+	});
+	catalog.mutate((value) => {
+		value.audio = { renditions: { en: rendition("../en", 64), es: rendition("../es", 128) } };
+	});
+	expect(() =>
+		catalog.mutate((value) => {
+			delete value.audio?.renditions.es;
+		}),
+	).not.toThrow();
+});
+
+for (const section of ["json", "binary"] as const) {
+	test(`catalog refuses zero or decreasing ${section} jitter without retaining it`, () => {
+		const catalog = new CatalogProducer();
+		const tracks = (value: Catalog.Root) => {
+			const sectionValue = value[section];
+			if (!sectionValue) throw new Error(`expected a retained ${section} section`);
+			return sectionValue.tracks;
+		};
+
+		expect(() =>
+			catalog.mutate((value) => {
+				value[section] = { tracks: { data: { mode: "stream", jitter: Catalog.u53(0) } } };
+			}),
+		).toThrow("omit jitter");
+		catalog.mutate((value) => {
+			expect(value[section]).toBeUndefined();
+		});
+
+		catalog.mutate((value) => {
+			value[section] = { tracks: { data: { mode: "stream", jitter: Catalog.u53(100) } } };
+		});
+		for (const jitter of [Catalog.u53(50), undefined]) {
+			expect(() =>
+				catalog.mutate((value) => {
+					tracks(value).data.jitter = jitter;
+				}),
+			).toThrow("jitter cannot decrease");
+			catalog.mutate((value) => {
+				expect(tracks(value).data.jitter).toBe(Catalog.u53(100));
+			});
+		}
+
+		// A new track under the same name, after the old one is gone, starts over.
+		catalog.mutate((value) => {
+			delete tracks(value).data;
+		});
+		catalog.mutate((value) => {
+			tracks(value).data = { mode: "stream", jitter: Catalog.u53(50) };
+		});
+	});
+}
+
+describe("estimate publication window", () => {
+	let clock = new Manual();
+	let restore: (() => void) | undefined;
+	const scopes: Effect[] = [];
+	const advance = (ms: number) => clock.advanceAsync(Nano.fromMilli(Milli(ms)));
+	afterEach(() => {
+		for (const scope of scopes.splice(0)) scope.close();
+		restore?.();
+	});
+	function fixture() {
+		clock = new Manual();
+		restore = clock.install();
+		const producer = new CatalogProducer();
+		producer.mutate((catalog) => {
+			catalog.video = { renditions: { v: { codec: "avc1.640028", container: { kind: "legacy" } } } };
+		});
+		const effect = new Effect();
+		scopes.push(effect);
+		const track = new Track.Producer("catalog.json");
+		producer.serve(track, effect);
+		const consumer = new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() });
+		const estimate = (jitter: number) =>
+			producer.mutate((catalog) => {
+				if (!catalog.video) throw new Error("video missing");
+				catalog.video.renditions.v.jitter = Catalog.u53(jitter);
+			});
+		// The newest catalog group published so far, followed through the live largest stream.
+		let newest: number | undefined;
+		const observer = track.subscribe();
+		void (async () => {
+			for (let largest = await observer.largest(); largest; largest = await observer.largest()) {
+				newest = largest.group;
+			}
+		})();
+		const sent = async () => {
+			await clock.advanceAsync(Nano(0));
+			return newest;
+		};
+		return { producer, effect, sent, consumer, estimate };
+	}
+
+	test("estimate rises publish at the leading edge and coalesce to the latest trailing value", async () => {
+		const { sent, consumer, estimate } = fixture();
+		await consumer.latest();
+		estimate(1);
+		expect((await consumer.latest())?.value.video?.renditions.v.jitter).toBe(Catalog.u53(1));
+		const first = await sent();
+		await advance(100);
+		estimate(2);
+		await advance(899);
+		estimate(17);
+		expect(await sent()).toBe(first);
+		await advance(1);
+		expect((await consumer.latest())?.value.video?.renditions.v.jitter).toBe(Catalog.u53(17));
+		const trailing = await sent();
+		await advance(1000);
+		expect(await sent()).toBe(trailing);
+		estimate(18);
+		expect((await consumer.latest())?.value.video?.renditions.v.jitter).toBe(Catalog.u53(18));
+	});
+
+	test("a structural edit publishes immediately with any pending estimate", async () => {
+		const { producer, sent, consumer, estimate } = fixture();
+		await consumer.latest();
+		estimate(1);
+		await consumer.latest();
+		await advance(100);
+		estimate(2);
+		producer.mutate((catalog) => {
+			if (!catalog.video) throw new Error("video missing");
+			catalog.video.renditions.v.codedWidth = Catalog.u53(1280);
+		});
+		const catalog = (await consumer.latest())?.value;
+		expect(catalog?.video?.renditions.v.jitter).toBe(Catalog.u53(2));
+		expect(catalog?.video?.renditions.v.codedWidth).toBe(Catalog.u53(1280));
+		const folded = await sent();
+		await advance(900);
+		expect(await sent()).toBe(folded);
+	});
+
+	test("removing a track cancels the pending estimate and publishes immediately", async () => {
+		const { producer, sent, consumer, estimate } = fixture();
+		await consumer.latest();
+		estimate(1);
+		await consumer.latest();
+		estimate(2);
+		producer.mutate((catalog) => {
+			delete catalog.video;
+		});
+		expect((await consumer.latest())?.value.video).toBeUndefined();
+		const removed = await sent();
+		await advance(1000);
+		expect(await sent()).toBe(removed);
+	});
+
+	test("closing the last output cancels its trailing timer", async () => {
+		const { producer, effect, consumer, estimate } = fixture();
+		await consumer.latest();
+		estimate(1);
+		await consumer.latest();
+		estimate(2);
+		effect.close();
+		await advance(1000);
+
+		// The window closed with the output, so a new subscriber's first estimate is immediate.
+		const again = new Effect();
+		scopes.push(again);
+		const track = new Track.Producer("catalog.json");
+		producer.serve(track, again);
+		const reader = new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() });
+		await reader.latest();
+		estimate(3);
+		expect((await reader.latest())?.value.video?.renditions.v.jitter).toBe(Catalog.u53(3));
+	});
+	test("delay shares the window across tracks and new tracks remain immediate", async () => {
+		const { producer, sent, consumer, estimate } = fixture();
+		await consumer.latest();
+		estimate(1);
+		await consumer.latest();
+		await advance(10);
+		producer.mutate((catalog) => {
+			if (!catalog.video) throw new Error("video missing");
+			catalog.video.renditions.v.delay = Catalog.u53(7);
+		});
+		const leading = await sent();
+		await advance(990);
+		expect((await consumer.latest())?.value.video?.renditions.v.delay).toBe(Catalog.u53(7));
+		expect(await sent()).toBe((leading ?? 0) + 1);
+		producer.mutate((catalog) => {
+			if (!catalog.video) throw new Error("video missing");
+			catalog.video.renditions.other = { codec: "avc1.640028", container: { kind: "legacy" } };
+		});
+		expect((await consumer.latest())?.value.video?.renditions.other).toBeDefined();
+	});
+
+	test("a folded estimate starts a new window and an extension edit stays immediate", async () => {
+		const { producer, sent, consumer, estimate } = fixture();
+		await consumer.latest();
+		estimate(1);
+		await consumer.latest();
+		await advance(100);
+		estimate(2);
+		producer.mutate((catalog) => {
+			catalog.scte35 = { jitter: 3 };
+		});
+		expect((await consumer.latest())?.value.scte35).toEqual({ jitter: 3 });
+		estimate(3);
+		const folded = await sent();
+		await advance(900);
+		expect(await sent()).toBe(folded);
+		await advance(100);
+		expect((await consumer.latest())?.value.video?.renditions.v.jitter).toBe(Catalog.u53(3));
+	});
+});
+
+// Each ID's estimate is checked on its own, even when two IDs alias one track.
+test("catalog refuses a falling estimate on one alias of a track", () => {
+	const catalog = new CatalogProducer();
+	const alias = (jitter: number) => ({
+		codec: "opus",
+		container: { kind: "legacy" as const },
+		sampleRate: Catalog.u53(48000),
+		numberOfChannels: Catalog.u53(2),
+		track: "audio",
+		jitter: Catalog.u53(jitter),
+	});
+	catalog.mutate((value) => {
+		value.audio = { renditions: { en: alias(100), es: alias(100) } };
+	});
+	expect(() =>
+		catalog.mutate((value) => {
+			value.audio = { renditions: { en: alias(10), es: alias(100) } };
+		}),
+	).toThrow("jitter cannot decrease");
+});
+
+// A renamed rendition's new track starts its estimates over.
+test("catalog lets a renamed track start its estimates over", () => {
+	const catalog = new CatalogProducer();
+	const config = { codec: "vp8", container: { kind: "legacy" as const } };
+	catalog.mutate((value) => {
+		value.video = { renditions: { video: { ...config, jitter: Catalog.u53(100) } } };
+	});
+	catalog.mutate((value) => {
+		value.video = { renditions: { video: { ...config, codec: "vp9", track: "video/1", jitter: Catalog.u53(10) } } };
+	});
+	expect(() =>
+		catalog.mutate((value) => {
+			value.video = {
+				renditions: { video: { ...config, codec: "vp9", track: "video/1", jitter: Catalog.u53(5) } },
+			};
+		}),
+	).toThrow("jitter cannot decrease");
 });

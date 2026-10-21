@@ -7,6 +7,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.12](https://github.com/moq-dev/moq/compare/moq-boy-v0.5.11...moq-boy-v0.5.12) - 2026-10-06
+
+### Other
+
+- updated the following local packages: moq-tokio
+
+## [0.5.11](https://github.com/moq-dev/moq/compare/moq-boy-v0.5.10...moq-boy-v0.5.11) - 2026-10-05
+
+### Other
+
+- updated the following local packages: moq-net, moq-json, hang, moq-mux, moq-tokio, moq-audio, moq-video
+
+## [0.5.10](https://github.com/moq-dev/moq/compare/moq-boy-v0.5.9...moq-boy-v0.5.10) - 2026-10-03
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.9](https://github.com/moq-dev/moq/compare/moq-boy-v0.5.8...moq-boy-v0.5.9) - 2026-09-30
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.8](https://github.com/moq-dev/moq/compare/moq-boy-v0.5.7...moq-boy-v0.5.8) - 2026-09-27
+
+### Other
+
+- updated the following local packages: moq-net, moq-json, hang, moq-mux, moq-tokio, moq-video, moq-audio
+
+## [0.5.7](https://github.com/moq-dev/moq/compare/moq-boy-v0.5.6...moq-boy-v0.5.7) - 2026-09-26
+
+### Added
+
+- end a broadcast with close() in every language ([#4031](https://github.com/moq-dev/moq/pull/4031))
+
+## [0.5.6](https://github.com/moq-dev/moq/compare/moq-boy-v0.5.5...moq-boy-v0.5.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-video, moq-json, hang, moq-mux, moq-tokio, moq-audio
+
+## [0.5.5](https://github.com/moq-dev/moq/compare/moq-boy-v0.5.4...moq-boy-v0.5.5) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, moq-tokio, moq-audio, moq-video, moq-json, hang
+
+## [0.5.4](https://github.com/moq-dev/moq/compare/moq-boy-v0.5.3...moq-boy-v0.5.4) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-json, hang, moq-mux, moq-tokio, moq-audio, moq-video
+
+## [0.5.3](https://github.com/moq-dev/moq/compare/moq-boy-v0.5.2...moq-boy-v0.5.3) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-json, moq-mux, moq-tokio, hang, moq-audio, moq-video
+
+## [0.5.2](https://github.com/moq-dev/moq/compare/moq-boy-v0.5.1...moq-boy-v0.5.2) - 2026-09-24
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.1](https://github.com/moq-dev/moq/compare/moq-boy-v0.5.0...moq-boy-v0.5.1) - 2026-09-23
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.5.0](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.16...moq-boy-v0.5.0) - 2026-09-23
+
+### Added
+
+- *(video)* [**breaking**] type the group configuration and make cut fallible ([#3876](https://github.com/moq-dev/moq/pull/3876))
+- preserve video capture timing ([#3849](https://github.com/moq-dev/moq/pull/3849))
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(hang)* [**breaking**] unify catalog APIs ([#3813](https://github.com/moq-dev/moq/pull/3813))
+- *(net)* [**breaking**] announce prefixes on every wire; consumers read paths ([#3770](https://github.com/moq-dev/moq/pull/3770))
+- *(json)* [**breaking**] Config means the same thing in json and binary ([#3718](https://github.com/moq-dev/moq/pull/3718))
+- *(hang)* [**breaking**] timelines only move forward ([#3711](https://github.com/moq-dev/moq/pull/3711))
+
+### Other
+
+- *(rs)* read constant-size chunks with as_chunks ([#3899](https://github.com/moq-dev/moq/pull/3899))
+- *(audio)* [**breaking**] separate configuration contracts ([#3843](https://github.com/moq-dev/moq/pull/3843))
+- *(audio)* [**breaking**] expose demand without track authority ([#3842](https://github.com/moq-dev/moq/pull/3842))
+- Make media backends optional ([#3839](https://github.com/moq-dev/moq/pull/3839))
+- *(net)* [**breaking**] name path roles without new types ([#3826](https://github.com/moq-dev/moq/pull/3826))
+- *(quic)* [**breaking**] keep only the noq backend ([#3811](https://github.com/moq-dev/moq/pull/3811))
+- Merge origin/main into dev
+- Merge remote-tracking branch 'origin/main' into merge-main-into-dev-20260914
+
+## [0.4.16](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.15...moq-boy-v0.4.16) - 2026-09-17
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.4.15](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.14...moq-boy-v0.4.15) - 2026-09-13
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.4.14](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.13...moq-boy-v0.4.14) - 2026-09-09
+
+### Added
+
+- *(audio,video)* compile the device, render, and VAAPI code by default ([#3353](https://github.com/moq-dev/moq/pull/3353))
+
+### Fixed
+
+- *(moq-native)* stop logging credentials in relay URLs and RTMP stream keys ([#3379](https://github.com/moq-dev/moq/pull/3379))
+
 ## [0.4.13](https://github.com/moq-dev/moq/compare/moq-boy-v0.4.12...moq-boy-v0.4.13) - 2026-09-02
 
 ### Added

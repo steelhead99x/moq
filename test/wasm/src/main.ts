@@ -70,9 +70,6 @@ const FIXTURE: Uint8Array[] = [encode("wasm-frame-0"), encode("wasm-frame-1"), p
 /** How many consecutive groups the round trip reads before it is satisfied. */
 const GROUPS_TO_READ = 2;
 
-/** How often the fixture publisher appends a group. */
-const GROUP_INTERVAL_MS = 50;
-
 function encode(text: string): Uint8Array {
 	return new TextEncoder().encode(text);
 }
@@ -90,8 +87,6 @@ function hexToBytes(hex: string): Uint8Array {
 	for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
 	return bytes;
 }
-
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /** Load and initialize the generated module once per page. */
 let loading: Promise<Wasm> | undefined;
@@ -126,59 +121,81 @@ async function connect(wasm: Wasm, relay: RelayFixture): Promise<Session> {
 }
 
 /**
- * Publish {@link FIXTURE} on `path` for the duration of `run`, one group every
- * {@link GROUP_INTERVAL_MS}.
+ * Publish {@link FIXTURE} on `path` for the duration of `run`: one group once the
+ * track has a subscriber, then one more per call to the `advance` handed to `run`.
  *
- * It keeps publishing rather than writing a fixed number of groups and closing:
- * a track that ends before the subscriber's stream is wired up is only reachable
- * through the relay's cache, so the test would be measuring retention, and would
- * race. A live edge that keeps moving has neither problem. Every track name
- * other than {@link TRACK} is rejected, which is what the refusal case reads.
+ * The reader paces the publisher, not a timer. The wasm subscription has the default
+ * `Latency::REAL_TIME` budget, which gives up on a group still arriving once a newer
+ * one lands. A loaded runner can deliver a 128 KiB group slower than any fixed
+ * interval, so every group is superseded mid-read and none arrives whole. With no
+ * newer group until the reader asks, whole delivery is guaranteed rather than raced.
+ *
+ * The track stays open rather than ending after a fixed number of groups: a track
+ * that ends before the subscriber's stream is wired up is only reachable through
+ * the relay's cache, so the test would be measuring retention, and would race. The
+ * `missing` track is rejected when subscribed, which is what the refusal case reads.
  */
-async function withPublisher<T>(relay: RelayFixture, path: string, run: () => Promise<T>): Promise<T> {
-	const connection = await Moq.Connection.connect(new URL(relay.url));
-	const broadcast = new Moq.Broadcast.Producer();
-	connection.publish(Moq.Path.from(path), broadcast);
+async function withPublisher<T>(
+	relay: RelayFixture,
+	path: string,
+	run: (advance: () => void) => Promise<T>,
+): Promise<T> {
+	// The session serves an origin rather than individual broadcasts, so the path is
+	// published into the origin and the session announces the table.
+	const origin = new Moq.Origin.Producer();
+	const broadcast = origin.createBroadcast(Moq.Path.from(path));
+	const track = broadcast.createTrack(TRACK, { timescale: Moq.Time.Timescale.MILLI });
+	const missing = broadcast.createTrack("missing");
+	const used = track.demand().wanted;
+	const missingUsed = missing.demand().wanted;
+	broadcast.announce();
+	const connection = await Moq.Connection.connect({ url: new URL(relay.url), publish: origin.consume() });
 
 	let stopped = false;
-	const writers: Promise<void>[] = [];
-
-	// lite-05 looks a track's info up before subscribing, so the same name can be
-	// requested more than once. Each request gets its own producer writing the same
-	// groups; the subscriber only ever reads the one it asked for.
-	const serving = (async () => {
-		for (;;) {
-			const request = await broadcast.requested();
-			if (!request) break;
-			if (request.name !== TRACK) {
-				request.reject(new Error(`no such track: ${request.name}`));
+	let wanted = 1;
+	let wake: (() => void) | undefined;
+	const advance = () => {
+		wanted++;
+		wake?.();
+	};
+	const writer = (async () => {
+		while (!stopped && track.closed.peek() === undefined) {
+			if (used.peek() === undefined || wanted === 0) {
+				const advanced = new Promise<void>((resolve) => {
+					wake = resolve;
+				});
+				await Promise.race([used.changed(), track.closed, advanced]);
 				continue;
 			}
-			const track = request.accept();
-			writers.push(
-				(async () => {
-					while (!stopped && track.closed.peek() === undefined) {
-						const group = track.appendGroup();
-						for (const frame of FIXTURE) {
-							group.writeFrame({ payload: frame, timestamp: Moq.Time.Timestamp.now() });
-						}
-						group.close();
-						await sleep(GROUP_INTERVAL_MS);
-					}
-					track.close();
-				})(),
-			);
+			wanted--;
+			const group = track.appendGroup();
+			for (const frame of FIXTURE) {
+				group.writeFrame({ payload: frame, timestamp: Moq.Time.Timestamp.now() });
+			}
+			group.close();
 		}
+		track.close();
+	})();
+	const rejecting = (async () => {
+		while (missingUsed.peek() === undefined && missing.closed.peek() === undefined) {
+			await Promise.race([missingUsed.changed(), missing.closed]);
+		}
+		if (missingUsed.peek() !== undefined) missing.close(new Error("no such track: missing"));
 	})();
 
 	try {
-		return await run();
+		return await run(advance);
 	} finally {
 		stopped = true;
+		track.close();
+		missing.close();
 		broadcast.close();
-		connection.close();
-		await serving;
-		await Promise.all(writers);
+		// Teardown, not a graceful end: the case is over and the harness is not waiting
+		// on delivery, so skip the drain `close()` would spend up to a second on.
+		connection.abort();
+		origin.close();
+		await writer;
+		await rejecting;
 	}
 }
 
@@ -201,12 +218,15 @@ async function consume(session: Session, path: string): Promise<Broadcast> {
 }
 
 /**
- * Read `count` groups off a track and check each one against {@link FIXTURE}.
+ * Read `count` consecutive groups off a track, asking the publisher for each next one
+ * with `advance`, and check each against {@link FIXTURE}.
  *
- * The first sequence is whatever the live edge was at subscribe time, so only
- * the step between groups is asserted, not the starting number.
+ * Every group must arrive whole: nothing newer exists while one is read (see
+ * {@link withPublisher}), so a skip or a short group is a bug, not real-time delivery.
+ * The first sequence is whatever the live edge was at subscribe time, so only the
+ * step between groups is asserted, not the starting number.
  */
-async function expectGroups(track: Track, count: number): Promise<void> {
+async function expectGroups(track: Track, count: number, advance: () => void): Promise<void> {
 	let previous: bigint | undefined;
 
 	for (let i = 0; i < count; i++) {
@@ -227,6 +247,7 @@ async function expectGroups(track: Track, count: number): Promise<void> {
 		} finally {
 			group.free();
 		}
+		advance();
 	}
 }
 
@@ -280,12 +301,12 @@ const CASES: Case[] = [
 		name: "reads a published broadcast",
 		run: async (wasm, relay) => {
 			const path = `wasm-test/${relay.name}`;
-			await withPublisher(relay, path, async () => {
+			await withPublisher(relay, path, async (advance) => {
 				await withSession(wasm, relay, async (session) => {
 					const broadcast = await consume(session, path);
 					const track = await broadcast.subscribe(TRACK);
 					try {
-						await expectGroups(track, GROUPS_TO_READ);
+						await expectGroups(track, GROUPS_TO_READ, advance);
 					} finally {
 						track.free();
 						broadcast.free();
@@ -295,40 +316,105 @@ const CASES: Case[] = [
 		},
 	},
 	{
-		// A refusal surfaces at different points depending on the version: lite-05
-		// looks a track's info up before subscribing, so `subscribe` itself rejects,
-		// while IETF and lite-02 have no such lookup and only find out when no group
-		// arrives. Either is fine. Delivering a group is not, and neither is never
-		// settling, which the case timeout catches.
+		// The refusal has to surface as an error. Where depends on the version: lite-06
+		// looks a track's info up before subscribing, so `subscribe` rejects, while IETF
+		// (REQUEST_ERROR, or PUBLISH_DONE after SUBSCRIBE_OK) and lite-02 can accept first
+		// and reject the read. Delivering a group or ending cleanly is not a refusal, and
+		// never settling fails on the case timeout.
 		name: "refuses a track the publisher does not serve",
 		run: async (wasm, relay) => {
 			const path = `wasm-test/${relay.name}-refuse`;
 			await withPublisher(relay, path, async () => {
 				await withSession(wasm, relay, async (session) => {
 					const broadcast = await consume(session, path);
-					let delivered = false;
+					let read: string;
 					try {
 						const track = await broadcast.subscribe("missing");
 						try {
 							const group = await track.recvGroup();
-							if (group) {
-								delivered = true;
-								group.free();
-							}
+							group?.free();
+							read = group ? "delivered a group" : "ended cleanly";
 						} finally {
 							track.free();
 						}
 					} catch {
-						// The refusal surfaced as a rejection, the other legal shape.
+						return;
 					} finally {
 						broadcast.free();
 					}
-					if (delivered) throw new Error("an unserved track delivered a group");
+					throw new Error(`an unserved track ${read}, want a refusal`);
 				});
 			});
 		},
 	},
+	{
+		// Freeing a session closes it, so a call still waiting on it has to reject
+		// rather than hang or take the page's wasm down with it.
+		name: "free() rejects a pending consume",
+		run: async (wasm, relay) => {
+			const session = await connect(wasm, relay);
+			const pending = session.consume(`wasm-test/${relay.name}-never-announced`);
+			session.free();
+			const resolved = await pending.then(
+				(broadcast) => {
+					broadcast?.free();
+					return true;
+				},
+				() => false,
+			);
+			if (resolved) throw new Error("consume resolved after the session was freed, want a rejection");
+			await expectUsable(wasm, relay);
+		},
+	},
+	{
+		// Freeing a handle cancels its pending call, even one that could finish
+		// right away, and releases what the call held; the page keeps working.
+		name: "free() cancels a pending read",
+		run: async (wasm, relay) => {
+			const path = `wasm-test/${relay.name}-free`;
+			await withPublisher(relay, path, async () => {
+				await withSession(wasm, relay, async (session) => {
+					const broadcast = await consume(session, path);
+					const track = await broadcast.subscribe(TRACK);
+					const pendingTrack = broadcast.subscribe(TRACK);
+					broadcast.free();
+					await expectCancelled("subscribe", pendingTrack, (track) => track.free());
+
+					const group = await track.recvGroup();
+					if (!group) throw new Error("track ended before its first group");
+					const pendingGroup = track.recvGroup();
+					track.free();
+					await expectCancelled("recvGroup", pendingGroup, (group) => group?.free());
+
+					const frame = group.readFrame();
+					group.free();
+					await expectCancelled("readFrame", frame, () => {});
+				});
+			});
+			await expectUsable(wasm, relay);
+		},
+	},
 ];
+
+/** Fail unless `pending` rejects, releasing whatever it resolved with instead. */
+async function expectCancelled<T>(what: string, pending: Promise<T>, release: (value: T) => void): Promise<void> {
+	const resolved = await pending.then(
+		(value) => {
+			release(value);
+			return true;
+		},
+		() => false,
+	);
+	if (resolved) throw new Error(`${what} resolved after its handle was freed, want a rejection`);
+}
+
+/** Fail unless a fresh session still works, which a corrupted wasm heap would not. */
+async function expectUsable(wasm: Wasm, relay: RelayFixture): Promise<void> {
+	await withSession(wasm, relay, async (session) => {
+		const version = session.version();
+		if (version !== relay.version) throw new Error(`version is "${version}", want "${relay.version}"`);
+	});
+}
 
 /** Run every case against every relay, sequentially, and report each outcome. */
 async function run(config: Config): Promise<CaseResult[]> {

@@ -9,9 +9,9 @@ edition = "2024"
 publish = false
 
 [package.metadata.cargo-shear]
-# Required indirectly (getrandom: feature enabler; wasm-bindgen-futures: async
-# codegen) with no `use`, so cargo-shear can't see them.
-ignored = ["getrandom", "wasm-bindgen-futures"]
+# Required indirectly (getrandom: feature enabler) with no `use`, so cargo-shear
+# can't see it.
+ignored = ["getrandom"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -27,16 +27,23 @@ crate-type = ["cdylib", "rlib"]
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 bytes = { workspace = true }
 console_error_panic_hook = "0.1"
+futures = { workspace = true }
 getrandom = { workspace = true } # wasm_js backend for rand-via-moq-net; cfg flag in .cargo/config.toml
 js-sys = "0.3"
 moq-net = { workspace = true }
 thiserror = { workspace = true }
 tracing-wasm = "0.2"
 url = { workspace = true }
-# Pinned to the wasm-bindgen-cli version in the Nix dev shell: the bindgen
-# schema must match exactly between crate and CLI. Bump both together.
-wasm-bindgen = "=0.2.121"
+# The bindgen schema must match exactly between crate and CLI. The Nix dev
+# shell selects its CLI from the resolved version in Cargo.lock.
+wasm-bindgen = "=0.2.129"
 wasm-bindgen-futures = "0.4"
 web-async = { workspace = true }
 web-transport-trait = { workspace = true }
 web-transport-wasm = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+moq-net = { path = "../moq-net" }
+thiserror = { workspace = true }
+web-transport-trait = { workspace = true }

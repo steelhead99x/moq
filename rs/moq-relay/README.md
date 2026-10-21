@@ -26,7 +26,7 @@ walkthrough.
 ### Fedora / RHEL / Rocky / AlmaLinux
 
 ```bash
-sudo dnf config-manager --add-repo https://rpm.moq.dev/moq.repo
+sudo curl -fsSL https://rpm.moq.dev/moq.repo -o /etc/yum.repos.d/moq.repo
 sudo dnf install moq-relay
 ```
 
@@ -43,12 +43,13 @@ docker pull moqdev/moq-relay
 ```
 
 Multi-arch images (`linux/amd64` and `linux/arm64`) are published to [Docker Hub](https://hub.docker.com/r/moqdev/moq-relay).
+The image is the package's nix closure on `scratch`, so it has no shell.
 
 ## HTTP
 
 Primarily for debugging, you can also connect to the relay via HTTP.
 
-- `GET /certificate.sha256`: Returns the fingerprint of the TLS certificate.
+- `GET /certificate.sha256`: Returns the fingerprint of the first configured TLS certificate.
 - `GET /announced/*prefix`: Returns all of the announced tracks with the given (optional) prefix.
 - `GET /fetch/*path`: Returns the latest group of the given track.
 
@@ -61,31 +62,28 @@ HTTPS is currently not supported.
 Relays can be joined together to proxy announcements and subscriptions. A viewer talks to whichever relay is closest; if their broadcast lives elsewhere in the cluster, the local relay fetches it from a neighbor and caches it. Hop tracking on every broadcast keeps loops out and picks the shortest path when there's more than one.
 
 - `--cluster-connect <peer-url>` lists the peers this relay dials. Repeatable; defines the topology by hand. A simple chain like `eu-west <- us-east <- us-west` lets `us-east` cache and dedup the transatlantic fetches that fan out to many `us-west` viewers.
-- `--cluster-mesh <self-url>` is optional. When set, this relay advertises its own URL to connected peers and dials any peers it learns about, so larger clusters don't need each node hand-configured. You still need at least one connection (in or out) so the advertisement has a path to flow. A relay with `--cluster-mesh` set and no `--cluster-connect` is a passive rendezvous.
+- `--cluster-connect-api <url-or-path>` fetches that list from an endpoint or file instead, reloading it without a restart.
+- `--cluster-lan` finds peers on the local network over mDNS.
 
-`--cluster-root` and `--cluster-node` from earlier versions were removed. The relay errors at startup if either is set and points at the replacements.
+A relay only dials peers listed this way or found on the LAN.
 
 See [doc/bin/relay/cluster.md](https://github.com/moq-dev/moq/blob/main/doc/bin/relay/cluster.md) for the full walkthrough, including topology trade-offs and authentication.
 
 ## Authentication
 
-The relay supports JWT-based authentication and authorization with path-based access control.
+The relay admits a session through an auth server (`--auth-url`, one JSON
+request per session event; `moq auth serve` is the reference server) or a
+static anonymous grant (`--auth-public`); an application embedding the relay
+can decide in process instead. A verified client certificate is reported to
+the server as a fact, never a grant on its own.
 
-For detailed authentication setup, including token generation and configuration examples, see:
+For the contract, the server's flags, and token generation, see:
 **[Authentication Documentation](https://github.com/moq-dev/moq/blob/main/doc/bin/relay/auth.md)**
-
-Key features:
-
-- JWT tokens passed via query parameters (`?jwt=<token>`)
-- Path-based authorization with `root`, `pub`, and `sub` claims
-- Anonymous access support for public content
-- Symmetric key cryptography (HMAC-SHA256/384/512)
-- Asymmetric key cryptography (RSASSA-PKCS1-SHA256/384/512, RSASSA-PSS-SHA256/384/512, ECDSA-SHA256/384, EdDSA)
 
 Quick example configuration in your `.toml` file:
 
 ```toml
 [auth]
-key = "demo/relay/root.jwk"    # JWT signing key (relative to working directory)
-public = "anon"         # Allow anonymous access to /anon prefix
+url = "http://127.0.0.1:4440/"    # moq auth serve --key root.jwk --public-subscribe 'anon/**'
+# public = "anon/**"              # or a static anonymous grant with no server
 ```

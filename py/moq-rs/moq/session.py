@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-from moq_ffi import MoqSession
+from moq_ffi import MoqBandwidth, MoqBandwidthConsumer, MoqError, MoqReservation, MoqSession
 
 from .origin import OriginConsumer, OriginProducer
-from .types import ConnectionStats
+from .publish import TrackDemand
+from .types import ConnectionStats, ConnectionStatus
 
 
 class Session:
     """An established MoQ connection, returned by `Client` and `Request.accept()`.
 
     Hold the session to keep the connection alive; dropping it closes the
-    connection. As an async context manager it shuts down gracefully on exit::
+    connection. As an async context manager it drains on a clean exit and
+    cancels on an error::
 
         session = await request.accept()
         async with session:
@@ -26,34 +28,152 @@ class Session:
         return self
 
     async def __aexit__(self, *exc) -> None:
-        self.shutdown()
+        # A body error is the failure worth reporting. Draining behind it would wait
+        # out the deadline and replace it with a delivery timeout.
+        if exc[0] is None:
+            await self.shutdown()
+        else:
+            self.cancel(0)
 
     async def closed(self) -> None:
-        """Wait until the session is closed by either side."""
+        """Wait until the session is over.
+
+        A client session resolves when its connection stops for good: it raises the
+        terminal error when the connection gave up, and returns normally after a local
+        :meth:`shutdown`/:meth:`cancel`. Transient drops the reconnect loop rides out
+        do not resolve this; watch :meth:`status` for those. A server-accepted session
+        raises the session's close reason."""
         await self._inner.closed()
+
+    async def status(self) -> ConnectionStatus:
+        """Wait for the connection status to differ from the one last reported.
+
+        A client session reports ``CONNECTED`` first (the connect it was built from),
+        then follows the reconnect loop: ``DISCONNECTED`` while redialing,
+        ``CONNECTED`` again on success, ``MIGRATING`` during a GOAWAY handover. It
+        raises once the connection stops for good. A server-accepted session's only
+        transition is terminal: this waits for the close and raises its reason.
+
+        This is the current status, not a queue of every edge: a drop that
+        reconnects before you ask again is coalesced away, so the outages it hides
+        are the ones that already healed. Do not count outages with it."""
+        return await self._inner.status()
+
+    def connects(self) -> int:
+        """How many times this session has connected: 1 for the connect that built it, one more
+        on each reconnect. A server-accepted session stays at 1.
+
+        Pair it with :meth:`status` to log each reconnect by number; a
+        ``CONNECTED`` status whose count grew is a reconnect."""
+        return self._inner.connects()
+
+    def failure(self) -> MoqError | None:
+        """Why a client session is reconnecting: the error that ended the last
+        connection or failed the latest redial, or ``None`` once a connection lands.
+
+        A redial that keeps failing never changes :meth:`status`, so poll this while
+        it reports ``DISCONNECTED`` to show the reason. Giving up for good raises from
+        :meth:`closed` instead. A server-accepted session always returns ``None``."""
+        return self._inner.failure()
 
     def cancel(self, code: int) -> None:
         """Close the session with the given error code."""
         self._inner.cancel(code)
 
-    def shutdown(self) -> None:
-        """Graceful shutdown; equivalent to `cancel(0)` (0 means no error)."""
-        self._inner.shutdown()
+    async def shutdown(self) -> None:
+        """Drain within one second, raising on failure.
 
-    def publisher(self) -> OriginProducer:
+        Explicit ``moq-lite-07-wip`` waits for the peer to receive finished tails;
+        older Lite versions, including the default lite-06, wait only for transport
+        ACKs. IETF also waits for transport ACKs.
+        """
+        await self._inner.shutdown()
+
+    def publish(self) -> OriginProducer:
         """The publish-side origin: where local broadcasts are advertised to
         the remote. Either the origin wired before connect/accept, or one
         auto-created if none was set."""
-        return OriginProducer._from_inner(self._inner.publisher())
+        return OriginProducer._from_inner(self._inner.publish())
 
-    def consumer(self) -> OriginConsumer:
+    def consume(self) -> OriginConsumer:
         """The subscribe-side origin: a read handle for announcements pushed by
         the remote."""
-        return OriginConsumer(self._inner.consumer())
+        return OriginConsumer(self._inner.consume())
 
     def stats(self) -> ConnectionStats:
         """Snapshot the current connection statistics (RTT, bandwidth estimates,
         byte/packet counters). Cheap to call; intended for periodic polling.
 
         Individual fields are ``None`` when the transport backend doesn't report them."""
-        return self._inner.stats()
+        return ConnectionStats._from_ffi(self._inner.stats())
+
+    def recv_bandwidth(self) -> Bandwidth.Consumer | None:
+        """Hold an owned receive-estimate consumer; releasing the last one stops PROBE."""
+        inner = self._inner.recv_bandwidth()
+        return None if inner is None else Bandwidth.Consumer(inner)
+
+    def bandwidth(self) -> Bandwidth:
+        """The session's bandwidth allocator.
+
+        Every call returns a handle to the same registry, so reservations made
+        through one are visible to the others. A client handle survives
+        reconnects: the grant is ``None`` while disconnected and resumes on the
+        next connection.
+        """
+        return Bandwidth(self._inner.bandwidth())
+
+
+class Bandwidth:
+    """Divides one connection's send estimate among the tracks sharing it.
+
+    Minted by :meth:`Session.bandwidth`. Clones share one reservation registry.
+    """
+
+    class Consumer:
+        """An owned bandwidth estimate, in bits per second."""
+
+        def __init__(self, inner: MoqBandwidthConsumer) -> None:
+            self._inner = inner
+
+        def peek(self) -> int | None:
+            """Read the current estimate, or None while unavailable."""
+            return self._inner.peek()
+
+        async def changed(self) -> int | None:
+            """Wait for the estimate to change, raising when its producer closes."""
+            return await self._inner.changed()
+
+        def cancel(self) -> None:
+            """Release this consumer's demand, including a pending wait."""
+            self._inner.cancel()
+
+    def __init__(self, inner: MoqBandwidth) -> None:
+        self._inner = inner
+
+    def reserve(self, demand: TrackDemand, max_bps: int) -> Reservation:
+        """Reserve up to ``max_bps`` for the track ``demand`` watches.
+
+        Every track producer hands out its ``demand()``. ``max_bps`` is a
+        ceiling, not a measurement: reserve the most the track can ever send.
+        Drop the reservation to hand the room back.
+        """
+        return Reservation(self._inner.reserve(demand._inner, max_bps))
+
+
+class Reservation:
+    """One track's standing claim on a :class:`Bandwidth`.
+
+    :meth:`grant` is a snapshot: ``None`` means no estimate or no demand, so
+    hold the current rate, and ``0`` is a real zero grant.
+    """
+
+    def __init__(self, inner: MoqReservation) -> None:
+        self._inner = inner
+
+    def grant(self) -> int | None:
+        """This reservation's slice right now, in bits per second."""
+        return self._inner.grant()
+
+    def update(self, max_bps: int) -> None:
+        """Change the ceiling, keeping the same claim."""
+        self._inner.update(max_bps)

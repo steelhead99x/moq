@@ -1,29 +1,34 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// Drives the real MoQOutput against stubbed libobs and libmoq, so the session
-// status callback's orderings can be forced instead of waited for. Everything
-// here is timing-sensitive in production: a terminal callback arrives on the
-// libmoq runtime thread at a moment we don't control, possibly during Start(),
-// during a restart, or during destruction.
+// Drives the real MoQOutput against stubbed libobs and the real moq-ffi, over a
+// relay in the same process. Everything here is timing-sensitive in production:
+// a connect or status result lands on the output's worker at a moment OBS does
+// not choose, possibly during Start(), during a restart, during destruction, or
+// racing a Stop(). The stubs record what OBS was told and when, and can hold an
+// OBS call open so a test can drive the other side into it.
 //
-// Run with `just obs test`. This is not part of the plugin build.
+// Run with `just obs test` (ThreadSanitizer) or `just obs ci` (plain). This is not
+// part of the plugin build.
 #include <atomic>
 #include <chrono>
-#include <cstdarg>
 #include <climits>
+#include <cstdarg>
 #include <cstdio>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <obs.h>
 #include <obs-module.h>
 
-extern "C" {
-#include "moq.h"
-}
+#include "moq-output.h"
+#include "moq-settings.h"
+#include "moq-test-relay.h"
 
 // ------------------------------------------------------------- libobs stubs
 
@@ -37,38 +42,51 @@ struct RecordedSignal {
 };
 
 // The plugin serializes its own signalling, but the tests read these from a
-// different thread than the callback writes them, so the stubs carry their own
+// different thread than the worker writes them, so the stubs carry their own
 // lock. Always go through the helpers below.
 std::mutex g_signals_mutex;
 std::vector<RecordedSignal> g_signals;
 std::string g_last_error;
 std::atomic<int> g_begin_capture{0};
-std::atomic<int> g_client_result{0};
+// Signals that reached OBS after the output was destroyed, which is a use after free.
+std::atomic<int> g_signals_after_destroy{0};
+std::atomic<bool> g_destroyed{false};
+
+std::string g_url;
+std::string g_rate_control = "CBR";
+uint32_t g_encoder_caps = OBS_ENCODER_CAP_DYN_BITRATE;
+// Every obs_encoder_update, as the encoder and the bitrate it was told in kbps.
+std::mutex g_updates_mutex;
+std::vector<std::pair<obs_encoder_t *, long long>> g_updates;
+std::atomic<bool> g_settings_ok{true};
+// A reason Configure reports itself, for a setting the config cannot express.
+std::string g_settings_error;
 // Lets a test run something inside obs_output_signal_stop, standing in for a
 // frontend that stops the output straight from the signal handler.
 std::function<void()> g_on_signal;
-// Released from inside Start(), just before it rewrites the members a stale
-// callback might read, so the two genuinely overlap.
-std::atomic<bool> *g_start_gate = nullptr;
 // obs_output_set_last_error sits between deciding to report a failure and
 // reporting it, so the stub announces that it is in that window and then holds
-// it open. A test can use this to drive a concurrent Stop() into the gap: with
-// signal_mutex held across the whole report the Stop() blocks, and without it
-// the stale report lands after the stop, which is the bug.
+// it open. A test drives a concurrent Stop() into the gap: with signal_mutex held
+// across the whole report the Stop() blocks, and without it the stale report
+// lands after the stop, which is the bug.
 std::atomic<bool> g_stall_last_error{false};
 std::atomic<bool> g_in_report_window{false};
+
+const std::vector<uint8_t> g_h264_init = TestH264Init();
+const std::vector<uint8_t> g_opus_head = TestOpusHead();
+
+obs_encoder_t *const VIDEO_ENCODER = reinterpret_cast<obs_encoder_t *>(0x2);
+obs_encoder_t *const AUDIO_ENCODER = reinterpret_cast<obs_encoder_t *>(0x3);
 } // namespace
 
 extern "C" {
 
 // Deliberately silent: stdio locking would create happens-before edges between
-// the OBS and libmoq threads and mask exactly the races we're looking for.
+// the OBS and worker threads and mask exactly the races we're looking for.
 void blog(int, const char *, ...) {}
 
 obs_service_t *obs_output_get_service(const obs_output_t *)
 {
-	if (g_start_gate)
-		g_start_gate->store(true, std::memory_order_relaxed);
 	return reinterpret_cast<obs_service_t *>(0x1);
 }
 
@@ -84,7 +102,7 @@ bool obs_output_initialize_encoders(obs_output_t *, uint32_t)
 
 const char *obs_service_get_connect_info(const obs_service_t *, uint32_t type)
 {
-	return type == OBS_SERVICE_CONNECT_INFO_SERVER_URL ? "https://relay.example/anon" : "room";
+	return type == OBS_SERVICE_CONNECT_INFO_SERVER_URL ? g_url.c_str() : "room";
 }
 
 obs_data_t *obs_service_get_settings(const obs_service_t *)
@@ -94,24 +112,15 @@ obs_data_t *obs_service_get_settings(const obs_service_t *)
 
 void obs_data_release(obs_data_t *) {}
 
+// Event mode stays off, so MoQOutput's event controller never emits a marker.
 bool obs_data_get_bool(obs_data_t *, const char *)
 {
 	return false;
 }
 
-long long obs_data_get_int(obs_data_t *, const char *)
-{
-	return 0;
-}
-
-const char *obs_data_get_string(obs_data_t *, const char *)
-{
-	return "";
-}
-
 obs_encoder_t *obs_output_get_video_encoder2(const obs_output_t *, size_t idx)
 {
-	return idx == 0 ? reinterpret_cast<obs_encoder_t *>(0x2) : nullptr;
+	return idx == 0 ? VIDEO_ENCODER : nullptr;
 }
 
 bool obs_output_begin_data_capture(obs_output_t *, uint32_t)
@@ -127,162 +136,145 @@ void obs_output_set_last_error(obs_output_t *, const char *message)
 		g_last_error = message ? message : "";
 	}
 	if (g_stall_last_error) {
-		g_in_report_window.store(true, std::memory_order_relaxed);
-		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		g_in_report_window.store(true);
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	}
 }
 
 void obs_output_signal_stop(obs_output_t *, int code)
 {
+	if (g_destroyed)
+		g_signals_after_destroy++;
 	{
 		std::lock_guard<std::mutex> lock(g_signals_mutex);
 		g_signals.push_back({code, g_last_error, g_begin_capture});
 	}
-	if (g_on_signal)
-		g_on_signal();
+	if (auto on_signal = std::exchange(g_on_signal, nullptr))
+		on_signal();
 }
 
 void obs_register_output_s(const struct obs_output_info *, size_t) {}
 
-bool obs_encoder_get_extra_data(const obs_encoder_t *, uint8_t **, size_t *)
+bool obs_encoder_get_extra_data(const obs_encoder_t *encoder, uint8_t **data, size_t *size)
 {
-	return false;
+	const auto &extra = encoder == AUDIO_ENCODER ? g_opus_head : g_h264_init;
+	*data = const_cast<uint8_t *>(extra.data());
+	*size = extra.size();
+	return true;
 }
 
-const char *obs_encoder_get_codec(const obs_encoder_t *)
+const char *obs_encoder_get_codec(const obs_encoder_t *encoder)
 {
-	return "h264";
+	return encoder == AUDIO_ENCODER ? "opus" : "h264";
 }
+
+// VideoInit reads coded size and CBR from the encoder. Any new libobs call in
+// src/moq-output.cpp needs a stub here or `just obs ci` fails at link.
+obs_data_t *obs_encoder_get_settings(const obs_encoder_t *)
+{
+	return reinterpret_cast<obs_data_t *>(0x4);
+}
+
+uint32_t obs_encoder_get_width(const obs_encoder_t *)
+{
+	return 1920;
+}
+
+uint32_t obs_encoder_get_height(const obs_encoder_t *)
+{
+	return 1080;
+}
+
+const char *obs_data_get_string(obs_data_t *, const char *)
+{
+	return g_rate_control.c_str();
+}
+
+long long obs_data_get_int(obs_data_t *, const char *)
+{
+	return 8000;
+}
+
+// The settings a retune builds carry only the bitrate, so the stub is that bitrate.
+struct obs_data {
+	long long bitrate = 0;
+};
+
+obs_data_t *obs_data_create()
+{
+	return new obs_data;
+}
+
+void obs_data_set_int(obs_data_t *data, const char *, long long value)
+{
+	data->bitrate = value;
+}
+
+uint32_t obs_encoder_get_caps(const obs_encoder_t *)
+{
+	return g_encoder_caps;
+}
+
+void obs_encoder_update(obs_encoder_t *encoder, obs_data_t *settings)
+{
+	std::lock_guard<std::mutex> lock(g_updates_mutex);
+	g_updates.emplace_back(encoder, settings->bitrate);
+	delete settings;
+}
+
+// Encoders outlive every test, so a weak ref is the encoder itself.
+obs_weak_encoder_t *obs_encoder_get_weak_encoder(obs_encoder_t *encoder)
+{
+	return reinterpret_cast<obs_weak_encoder_t *>(encoder);
+}
+
+obs_encoder_t *obs_weak_encoder_get_encoder(obs_weak_encoder_t *weak)
+{
+	return reinterpret_cast<obs_encoder_t *>(weak);
+}
+
+obs_encoder_t *obs_encoder_get_ref(obs_encoder_t *encoder)
+{
+	return encoder;
+}
+
+void obs_weak_encoder_addref(obs_weak_encoder_t *) {}
+void obs_weak_encoder_release(obs_weak_encoder_t *) {}
+void obs_encoder_release(obs_encoder_t *) {}
 
 } // extern "C"
 
+// Stands in for the advanced settings: reconnect fast, so a dropped session is
+// back within a test's patience. An unparseable bind address is what moq-ffi refuses
+// when it builds the client.
 namespace MoQSettings {
-int CreateClient(obs_data_t *)
+std::string Configure(obs_data_t *, moq::ClientConfig &config)
 {
-	return g_client_result;
+	if (!g_settings_ok)
+		config.bind = "not an address";
+	config.backoff.initial_us = 10'000;
+	config.backoff.max_us = 50'000;
+	return g_settings_error;
 }
 } // namespace MoQSettings
 
-// ------------------------------------------------------------- libmoq stubs
-
-namespace {
-void (*g_on_status)(void *, int32_t) = nullptr;
-void *g_user_data = nullptr;
-std::atomic<int> g_next_handle{10};
-std::atomic<int> g_last_handle{0};
-std::atomic<int> g_closed_handle{0};
-// libmoq is allowed to deliver the terminal before connect returns. "inline" is
-// the defensive case (same thread); "thread" is what libmoq actually does, from
-// its runtime thread, which is the ordering signal_mutex has to handle.
-std::atomic<bool> g_connect_fires_terminal{false};
-std::atomic<bool> g_connect_fires_terminal_threaded{false};
-std::thread g_connect_terminal_thread;
-const char *g_error = "unauthorized";
-} // namespace
-
-extern "C" {
-
-const char *moq_error(void)
-{
-	return g_error;
-}
-
-int32_t moq_origin_create(void)
-{
-	return 1;
-}
-
-int32_t moq_origin_close(uint32_t)
-{
-	return 0;
-}
-
-int32_t moq_origin_publish(uint32_t, const char *, size_t)
-{
-	return 5;
-}
-
-int32_t moq_publish_finish(uint32_t)
-{
-	return 0;
-}
-
-int32_t moq_publish_media(uint32_t, const char *, size_t, const uint8_t *, size_t)
-{
-	return 7;
-}
-
-int32_t moq_publish_media_finish(uint32_t)
-{
-	return 0;
-}
-
-int32_t moq_publish_media_frame(uint32_t, const uint8_t *, uintptr_t, uint64_t)
-{
-	return 0;
-}
-
-int32_t moq_session_connect(const char *, size_t, uint32_t, uint32_t, void (*on_status)(void *, int32_t),
-			    void *user_data)
-{
-	g_on_status = on_status;
-	g_user_data = user_data;
-	int handle = g_next_handle++;
-	g_last_handle = handle;
-	if (g_connect_fires_terminal) {
-		g_on_status(g_user_data, -34);
-		g_on_status = nullptr;
-	} else if (g_connect_fires_terminal_threaded) {
-		auto cb = g_on_status;
-		auto ud = g_user_data;
-		g_on_status = nullptr;
-		// One connect per test with this flag set: reset() joins between tests, and
-		// moving onto a still-joinable thread would call std::terminate. Joining
-		// here instead would deadlock, since Start() holds signal_mutex and the
-		// terminal callback needs it.
-		g_connect_terminal_thread = std::thread([cb, ud] { cb(ud, -34); });
-	}
-	return handle;
-}
-
-int32_t moq_client_connect(const char *url, size_t url_len, uint32_t, uint32_t origin_publish, uint32_t origin_consume,
-			   void (*on_status)(void *, int32_t), void *user_data)
-{
-	return moq_session_connect(url, url_len, origin_publish, origin_consume, on_status, user_data);
-}
-
-int32_t moq_client_close(uint32_t)
-{
-	return 0;
-}
-
-int32_t moq_session_close(uint32_t session)
-{
-	g_closed_handle = static_cast<int>(session);
-	return 0;
-}
-
-} // extern "C"
-
 // -------------------------------------------------------------------- tests
-
-#include "moq-output.h"
 
 namespace {
 int g_failures = 0;
 
-// Spin until `ready`, giving up after a few seconds. A test that hangs reports
-// nothing; one that fails names the assertion.
-bool spinUntil(const std::atomic<bool> &ready)
-{
-	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-	while (!ready.load(std::memory_order_relaxed)) {
-		if (std::chrono::steady_clock::now() > deadline)
-			return false;
-		std::this_thread::yield();
-	}
-	return true;
-}
+#define CHECK(cond)                                                                 \
+	do {                                                                        \
+		if (!(cond)) {                                                      \
+			fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+			g_failures++;                                               \
+		}                                                                   \
+	} while (0)
+
+obs_output_t *const OUTPUT = reinterpret_cast<obs_output_t *>(0x9);
+
+// A URL moq-ffi rejects as soon as the connect runs, for a failure with no network in it.
+const char *const BAD_URL = "not a url";
 
 // Indexing directly turns a missing signal into a segfault, which hides which
 // assertion actually regressed.
@@ -298,382 +290,571 @@ size_t signalCount()
 	return g_signals.size();
 }
 
-std::vector<RecordedSignal> signalsSince(size_t from)
+void reset(std::string url)
 {
-	std::lock_guard<std::mutex> lock(g_signals_mutex);
-	return {g_signals.begin() + static_cast<long>(from), g_signals.end()};
-}
-
-void fire(int code)
-{
-	auto cb = g_on_status;
-	auto ud = g_user_data;
-	if (!cb) {
-		fprintf(stderr, "FAIL: no status callback registered\n");
-		g_failures++;
-		return;
-	}
-	if (code <= 0)
-		g_on_status = nullptr;
-	cb(ud, code);
-}
-
-void reset()
-{
-	if (g_connect_terminal_thread.joinable())
-		g_connect_terminal_thread.join();
 	{
 		std::lock_guard<std::mutex> lock(g_signals_mutex);
 		g_signals.clear();
 		g_last_error.clear();
 	}
+	g_url = std::move(url);
 	g_on_signal = nullptr;
-	g_on_status = nullptr;
-	g_closed_handle = 0;
 	g_begin_capture = 0;
-	g_client_result = 0;
-	g_start_gate = nullptr;
-	g_connect_fires_terminal = false;
-	g_connect_fires_terminal_threaded = false;
+	g_settings_ok = true;
+	g_settings_error.clear();
+	g_rate_control = "CBR";
+	g_encoder_caps = OBS_ENCODER_CAP_DYN_BITRATE;
+	{
+		std::lock_guard<std::mutex> lock(g_updates_mutex);
+		g_updates.clear();
+	}
 	g_stall_last_error = false;
 	g_in_report_window = false;
+	g_destroyed = false;
+}
+
+encoder_packet videoPacket(std::vector<uint8_t> &payload, int64_t pts)
+{
+	encoder_packet packet{};
+	packet.type = OBS_ENCODER_VIDEO;
+	packet.encoder = VIDEO_ENCODER;
+	packet.timebase_num = 1;
+	packet.timebase_den = 30;
+	packet.pts = pts;
+	packet.data = payload.data();
+	packet.size = payload.size();
+	packet.keyframe = true;
+	return packet;
+}
+
+encoder_packet audioPacket(std::vector<uint8_t> &payload, int64_t pts)
+{
+	encoder_packet packet{};
+	packet.type = OBS_ENCODER_AUDIO;
+	packet.encoder = AUDIO_ENCODER;
+	packet.timebase_num = 1;
+	packet.timebase_den = 48000;
+	packet.pts = pts;
+	packet.data = payload.data();
+	packet.size = payload.size();
+	return packet;
+}
+
+// The output's broadcast as the relay serves it, or null once the wait times out.
+std::shared_ptr<moq::BroadcastConsumer> relayBroadcast(TestRelay &relay)
+{
+	auto announced = TestOk(relay.origin->consume()->announced_broadcast("room"), "announced_broadcast");
+	auto available = announced->available();
+	if (available.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+		return nullptr;
+	return TestOk(available.get(), "available");
+}
+
+// The broadcast's catalog, once it has video and audio.
+std::optional<moq::Catalog> relayCatalog(const std::shared_ptr<moq::BroadcastConsumer> &broadcast)
+{
+	if (!broadcast)
+		return std::nullopt;
+	auto catalogs = TestOk(moq::MediaCatalogConsumer::subscribe(broadcast).get(), "catalog consumer");
+	for (;;) {
+		auto next = catalogs->next();
+		if (next.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+			return std::nullopt;
+		auto catalog = TestOk(next.get(), "catalog next");
+		if (!catalog)
+			return std::nullopt;
+		if (!catalog->video.empty() && !catalog->audio.empty())
+			return catalog;
+	}
 }
 } // namespace
 
-#define CHECK(cond)                                                                 \
-	do {                                                                        \
-		if (!(cond)) {                                                      \
-			fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-			g_failures++;                                               \
-		}                                                                   \
-	} while (0)
+// The production commit boundary lets a real stats call race retirement without
+// callbacks or branches in the output's hot path.
+struct MoQOutputStatsTest {
+	static std::optional<std::string> Epoch(MoQOutput &output)
+	{
+		std::shared_ptr<moq::OriginProducer> origin;
+		{
+			std::lock_guard<std::mutex> lock(output.media_mutex);
+			origin = output.origin;
+		}
+		auto announced = TestOk(origin->consume()->announced(moq::AnnounceConfig{}), "announced");
+		auto next = announced->next();
+		if (next.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+			return std::nullopt;
+		auto event = TestOk(next.get(), "announcement");
+		if (!event)
+			return std::nullopt;
+		const auto *start = std::get_if<moq::AnnounceEvent::kStart>(&event->get_variant());
+		return start ? start->announce.route.epoch : std::nullopt;
+	}
+
+	static std::shared_ptr<moq::Session> Session(MoQOutput &output)
+	{
+		std::lock_guard<std::mutex> lock(output.mutex);
+		return output.session;
+	}
+	static bool Commit(MoQOutput &output, const std::shared_ptr<moq::Session> &session,
+			   MoQOutput::ConnectionStats *accepted)
+	{
+		MoQOutput::ConnectionStats stale;
+		stale.dial = "retired";
+		stale.bytes_sent = 123;
+		return output.CommitConnectionStats(session, std::move(stale), accepted);
+	}
+	static void Disconnect(MoQOutput &output)
+	{
+		std::lock_guard<std::mutex> lock(output.mutex);
+		output.live = false;
+	}
+	// Whether every audio and video track holds a reservation.
+	static bool Reserved(MoQOutput &output)
+	{
+		std::lock_guard<std::mutex> lock(output.media_mutex);
+		for (const auto *tracks : {&output.video_tracks, &output.audio_tracks}) {
+			if (tracks->empty())
+				return false;
+			for (const auto &[encoder, track] : *tracks) {
+				if (!track.reservation)
+					return false;
+			}
+		}
+		return true;
+	}
+	// Drive every following video track to its floor, as a collapsed uplink would.
+	static void Collapse(MoQOutput &output)
+	{
+		std::lock_guard<std::mutex> lock(output.media_mutex);
+		for (auto &[encoder, track] : output.video_tracks) {
+			if (track.rate)
+				track.rate->Update(1, MoQRate::Clock::now());
+		}
+	}
+};
+
+std::vector<std::pair<obs_encoder_t *, long long>> updates()
+{
+	std::lock_guard<std::mutex> lock(g_updates_mutex);
+	return g_updates;
+}
 
 int main()
 {
-	auto out = reinterpret_cast<obs_output_t *>(0x9);
-
-	// Invalid advanced settings stop before a session or capture is created.
 	{
-		reset();
-		g_client_result = -40;
-		MoQOutput o(nullptr, out);
+		TestRelay relay;
+		reset(relay.Url());
+		MoQOutput output(nullptr, OUTPUT);
+		CHECK(output.Start());
+		const auto first = MoQOutputStatsTest::Epoch(output);
+		CHECK(first.has_value());
+		CHECK(first == output.GetEpoch());
+		CHECK(WaitFor([&] { return output.IsLiveSession() && relay.Accepted() == 1; }));
+		relay.DropSessions();
+		CHECK(WaitFor([&] { return output.GetReconnectCount() == 1 && output.IsLiveSession(); }));
+		CHECK(MoQOutputStatsTest::Epoch(output) == first);
+		CHECK(first == output.GetEpoch());
+		output.Stop();
+		CHECK(output.GetEpoch().empty());
+		CHECK(output.Start());
+		const auto second = MoQOutputStatsTest::Epoch(output);
+		CHECK(second.has_value());
+		CHECK(second != first);
+		CHECK(second == output.GetEpoch());
+		output.Stop();
+	}
+	printf("each start announces a fresh epoch, reconnect preserves it: ok\n");
+
+	for (int retirement = 0; retirement < 3; ++retirement) {
+		TestRelay relay;
+		reset(relay.Url());
+		MoQOutput output(nullptr, OUTPUT);
+		CHECK(output.Start());
+		CHECK(WaitFor([&] { return output.IsLiveSession(); }));
+		auto sampled = MoQOutputStatsTest::Session(output);
+		CHECK(sampled != nullptr);
+		if (!sampled)
+			continue;
+		// Use the generated bindings and real session before crossing the commit boundary.
+		const auto raw = sampled->stats();
+		(void)raw;
+		MoQOutput::ConnectionStats accepted;
+		accepted.dial = "accepted";
+		accepted.bytes_sent = 456;
+		if (retirement == 0) {
+			output.Stop();
+		} else if (retirement == 1) {
+			output.Stop();
+			CHECK(output.Start());
+			CHECK(WaitFor([&] { return output.IsLiveSession(); }));
+		} else {
+			MoQOutputStatsTest::Disconnect(output);
+		}
+		CHECK(!MoQOutputStatsTest::Commit(output, sampled, &accepted));
+		CHECK(accepted.dial == "accepted");
+		CHECK(accepted.bytes_sent == 456);
+		output.Stop();
+	}
+	printf("retired stats never replace the accepted sample: ok\n");
+
+	// Publishes over a real session: connects, reports itself live, carries
+	// stats, and lands video and audio renditions in the relay's catalog. Only CBR
+	// publishes the configured bitrate as a hint.
+	for (const char *mode : {"CBR", "VBR"}) {
+		TestRelay relay;
+		reset(relay.Url());
+		g_rate_control = mode;
+		{
+			MoQOutput o(nullptr, OUTPUT);
+			CHECK(o.Start());
+			CHECK(WaitFor([&] { return o.IsLiveSession(); }));
+			CHECK(o.GetConnectTime() > 0);
+			CHECK(o.GetReconnectCount() == 0);
+
+			MoQOutput::ConnectionStats stats;
+			CHECK(o.TryGetConnectionStats(&stats));
+			CHECK(stats.dial == "http");
+			CHECK(!stats.protocol.empty());
+
+			auto keyframe = TestH264Keyframe();
+			std::vector<uint8_t> opus = {0xfc, 0xff, 0xfe};
+			for (int64_t pts = 0; pts < 3; pts++) {
+				auto video = videoPacket(keyframe, pts);
+				o.Data(&video);
+				auto audio = audioPacket(opus, pts * 960);
+				o.Data(&audio);
+			}
+			CHECK(o.GetTotalBytes() == 3 * (keyframe.size() + opus.size()));
+
+			auto catalog = relayCatalog(relayBroadcast(relay));
+			CHECK(catalog.has_value());
+			if (catalog) {
+				CHECK(catalog->video.size() == 1);
+				CHECK(catalog->audio.size() == 1);
+				for (const auto &[name, video] : catalog->video) {
+					CHECK(video.coded.has_value());
+					CHECK(video.bitrate.has_value() == (g_rate_control == "CBR"));
+				}
+			}
+
+			o.Stop();
+			CHECK(signalCount() == 1);
+			CHECK(signalAt(0).code == OBS_OUTPUT_SUCCESS);
+			CHECK(!o.IsLiveSession());
+			CHECK(o.GetConnectTime() == 0);
+		}
+		// The destructor stops too, which OBS ignores for an output already stopped.
+		CHECK(signalCount() == 2);
+	}
+	printf("publishes, and only CBR hints its bitrate: ok\n");
+
+	// Video follows the grant only when the encoder retunes live and the bitrate
+	// drives it; every track reserves either way once the session connects.
+	struct FollowCase {
+		const char *rate_control;
+		uint32_t caps;
+		bool follows;
+	};
+	for (const auto &c : {FollowCase{"CBR", OBS_ENCODER_CAP_DYN_BITRATE, true},
+			      FollowCase{"vbr", OBS_ENCODER_CAP_DYN_BITRATE, true},
+			      FollowCase{"CQP", OBS_ENCODER_CAP_DYN_BITRATE, false}, FollowCase{"CBR", 0, false}}) {
+		TestRelay relay;
+		reset(relay.Url());
+		g_rate_control = c.rate_control;
+		g_encoder_caps = c.caps;
+		MoQOutput o(nullptr, OUTPUT);
+		CHECK(o.Start());
+		CHECK(WaitFor([&] { return o.IsLiveSession(); }));
+
+		auto keyframe = TestH264Keyframe();
+		std::vector<uint8_t> opus = {0xfc, 0xff, 0xfe};
+		auto video = videoPacket(keyframe, 0);
+		o.Data(&video);
+		auto audio = audioPacket(opus, 0);
+		o.Data(&audio);
+		CHECK(MoQOutputStatsTest::Reserved(o));
+
+		MoQOutput::VideoRate rate;
+		CHECK(o.TryGetVideoRate(&rate) == c.follows);
+		if (c.follows) {
+			CHECK(rate.configured_bps == 8'000'000);
+			CHECK(rate.target_bps <= rate.configured_bps);
+		}
+		o.Stop();
+	}
+	printf("video follows only a live-retunable, bitrate-driven encoder: ok\n");
+
+	// Stopping hands the configured bitrate back to an encoder the grant lowered,
+	// so the next Start() reads the user's rate rather than the last grant.
+	{
+		TestRelay relay;
+		reset(relay.Url());
+		MoQOutput o(nullptr, OUTPUT);
+		CHECK(o.Start());
+		CHECK(WaitFor([&] { return o.IsLiveSession(); }));
+		auto keyframe = TestH264Keyframe();
+		auto video = videoPacket(keyframe, 0);
+		o.Data(&video);
+		MoQOutputStatsTest::Collapse(o);
+		MoQOutput::VideoRate rate;
+		CHECK(o.TryGetVideoRate(&rate));
+		CHECK(rate.target_bps == 800'000);
+		o.Stop();
+		const auto applied = updates();
+		CHECK(!applied.empty());
+		CHECK(!applied.empty() && applied.back() == std::make_pair(VIDEO_ENCODER, 8000LL));
+	}
+	printf("stop restores the configured bitrate: ok\n");
+
+	// Stop drains the session, even when the output is destroyed straight after: a
+	// large frame written just before it still reaches the relay, and the track then
+	// ends cleanly instead of being cut off with the session.
+	{
+		TestRelay relay;
+		reset(relay.Url());
+		auto o = std::make_unique<MoQOutput>(nullptr, OUTPUT);
+		CHECK(o->Start());
+		CHECK(WaitFor([&] { return o->IsLiveSession(); }));
+
+		auto keyframe = TestH264Keyframe();
+		std::vector<uint8_t> opus = {0xfc, 0xff, 0xfe};
+		auto video = videoPacket(keyframe, 0);
+		o->Data(&video);
+		auto audio = audioPacket(opus, 0);
+		o->Data(&audio);
+
+		auto broadcast = relayBroadcast(relay);
+		auto catalog = relayCatalog(broadcast);
+		CHECK(catalog.has_value());
+		if (catalog) {
+			const auto &[name, rendition] = *catalog->video.begin();
+			auto media = TestOk(
+				moq::MediaTrackConsumer::subscribe(broadcast, {moq::Rendition::kVideo{name, rendition}})
+					.get(),
+				"container consumer");
+			// Read a frame first, so the relay is subscribed before the last one is written.
+			auto next = media->next();
+			CHECK(next.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+			auto first = TestOk(next.get(), "first frame");
+			CHECK(first.has_value());
+
+			// Large enough that it is still in flight when Stop() runs.
+			auto large = keyframe;
+			large.resize(large.size() + 16 * 1024 * 1024, 0xff);
+			auto last = videoPacket(large, 1);
+			o->Data(&last);
+			// OBS may destroy the output right after stopping it.
+			o->Stop();
+			o.reset();
+
+			// Read once the relay has seen the session end, so it serves only what the
+			// session delivered before closing.
+			auto closed = relay.Session(0)->closed();
+			CHECK(closed.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+
+			// Everything up to the last frame, then the end of the track.
+			bool ended = false;
+			uint64_t last_timestamp = first ? first->timestamp_us : 0;
+			for (;;) {
+				next = media->next();
+				if (next.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+					break;
+				auto result = next.get();
+				if (!result)
+					break;
+				if (!*result) {
+					ended = true;
+					break;
+				}
+				last_timestamp = (*result)->timestamp_us;
+			}
+			CHECK(ended);
+			CHECK(first && last_timestamp > first->timestamp_us);
+		}
+	}
+	printf("stop drains the session: ok\n");
+
+	// Invalid advanced settings refuse the start before any capture begins.
+	{
+		reset(BAD_URL);
+		g_settings_ok = false;
+		MoQOutput o(nullptr, OUTPUT);
 		CHECK(!o.Start());
-		CHECK(g_on_status == nullptr);
 		CHECK(g_begin_capture == 0);
 		CHECK(signalCount() == 1);
 		CHECK(signalAt(0).code == OBS_OUTPUT_CONNECT_FAILED);
+		CHECK(signalAt(0).last_error.find("bind") != std::string::npos);
+	}
+	{
+		reset(BAD_URL);
+		g_settings_error = "unknown congestion control: fast";
+		MoQOutput o(nullptr, OUTPUT);
+		CHECK(!o.Start());
+		CHECK(g_begin_capture == 0);
+		CHECK(signalCount() == 1);
+		CHECK(signalAt(0).code == OBS_OUTPUT_CONNECT_FAILED);
+		CHECK(signalAt(0).last_error.find("congestion") != std::string::npos);
 	}
 	printf("invalid advanced settings: ok\n");
 
-	// Reconnection gave up after the session had been up: OBS must be told, with
-	// the libmoq reason attached, so it stops reporting a live stream.
+	// Never reached the server, so OBS must not retry the endpoint, and the failure
+	// lands after the output was committed, with moq-ffi's reason attached.
 	{
-		reset();
-		MoQOutput o(nullptr, out);
+		reset(BAD_URL);
+		MoQOutput o(nullptr, OUTPUT);
 		CHECK(o.Start());
-		fire(1);
-		fire(-34);
-		CHECK(signalCount() == 1);
-		CHECK(signalAt(0).code == OBS_OUTPUT_DISCONNECTED);
-		CHECK(signalAt(0).last_error == "unauthorized");
-	}
-	printf("fatal after connect: ok\n");
-
-	// Never reached the server, so OBS should not retry the endpoint.
-	{
-		reset();
-		MoQOutput o(nullptr, out);
-		CHECK(o.Start());
-		fire(-34);
-		CHECK(signalCount() == 1);
+		CHECK(WaitFor([] { return signalCount() == 1; }));
 		CHECK(signalAt(0).code == OBS_OUTPUT_CONNECT_FAILED);
+		CHECK(signalAt(0).begin_capture_at == 1);
+		CHECK(signalAt(0).last_error.find("url") != std::string::npos);
+		int code = 0;
+		std::string reason;
+		o.CopyLastFailure(&code, &reason);
+		CHECK(!reason.empty());
+		CHECK(!o.IsLiveSession());
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		CHECK(signalCount() == 1);
 	}
 	printf("fatal before connect: ok\n");
 
-	// A clean close is the expected end of a stopped output, not a failure.
+	// A dropped session reconnects on its own, and the dock sees the count.
 	{
-		reset();
-		MoQOutput o(nullptr, out);
+		TestRelay relay;
+		reset(relay.Url());
+		MoQOutput o(nullptr, OUTPUT);
 		CHECK(o.Start());
-		fire(1);
-		o.Stop(false);
-		fire(0);
+		CHECK(WaitFor([&] { return o.IsLiveSession() && relay.Accepted() == 1; }));
+		relay.DropSessions();
+		CHECK(WaitFor([&] { return relay.Accepted() == 2; }));
+		CHECK(WaitFor([&] { return o.GetReconnectCount() == 1; }));
+		MoQOutput::ConnectionStats stats;
+		CHECK(WaitFor([&] { return o.TryGetConnectionStats(&stats); }));
 		CHECK(signalCount() == 0);
+		o.Stop();
 	}
-	printf("clean close: ok\n");
+	printf("reconnect after a drop: ok\n");
 
-	// A terminal belonging to an attempt that has already been torn down must
-	// not stop the stream that replaced it.
+	// While a dropped session redials, the dock names why it dropped instead of a
+	// bare "offline". The relay is gone, so nothing answers the redial.
 	{
-		reset();
-		MoQOutput o(nullptr, out);
+		auto relay = std::make_unique<TestRelay>();
+		reset(relay->Url());
+		MoQOutput o(nullptr, OUTPUT);
 		CHECK(o.Start());
-		auto stale_cb = g_on_status;
-		auto stale_ud = g_user_data;
-		o.Stop(false);
-		CHECK(o.Start());
-		stale_cb(stale_ud, -34);
+		CHECK(WaitFor([&] { return o.IsLiveSession(); }));
+		relay.reset();
+		MoQOutput::ConnectionStats stats;
+		CHECK(WaitFor([&] { return !o.TryGetConnectionStats(&stats); }));
+		// Still reconnecting rather than failed, so this is the reconnect path.
+		CHECK(o.IsLiveSession());
 		CHECK(signalCount() == 0);
-		int live = g_last_handle;
-		g_closed_handle = 0;
-		o.Stop(false);
-		CHECK(g_closed_handle == live);
-		fire(0);
+		int code = 0;
+		std::string reason;
+		o.CopyLastFailure(&code, &reason);
+		CHECK(!reason.empty());
+		CHECK(reason != "offline");
+		o.Stop();
 	}
-	printf("superseded terminal ignored: ok\n");
+	printf("names the failure while reconnecting: ok\n");
 
-	// The terminal can beat moq_session_connect's return. Start() must refuse
-	// rather than capture into a session that is already gone, and the dead
-	// handle must never be closed.
+	// Stopping while the connect is still pending cancels it: nothing but the stop
+	// reaches OBS, then or later.
 	{
-		reset();
-		g_connect_fires_terminal = true;
-		MoQOutput o(nullptr, out);
-		CHECK(!o.Start());
-		CHECK(g_begin_capture == 0);
+		TestRelay relay(false);
+		reset(relay.Url());
+		MoQOutput o(nullptr, OUTPUT);
+		CHECK(o.Start());
+		o.Stop();
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		CHECK(signalCount() == 1);
-		CHECK(signalAt(0).code == OBS_OUTPUT_CONNECT_FAILED);
-		g_closed_handle = 0;
-		o.Stop(false);
-		CHECK(g_closed_handle == 0);
+		CHECK(signalAt(0).code == OBS_OUTPUT_SUCCESS);
 	}
-	printf("terminal before connect returns: ok\n");
+	printf("stop during connect: ok\n");
 
 	// A frontend that stops the output straight from the stop signal re-enters
-	// Stop() on the libmoq thread. It must not deadlock against session_mutex.
+	// Stop() on the worker. It must not deadlock against the report it is inside.
 	{
-		reset();
-		MoQOutput o(nullptr, out);
-		bool reentered = false;
-		g_on_signal = [&o, &reentered] {
-			if (reentered)
-				return;
-			reentered = true;
-			o.Stop(true);
+		reset(BAD_URL);
+		MoQOutput o(nullptr, OUTPUT);
+		g_on_signal = [&o] {
+			o.Stop();
 		};
 		CHECK(o.Start());
-		fire(1);
-		fire(-34);
-		CHECK(signalCount() == 2);
-		CHECK(signalAt(0).code == OBS_OUTPUT_DISCONNECTED);
+		CHECK(WaitFor([] { return signalCount() == 2; }));
+		CHECK(signalAt(0).code == OBS_OUTPUT_CONNECT_FAILED);
 		CHECK(signalAt(1).code == OBS_OUTPUT_SUCCESS);
 	}
 	printf("re-entrant Stop from the signal: ok\n");
 
-	// The destructor waits for the terminal callback. It must return on the
-	// callback rather than the bounded-wait timeout, and the callback must not
-	// signal an output that is being destroyed.
+	// A failure racing a user-initiated Stop must not report afterwards: OBS turns
+	// a late OBS_OUTPUT_DISCONNECTED into a reconnect of a stopped stream, because
+	// obs_output_signal_stop never checks whether the output is active. Holding the
+	// report open shows the Stop() waits for it rather than slipping in between.
 	{
-		reset();
-		auto o = new MoQOutput(nullptr, out);
-		CHECK(o->Start());
-		fire(1);
-		auto cb = g_on_status;
-		auto ud = g_user_data;
-		g_on_status = nullptr;
-
-		std::thread late([cb, ud] {
-			std::this_thread::sleep_for(std::chrono::milliseconds(200));
-			cb(ud, -34);
-		});
-		auto start = std::chrono::steady_clock::now();
-		delete o;
-		auto elapsed = std::chrono::steady_clock::now() - start;
-		late.join();
-		CHECK(elapsed > std::chrono::milliseconds(100));
-		// Comfortably under the destructor's own 2s bounded wait, so this fails if
-		// teardown returned on that timeout instead of on the callback.
-		CHECK(elapsed < std::chrono::milliseconds(1500));
-		CHECK(signalCount() == 1);
-		CHECK(signalAt(0).code == OBS_OUTPUT_SUCCESS);
+		reset(BAD_URL);
+		g_stall_last_error = true;
+		MoQOutput o(nullptr, OUTPUT);
+		CHECK(o.Start());
+		CHECK(WaitFor([] { return g_in_report_window.load(); }));
+		o.Stop();
+		CHECK(signalCount() == 2);
+		CHECK(signalAt(0).code == OBS_OUTPUT_CONNECT_FAILED);
+		CHECK(signalAt(1).code == OBS_OUTPUT_SUCCESS);
 	}
-	printf("terminal during destruction: ok\n");
+	printf("failure racing user Stop: ok\n");
 
 	// OBS restarts a reconnecting output by calling start again with no stop in
-	// between, so Start() has to drop the previous attempt itself.
+	// between. Each Start() reports its own failure once, after its own commit.
 	{
-		reset();
-		MoQOutput o(nullptr, out);
+		reset(BAD_URL);
+		MoQOutput o(nullptr, OUTPUT);
 		CHECK(o.Start());
-		fire(1);
-		fire(-34);
-		CHECK(signalCount() == 1);
-		g_closed_handle = 0;
+		CHECK(WaitFor([] { return signalCount() == 1; }));
 		CHECK(o.Start());
-		CHECK(g_closed_handle == 0); // the dead handle is retired, not closed
-		fire(-34);
+		CHECK(WaitFor([] { return signalCount() == 2; }));
+		CHECK(signalAt(0).begin_capture_at == 1);
+		CHECK(signalAt(1).begin_capture_at == 2);
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 		CHECK(signalCount() == 2);
-		CHECK(signalAt(1).code == OBS_OUTPUT_CONNECT_FAILED);
 	}
 	printf("OBS-driven restart: ok\n");
 
-	// libmoq delivers the terminal on its own thread while Start() is still
-	// committing. It must not report against a half-started output: signal_mutex
-	// parks it until capture has begun, so OBS sees a started-then-stopped output
-	// rather than an active one with no session.
+	// Restarts and teardown racing failures still in flight, repeatedly. Whatever
+	// the order, each Start() reports at most once, and nothing reports once the
+	// output is gone.
 	{
-		reset();
-		g_connect_fires_terminal_threaded = true;
-		MoQOutput o(nullptr, out);
-		CHECK(o.Start());
-		if (g_connect_terminal_thread.joinable())
-			g_connect_terminal_thread.join();
-		// Capture began before the report, so OBS's normal stop path applies.
-		// The report must land after capture began, so OBS sees an active output and
-		// runs its normal stop path instead of one that was never committed.
-		CHECK(signalAt(0).begin_capture_at == 1);
+		const int rounds = 100;
+		for (int round = 0; round < rounds; round++) {
+			reset(BAD_URL);
+			auto *o = new MoQOutput(nullptr, OUTPUT);
+			CHECK(o->Start());
+			if (round % 2)
+				CHECK(o->Start());
+			delete o;
+			g_destroyed = true;
+			// Start, [Start,] and the destructor's stop.
+			const size_t starts = round % 2 ? 2 : 1;
+			CHECK(signalCount() <= starts + 1);
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		CHECK(g_signals_after_destroy == 0);
+	}
+	printf("failures outliving the output: ok\n");
+
+	// An encoder failure stops the output once, with the encode error.
+	{
+		reset(BAD_URL);
+		MoQOutput o(nullptr, OUTPUT);
+		o.Data(nullptr);
 		CHECK(signalCount() == 1);
-		CHECK(signalAt(0).code == OBS_OUTPUT_CONNECT_FAILED);
-		CHECK(signalAt(0).last_error == "unauthorized");
+		CHECK(signalAt(0).code == OBS_OUTPUT_ENCODE_ERROR);
 	}
-	printf("terminal during startup commit: ok\n");
-
-	// A terminal racing a user-initiated Stop must not report afterwards: OBS
-	// turns a late OBS_OUTPUT_DISCONNECTED into a reconnect of a stopped stream,
-	// because obs_output_signal_stop never checks whether the output is active.
-	{
-		reset();
-		g_stall_last_error = true;
-		const int rounds = 50;
-		int reconnect_after_stop = 0;
-		for (int i = 0; i < rounds; i++) {
-			MoQOutput o(nullptr, out);
-			CHECK(o.Start());
-			fire(1); // connected, so a failure would ask OBS to reconnect
-			auto cb = g_on_status;
-			auto ud = g_user_data;
-			if (!cb)
-				break;
-			g_on_status = nullptr;
-
-			size_t before = signalCount();
-			g_in_report_window = false;
-			std::thread terminal([cb, ud] { cb(ud, -34); });
-
-			// Wait until the callback has committed to reporting a failure and is
-			// sitting in the window, then stop from underneath it.
-			CHECK(spinUntil(g_in_report_window));
-			o.Stop(true); // the user pressed stop
-			terminal.join();
-
-			// Whatever the interleaving, a DISCONNECTED must never follow the
-			// SUCCESS that reported the user's stop.
-			bool stopped = false;
-			for (const auto &s : signalsSince(before)) {
-				if (s.code == OBS_OUTPUT_SUCCESS)
-					stopped = true;
-				else if (stopped && s.code == OBS_OUTPUT_DISCONNECTED)
-					reconnect_after_stop++;
-			}
-		}
-		CHECK(reconnect_after_stop == 0);
-		printf("terminal racing user Stop: ok (%d late reconnect signals over %d rounds)\n",
-		       reconnect_after_stop, rounds);
-	}
-
-	// The dock reads the connect time as the live "connected" indicator, so it
-	// must not outlive the attempt it describes.
-	{
-		reset();
-		MoQOutput o(nullptr, out);
-		CHECK(o.Start());
-		CHECK(o.GetConnectTime() == 0);
-		fire(1);
-		std::this_thread::sleep_for(std::chrono::milliseconds(2));
-		fire(2); // a reconnect epoch, so the elapsed time is non-zero
-		CHECK(o.GetConnectTime() > 0);
-		fire(-34);
-		CHECK(o.GetConnectTime() == 0);
-		CHECK(o.Start());
-		CHECK(o.GetConnectTime() == 0);
-		fire(1);
-		o.Stop(false);
-		CHECK(o.GetConnectTime() == 0);
-		fire(0);
-	}
-	printf("connect time cleared on teardown: ok\n");
-
-	// The terminal callback racing a user-initiated stop, repeatedly. Whichever
-	// wins, the failure signal fires at most once per Start().
-	{
-		reset();
-		const int rounds = 200;
-		for (int i = 0; i < rounds; i++) {
-			MoQOutput o(nullptr, out);
-			CHECK(o.Start());
-			auto cb = g_on_status;
-			auto ud = g_user_data;
-			if (!cb)
-				break;
-			g_on_status = nullptr;
-			std::thread terminal([cb, ud] { cb(ud, -34); });
-			o.Stop(false);
-			terminal.join();
-		}
-		size_t fatal = 0, success = 0;
-		for (const auto &s : signalsSince(0)) {
-			if (s.code == OBS_OUTPUT_SUCCESS)
-				success++;
-			else if (s.code == OBS_OUTPUT_DISCONNECTED || s.code == OBS_OUTPUT_CONNECT_FAILED)
-				fatal++;
-			else
-				CHECK(false);
-		}
-		// Exactly one SUCCESS per round from the destructor's Stop(), plus a fatal
-		// only where the terminal beat Stop() to the attempt.
-		CHECK(success == static_cast<size_t>(rounds));
-		CHECK(signalCount() == success + fatal);
-		printf("terminal racing Stop: ok (%zu of %d rounds signalled)\n", fatal, rounds);
-	}
-
-	// A stale terminal callback overlapping the next Start(), which rewrites the
-	// members the callback used to read. Exercises the interleaving; note it is
-	// not a proven detector, since session_mutex tends to order the two in
-	// practice even when nothing guarantees it.
-	{
-		reset();
-		MoQOutput o(nullptr, out);
-		std::atomic<bool> stranded{false};
-		for (int i = 0; i < 500; i++) {
-			CHECK(o.Start());
-			auto cb = g_on_status;
-			auto ud = g_user_data;
-			if (!cb)
-				break;
-			g_on_status = nullptr;
-			std::atomic<bool> gate{false};
-			std::thread stale([cb, ud, &gate, &stranded] {
-				// The gate opens from inside the next Start(); if that never
-				// happens, give up rather than hanging the run.
-				if (!spinUntil(gate)) {
-					stranded = true;
-					return;
-				}
-				cb(ud, -34);
-			});
-			o.Stop(false);
-			g_start_gate = &gate;
-			bool restarted = o.Start();
-			g_start_gate = nullptr;
-			stale.join();
-			CHECK(restarted);
-
-			auto live = g_on_status;
-			auto live_ud = g_user_data;
-			if (!live)
-				break;
-			g_on_status = nullptr;
-			o.Stop(false);
-			live(live_ud, 0);
-		}
-		CHECK(!stranded);
-	}
-	printf("stale terminal racing restart: ok\n");
+	printf("encode error: ok\n");
 
 	if (g_failures) {
-		printf("\nFAILURES: %d\n", g_failures);
+		fprintf(stderr, "%d failure(s)\n", g_failures);
 		return 1;
 	}
-	printf("\nall passed\n");
+	printf("all MoQOutput tests passed\n");
 	return 0;
 }

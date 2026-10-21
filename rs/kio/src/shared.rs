@@ -61,16 +61,17 @@ impl<T> Shared<T> {
 	/// [`Ref`], so it can't flag the state modified and spuriously wake this poll's own
 	/// waiter. Registers `waiter` while pending; any mutation through a [`lock`](Self::lock)
 	/// guard re-polls it.
-	pub fn poll<F>(&self, waiter: &Waiter, mut f: F) -> Poll<Mut<'_, T>>
+	#[cfg_attr(feature = "sim", track_caller)]
+	pub fn poll<F>(&self, waiter: &Waiter, f: F) -> Poll<Mut<'_, T>>
 	where
-		F: FnMut(&Ref<'_, T>) -> Poll<()>,
+		F: FnOnce(&Ref<'_, T>) -> Poll<()>,
 	{
 		let mut guard = Ref {
 			state: self.state.lock(),
 		};
 		match f(&guard) {
 			// Upgrade the Ref to a Mut, keeping the same lock guard.
-			Poll::Ready(()) => Poll::Ready(Mut::new(guard.state)),
+			Poll::Ready(()) => crate::coop::ready(Mut::new(guard.state)),
 			Poll::Pending => {
 				waiter.register(&mut guard.state.waiters_value);
 				Poll::Pending

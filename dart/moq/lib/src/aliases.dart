@@ -1,0 +1,160 @@
+import 'package:moq_ffi/moq_ffi.dart';
+
+// Re-export the UniFFI types without their `Moq` prefix, so consumers spell
+// them the way the Rust API does. These are type aliases, not wrappers: the
+// values are the exact same objects, so every generated method applies
+// unchanged and the prefixed names stay valid.
+//
+// Four types are deliberately not aliased, because the unprefixed name is
+// already taken where this package is used:
+//
+//   * `MoqServer` - `Server` is the listen facade in server.dart.
+//   * `MoqContainer` / `MoqRoute` - `Container` and `Route` are Flutter's, and
+//     an ambiguous import would break every Flutter app that uses them.
+//   * `MoqException` - `Exception` is in `dart:core`.
+
+/// A MoQ client: configure the TLS/bind knobs, then connect to a relay.
+typedef Client = MoqClient;
+
+/// A live pub/sub session with a relay, exposing publish and consume origins.
+typedef Session = MoqSession;
+
+/// An incoming session awaiting a decision: accept it to handshake, or reject it.
+typedef Request = MoqRequest;
+
+/// The network transport carrying an incoming session.
+typedef Transport = MoqTransport;
+
+/// The congestion control family for a QUIC connection.
+typedef CongestionControl = MoqCongestionControl;
+
+/// The publish side of an origin: create broadcasts so subscribers can discover them.
+typedef OriginProducer = MoqOriginProducer;
+
+/// Config for creating an origin, such as its total cache budget.
+typedef OriginConfig = MoqOriginConfig;
+
+/// The subscribe side of an origin: discover and request published broadcasts.
+typedef OriginConsumer = MoqOriginConsumer;
+
+/// A served route: advertises a path prefix and yields broadcast requests beneath it.
+typedef OriginDynamic = MoqOriginDynamic;
+
+/// A requested broadcast not yet accepted: fulfill it with a producer or reject it.
+typedef BroadcastRequest = MoqBroadcastRequest;
+
+/// A stream of announce events under a prefix.
+typedef AnnounceConsumer = MoqAnnounceConsumer;
+
+/// A literal prefix, an optional relative pattern, and the hidden-path opt-in for announcement discovery.
+typedef AnnounceConfig = MoqAnnounceConfig;
+
+/// A pending wait for a route to cover a specific path.
+typedef AnnouncedBroadcast = MoqAnnouncedBroadcast;
+
+/// A route over a prefix: its origin-relative path, wildcard captures, and route metadata.
+typedef Announce = MoqAnnounce;
+
+/// What an [AnnounceConsumer] yields: [AnnounceEventStart],
+/// [AnnounceEventUpdate], [AnnounceEventEnd], or [AnnounceEventRestart].
+typedef AnnounceEvent = MoqAnnounceEvent;
+
+/// A route now covers the prefix; the stream had none there.
+typedef AnnounceEventStart = StartMoqAnnounceEvent;
+
+/// The route covering the prefix changed hops or cost.
+typedef AnnounceEventUpdate = UpdateMoqAnnounceEvent;
+
+/// No route covers the prefix any more; carries its last route.
+typedef AnnounceEventEnd = EndMoqAnnounceEvent;
+
+/// Another publisher instance now serves the prefix: drop what was resolved
+/// under it and request afresh.
+typedef AnnounceEventRestart = RestartMoqAnnounceEvent;
+
+/// The write side of a broadcast: publish tracks into it.
+typedef BroadcastProducer = MoqBroadcastProducer;
+
+/// The read side of a broadcast: subscribe to its catalog and tracks.
+typedef BroadcastConsumer = MoqBroadcastConsumer;
+
+/// Receives tracks requested from a dynamically served broadcast.
+typedef BroadcastDynamic = MoqBroadcastDynamic;
+
+/// The write side of a raw track: append groups of frames.
+typedef TrackProducer = MoqTrackProducer;
+
+/// A subscriber-requested track not yet accepted: accept it for a [TrackProducer] or abort it.
+typedef TrackRequest = MoqTrackRequest;
+
+/// A stream of uncached group requests for one track, for serving fetches on demand.
+typedef TrackDynamic = MoqTrackDynamic;
+
+/// A watch-only handle to whether a published track has subscribers; holding it keeps nothing open.
+typedef TrackDemand = MoqTrackDemand;
+
+/// The read side of a raw track: yields groups in sequence order, skipping ahead if it falls behind.
+typedef TrackConsumer = MoqTrackConsumer;
+
+/// A request to produce one uncached group for a fetch consumer.
+typedef GroupRequest = MoqGroupRequest;
+
+/// A watch-only handle to whether any caller still wants a requested group; holding it keeps nothing open.
+typedef GroupDemand = MoqGroupDemand;
+
+/// The write side of a single group: append frames to it.
+typedef GroupProducer = MoqGroupProducer;
+
+/// The read side of a single group: yields timestamped raw frames.
+typedef GroupConsumer = MoqGroupConsumer;
+
+/// A datagram-delivered frame, tagged with a per-track sequence number.
+typedef Datagram = MoqDatagram;
+
+/// A payload plus the timestamp it should be presented at.
+typedef Frame = MoqFrame;
+
+/// Tunes how a track subscription is delivered: priority, latency budget, ranges, and group ordering.
+typedef Subscription = MoqSubscription;
+
+/// A span of a track to deliver: from `start` up to `end`, or onward when `end` is null.
+typedef Range = MoqRange;
+
+/// Where one end of a [Range] falls: absolute or relative to the latest group.
+typedef Anchor = MoqAnchor;
+
+/// Which pending group the publisher sends first.
+typedef Order = MoqOrder;
+
+/// Options for fetching one past group by sequence.
+typedef FetchGroupOptions = MoqFetchGroupOptions;
+
+/// Delivery settings for a raw track: priority, ordering, latency budget, and timescale.
+typedef TrackInfo = MoqTrackInfo;
+
+/// Divides one connection's send estimate among the tracks sharing it.
+typedef Bandwidth = MoqBandwidth;
+
+/// An owned bandwidth estimate; release it to stop receive PROBE demand.
+typedef BandwidthConsumer = MoqBandwidthConsumer;
+
+/// One track's standing claim on a [Bandwidth].
+typedef Reservation = MoqReservation;
+
+/// A snapshot of transport connection statistics.
+typedef ConnectionStats = MoqConnectionStats;
+
+/// A connection lifecycle transition reported by [Session.status].
+typedef ConnectionStatus = MoqConnectionStatus;
+
+/// Retry pacing for the automatic reconnect: initial delay, multiplier, ceiling, and give-up window.
+typedef Backoff = MoqBackoff;
+
+/// Whether a protocol code is from the session or stream registry.
+typedef ErrorScope = MoqErrorScope;
+
+/// A recognized protocol kind, or APP / UNKNOWN when the code is not named.
+typedef ProtocolKind = MoqProtocolKind;
+
+/// A protocol failure: scope, verbatim wire code, kind, and a diagnostic message.
+typedef ProtocolException = MoqProtocolException;

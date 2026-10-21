@@ -7,6 +7,236 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- [**breaking**] `encode::Producer::new` and `with_track` take a `moq_mux::catalog::Reserved` instead of the catalog, so a caller declares the encoder's GOP with `reserve().with_timeline_hint(gop)`.
+
+## [0.1.10](https://github.com/moq-dev/moq/compare/moq-video-v0.1.9...moq-video-v0.1.10) - 2026-10-05
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.1.9](https://github.com/moq-dev/moq/compare/moq-video-v0.1.8...moq-video-v0.1.9) - 2026-10-03
+
+### Added
+
+- *(video)* capture Windows displays and windows with WGC ([#4665](https://github.com/moq-dev/moq/pull/4665))
+
+## [0.1.8](https://github.com/moq-dev/moq/compare/moq-video-v0.1.7...moq-video-v0.1.8) - 2026-09-30
+
+### Fixed
+
+- *(video)* list V4L2 cameras once with PipeWire ([#4488](https://github.com/moq-dev/moq/pull/4488))
+- *(video)* guard portal sessions during negotiation ([#4492](https://github.com/moq-dev/moq/pull/4492))
+- *(video)* re-anchor native capture above its last timestamp ([#4418](https://github.com/moq-dev/moq/pull/4418))
+
+### Other
+
+- compile the Windows, macOS, and OBS plugin code on every PR ([#4370](https://github.com/moq-dev/moq/pull/4370))
+
+## [0.1.7](https://github.com/moq-dev/moq/compare/moq-video-v0.1.6...moq-video-v0.1.7) - 2026-09-27
+
+### Fixed
+
+- *(video)* keep the CUDA context alive until the NVDEC decoder is destroyed ([#4290](https://github.com/moq-dev/moq/pull/4290))
+
+## [0.1.6](https://github.com/moq-dev/moq/compare/moq-video-v0.1.5...moq-video-v0.1.6) - 2026-09-26
+
+### Added
+
+- *(moq-mux)* catalog delay measures cross-rendition encoder lateness ([#4170](https://github.com/moq-dev/moq/pull/4170))
+
+### Other
+
+- rename CLAUDE.md to AGENTS.md ([#4235](https://github.com/moq-dev/moq/pull/4235))
+
+## [0.1.5](https://github.com/moq-dev/moq/compare/moq-video-v0.1.4...moq-video-v0.1.5) - 2026-09-26
+
+### Fixed
+
+- *(nvenc)* commit rate changes and cleanup only once the driver accepts ([#4146](https://github.com/moq-dev/moq/pull/4146))
+
+## [0.1.4](https://github.com/moq-dev/moq/compare/moq-video-v0.1.3...moq-video-v0.1.4) - 2026-09-25
+
+### Other
+
+- *(capture)* drive native capture through clock edge cases in CI ([#4125](https://github.com/moq-dev/moq/pull/4125))
+
+## [0.1.3](https://github.com/moq-dev/moq/compare/moq-video-v0.1.2...moq-video-v0.1.3) - 2026-09-25
+
+### Added
+
+- *(mux)* measure encoder flush jitter per rendition ([#3940](https://github.com/moq-dev/moq/pull/3940))
+
+## [0.1.2](https://github.com/moq-dev/moq/compare/moq-video-v0.1.1...moq-video-v0.1.2) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, hang
+
+## [0.1.1](https://github.com/moq-dev/moq/compare/moq-video-v0.1.0...moq-video-v0.1.1) - 2026-09-24
+
+### Added
+
+- *(moq-video)* one VAAPI render node for encode, decode and resize ([#4023](https://github.com/moq-dev/moq/pull/4023))
+
+## [0.0.27](https://github.com/moq-dev/moq/compare/moq-video-v0.0.26...moq-video-v0.0.27) - 2026-09-23
+
+### Fixed
+
+- *(ci)* repair nightly builds hidden behind the first failure ([#3956](https://github.com/moq-dev/moq/pull/3956))
+
+## [0.0.26](https://github.com/moq-dev/moq/compare/moq-video-v0.0.25...moq-video-v0.0.26) - 2026-09-23
+
+### Added
+
+- *(video)* fork v4l in-tree with checked-in V4L2 bindings ([#3867](https://github.com/moq-dev/moq/pull/3867))
+- *(video)* GPU color conversion and NVENC for imported Vulkan frames ([#3869](https://github.com/moq-dev/moq/pull/3869))
+- *(video)* [**breaking**] type the group configuration and make cut fallible ([#3876](https://github.com/moq-dev/moq/pull/3876))
+- preserve video capture timing ([#3849](https://github.com/moq-dev/moq/pull/3849))
+- *(video)* import retained Vulkan images into CUDA ([#3836](https://github.com/moq-dev/moq/pull/3836))
+- *(net)* [**breaking**] simplify origin scoping ([#3804](https://github.com/moq-dev/moq/pull/3804))
+- *(hang)* [**breaking**] unify catalog APIs ([#3813](https://github.com/moq-dev/moq/pull/3813))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- *(net)* [**breaking**] announce prefixes on every wire; consumers read paths ([#3770](https://github.com/moq-dev/moq/pull/3770))
+- [**breaking**] borrow publisher finish so abort can still run ([#3714](https://github.com/moq-dev/moq/pull/3714))
+- *(hang)* [**breaking**] timelines only move forward ([#3711](https://github.com/moq-dev/moq/pull/3711))
+
+### Fixed
+
+- *(video)* compile the macOS capture backends after the Frame reshape ([#3877](https://github.com/moq-dev/moq/pull/3877))
+- *(nvenc)* [**breaking**] make driver loading fallible ([#3838](https://github.com/moq-dev/moq/pull/3838))
+- *(video)* convert CUDA device UUID bytes portably ([#3861](https://github.com/moq-dev/moq/pull/3861))
+- *(nvenc)* [**breaking**] retain resources through completion ([#3835](https://github.com/moq-dev/moq/pull/3835))
+- *(video)* [**breaking**] confine synchronous codecs to their thread ([#3837](https://github.com/moq-dev/moq/pull/3837))
+- *(moq-audio,moq-video)* build capture and Android again, and gate both on PRs ([#3850](https://github.com/moq-dev/moq/pull/3850))
+- *(net)* drop origin source track when last reader leaves
+
+### Other
+
+- *(rs)* read constant-size chunks with as_chunks ([#3899](https://github.com/moq-dev/moq/pull/3899))
+- *(deps)* bump the cargo group with 3 updates ([#3905](https://github.com/moq-dev/moq/pull/3905))
+- *(video)* validate the GPU conversion and NVENC path on NVIDIA hardware ([#3890](https://github.com/moq-dev/moq/pull/3890))
+- *(quest)* complete the media release review ([#3878](https://github.com/moq-dev/moq/pull/3878))
+- *(video)* [**breaking**] separate decoder output from subscription policy ([#3875](https://github.com/moq-dev/moq/pull/3875))
+- Unify mux track and rendition ownership ([#3857](https://github.com/moq-dev/moq/pull/3857))
+- Make media backends optional ([#3839](https://github.com/moq-dev/moq/pull/3839))
+- *(video)* [**breaking**] type frame conversions ([#3846](https://github.com/moq-dev/moq/pull/3846))
+- *(mux)* [**breaking**] share media rate policy ([#3840](https://github.com/moq-dev/moq/pull/3840))
+- *(net)* [**breaking**] return the next deadline from driver polls ([#3828](https://github.com/moq-dev/moq/pull/3828))
+- *(net)* [**breaking**] drive time and cache cleanup explicitly ([#3825](https://github.com/moq-dev/moq/pull/3825))
+- Merge origin/main into dev
+- Merge remote-tracking branch 'origin/main' into merge-main-into-dev-20260914
+
+### Added
+
+- Import retained Vulkan RGBA8 slots into CUDA with explicit timeline synchronization.
+- `frame::cuda::Converter` converts imported Vulkan RGBA8/BGRA8 frames to NV12 on the GPU from a
+  bounded buffer pool, and `cuda::Frame::resize` scales them there; `vulkan::Image::bgra8` declares
+  the other channel order.
+
+### Changed
+
+- [**breaking**] OpenH264 is now the default `openh264` feature, rendering is
+  opt-in, and the deprecated `nvenc` and `nvdec` feature aliases are removed.
+- [**breaking**] `encode::Producer::finish` borrows (`&mut self`) instead of consuming, so a later
+  `abort(self)` can still run after a clean end.
+- [**breaking**] Frame resize and RGB/BGRA conversion each have one configured
+  operation: `resize(size, config)`, `to_rgba(config)`, and `to_bgra(config)`.
+- [**breaking**] `Surface::into_i420` returns typed `I420`, preserving its size,
+  color, and allocation. Use `I420::into_data` to extract packed bytes.
+- [**breaking**] `I420::new` and `I420::len` take `Size`; `Frame` and
+  `encode::Encoded` are non-exhaustive and remain constructible through `new`.
+- [**breaking**] `decode::Config` describes only the decoder: `kind`, a
+  native-or-CPU `output`, and a best-effort `scale_hint`. `decode::Consumer`
+  takes `decode::Options`, which carries the subscription's `start` and
+  `max_age` beside the decoder config. `gpu_frames` and
+  `resize::Acceleration` are replaced by `moq_video::Output`, which
+  `resize::Config::output` shares.
+- [**breaking**] `encode::Config::gop` is the non-exhaustive `encode::Gop`
+  enum (`Gop::Keyframe { interval }`, `Gop::keyframe_every(duration, rate)`)
+  instead of a bare `u32`; an interval of 0 is refused with `Error::InvalidGop`.
+- [**breaking**] `Encoder::keyframe` and `Sink::keyframe` are `cut()` and
+  return `Result`; a backend that cannot force a group boundary refuses at
+  open with `Error::CutUnsupported`.
+- [**breaking**] Frame rates are the reduced rational `moq_video::Rate`
+  (`encode::Config::new(width, height, rate)`, `capture::Config::framerate`),
+  and capture reads return timestamped `Frame`s stamped before queue
+  replacement rather than bare `Surface`s.
+- [**breaking**] `encode::rate::{Policy, Control}` moved to `moq_mux::rate`.
+- [**breaking**] The synchronous `encode::Encoder` and `decode::Decoder` are
+  `!Send` and `!Sync`; the async `Sink` and `Consumer` stay `Send` and own
+  codec execution.
+- [**breaking**] `RateError` is non-exhaustive.
+
+## [0.0.25](https://github.com/moq-dev/moq/compare/moq-video-v0.0.24...moq-video-v0.0.25) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, hang
+
+## [0.0.24](https://github.com/moq-dev/moq/compare/moq-video-v0.0.23...moq-video-v0.0.24) - 2026-09-13
+
+### Added
+
+- *(moq-video)* convert a surface by reference, and to BGRA ([#3593](https://github.com/moq-dev/moq/pull/3593))
+- *(moq-video)* list the modes a V4L2 camera reports ([#3569](https://github.com/moq-dev/moq/pull/3569))
+
+### Fixed
+
+- *(moq-video)* cap NVENC keyframes with a single-frame VBV ([#3609](https://github.com/moq-dev/moq/pull/3609))
+- *(moq-video)* report backend selection, and name every backend publicly ([#3567](https://github.com/moq-dev/moq/pull/3567))
+- *(moq-video)* stop a dead codec session and a failed flush from spinning a reader ([#3568](https://github.com/moq-dev/moq/pull/3568))
+- *(moq-video,moq-audio)* open a decoder at the live edge ([#3565](https://github.com/moq-dev/moq/pull/3565))
+
+### Other
+
+- *(moq-video)* decode H.264 bitstreams this crate did not produce ([#3570](https://github.com/moq-dev/moq/pull/3570))
+
+### Added
+
+- *(moq-video)* `Surface::to_bgra` and `to_bgra_with`, the same conversion as
+  `to_rgba` with red and blue exchanged, for the toolkits that want that order
+- *(moq-video)* `Surface::to_rgba` and `to_rgba_with`, which borrow the surface
+  where `into_rgba` consumed it
+- *(moq-video)* `Surface::to_i420` is public, the borrowing counterpart to
+  `into_i420`
+
+### Fixed
+
+- `encode::Producer` carries a rendition's `label` into the catalog. It copied the config into hints
+  field by field and had no case for the new field.
+
+## [0.0.23](https://github.com/moq-dev/moq/compare/moq-video-v0.0.22...moq-video-v0.0.23) - 2026-09-09
+
+### Added
+
+- *(moq-video)* add the VAAPI H.264 decoder and import its pictures zero-copy ([#3331](https://github.com/moq-dev/moq/pull/3331))
+- *(moq-video)* add the Android MediaCodec encoder and decoder ([#3354](https://github.com/moq-dev/moq/pull/3354))
+- *(moq-video)* add the V4L2 stateful M2M hardware encoder and decoder ([#3332](https://github.com/moq-dev/moq/pull/3332))
+- *(audio,video)* compile the device, render, and VAAPI code by default ([#3353](https://github.com/moq-dev/moq/pull/3353))
+
+### Fixed
+
+- *(moq-video)* pick the V4L2 mode nearest the requested resolution ([#3355](https://github.com/moq-dev/moq/pull/3355))
+- *(moq-video)* stop openh264 leaking its picture pool, and survive a lost picture ([#3357](https://github.com/moq-dev/moq/pull/3357))
+- *(rs)* compile the lib tests at --no-default-features ([#3397](https://github.com/moq-dev/moq/pull/3397))
+- *(moq-audio)* treat a media gap as a hole rather than a splice ([#3386](https://github.com/moq-dev/moq/pull/3386))
+- *(moq-video)* end the stream when an AVFoundation camera goes away ([#3382](https://github.com/moq-dev/moq/pull/3382))
+- *(moq-video)* decode an avc1 track with no avcC as Annex-B ([#3388](https://github.com/moq-dev/moq/pull/3388))
+- *(video)* hold window capture through a minimize and settle a resize ([#3374](https://github.com/moq-dev/moq/pull/3374))
+- *(moq-video)* name the libspa transfer functions older headers lack ([#3387](https://github.com/moq-dev/moq/pull/3387))
+- *(moq-video)* print GPU-composited windows instead of copying a black DC ([#3370](https://github.com/moq-dev/moq/pull/3370))
+- *(moq-video)* compile the Windows test target, and gate it nightly ([#3391](https://github.com/moq-dev/moq/pull/3391))
+- *(moq-video)* end X11 window capture when the window is destroyed ([#3383](https://github.com/moq-dev/moq/pull/3383))
+
+### Other
+
+- make the agent guides minimal and situational ([#3469](https://github.com/moq-dev/moq/pull/3469))
+- take every feature that needs a library or libclang at build time off the defaults ([#3464](https://github.com/moq-dev/moq/pull/3464))
+- *(moq-audio,moq-cli)* assert publish_capture stays Send off macOS ([#3433](https://github.com/moq-dev/moq/pull/3433))
+
 ## [0.0.22](https://github.com/moq-dev/moq/compare/moq-video-v0.0.21...moq-video-v0.0.22) - 2026-09-02
 
 ### Fixed

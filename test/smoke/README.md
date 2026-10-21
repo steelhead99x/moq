@@ -1,90 +1,65 @@
-# In-tree smoke test
+# moq smoke
 
-Cross-language interop smoke test that builds every client from **this checkout**
-and runs them against each other.
+### [Latest smoke results](https://moq-dev.github.io/moq/relays/)
 
-This is the in-tree companion to [moq-dev/smoke](https://github.com/moq-dev/smoke).
-That repo installs each client from its public package registry (crates.io, PyPI,
-npm, ...) to catch *packaging* breakage in a release. This one builds each client
-from the workspace source (`cargo`, `bun`, `uv`, `cc`) to catch *interop*
-regressions before anything is published. No apt/brew/npm/PyPI, and no
-distribution-mechanism matrix.
+Nightly publish/subscribe results for the published clients through public MoQ relays. One row per relay, sorted by name ignoring case, with a passing pair count per transport (WebTransport, QUIC, WebSocket). An empty cell means that relay has no endpoint there. Hover a count for the failure, click it for the logs. The page keeps the last 60 runs and updates from `main`.
 
-It stands up a `moq-relay`, then for each publisher language publishes an H.264
-broadcast and confirms every subscriber sees data flowing before the timeout.
-Most subscribers check for a non-empty frame. The browser additionally verifies
-WebCodecs output painted to a canvas and drives the player's pause/resume controls.
-The browser publisher also sends fake microphone audio, which the browser
-subscriber checks end-to-end.
+This suite installs the published moq packages and checks that they exchange media. [`test/interop`](../interop) is its in-tree companion: it builds each client from this checkout instead, to catch interop regressions before anything is published. A missing wheel, a stale Homebrew formula, a broken `.deb`, or an export lost in packaging shows up as a red cell. A cell passes when the subscriber receives a non-empty frame.
+
+## Lanes
+
+| Lane | Run | Coverage |
+| --- | --- | --- |
+| Packages | `just smoke`, `just full` | Published clients through a local `moq-relay`. `smoke` is Rust only. `full` is the cross-language matrix. |
+| Public relays | `just relays` | Rust publisher and subscriber through every relay in the [moq-interop-runner](https://github.com/englishm/moq-interop-runner) registry. CI publishes with Rust and the browser (`js-web`) and subscribes with Rust, `js-web`, and `js-bun`. On those relays `js-web` and `js-bun` run only on WebTransport (`@moq/web-transport` has no raw QUIC mode); a client that does not belong is omitted. WebSocket is its own column for the relays in `WEBSOCKET_KEYS` (`moq-dev-rs`): each of their `http(s)` endpoints also runs as `ws(s)`, and every other relay keeps that fallback off. A relay that refuses anonymous root broadcasts is dialed on the path `publish_path` names (`stitcher-moq` publishes under `/moq-test`). That run is what the [results page](https://moq-dev.github.io/moq/relays/) shows. Only `--required` relays fail the run; the default is moq-dev's `cdn.moq.dev`, including its WebSocket endpoint. |
+| Cloudflare | `just cloudflare` | Relays built from the default branches of [cloudflare/moq-rs](https://github.com/cloudflare/moq-rs) and moq-dev/moq, driven by a Cloudflare client over WebTransport and raw QUIC. |
+| moxygen | `just moxygen` | Meta's [`moxygen`](https://github.com/facebookexperimental/moxygen) interop client through the latest moq-dev relay. Needs Linux Docker. |
+| Tokens | `just token`, `just token-full` | `moq auth` and npm [`@moq/auth`](https://www.npmjs.com/package/@moq/auth) mint and verify each other's JWTs, and each verifier rejects a tampered token. |
+
+Hang media, Cloudflare, and moxygen each have their own lane.
+
+CI runs the matrix nightly and on pull requests that touch `test/smoke/`: [`.github/workflows/smoke.yml`](../../.github/workflows/smoke.yml).
 
 ## Clients
 
-| Client | Source under test | Built with | Roles |
-|---|---|---|---|
-| Rust | `rs/moq-relay` + `rs/moq-cli` | `cargo build` | publish + subscribe |
-| Python | `py/moq-rs` (+ `rs/moq-ffi`, import `moq`) | `just py build` (maturin editable into `.venv`) | publish + subscribe |
-| Browser | `js/watch` + `js/publish` | `vite build` + headless Chromium (Playwright) | audio/video publish + rendered playback |
-| Native JS | `js/net` + `js/hang` + the npm `@moq/web-transport` polyfill | `node` (tsx) and `bun` | subscribe |
-| C | `rs/libmoq` | `cargo build -p libmoq` + `cc` | subscribe |
-| GStreamer | `rs/moq-gst` (`moqsrc`) | `cargo build -p moq-gst` + `gst-launch-1.0` | subscribe |
+`moq-relay` and `moq` come from `PATH` or from `RELAY_BIN` and `MOQ_BIN`. Every other client installs from its registry on each run.
 
-The browser, native JS, C, and GStreamer clients subscribe only by choice
-(publishing media needs an encoder the native JS runtimes lack, the C client is
-intentionally minimal, and `moqsink` publishing needs request-pad muxing this
-client doesn't drive). Rust, Python, and the browser publish.
+| Client | Role | Install |
+| --- | --- | --- |
+| Rust | publish, subscribe | cargo, Homebrew, apt, `nix build github:moq-dev/moq`, or [`moqdev/*`](https://hub.docker.com/u/moqdev) images |
+| Python | publish, subscribe | PyPI [`moq-rs`](https://pypi.org/project/moq-rs/) |
+| Go | publish, subscribe | [`moq.dev/moq`](https://pkg.go.dev/moq.dev/moq) |
+| Browser | publish, subscribe | npm [`@moq/watch`](https://www.npmjs.com/package/@moq/watch) + [`@moq/publish`](https://www.npmjs.com/package/@moq/publish), via vite, esbuild, or [jsDelivr](https://www.jsdelivr.com/) |
+| Native JS | subscribe | npm [`@moq/net`](https://www.npmjs.com/package/@moq/net) + [`@moq/hang`](https://www.npmjs.com/package/@moq/hang) under node and bun |
+| Swift | subscribe | SPM [`moq-dev/moq-swift`](https://github.com/moq-dev/moq-swift), macOS |
+| Kotlin | subscribe | Maven Central [`dev.moq:moq`](https://central.sonatype.com/artifact/dev.moq/moq) |
+| C | subscribe | [`libmoq`](https://github.com/moq-dev/moq/releases) release tarball, linked by hand, pkg-config, or CMake |
+| GStreamer | subscribe | [`moq-gst`](https://github.com/moq-dev/moq/releases?q=moq-gst) plugin against system GStreamer |
 
-The GStreamer client builds the `moqsrc` plugin from `rs/moq-gst` and points
-`GST_PLUGIN_PATH` at it, then reads a broadcast with
-`gst-launch-1.0 moqsrc ... ! filesink`. The plugin dynamic-links the host's
-GStreamer, so this cell needs `gst-launch-1.0` + the core plugins on the system.
-The `nix develop` shell ships them; a bare shell without GStreamer marks the cell
-unavailable rather than failing it.
+## Run
 
-The `@moq/web-transport` polyfill is the one dependency that comes from npm rather
-than this checkout: it's a prebuilt NAPI QUIC/HTTP3 addon, not part of the moq
-source tree. Everything else (`@moq/net`, `@moq/hang`, ...) resolves to the
-workspace packages, because the JS clients here are bun workspace members.
-
-## Running locally
-
-You need the workspace toolchain on `PATH` (cargo, ffmpeg, bun, uv, a C
-compiler). `nix develop` provides all of it except Playwright's Chromium, which
-`smoke.sh` fetches on first run (`bunx playwright install chromium`).
+This directory's own Nix flake carries the client toolchains, separate from moq's (direnv loads `.envrc` here). Put `moq-relay` and `moq` on `PATH` (cargo, Homebrew, or apt) before the lanes below.
 
 ```bash
-# Default: rust publishes, rust subscribes (a fast sanity check).
-just test smoke
-
-# Full matrix: rust/python/browser publish; everyone subscribes.
-just test smoke-full
-
-# Pick your own axes:
-just test smoke --publishers rust,python --subscribers rust,c,js-native-bun
-
-# Negative control: no publisher, every subscriber must time out.
-just test smoke-negative
+cd test/smoke
+nix develop
+cargo install moq-relay moq-cli   # or brew / apt
+just full
+just relays
+just cloudflare
+just moxygen
+just token
+just check    # shfmt, shellcheck, actionlint, freshness
 ```
 
-Subscriber names: `rust`, `python`, `js` (browser), `js-native-node`,
-`js-native-bun`, `c`, `gst`. Publisher names: `rust`, `python`, `js`.
+`just nix-channel` is a run, not an install. It builds `github:moq-dev/moq#moq-relay` and `#moq` with `nix build --refresh --no-link`, then runs `smoke.sh` with `RELAY_BIN` and `MOQ_BIN` pointed at those outputs. Nothing is left on `PATH`, so a later `just full` does not see those binaries. The Docker images work the same way: point `RELAY_BIN` and `MOQ_BIN` at the wrappers in [`clients/docker`](clients/docker). Those wrappers are not an install.
 
-A client whose source build fails fails only its own matrix cells (see
-`mark_broken` in `smoke.sh`); it never aborts the rest of the run.
+`just check` lints the harness. Run the lane you changed.
 
-## Layout
+## Versions
 
-```text
-smoke.sh                  orchestrator: build clients, run the relay + matrix
-smoke.toml                relay config (anonymous, self-signed localhost)
-clients/
-  python/smoke.py         publish/subscribe via py/moq-rs (import moq)
-  js/                      headless-Chromium publish/subscribe via @moq/watch + @moq/publish
-  js-native/subscribe.ts  subscribe via @moq/net + @moq/hang + the WebTransport polyfill
-  c/subscribe.c           subscribe via rs/libmoq
-```
+Packages resolve to latest on every run: `@moq/*` on the `latest` tag, PyPI `moq-rs`, `moq.dev/moq`, `moqdev/*` images, and GitHub release tarballs. `cloudflare.sh` and `moxygen.sh` build from unpinned Git HEAD. `test/smoke/` commits no package lock files. `flake.lock` pins the dev toolchain.
 
-## CI
+npm `playwright` is pinned to the flake's `PLAYWRIGHT_VERSION`. `just freshness` fails when that pin drifts or a lock file is committed. Bump the toolchain with `nix flake update` and the pin together.
 
-`.github/workflows/smoke.yml` runs the full matrix nightly (and on demand, and on
-PRs that touch `test/smoke/`). A red cell means a real interop break in the
-current tree.
+A broken package fails only its own cells.

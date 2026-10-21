@@ -1,19 +1,26 @@
 /**
  * Lossy latest-value JSON publishing over MoQ tracks.
  *
- * One JSON value updated over time, for consumers that only care about the current state (a
- * catalog, a status document). This mode is **lossy** by design: a consumer yields only the most
- * recent value. A late joiner (or a consumer that falls behind) jumps straight to the newest
- * group and collapses any buffered backlog into a single yield, and older groups are dropped
- * entirely. Intermediate updates are never replayed. For an ordered log where every record is
- * preserved, use the `Stream` module instead.
+ * One JSON value updated over time, for consumers that care about the state rather than every
+ * record (a catalog, a status document). This mode is **lossy** by design: a new group supersedes
+ * the older ones, which are dropped. {@link Consumer.next} yields every state it still receives,
+ * in order, each with its frame's timestamp, for a caller that picks the state at a playhead.
+ * {@link Consumer.latest} jumps straight to the newest group and collapses any buffered backlog
+ * into a single yield, for a caller that only wants the current value. For an ordered log where
+ * every record is preserved, use the `Stream` module instead.
  *
  * On the wire the value is a series of self-contained groups: frame 0 is a full snapshot and any
  * following frames are RFC 7396 JSON Merge Patch deltas applied in order. Interoperable with the
  * Rust `moq_json::snapshot`.
  *
- * {@link Producer} and {@link Consumer} own a track: hand one a track and it manages the groups for
- * you. {@link Encoder} and {@link Decoder} are the same logic without the track. The encoder turns
+ * The encoder rolls a group on its own budget, but a caller can roll one for its own reasons with
+ * {@link Producer.cut}: it closes the open group and leaves the next update to open the replacement
+ * with a full snapshot, so the deltas already written stop being provisional without publishing an
+ * empty group.
+ *
+ * {@link Producer} and {@link Consumer} own a track: pass a {@link Producer.Config} /
+ * {@link Consumer.Config} (`{ track, ... }`) and they manage the groups
+ * for you. {@link Encoder} and {@link Decoder} are the same logic without the track. The encoder turns
  * values into {@link Encoded} frame payloads and says where the group boundaries fall; the decoder
  * reconstructs a value from those payloads. Reach for them when something else is already in charge
  * of the track.
@@ -26,7 +33,8 @@
  * @module
  */
 
+export { MissingSnapshot } from "../error.ts";
 export { Consumer } from "./consumer.ts";
 export { Decoder } from "./decoder.ts";
 export { type Config, type Encoded, Encoder, type Pending } from "./encoder.ts";
-export { Producer, type ProducerConfig } from "./producer.ts";
+export { Producer } from "./producer.ts";

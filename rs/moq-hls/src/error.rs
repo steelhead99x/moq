@@ -39,13 +39,17 @@ pub enum Error {
 	#[error("mux: {0}")]
 	Mux(#[from] moq_mux::Error),
 
-	/// The playlist argument looked like an HTTP(S) URL but failed to parse.
-	#[error("invalid playlist URL")]
-	InvalidPlaylistUrl,
+	/// History mode found no first group on this timeline, as in a retained (DVR) recording.
+	#[error("history needs timeline {0} from its first group; retained recordings are not supported")]
+	HistoryPruned(String),
 
-	/// The playlist argument was a local path that could not be made into a `file://` URL.
-	#[error("invalid file path")]
-	InvalidFilePath,
+	/// A range playlist was requested from a timeline whose media is not durable.
+	#[error("range playlists require a durable timeline")]
+	RangeNotDurable,
+
+	/// A requested range is invalid or no longer fully retained.
+	#[error("requested range is unavailable: {0}")]
+	RangeUnavailable(String),
 
 	/// A `file://` URL could not be turned back into a filesystem path.
 	#[error("invalid file URL")]
@@ -116,6 +120,10 @@ pub enum Error {
 		value: u64,
 	},
 
+	/// An export generation had characters a URL path segment can't carry verbatim.
+	#[error("invalid generation {0:?}: expected ASCII letters, digits, '-', or '_'")]
+	InvalidGeneration(String),
+
 	/// A playlist or segment URI could not be resolved against its base.
 	#[error("url parse: {0}")]
 	UrlParse(#[from] url::ParseError),
@@ -127,10 +135,6 @@ pub enum Error {
 	/// I/O error while reading a local playlist or segment.
 	#[error("io: {0}")]
 	Io(std::sync::Arc<std::io::Error>),
-
-	/// Catch-all for gateway logic that reports via `anyhow`.
-	#[error("{0}")]
-	Other(std::sync::Arc<anyhow::Error>),
 }
 
 impl Error {
@@ -149,19 +153,15 @@ impl Error {
 
 impl From<reqwest::Error> for Error {
 	fn from(err: reqwest::Error) -> Self {
-		Error::Reqwest(std::sync::Arc::new(err))
+		// reqwest prints the full URL in its error, and a playlist or segment URL
+		// routinely carries a signed token in its query.
+		Error::Reqwest(std::sync::Arc::new(err.without_url()))
 	}
 }
 
 impl From<std::io::Error> for Error {
 	fn from(err: std::io::Error) -> Self {
 		Error::Io(std::sync::Arc::new(err))
-	}
-}
-
-impl From<anyhow::Error> for Error {
-	fn from(err: anyhow::Error) -> Self {
-		Error::Other(std::sync::Arc::new(err))
 	}
 }
 
@@ -179,5 +179,23 @@ mod tests {
 		assert_eq!(Error::NoVariants.status(), None);
 		assert_eq!(Error::ParsePlaylist("not a playlist".to_string()).status(), None);
 		assert_eq!(Error::Moq(moq_net::Error::Transport("lost".to_string())).status(), None);
+	}
+
+	#[tokio::test]
+	async fn http_error_redacts_url() {
+		// A freed port refuses the connection, so reqwest fails with the dialed URL attached.
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+		let address = listener.local_addr().expect("local address");
+		drop(listener);
+
+		let err: Error = reqwest::get(format!("http://user:pass@{address}/media.m3u8?jwt=secret"))
+			.await
+			.expect_err("dial a closed port")
+			.into();
+
+		let printed = format!("{err} {err:?}");
+		for secret in ["jwt", "secret", "user:pass"] {
+			assert!(!printed.contains(secret), "error leaked {secret}: {printed}");
+		}
 	}
 }

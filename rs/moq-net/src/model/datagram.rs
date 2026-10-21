@@ -3,15 +3,18 @@
 //! Unlike a group (an ordered stream of frames over a QUIC stream), a datagram is one self-contained
 //! payload carried in a single QUIC datagram: best-effort, unordered, and never retransmitted. It
 //! shares the track's monotonic sequence-number namespace with groups but is otherwise independent,
-//! produced via [`super::track::Producer::append_datagram`] / [`super::track::Producer::write_datagram`]
+//! produced via [`super::track::Producer::append_datagram`] / [`super::track::Producer::insert_datagram`]
 //! and consumed via [`super::track::Subscriber::recv_datagram`].
 //!
 //! Delivery is best-effort per hop: a session drops (with a debug log) any datagram whose encoded
 //! body exceeds the transport's datagram size, and sessions that can't carry datagrams at all
-//! (IETF moq-transport, moq-lite before 05, or stream-only transports like WebSocket) never
-//! deliver them.
+//! (moq-lite before 05, or stream-only transports like WebSocket) never deliver them.
 //!
-//! Wire counterpart: [`crate::lite::Datagram`].
+//! A datagram is never cached or served by a fetch. Only the short per-track send buffer holds
+//! it, which a new subscription may still read.
+//!
+//! Wire counterparts: [`crate::lite::Datagram`], and on moq-transport an OBJECT_DATAGRAM at
+//! object 0 whose Group ID is the sequence ([`crate::ietf::ObjectDatagram`]).
 
 use bytes::Bytes;
 
@@ -23,18 +26,48 @@ use crate::Timestamp;
 /// encoded body exceeds the transport's current datagram size (roughly the path MTU minus QUIC
 /// and MoQ header overhead), so callers should keep payloads well below the minimum path MTU
 /// of 1200 bytes (e.g. a single audio frame).
-pub(crate) const MAX_DATAGRAM_PAYLOAD: usize = u16::MAX as usize;
+pub(super) const MAX_DATAGRAM_PAYLOAD: usize = u16::MAX as usize;
 
-/// A single unreliable payload on a track: a sequence number, a presentation timestamp, and the bytes.
+/// A single unreliable payload on a track: a sequence number, an optional presentation timestamp, and the bytes.
 ///
 /// The sequence number is drawn from the same namespace as the track's groups, so a relay can forward
-/// a datagram while preserving the origin's numbering (see [`super::track::Producer::write_datagram`]).
+/// a datagram while preserving the origin's numbering (see [`super::track::Producer::insert_datagram`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Datagram {
 	/// Per-track sequence number, shared with the group namespace.
 	pub sequence: u64,
-	/// Presentation timestamp in the track's timescale.
-	pub timestamp: Timestamp,
+	/// Presentation timestamp in the track's timescale, or `None` when untimed.
+	pub timestamp: Option<Timestamp>,
 	/// The datagram payload.
 	pub payload: Bytes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+// private: passthrough
+pub(crate) struct Wire {
+	pub object_id: Option<u64>,
+	pub priority: Option<u8>,
+	pub end_of_group: bool,
+	pub status: Option<u64>,
+	pub properties: super::object::Properties,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+// private: passthrough
+pub(crate) struct Stored {
+	pub datagram: Datagram,
+	pub wire: Option<std::sync::Arc<Wire>>,
+}
+
+impl From<Datagram> for Stored {
+	fn from(datagram: Datagram) -> Self {
+		Self { datagram, wire: None }
+	}
+}
+
+impl std::ops::Deref for Stored {
+	type Target = Datagram;
+	fn deref(&self) -> &Datagram {
+		&self.datagram
+	}
 }

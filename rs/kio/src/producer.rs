@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
 	Closed, Counts, State,
-	consumer::Consumer,
+	consumer::{self, Consumer},
 	lock::*,
 	sync::Arc,
 	waiter::*,
@@ -35,6 +35,21 @@ impl<T: Default> Default for Producer<T> {
 }
 
 impl<T> Producer<T> {
+	/// Heap bytes this channel occupies, for callers budgeting memory per channel.
+	///
+	/// A channel owns two allocations regardless of how it is used: the state cell
+	/// holding `T`, its mutex and the three waiter lists, plus the reference counts
+	/// beside it. Both are sized at compile time, so a caller charging per channel can
+	/// derive its constant from this rather than measuring a process and pasting the
+	/// number.
+	///
+	/// [`Consumer`] has no counterpart because it shares these same two allocations:
+	/// [`consume`](Self::consume) hands back two more pointers and bumps a count, so a
+	/// channel costs this whether it has one consumer or a thousand.
+	///
+	/// Excludes whatever `T` allocates on its own.
+	pub const HEAP: usize = crate::arc_heap::<crate::sync::Mutex<State<T>>>() + crate::arc_heap::<Counts>();
+
 	/// Create a new producer with the given initial value.
 	pub fn new(value: T) -> Self {
 		Self {
@@ -45,18 +60,36 @@ impl<T> Producer<T> {
 
 	/// Create a new [`Consumer`] that shares this producer's state.
 	pub fn consume(&self) -> Consumer<T> {
-		let prev = self.counts.consumers.fetch_add(1, Ordering::AcqRel);
+		consumer::consume(&self.state, &self.counts)
+	}
 
-		// Wake `used()` waiters when the first consumer appears.
-		if prev == 0 {
-			let mut waiters = self.state.lock().waiters_consumer.take();
-			waiters.wake();
+	/// Acquire mutable access only while nothing is consuming the channel.
+	///
+	/// The count is read under the lock [`consume`](Self::consume) takes when
+	/// demand is zero, so the returned guard keeps the channel unused until it
+	/// drops. That is what a teardown decided by [`poll_unused`](Self::poll_unused)
+	/// needs: the poll is a level snapshot, so committing on it directly can cancel
+	/// a consumer that appeared in the gap. Commit through this instead, and take
+	/// [`Unused::Used`] as "a consumer got there first, keep going".
+	///
+	/// Pair it with [`ProducerWeak::try_consume`], which refuses to mint a consumer for
+	/// a closed channel: between the two, a consumer either exists in time to
+	/// decline the teardown or is never handed out at all.
+	pub fn write_unused(&self) -> Unused<'_, T> {
+		let state = self.state.lock();
+		if state.closed {
+			return Unused::Closed;
 		}
 
-		Consumer {
-			state: self.state.clone(),
-			counts: self.counts.clone(),
+		// Relaxed is enough: a zero-to-one increment happens under this lock.
+		// Further increments cannot pass through zero. A decrement runs outside
+		// it, so this may still read a consumer that is going away, which only
+		// declines a teardown that the next `unused` wake will offer again.
+		if self.counts.consumers.load(Ordering::Relaxed) > 0 {
+			return Unused::Used;
 		}
+
+		Unused::Idle(Mut::new(state))
 	}
 
 	/// Close the channel, notifying all consumers.
@@ -91,19 +124,20 @@ impl<T> Producer<T> {
 	/// while pending.
 	///
 	/// Returns `Poll::Ready(Err(`[`Ref`]`))` if the channel is closed.
-	pub fn poll<F>(&self, waiter: &Waiter, mut f: F) -> Poll<Result<Mut<'_, T>, Ref<'_, T>>>
+	#[cfg_attr(feature = "sim", track_caller)]
+	pub fn poll<F>(&self, waiter: &Waiter, f: F) -> Poll<Result<Mut<'_, T>, Ref<'_, T>>>
 	where
-		F: FnMut(&Ref<'_, T>) -> Poll<()>,
+		F: FnOnce(&Ref<'_, T>) -> Poll<()>,
 	{
 		let state = self.state.lock();
 		if state.closed {
-			return Poll::Ready(Err(Ref { state }));
+			return crate::coop::ready(Err(Ref { state }));
 		}
 
 		let mut guard = Ref { state };
 		match f(&guard) {
 			// Upgrade the Ref to a Mut, keeping the same lock guard.
-			Poll::Ready(()) => Poll::Ready(Ok(Mut::new(guard.state))),
+			Poll::Ready(()) => crate::coop::ready(Ok(Mut::new(guard.state))),
 			Poll::Pending => {
 				waiter.register(&mut guard.state.waiters_value);
 				Poll::Pending
@@ -117,19 +151,20 @@ impl<T> Producer<T> {
 	/// [`Mut`], so it never flags the state modified and never wakes consumers.
 	/// Use it to wait on a read condition from the producer side without creating
 	/// a [`Consumer`].
-	pub fn poll_ref<F, R>(&self, waiter: &Waiter, mut f: F) -> Poll<Result<R, Ref<'_, T>>>
+	#[cfg_attr(feature = "sim", track_caller)]
+	pub fn poll_ref<F, R>(&self, waiter: &Waiter, f: F) -> Poll<Result<R, Ref<'_, T>>>
 	where
-		F: FnMut(&Ref<'_, T>) -> Poll<R>,
+		F: FnOnce(&Ref<'_, T>) -> Poll<R>,
 	{
 		let state = self.state.lock();
 		let mut guard = Ref { state };
 
 		if let Poll::Ready(res) = f(&guard) {
-			return Poll::Ready(Ok(res));
+			return crate::coop::ready(Ok(res));
 		}
 
 		if guard.state.closed {
-			return Poll::Ready(Err(guard));
+			return crate::coop::ready(Err(guard));
 		}
 
 		waiter.register(&mut guard.state.waiters_value);
@@ -158,10 +193,11 @@ impl<T> Producer<T> {
 
 	/// Poll for channel closure (an explicit [`Mut::close`], e.g. an abort),
 	/// registering the waiter if still open.
+	#[cfg_attr(feature = "sim", track_caller)]
 	pub fn poll_closed(&self, waiter: &Waiter) -> Poll<()> {
 		let mut state = self.state.lock();
 		if state.closed {
-			return Poll::Ready(());
+			return crate::coop::ready(());
 		}
 
 		waiter.register(&mut state.waiters_closed);
@@ -172,22 +208,20 @@ impl<T> Producer<T> {
 	///
 	/// Returns `Ok(())` when no consumers remain, or [`Closed`] if the channel closes first.
 	pub async fn unused(&self) -> Result<(), Closed> {
-		match crate::wait(move |waiter| self.poll_unused(waiter)).await {
-			Some(()) => Ok(()),
-			None => Err(Closed),
-		}
+		crate::wait(move |waiter| self.poll_unused(waiter)).await
 	}
 
-	/// Poll-based variant of [`Self::unused`]: `Ready(Some(()))` when no consumers
-	/// remain, `Ready(None)` if the channel closed first, else `Pending`.
-	pub fn poll_unused(&self, waiter: &Waiter) -> Poll<Option<()>> {
+	/// Poll-based variant of [`Self::unused`]: `Ready(Ok(()))` when no consumers
+	/// remain, [`Closed`] if the channel closed first, else `Pending`.
+	#[cfg_attr(feature = "sim", track_caller)]
+	pub fn poll_unused(&self, waiter: &Waiter) -> Poll<Result<(), Closed>> {
 		let mut state = self.state.lock();
 		if state.closed {
-			return Poll::Ready(None);
+			return crate::coop::ready(Err(Closed));
 		}
 
 		if self.counts.consumers.load(Ordering::Relaxed) == 0 {
-			return Poll::Ready(Some(()));
+			return crate::coop::ready(Ok(()));
 		}
 
 		waiter.register(&mut state.waiters_consumer);
@@ -195,7 +229,7 @@ impl<T> Producer<T> {
 		// Re-check after registration to avoid TOCTOU race where the last
 		// consumer drops between the initial check and waiter registration.
 		if self.counts.consumers.load(Ordering::Relaxed) == 0 {
-			return Poll::Ready(Some(()));
+			return crate::coop::ready(Ok(()));
 		}
 
 		Poll::Pending
@@ -213,22 +247,20 @@ impl<T> Producer<T> {
 	///
 	/// Returns `Ok(())` when a consumer is created, or [`Closed`] if the channel closes first.
 	pub async fn used(&self) -> Result<(), Closed> {
-		match crate::wait(move |waiter| self.poll_used(waiter)).await {
-			Some(()) => Ok(()),
-			None => Err(Closed),
-		}
+		crate::wait(move |waiter| self.poll_used(waiter)).await
 	}
 
-	/// Poll-based variant of [`Self::used`]: `Ready(Some(()))` once a consumer
-	/// exists, `Ready(None)` if the channel closed first, else `Pending`.
-	pub fn poll_used(&self, waiter: &Waiter) -> Poll<Option<()>> {
+	/// Poll-based variant of [`Self::used`]: `Ready(Ok(()))` once a consumer
+	/// exists, [`Closed`] if the channel closed first, else `Pending`.
+	#[cfg_attr(feature = "sim", track_caller)]
+	pub fn poll_used(&self, waiter: &Waiter) -> Poll<Result<(), Closed>> {
 		let mut state = self.state.lock();
 		if state.closed {
-			return Poll::Ready(None);
+			return crate::coop::ready(Err(Closed));
 		}
 
 		if self.counts.consumers.load(Ordering::Relaxed) > 0 {
-			return Poll::Ready(Some(()));
+			return crate::coop::ready(Ok(()));
 		}
 
 		waiter.register(&mut state.waiters_consumer);
@@ -236,7 +268,7 @@ impl<T> Producer<T> {
 		// Re-check after registration to avoid TOCTOU race where a consumer
 		// is created between the initial check and waiter registration.
 		if self.counts.consumers.load(Ordering::Relaxed) > 0 {
-			return Poll::Ready(Some(()));
+			return crate::coop::ready(Ok(()));
 		}
 
 		Poll::Pending
@@ -252,16 +284,6 @@ impl<T> Producer<T> {
 	/// Returns `true` if both producers share the same underlying state.
 	pub fn same_channel(&self, other: &Self) -> bool {
 		self.state.is_clone(&other.state)
-	}
-
-	/// Returns `true` if this is the only remaining producer.
-	#[doc(hidden)]
-	#[deprecated(
-		note = "racy: a clone, or a Weak upgraded by another thread, can invalidate the answer \
-		        before you act on it. Run last-handle cleanup from the Drop of a shared guard instead."
-	)]
-	pub fn is_last(&self) -> bool {
-		self.counts.producers.load(Ordering::Acquire) == 1
 	}
 
 	/// Create a [`ProducerWeak`] reference that doesn't affect the producer/consumer ref counts.
@@ -321,6 +343,20 @@ impl<T> Drop for Producer<T> {
 			list.wake();
 		}
 	}
+}
+
+/// What [`Producer::write_unused`] found.
+#[must_use]
+#[derive(Debug)]
+pub enum Unused<'a, T> {
+	/// Nothing is consuming the channel: write access, held under the lock a new
+	/// consumer has to take, so the write lands before one can exist.
+	Idle(Mut<'a, T>),
+	/// A consumer exists, so whatever was decided while the channel looked unused
+	/// is stale.
+	Used,
+	/// The channel is already closed, so there is nothing left to write.
+	Closed,
 }
 
 /// A mutable guard over the shared state.

@@ -1,0 +1,142 @@
+import { expect, test } from "bun:test";
+import { GrantSchema, RefusalSchema, RequestSchema, TokenSchema } from "./contract.ts";
+
+// The fixtures below are what the Rust `moq_auth::Request` and `Grant` serialize to,
+// so a server written against these schemas reads what a relay sends.
+
+test("a connect request parses with every field", () => {
+	const request = RequestSchema.parse({
+		id: "00ff",
+		event: "connect",
+		node: "relay-1",
+		transport: "quic",
+		remote: "203.0.113.9:4433",
+		local: "[::1]:443",
+		server_name: "relay.example",
+		alpn: "moq-lite-05",
+		path: "/demo/room",
+		query: "jwt=abc",
+		role: "publisher",
+		tls: { name: "edge0", fingerprint: "ab".repeat(32), expires: 4102444800, issuer: "CN=cluster" },
+	});
+	expect(request.event).toBe("connect");
+	expect(request.tls?.name).toBe("edge0");
+});
+
+test("an end request carries its facts beside the rest", () => {
+	const request = RequestSchema.parse({
+		id: "00ff",
+		event: "end",
+		node: "relay-1",
+		transport: "unix",
+		path: "",
+		reason: "disconnected",
+		duration: 1.5,
+		bytes: { sent: 10, received: 20 },
+	});
+	if (request.event !== "end") throw new Error("expected an end");
+	expect(request.reason).toBe("disconnected");
+	expect(request.bytes.received).toBe(20);
+
+	const invalid = RequestSchema.parse({
+		id: "00ff",
+		event: "end",
+		node: "relay-1",
+		transport: "unix",
+		path: "",
+		reason: "invalid",
+		duration: 1.5,
+		bytes: { sent: 10, received: 20 },
+	});
+	if (invalid.event !== "end") throw new Error("expected an end");
+	expect(invalid.reason).toBe("invalid");
+});
+
+test("a SETUP token parses as the Rust vector", () => {
+	// What `moq_auth::Request` serializes a CAT of bytes 00 fb ff to.
+	const request = RequestSchema.parse(
+		JSON.parse(
+			'{"id":"00ff","event":"connect","node":"relay-1","transport":"quic","path":"/demo/room","token":{"kind":1,"value":"APv_"}}',
+		),
+	);
+	expect(request.token).toEqual({ kind: 1, value: "APv_" });
+
+	expect(() =>
+		RequestSchema.parse({
+			id: "1",
+			event: "connect",
+			node: "n",
+			transport: "quic",
+			path: "/",
+			token: { kind: 0, value: "AP+/" },
+		}),
+	).toThrow();
+
+	// Not a length or final character any byte string encodes to, which Rust refuses too.
+	for (const value of ["A", "AB", "APv_A"]) {
+		expect(() => TokenSchema.parse({ kind: 0, value })).toThrow();
+	}
+	for (const value of ["", "AA", "AAA", "AAAA", "AQ", "AAE"]) {
+		expect(TokenSchema.parse({ kind: 0, value }).value).toBe(value);
+	}
+});
+
+test("a connect must not carry end facts", () => {
+	expect(() => RequestSchema.parse({ id: "1", event: "end", node: "n", transport: "quic", path: "/" })).toThrow();
+});
+
+test("WebTransport and future transport names follow the Rust contract", () => {
+	for (const [incoming, expected] of [
+		["webtransport", "webtransport"],
+		["carrier-pigeon", "unknown"],
+	] as const) {
+		const request = RequestSchema.parse({ id: "1", event: "connect", node: "n", transport: incoming, path: "/" });
+		expect(request.transport).toBe(expected);
+	}
+});
+
+test("malformed transport values are refused", () => {
+	for (const transport of [undefined, null, 1, {}, []]) {
+		expect(() => RequestSchema.parse({ id: "1", event: "connect", node: "n", transport, path: "/" })).toThrow();
+	}
+});
+
+test("a grant round trips and is validated", () => {
+	const grant = GrantSchema.parse({
+		publish: ["alice/**"],
+		subscribe: ["**"],
+		root: "pid/room",
+		expires: 4102444800,
+		revalidate: 60,
+		tier: "websocket",
+		label: "project/key/123",
+	});
+	expect(grant.publish?.toJSON()).toEqual(["alice/**"]);
+
+	expect(() => GrantSchema.parse({})).toThrow(/name something/);
+	expect(() => GrantSchema.parse({ publish: ["**"], revalidate: 60 })).toThrow(/must expire/);
+	expect(() => GrantSchema.parse({ publish: ["**"], expires: 4102444800, revalidate: 0 })).toThrow();
+	// The Rust side reads whole seconds; a fraction would be refused there.
+	expect(() => GrantSchema.parse({ publish: ["**"], expires: 4102444800, revalidate: 0.5 })).toThrow();
+	expect(() => GrantSchema.parse({ publish: ["**"], expires: 4102444800.5 })).toThrow();
+	expect(() => GrantSchema.parse({ publish: ["a/**/b/**"] })).toThrow();
+	expect(() => GrantSchema.parse({ publish: ["**"], label: "project/*" })).toThrow(/invalid path/);
+});
+
+test("an auth endpoint grant accepts a capped role", () => {
+	const grant = GrantSchema.parse({ publish: { path: "alice/**", rate: 8_000_000 } });
+	expect(grant).toHaveProperty("publish.rate", 8_000_000);
+});
+
+test("refusal reasons preserve verified attribution and accept future reasons", () => {
+	for (const reason of ["refused", "forbidden", "expired"] as const) {
+		expect(RefusalSchema.parse({ reason, root: "tenant", tier: "edge" })).toEqual({
+			reason,
+			root: "tenant",
+			tier: "edge",
+		});
+		expect(RefusalSchema.parse({ reason })).toEqual({ reason });
+	}
+	expect(RefusalSchema.parse({ reason: "future" })).toEqual({ reason: "refused" });
+	expect(RefusalSchema.safeParse({ reason: 42 }).success).toBe(false);
+});

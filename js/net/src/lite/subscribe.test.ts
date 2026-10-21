@@ -1,9 +1,13 @@
 import { expect, test } from "bun:test";
+import { ProtocolViolation } from "../error.ts";
 import * as Path from "../path.ts";
 import { Reader, Writer } from "../stream.ts";
 import {
 	decodeSubscribeResponse,
+	emptyRange,
 	encodeSubscribeResponse,
+	exclusiveGroupEnd,
+	inclusiveGroupEnd,
 	Subscribe,
 	SubscribeDrop,
 	SubscribeEnd,
@@ -29,6 +33,7 @@ async function encode(version: Version, resp: SubscribeResponse): Promise<Uint8A
 	const written: Uint8Array[] = [];
 	const writer = new Writer(
 		new WritableStream<Uint8Array>({ write: (chunk) => void written.push(new Uint8Array(chunk)) }),
+		version,
 	);
 	await encodeSubscribeResponse(writer, resp, version);
 	writer.close();
@@ -37,8 +42,17 @@ async function encode(version: Version, resp: SubscribeResponse): Promise<Uint8A
 }
 
 async function responseRoundtrip(version: Version, resp: SubscribeResponse): Promise<SubscribeResponse> {
-	const reader = new Reader(undefined, await encode(version, resp));
+	const reader = new Reader(undefined, await encode(version, resp), version);
 	return decodeSubscribeResponse(reader, version);
+}
+
+async function encodeSubscribe(msg: Subscribe): Promise<void> {
+	const writer = new Writer(new WritableStream<Uint8Array>(), Version.DRAFT_06);
+	try {
+		await msg.encode(writer, Version.DRAFT_06);
+	} finally {
+		writer.close();
+	}
 }
 
 async function encodeMessage(
@@ -48,6 +62,7 @@ async function encodeMessage(
 	const written: Uint8Array[] = [];
 	const writer = new Writer(
 		new WritableStream<Uint8Array>({ write: (chunk) => void written.push(new Uint8Array(chunk)) }),
+		version,
 	);
 	await message.encode(writer, version);
 	writer.close();
@@ -55,14 +70,13 @@ async function encodeMessage(
 	return concat(written);
 }
 
-test("SubscribeOk round-trips priority/ordered/groups on draft-04", async () => {
+test("SubscribeOk round-trips priority/groups on draft-04", async () => {
 	const got = await responseRoundtrip(Version.DRAFT_04, {
-		ok: new SubscribeOk({ priority: 7, ordered: true, maxLatency: 250, startGroup: 3 }),
+		ok: new SubscribeOk({ priority: 7, maxDelay: 250, startGroup: 3 }),
 	});
 	expect("ok" in got).toBe(true);
 	if (!("ok" in got)) throw new Error("expected ok");
 	expect(got.ok.priority).toBe(7);
-	expect(got.ok.ordered).toBe(true);
 	expect(got.ok.startGroup).toBe(3);
 });
 
@@ -72,39 +86,84 @@ test("Subscribe round-trips every option including startGroup 0", async () => {
 		broadcast: Path.from("test"),
 		track: "video",
 		priority: 7,
-		ordered: true,
-		maxLatency: 250,
+		maxDelay: 250,
 		startGroup: 0,
 		endGroup: 9,
 	});
+	// Lite-06 carries the raw floor, and a floor of 0 with no frame offset is the same
+	// absence of a constraint as no floor at all, so it canonicalizes to undefined.
 	const got = await Subscribe.decode(
-		new Reader(undefined, await encodeMessage(Version.DRAFT_05, message)),
-		Version.DRAFT_05,
+		new Reader(undefined, await encodeMessage(Version.DRAFT_06, message), Version.DRAFT_06),
+		Version.DRAFT_06,
 	);
 	expect(got.priority).toBe(7);
-	expect(got.ordered).toBe(true);
-	expect(got.maxLatency).toBe(250);
-	expect(got.startGroup).toBe(0);
+	expect(got.maxDelay).toBe(250);
+	expect(got.startGroup).toBeUndefined();
 	expect(got.endGroup).toBe(9);
+
+	// Group 0 stays named when a Frame Start qualifies it: a subscription can resume
+	// partway through group 0 (a catalog never leaves it).
+	message.startFrame = 4;
+	const resumed = await Subscribe.decode(
+		new Reader(undefined, await encodeMessage(Version.DRAFT_06, message), Version.DRAFT_06),
+		Version.DRAFT_06,
+	);
+	expect(resumed.startGroup).toBe(0);
+	expect(resumed.startFrame).toBe(4);
+	message.startFrame = 0;
+
+	// A pre-06 wire encodes an explicit group 0 as sequence + 1, so it round-trips.
+	// Omitting the floor is still the latest group, not group 0.
+	const explicit = await Subscribe.decode(
+		new Reader(undefined, await encodeMessage(Version.DRAFT_05, message), Version.DRAFT_05),
+		Version.DRAFT_05,
+	);
+	expect(explicit.startGroup).toBe(0);
+	expect(explicit.endGroup).toBe(9);
+	const absent = await Subscribe.decode(
+		new Reader(
+			undefined,
+			await encodeMessage(Version.DRAFT_05, new Subscribe({ ...message, startGroup: undefined })),
+			Version.DRAFT_05,
+		),
+		Version.DRAFT_05,
+	);
+	expect(absent.startGroup).toBeUndefined();
 });
 
 test("SubscribeUpdate round-trips every option including startGroup 0", async () => {
 	const message = new SubscribeUpdate({
 		priority: 8,
-		ordered: true,
-		maxLatency: 500,
+		maxDelay: 500,
 		startGroup: 0,
 		endGroup: 12,
 	});
 	const got = await SubscribeUpdate.decode(
-		new Reader(undefined, await encodeMessage(Version.DRAFT_05, message)),
-		Version.DRAFT_05,
+		new Reader(undefined, await encodeMessage(Version.DRAFT_06, message), Version.DRAFT_06),
+		Version.DRAFT_06,
 	);
 	expect(got.priority).toBe(8);
-	expect(got.ordered).toBe(true);
-	expect(got.maxLatency).toBe(500);
-	expect(got.startGroup).toBe(0);
+	expect(got.maxDelay).toBe(500);
+	expect(got.startGroup).toBeUndefined();
 	expect(got.endGroup).toBe(12);
+
+	// The same pre-06 encoding as SUBSCRIBE: explicit group 0 round-trips, and an
+	// omitted floor stays omitted.
+	const explicit = await SubscribeUpdate.decode(
+		new Reader(undefined, await encodeMessage(Version.DRAFT_05, message), Version.DRAFT_05),
+		Version.DRAFT_05,
+	);
+	expect(explicit.startGroup).toBe(0);
+	expect(explicit.endGroup).toBe(12);
+	const absent = await SubscribeUpdate.decode(
+		new Reader(
+			undefined,
+			await encodeMessage(Version.DRAFT_05, new SubscribeUpdate({ ...message, startGroup: undefined })),
+			Version.DRAFT_05,
+		),
+		Version.DRAFT_05,
+	);
+	expect(absent.startGroup).toBeUndefined();
 });
 
 test("SubscribeStart round-trips on draft-05", async () => {
@@ -114,11 +173,42 @@ test("SubscribeStart round-trips on draft-05", async () => {
 	expect(got.start.group).toBe(42);
 });
 
+test("SubscribeStart carries the largest position on draft-07", async () => {
+	// Type, length, group, largest group + 1, largest frame.
+	expect(await encode(Version.DRAFT_07, { start: new SubscribeStart(4, { group: 3, frame: 2 }) })).toEqual(
+		new Uint8Array([0, 3, 4, 4, 2]),
+	);
+	for (const largest of [undefined, { group: 3, frame: 2 }]) {
+		const got = await responseRoundtrip(Version.DRAFT_07, { start: new SubscribeStart(4, largest) });
+		if (!("start" in got)) throw new Error("expected start");
+		expect([got.start.group, got.start.largest]).toEqual([4, largest]);
+	}
+	// Draft-06 has no largest position on the wire.
+	expect(await encode(Version.DRAFT_06, { start: new SubscribeStart(4, { group: 3, frame: 2 }) })).toEqual(
+		new Uint8Array([0, 1, 4]),
+	);
+});
+
 test("SubscribeEnd round-trips on draft-05", async () => {
+	// Type, length, exclusive final group.
+	expect(await encode(Version.DRAFT_05, { end: new SubscribeEnd(7) })).toEqual(new Uint8Array([1, 1, 7]));
 	const got = await responseRoundtrip(Version.DRAFT_05, { end: new SubscribeEnd(7) });
 	expect("end" in got).toBe(true);
 	if (!("end" in got)) throw new Error("expected end");
 	expect(got.end.group).toBe(7);
+});
+
+test("SubscribeEnd has no stream count on draft-07", async () => {
+	expect(await encode(Version.DRAFT_07, { end: new SubscribeEnd(7) })).toEqual(new Uint8Array([1, 1, 7]));
+});
+
+test("SubscribeDrop is restored on draft-07", async () => {
+	const drop: SubscribeResponse = { drop: new SubscribeDrop({ start: 1, end: 3, error: 7 }) };
+	const wire = await encode(Version.DRAFT_07, drop);
+	expect(wire).toEqual(new Uint8Array([2, 3, 1, 3, 7]));
+	const got = await responseRoundtrip(Version.DRAFT_07, drop);
+	if (!("drop" in got)) throw new Error("expected drop");
+	expect([got.drop.start, got.drop.end, got.drop.error]).toEqual([1, 3, 7]);
 });
 
 test("SubscribeDrop is type 0x2 on draft-05 and 0x1 on draft-04", async () => {
@@ -138,4 +228,102 @@ test("SubscribeDrop is type 0x2 on draft-05 and 0x1 on draft-04", async () => {
 
 test("SUBSCRIBE_OK is rejected on draft-05", async () => {
 	await expect(encode(Version.DRAFT_05, { ok: new SubscribeOk({ priority: 1 }) })).rejects.toThrow();
+});
+
+test("frame bounds without their group bounds are rejected before encoding", async () => {
+	const base = {
+		id: 1n,
+		broadcast: Path.from("room"),
+		track: "video",
+		priority: 0,
+	};
+	await expect(encodeSubscribe(new Subscribe({ ...base, startFrame: 3 }))).rejects.toThrow(
+		"frame bound without a group bound",
+	);
+	await expect(encodeSubscribe(new Subscribe({ ...base, endFrame: 7 }))).rejects.toThrow(
+		"frame bound without a group bound",
+	);
+});
+
+test("model and wire group ends convert without an off-by-one", () => {
+	expect(exclusiveGroupEnd(undefined)).toBeUndefined();
+	expect(exclusiveGroupEnd(0)).toBe(1);
+	expect(exclusiveGroupEnd(9)).toBe(10);
+	expect(inclusiveGroupEnd(undefined)).toBeUndefined();
+	expect(inclusiveGroupEnd(1)).toBe(0);
+	expect(inclusiveGroupEnd(10)).toBe(9);
+	expect(() => inclusiveGroupEnd(0)).toThrow("empty subscription range cannot be encoded");
+});
+
+test("a requested range is empty when its bounds meet anywhere", () => {
+	expect(emptyRange({})).toBe(false);
+	expect(emptyRange({ endGroup: 0 })).toBe(true);
+	expect(emptyRange({ startGroup: 5, endGroup: 5 })).toBe(true);
+	expect(emptyRange({ startGroup: 6, endGroup: 5 })).toBe(true);
+	expect(emptyRange({ startGroup: 5, endGroup: 6 })).toBe(false);
+	expect(emptyRange({ startGroup: 5 })).toBe(false);
+});
+
+// Lite-07 carries `Group Order` right after the priority, on SUBSCRIBE and SUBSCRIBE_UPDATE
+// alike, and refuses a value it does not define.
+test.each(["ascending", "descending"] as const)("lite-07 round-trips a %s group order", async (order) => {
+	const version = Version.DRAFT_07;
+	const subscribe = new Subscribe({ id: 1n, broadcast: Path.from("room"), track: "video", priority: 3, order });
+	const got = await Subscribe.decode(
+		new Reader(undefined, await encodeMessage(version, subscribe), version),
+		version,
+	);
+	expect(got.order).toBe(order);
+
+	const update = await encodeMessage(version, new SubscribeUpdate({ priority: 3, order, maxDelay: 250 }));
+	// The length prefix, the priority, then the order.
+	expect(update[1]).toBe(3);
+	expect(update[2]).toBe(order === "ascending" ? 1 : 0);
+	const decoded = await SubscribeUpdate.decode(new Reader(undefined, update, version), version);
+	expect(decoded.order).toBe(order);
+
+	const invalid = new Uint8Array(update);
+	invalid[2] = 2;
+	await expect(SubscribeUpdate.decode(new Reader(undefined, invalid, version), version)).rejects.toThrow(
+		ProtocolViolation,
+	);
+});
+
+// No earlier wire has `Group Order`, so an ascending subscription falls back to descending,
+// byte-identical to one that never asked.
+test.each([Version.DRAFT_03, Version.DRAFT_05, Version.DRAFT_06])(
+	"version %d falls back to a descending group order",
+	async (version) => {
+		const props = { id: 1n, broadcast: Path.from("room"), track: "video", priority: 3, maxDelay: 250 };
+		const descending = await encodeMessage(version, new Subscribe(props));
+		const ascending = await encodeMessage(version, new Subscribe({ ...props, order: "ascending" }));
+		expect(ascending).toEqual(descending);
+		const got = await Subscribe.decode(new Reader(undefined, ascending, version), version);
+		expect(got.order).toBe("descending");
+
+		const update = await encodeMessage(version, new SubscribeUpdate({ priority: 3, order: "ascending" }));
+		expect(update).toEqual(await encodeMessage(version, new SubscribeUpdate({ priority: 3 })));
+		const decoded = await SubscribeUpdate.decode(new Reader(undefined, update, version), version);
+		expect(decoded.order).toBe("descending");
+	},
+);
+
+test("wanted group survives lite-07 and disappears on legacy wires", async () => {
+	for (const version of [Version.DRAFT_05, Version.DRAFT_06, Version.DRAFT_07]) {
+		for (const wantedGroup of [undefined, 0, 3, Number.MAX_SAFE_INTEGER]) {
+			const update = new SubscribeUpdate({ priority: 7, wantedGroup });
+			const encoded = await encodeMessage(version, update);
+			const decoded = await SubscribeUpdate.decode(new Reader(undefined, encoded, version), version);
+			expect(decoded.wantedGroup).toBe(version === Version.DRAFT_07 ? wantedGroup : undefined);
+		}
+	}
+});
+
+test("wanted groups refuse malformed input before writing bytes", async () => {
+	for (const wantedGroup of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN]) {
+		expect(() => new SubscribeUpdate({ priority: 0, wantedGroup })).toThrow(RangeError);
+		const update = new SubscribeUpdate({ priority: 0 });
+		update.wantedGroup = wantedGroup;
+		await expect(encodeMessage(Version.DRAFT_07, update)).rejects.toThrow(RangeError);
+	}
 });

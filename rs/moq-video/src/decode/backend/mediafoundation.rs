@@ -2,7 +2,7 @@
 //! DXVA.
 //!
 //! The inverse of the encode Media Foundation backend, and the Windows
-//! counterpart to the macOS VideoToolbox decode backend. Unlike encoders, the
+//! counterpart to the VideoToolbox decode backend. Unlike encoders, the
 //! GPU vendors (NVIDIA especially) don't ship standalone async hardware decoder
 //! MFTs; the portable hardware path is the Microsoft decoder MFT driven
 //! synchronously with a Direct3D11 device manager bound to it, which routes the
@@ -25,8 +25,8 @@
 //! does the MFT offer an output type carrying the real frame size, so we set the
 //! NV12 output type (and read the size off it) right after that first input.
 //!
-//! Used only from the one decode task (the consumer's `read` loop), so the COM
-//! handles are wrapped in a thread-confined `Send` type.
+//! The backend is `!Send`: the COM handles must stay on the thread that created
+//! them, either the `Sink` worker thread or the thread owning a direct `Decoder`.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -99,10 +99,6 @@ pub(crate) struct MediaFoundation {
 	_com: ComGuard,
 }
 
-// The MFT and its COM handles are only ever touched from the one decode task (the
-// consumer's single-threaded `read` loop).
-unsafe impl Send for MediaFoundation {}
-
 impl MediaFoundation {
 	/// `config` is accepted for signature parity; the decoder MFT emits frames
 	/// at the stream's native size (callers scale the frames themselves).
@@ -110,9 +106,10 @@ impl MediaFoundation {
 		let (input_subtype, label) = match codec {
 			Codec::H264 => (MFVideoFormat_H264, "H.264"),
 			Codec::H265 => (MFVideoFormat_HEVC, "H.265"),
-			Codec::Av1 => {
+			Codec::Av1 | Codec::Vp8 | Codec::Vp9 => {
 				return Err(Error::Codec(anyhow::anyhow!(
-					"Media Foundation AV1 decode is not wired"
+					"Media Foundation {} decode is not wired",
+					codec.label()
 				)));
 			}
 		};
@@ -419,7 +416,10 @@ impl MediaFoundation {
 				.ContiguousCopyTo(&mut nv12)
 				.map_err(|e| mf_err("contiguous copy", e))?;
 		}
-		Ok(Surface::I420(I420::from_nv12(&nv12, self.width, self.height)?))
+		Ok(Surface::I420(I420::from_nv12(
+			&nv12,
+			crate::Size::new(self.width, self.height),
+		)?))
 	}
 }
 
@@ -456,7 +456,11 @@ impl Backend for MediaFoundation {
 			}
 		}
 		self.discontinuity = false;
-		remember_timestamp(&mut self.pending, self.sample_time(), timestamp);
+		// Read the stamp before the call: arguments evaluate left to right, so
+		// `&mut self.pending` would still hold the borrow when `sample_time`
+		// wants `&self`.
+		let sample_time = self.sample_time();
+		remember_timestamp(&mut self.pending, sample_time, timestamp);
 		self.sample_index += 1;
 
 		// The decoder only reports the picture size once it has parsed the first

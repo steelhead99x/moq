@@ -7,10 +7,11 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 /// Browser CORS policy for HTTP gateway listeners.
-#[derive(clap::Args, Clone, Default)]
+#[derive(usage_rs::Args, Clone, Default)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 pub struct Cors {
 	/// Browser origin allowed to call this listener. Repeat to allow multiple.
-	#[arg(long = "cors-origin", value_name = "ORIGIN", value_parser = parse_origin)]
+	#[usage(long = "cors-origin", value_name = "ORIGIN")]
 	pub origin: Vec<HeaderValue>,
 }
 
@@ -34,10 +35,6 @@ impl Cors {
 	}
 }
 
-fn parse_origin(origin: &str) -> Result<HeaderValue, axum::http::header::InvalidHeaderValue> {
-	origin.parse()
-}
-
 /// Serve an axum router over TCP, optionally terminating TLS. Used by the HLS
 /// and WebRTC (WHIP/WHEP) HTTP endpoints.
 pub async fn serve(
@@ -59,9 +56,9 @@ pub async fn serve(
 }
 
 /// Serve the `/certificate.sha256` self-signed fingerprint over HTTP, so an
-/// `http://` client can pin a `--server-bind` server's generated cert.
-pub async fn run_web(bind: &str, certificates: moq_native::tls::Certificates) -> anyhow::Result<()> {
-	let listen = tokio::net::lookup_host(bind)
+/// `http://` client can pin a `--listen` server's generated cert.
+pub async fn run_web(bind: moq_tokio::listen::Bind, certificates: moq_tokio::tls::Certificates) -> anyhow::Result<()> {
+	let listen = tokio::net::lookup_host(bind.to_string())
 		.await
 		.context("invalid listen address")?
 		.next()
@@ -72,8 +69,8 @@ pub async fn run_web(bind: &str, certificates: moq_native::tls::Certificates) ->
 	}
 
 	let fingerprint_handler = move || async move {
-		// Get the first certificate's fingerprint.
-		// TODO serve all of them so we can support multiple signature algorithms.
+		// The first certificate in configuration order, deliberately: this exists
+		// to pin one generated self-signed certificate. See the relay's copy.
 		match certificates.fingerprints().into_iter().next() {
 			Some(fingerprint) => fingerprint.into_response(),
 			// A stream-only server has no certificate to pin.
@@ -88,7 +85,7 @@ pub async fn run_web(bind: &str, certificates: moq_native::tls::Certificates) ->
 
 	// Dual-stack so the cert endpoint answers over IPv4 too, even on Windows
 	// where `[::]` is IPv6-only by default.
-	let listener = moq_native::bind::tcp(listen).context("failed to bind web listener")?;
+	let listener = moq_tokio::bind::tcp(listen).context("failed to bind web listener")?;
 	let server = axum_server::from_tcp(listener)?;
 	server.serve(app.into_make_service()).await?;
 

@@ -8,7 +8,11 @@ use std::{ffi::c_void, ptr, sync::Arc};
 
 use cudarc::driver::CudaContext;
 
-use super::{api::ENCODE_API, result::EncodeError, session::Session};
+use super::{
+	api::{self, EncodeAPI, LoadError},
+	result::{EncodeError, ErrorKind},
+	session::Session,
+};
 use crate::sys::nvEncodeAPI::{
 	GUID, NVENCAPI_VERSION, NV_ENC_BUFFER_FORMAT, NV_ENC_CONFIG, NV_ENC_CONFIG_VER, NV_ENC_DEVICE_TYPE,
 	NV_ENC_INITIALIZE_PARAMS, NV_ENC_INITIALIZE_PARAMS_VER, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
@@ -38,6 +42,7 @@ use crate::sys::nvEncodeAPI::{
 #[derive(Debug)]
 pub struct Encoder {
 	pub(crate) ptr: *mut c_void,
+	pub(crate) api: &'static EncodeAPI,
 	// Used to fetch the device pointer for an externally allocated buffer
 	pub(crate) ctx: Arc<CudaContext>,
 }
@@ -54,21 +59,30 @@ pub struct Encoder {
 /// If using events, they must also be unregistered.
 impl Drop for Encoder {
 	fn drop(&mut self) {
-		unsafe { (ENCODE_API.destroy_encoder)(self.ptr) }
-			.result(self)
-			.expect("The encoder pointer should be valid.");
+		let _ = unsafe { (self.api.destroy_encoder)(self.ptr) }.result(self);
 	}
 }
 
 impl Encoder {
+	/// Load and validate the NVIDIA encode driver API.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the driver library or an entry point is missing,
+	/// the driver is too old, or API initialization fails.
+	pub fn load() -> Result<(), LoadError> {
+		api::get().map(|_| ())
+	}
+
 	/// Create an [`Encoder`] with CUDA as the encode device.
 	///
 	/// See [NVIDIA docs](https://docs.nvidia.com/video-technologies/video-codec-sdk/12.0/nvenc-video-encoder-api-prog-guide/index.html#cuda).
 	///
 	/// # Errors
 	///
-	/// Could error if there was no encode capable device detected
-	/// or if the encode device was invalid.
+	/// Returns an error if the NVENC library or a required entry point is
+	/// unavailable, the NVIDIA driver is too old, or the encode device is
+	/// unsupported or invalid.
 	///
 	/// # Examples
 	///
@@ -78,8 +92,8 @@ impl Encoder {
 	/// let cuda_ctx = CudaContext::new(0).unwrap();
 	/// let encoder = Encoder::initialize_with_cuda(cuda_ctx).unwrap();
 	/// ```
-	pub fn initialize_with_cuda(cuda_ctx: Arc<CudaContext>) -> Result<Self, EncodeError> {
-		let mut encoder = ptr::null_mut();
+	pub fn initialize_with_cuda(cuda_ctx: Arc<CudaContext>) -> Result<Self, LoadError> {
+		let api = api::get()?;
 		let mut session_params = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
 			version: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
 			deviceType: NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA,
@@ -89,17 +103,14 @@ impl Encoder {
 			device: cuda_ctx.cu_ctx().cast::<c_void>(),
 			..Default::default()
 		};
-
-		if let err @ Err(_) =
-			unsafe { (ENCODE_API.open_encode_session_ex)(&mut session_params, &mut encoder) }.result_without_string()
-		{
-			// We are required to destroy the encoder if there was an error.
-			unsafe { (ENCODE_API.destroy_encoder)(encoder) }.result_without_string()?;
-			err?;
-		}
+		let encoder = open_session(
+			|encoder| unsafe { (api.open_encode_session_ex)(&mut session_params, encoder) }.result_without_string(),
+			|encoder| unsafe { (api.destroy_encoder)(encoder) }.result_without_string(),
+		)?;
 
 		Ok(Self {
 			ptr: encoder,
+			api,
 			ctx: cuda_ctx,
 		})
 	}
@@ -134,14 +145,12 @@ impl Encoder {
 	pub fn get_encode_guids(&self) -> Result<Vec<GUID>, EncodeError> {
 		// Query number of supported encoder codec GUIDs.
 		let mut supported_count = 0;
-		unsafe { (ENCODE_API.get_encode_guid_count)(self.ptr, &mut supported_count) }.result(self)?;
+		unsafe { (self.api.get_encode_guid_count)(self.ptr, &mut supported_count) }.result(self)?;
 		// Get the supported GUIDs.
 		let mut encode_guids = vec![GUID::default(); supported_count as usize];
 		let mut actual_count = 0;
-		unsafe {
-			(ENCODE_API.get_encode_guids)(self.ptr, encode_guids.as_mut_ptr(), supported_count, &mut actual_count)
-		}
-		.result(self)?;
+		unsafe { (self.api.get_encode_guids)(self.ptr, encode_guids.as_mut_ptr(), supported_count, &mut actual_count) }
+			.result(self)?;
 		encode_guids.truncate(actual_count as usize);
 		Ok(encode_guids)
 	}
@@ -181,12 +190,12 @@ impl Encoder {
 	pub fn get_preset_guids(&self, encode_guid: GUID) -> Result<Vec<GUID>, EncodeError> {
 		// Query the number of preset GUIDS.
 		let mut preset_count = 0;
-		unsafe { (ENCODE_API.get_encode_preset_count)(self.ptr, encode_guid, &mut preset_count) }.result(self)?;
+		unsafe { (self.api.get_encode_preset_count)(self.ptr, encode_guid, &mut preset_count) }.result(self)?;
 		// Get the preset GUIDs.
 		let mut actual_count = 0;
 		let mut preset_guids = vec![GUID::default(); preset_count as usize];
 		unsafe {
-			(ENCODE_API.get_encode_preset_guids)(
+			(self.api.get_encode_preset_guids)(
 				self.ptr,
 				encode_guid,
 				preset_guids.as_mut_ptr(),
@@ -234,13 +243,12 @@ impl Encoder {
 	pub fn get_profile_guids(&self, encode_guid: GUID) -> Result<Vec<GUID>, EncodeError> {
 		// Query the number of profile GUIDs.
 		let mut profile_count = 0;
-		unsafe { (ENCODE_API.get_encode_profile_guid_count)(self.ptr, encode_guid, &mut profile_count) }
-			.result(self)?;
+		unsafe { (self.api.get_encode_profile_guid_count)(self.ptr, encode_guid, &mut profile_count) }.result(self)?;
 		// Get the profile GUIDs.
 		let mut profile_guids = vec![GUID::default(); profile_count as usize];
 		let mut actual_count = 0;
 		unsafe {
-			(ENCODE_API.get_encode_profile_guids)(
+			(self.api.get_encode_profile_guids)(
 				self.ptr,
 				encode_guid,
 				profile_guids.as_mut_ptr(),
@@ -290,13 +298,13 @@ impl Encoder {
 	pub fn get_supported_input_formats(&self, encode_guid: GUID) -> Result<Vec<NV_ENC_BUFFER_FORMAT>, EncodeError> {
 		// Query the number of supported input formats.
 		let mut format_count = 0;
-		unsafe { (ENCODE_API.get_input_format_count)(self.ptr, encode_guid, &mut format_count) }.result(self)?;
+		unsafe { (self.api.get_input_format_count)(self.ptr, encode_guid, &mut format_count) }.result(self)?;
 		// Get the supported input formats.
 		let mut supported_input_formats =
 			vec![NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_UNDEFINED; format_count as usize];
 		let mut actual_count = 0;
 		unsafe {
-			(ENCODE_API.get_input_formats)(
+			(self.api.get_input_formats)(
 				self.ptr,
 				encode_guid,
 				supported_input_formats.as_mut_ptr(),
@@ -370,13 +378,7 @@ impl Encoder {
 			..Default::default()
 		};
 		unsafe {
-			(ENCODE_API.get_encode_preset_config_ex)(
-				self.ptr,
-				encode_guid,
-				preset_guid,
-				tuning_info,
-				&mut preset_config,
-			)
+			(self.api.get_encode_preset_config_ex)(self.ptr, encode_guid, preset_guid, tuning_info, &mut preset_config)
 		}
 		.result(self)?;
 		Ok(preset_config)
@@ -384,9 +386,11 @@ impl Encoder {
 
 	/// Initialize an encoder session with the given configuration.
 	///
+	/// Refuses lookahead and B-frames, including those a preset selects when no config is given.
+	///
 	/// You must do this before you can encode a picture.
-	/// You should use the [`NV_ENC_INITIALIZE_PARAMS`] builder
-	/// via [`NV_ENC_INITIALIZE_PARAMS::new`].
+	/// You should use the [`EncoderInitParams`] builder
+	/// via [`EncoderInitParams::new`].
 	///
 	/// See [NVIDIA docs](https://docs.nvidia.com/video-technologies/video-codec-sdk/12.0/nvenc-video-encoder-api-prog-guide/index.html#initializing-the-hardware-encoder-session).
 	///
@@ -394,6 +398,8 @@ impl Encoder {
 	///
 	/// Could error if the `initialize_params` are invalid
 	/// or if we run out of memory.
+	/// Lookahead (`enableLookahead` or `enableExtLookahead`) and B-frames
+	/// (`frameIntervalP` greater than 1) return [`ErrorKind::InvalidParam`].
 	///
 	/// # Examples
 	///
@@ -424,22 +430,35 @@ impl Encoder {
 	pub fn start_session(
 		self,
 		buffer_format: NV_ENC_BUFFER_FORMAT,
-		mut initialize_params: EncoderInitParams<'_>,
+		mut initialize_params: EncoderInitParams,
 	) -> Result<Session, EncodeError> {
+		// Refuse before initialize. A held frame comes back as need-more-input,
+		// and locking it fails, which no caller can recover from here.
+		let reason = match initialize_params.config.as_deref() {
+			Some(config) => held_output_reason(config),
+			// No config: the driver applies the preset, so those are the settings.
+			None => {
+				let preset = self.get_preset_config(
+					initialize_params.param.encodeGUID,
+					initialize_params.param.presetGUID,
+					initialize_params.param.tuningInfo,
+				)?;
+				held_output_reason(&preset.presetCfg)
+			}
+		};
+		if let Some(reason) = reason {
+			return Err(EncodeError::new(ErrorKind::InvalidParam, Some(reason.into())));
+		}
+
+		let mut config = initialize_params.config.take();
+		initialize_params.param.encodeConfig = config.as_deref_mut().map_or(std::ptr::null_mut(), std::ptr::from_mut);
 		let initialize_params = &mut initialize_params.param;
 		let width = initialize_params.encodeWidth;
 		let height = initialize_params.encodeHeight;
-		unsafe { (ENCODE_API.initialize_encoder)(self.ptr, initialize_params) }.result(&self)?;
+		unsafe { (self.api.initialize_encoder)(self.ptr, initialize_params) }.result(&self)?;
 
-		// Copy the caller's config before their borrow ends, so the session can
-		// resubmit it to `reconfigure` later. NVENC has already copied it
-		// internally by this point, so the copy is only for our own use.
-		let mut config = unsafe { initialize_params.encodeConfig.as_ref() }.map(|c| Box::new(*c));
-
-		// Re-point at our copy immediately. The caller's pointer dies with their
-		// borrow, so retaining it would leave a dangling pointer in `init` until
-		// something fixed it up. The box keeps its address when the `Session`
-		// moves, so this stays valid for the session's life.
+		// The box keeps its address when the session moves and remains owned for
+		// reconfiguration, so `init.encodeConfig` never points into caller storage.
 		let mut init = *initialize_params;
 		init.encodeConfig = match config.as_mut() {
 			Some(config) => std::ptr::from_mut::<NV_ENC_CONFIG>(&mut **config),
@@ -447,7 +466,7 @@ impl Encoder {
 		};
 
 		Ok(Session {
-			encoder: self,
+			encoder: Arc::new(self),
 			width,
 			height,
 			buffer_format,
@@ -458,15 +477,55 @@ impl Encoder {
 	}
 }
 
-/// A safe wrapper for [`NV_ENC_INITIALIZE_PARAMS`], which is the encoder
-/// initialize parameter.
-#[derive(Debug)]
-pub struct EncoderInitParams<'a> {
-	param: NV_ENC_INITIALIZE_PARAMS,
-	marker: std::marker::PhantomData<&'a mut NV_ENC_CONFIG>,
+/// Why `config` would make NVENC hold output until a later submission.
+fn held_output_reason(config: &NV_ENC_CONFIG) -> Option<&'static str> {
+	if config.rcParams.enableLookahead() != 0 || config.rcParams.enableExtLookahead() != 0 {
+		Some("lookahead holds frames, which this session cannot return")
+	} else if config.frameIntervalP > 1 {
+		Some("B-frames hold frames, which this session cannot return")
+	} else {
+		None
+	}
 }
 
-impl<'a> EncoderInitParams<'a> {
+/// Open an encode session, destroying whatever a failed open left behind as
+/// NVENC requires. A failed destroy is attached to the open error, not
+/// reported in its place.
+fn open_session(
+	open: impl FnOnce(&mut *mut c_void) -> Result<(), EncodeError>,
+	destroy: impl FnOnce(*mut c_void) -> Result<(), EncodeError>,
+) -> Result<*mut c_void, EncodeError> {
+	let mut encoder = ptr::null_mut();
+	let Err(primary) = open(&mut encoder) else {
+		return Ok(encoder);
+	};
+	if encoder.is_null() {
+		return Err(primary);
+	}
+	match destroy(encoder) {
+		Ok(()) => Err(primary),
+		Err(cleanup) => Err(primary.with_cleanup(cleanup)),
+	}
+}
+
+/// A safe wrapper for [`NV_ENC_INITIALIZE_PARAMS`], which is the encoder
+/// initialize parameter.
+pub struct EncoderInitParams {
+	param: NV_ENC_INITIALIZE_PARAMS,
+	config: Option<Box<NV_ENC_CONFIG>>,
+}
+
+impl std::fmt::Debug for EncoderInitParams {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("EncoderInitParams")
+			.field("width", &self.param.encodeWidth)
+			.field("height", &self.param.encodeHeight)
+			.field("has_config", &self.config.is_some())
+			.finish_non_exhaustive()
+	}
+}
+
+impl EncoderInitParams {
 	/// Create a new builder for [`EncoderInitParams`], which is a wrapper for
 	/// [`NV_ENC_INITIALIZE_PARAMS`].
 	#[must_use]
@@ -478,10 +537,7 @@ impl<'a> EncoderInitParams<'a> {
 			encodeHeight: height,
 			..Default::default()
 		};
-		Self {
-			param,
-			marker: std::marker::PhantomData,
-		}
+		Self { param, config: None }
 	}
 
 	/// Specifies the preset for encoding. If the preset GUID is set then
@@ -508,8 +564,18 @@ impl<'a> EncoderInitParams<'a> {
 	/// send down a custom config structure using this method. Even in this
 	/// case the client is recommended to pass the same preset GUID it has
 	/// used to get the config.
-	pub fn encode_config(&mut self, encode_config: &'a mut NV_ENC_CONFIG) -> &mut Self {
-		self.param.encodeConfig = encode_config;
+	///
+	/// # Safety
+	///
+	/// Any pointers embedded in `encode_config` must remain valid until the
+	/// encoder session is dropped. Prefer a config returned by
+	/// [`Encoder::get_preset_config`], whose reserved pointers are null.
+	pub unsafe fn encode_config(&mut self, encode_config: NV_ENC_CONFIG) -> &mut Self {
+		self.config = Some(Box::new(encode_config));
+		self.param.encodeConfig = self
+			.config
+			.as_deref_mut()
+			.map_or(std::ptr::null_mut(), std::ptr::from_mut);
 		self
 	}
 
@@ -534,5 +600,96 @@ impl<'a> EncoderInitParams<'a> {
 	pub fn enable_picture_type_decision(&mut self) -> &mut Self {
 		self.param.enablePTD = 1;
 		self
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::cell::RefCell;
+
+	use super::*;
+	use crate::safe::result::ErrorKind;
+
+	fn handle() -> *mut c_void {
+		ptr::NonNull::<u8>::dangling().as_ptr().cast()
+	}
+
+	fn fail(kind: ErrorKind) -> Result<(), EncodeError> {
+		Err(EncodeError::new(kind, None))
+	}
+
+	#[test]
+	fn failed_open_destroys_the_partial_session() {
+		let destroyed = RefCell::new(Vec::new());
+		let error = open_session(
+			|encoder| {
+				*encoder = handle();
+				fail(ErrorKind::InvalidVersion)
+			},
+			|encoder| {
+				destroyed.borrow_mut().push(encoder);
+				Ok(())
+			},
+		)
+		.expect_err("open failed");
+		assert_eq!(error.kind(), ErrorKind::InvalidVersion);
+		assert!(error.cleanup().is_none());
+		assert_eq!(*destroyed.borrow(), [handle()]);
+	}
+
+	#[test]
+	fn failed_destroy_keeps_the_open_error() {
+		let error = open_session(
+			|encoder| {
+				*encoder = handle();
+				fail(ErrorKind::NoEncodeDevice)
+			},
+			|_| fail(ErrorKind::InvalidPtr),
+		)
+		.expect_err("open failed");
+		assert_eq!(error.kind(), ErrorKind::NoEncodeDevice);
+		assert_eq!(error.cleanup().map(EncodeError::kind), Some(ErrorKind::InvalidPtr));
+	}
+
+	#[test]
+	fn failed_open_without_a_handle_destroys_nothing() {
+		let error = open_session(|_| fail(ErrorKind::OutOfMemory), |_| panic!("destroyed a null session"))
+			.expect_err("open failed");
+		assert_eq!(error.kind(), ErrorKind::OutOfMemory);
+	}
+
+	#[test]
+	fn lookahead_and_b_frames_hold_output() {
+		let mut config = NV_ENC_CONFIG::default();
+		assert_eq!(held_output_reason(&config), None);
+
+		config.frameIntervalP = 1;
+		assert_eq!(held_output_reason(&config), None);
+
+		config.rcParams.set_enableLookahead(1);
+		assert!(held_output_reason(&config).is_some());
+		config.rcParams.set_enableLookahead(0);
+
+		config.rcParams.set_enableExtLookahead(1);
+		assert!(held_output_reason(&config).is_some());
+		config.rcParams.set_enableExtLookahead(0);
+
+		config.frameIntervalP = 2;
+		assert!(held_output_reason(&config).is_some());
+		config.frameIntervalP = 0;
+		assert_eq!(held_output_reason(&config), None);
+	}
+
+	#[test]
+	fn successful_open_destroys_nothing() {
+		let encoder = open_session(
+			|encoder| {
+				*encoder = handle();
+				Ok(())
+			},
+			|_| panic!("destroyed a live session"),
+		)
+		.unwrap();
+		assert_eq!(encoder, handle());
 	}
 }

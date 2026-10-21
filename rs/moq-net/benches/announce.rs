@@ -1,0 +1,217 @@
+//! Lite-07 announce compression against lite-06 literal framing: the bytes an
+//! announce stream costs, and the CPU to encode and decode it.
+//!
+//! Bytes and decode are measured over a whole stream: `routes` routes, then `churn` of
+//! them replaced (an END and a fresh START), so the bases the encoder picks come and
+//! go. Encode is measured in the steady state a relay sees: the encoder already holds
+//! `routes` live routes, and each iteration retracts the oldest and starts a new one.
+//! Two workloads bracket the gain:
+//!
+//! - health: `<pid>/private/channel_N/stream-health-<ts>` from a few origins behind
+//!   a shared pair of relays, the shape that motivated compression.
+//! - unique: random single-segment paths and random two-hop chains, where nothing
+//!   is shared and every START pays the four zero base/keep bytes.
+//!
+//! The byte counts print once before the timings.
+//!
+//! Run with `cargo bench -p moq-net --features fuzz --bench announce`.
+
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use moq_net::{
+	Hop, Hops, PathOwned, announce,
+	fuzz::{AnnounceWriter, Announced, decode_announces, encode_announces},
+};
+
+// Compile the actual private replay code, as the priority bench does for its queue.
+#[path = "../src/lite/replay.rs"]
+mod replay;
+
+/// The previous replay, retained here as a scaling reference.
+fn scanned(events: Vec<announce::Event>) -> Vec<announce::Announce> {
+	let mut initial: Vec<announce::Announce> = Vec::new();
+	for event in events {
+		let (update, active) = match event {
+			announce::Event::Start(update) | announce::Event::Update(update) | announce::Event::Restart(update) => {
+				(update, true)
+			}
+			announce::Event::End(update) => (update, false),
+		};
+		initial.retain(|held| held.prefix != update.prefix);
+		if active {
+			initial.push(update);
+		}
+	}
+	initial
+}
+
+fn initial(c: &mut Criterion) {
+	let mut group = c.benchmark_group("announce_replay");
+	for routes in [1, 64, 1024] {
+		for updates in [1, 8, 32] {
+			let events: Vec<_> = (0..updates)
+				.flat_map(|cost| {
+					(0..routes).map(move |route| {
+						announce::Event::Update(announce::Announce {
+							prefix: format!("route/{route}").into(),
+							captures: None,
+							route: moq_net::origin::Route::default().with_cost(cost),
+						})
+					})
+				})
+				.collect();
+			group.throughput(Throughput::Elements(events.len() as u64));
+			for indexed in [false, true] {
+				let name = if indexed { "indexed" } else { "scan" };
+				group.bench_function(format!("{name}/{routes}r_{updates}u"), |b| {
+					b.iter_batched(
+						|| events.clone(),
+						|events| {
+							let initial = if indexed {
+								replay::initial(events)
+							} else {
+								scanned(events)
+							};
+							assert_eq!(initial.len(), routes);
+							std::hint::black_box(initial);
+						},
+						BatchSize::PerIteration,
+					);
+				});
+			}
+		}
+	}
+	group.finish();
+}
+
+/// `(routes, churn)` shapes for the whole-stream measurements.
+const SHAPES: [(u64, u64); 4] = [(100, 0), (1_000, 0), (1_000, 1_000), (10_000, 1_000)];
+
+/// Live routes for the steady-state encode.
+const LIVE: [u64; 3] = [100, 1_000, 10_000];
+
+/// How many origins publish health streams, each behind the same two relays.
+const ORIGINS: u64 = 8;
+
+/// A deterministic 62-bit id, standing in for a random Hop ID.
+fn id(seed: u64) -> u64 {
+	// SplitMix64, masked to the varint range and kept non-zero.
+	let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+	z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+	z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+	((z ^ (z >> 31)) & ((1 << 62) - 1)).max(1)
+}
+
+fn hops(ids: &[u64]) -> Hops {
+	Hops::try_from(ids.iter().map(|id| Hop::new(*id).unwrap()).collect::<Vec<_>>()).unwrap()
+}
+
+/// Announce `routes` routes, then replace `churn` of them, oldest first.
+fn stream(routes: u64, churn: u64, route: impl Fn(u64) -> (PathOwned, Hops)) -> Vec<Announced> {
+	let mut announced: Vec<_> = (0..routes)
+		.map(|n| {
+			let (path, hops) = route(n);
+			Announced::Start(path, hops)
+		})
+		.collect();
+	for n in 0..churn {
+		announced.push(Announced::End(n));
+		let (path, hops) = route(routes + n);
+		announced.push(Announced::Start(path, hops));
+	}
+	announced
+}
+
+fn health(n: u64) -> (PathOwned, Hops) {
+	let origin = n % ORIGINS;
+	let path = format!(
+		"{:x}/private/channel_{}/stream-health-{}",
+		id(origin),
+		n % 16,
+		1_700_000_000 + n
+	);
+	(path.into(), hops(&[id(origin), id(100), id(101)]))
+}
+
+fn unique(n: u64) -> (PathOwned, Hops) {
+	(
+		format!("{:x}", id(n)).into(),
+		hops(&[id(n + 1_000_000), id(n + 2_000_000)]),
+	)
+}
+
+type Workload = (&'static str, fn(u64) -> (PathOwned, Hops));
+const WORKLOADS: [Workload; 2] = [("health", health), ("unique", unique)];
+
+fn report() {
+	eprintln!("announce stream bytes (lite-06 literal -> lite-07 compressed):");
+	for (name, route) in WORKLOADS {
+		for (routes, churn) in SHAPES {
+			let announced = stream(routes, churn, route);
+			let literal = encode_announces(&announced, false).len();
+			let compressed = encode_announces(&announced, true).len();
+			let starts = routes + churn;
+			eprintln!(
+				"  {name:>6} routes={routes:>5} churn={churn:>5}: {literal:>8} -> {compressed:>8} bytes, {:.1} -> {:.1} per START ({:+.0}%)",
+				literal as f64 / starts as f64,
+				compressed as f64 / starts as f64,
+				(compressed as f64 / literal as f64 - 1.0) * 100.0,
+			);
+		}
+	}
+}
+
+fn bench(c: &mut Criterion) {
+	report();
+
+	for (name, route) in WORKLOADS {
+		let mut group = c.benchmark_group(format!("announce_{name}"));
+
+		for routes in LIVE {
+			// A ring twice the live set, so the route started never collides with one
+			// still live.
+			let ring: Vec<_> = (0..2 * routes)
+				.map(|n| {
+					let (path, hops) = route(n);
+					Announced::Start(path, hops)
+				})
+				.collect();
+			group.throughput(Throughput::Elements(2));
+
+			for compress in [false, true] {
+				let version = if compress { "lite07" } else { "lite06" };
+				group.bench_function(BenchmarkId::new(format!("churn_{version}"), routes), |b| {
+					let mut writer = AnnounceWriter::new(compress);
+					let mut data = Vec::new();
+					for start in &ring[..routes as usize] {
+						writer.write(start, &mut data);
+					}
+					let mut oldest = 0;
+					b.iter(|| {
+						data.clear();
+						writer.write(&Announced::End(oldest), &mut data);
+						writer.write(&ring[((routes + oldest) % (2 * routes)) as usize], &mut data);
+						oldest += 1;
+					});
+				});
+			}
+		}
+
+		for (routes, churn) in SHAPES {
+			let announced = stream(routes, churn, route);
+			group.throughput(Throughput::Elements(announced.len() as u64));
+			for compress in [false, true] {
+				let version = if compress { "lite07" } else { "lite06" };
+				let encoded = encode_announces(&announced, compress);
+				group.bench_with_input(
+					BenchmarkId::new(format!("decode_{version}"), format!("{routes}x{churn}")),
+					&encoded,
+					|b, encoded| b.iter(|| decode_announces(encoded, compress)),
+				);
+			}
+		}
+		group.finish();
+	}
+}
+
+criterion_group!(benches, bench, initial);
+criterion_main!(benches);

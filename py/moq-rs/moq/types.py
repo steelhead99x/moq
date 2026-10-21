@@ -1,64 +1,52 @@
-"""Re-export moq-ffi record types without the Moq prefix."""
+"""Re-export moq-ffi record types without the Moq prefix.
+
+Records with duration fields are owned in `_records` instead, so they read as `timedelta`.
+"""
 
 from moq_ffi import (
-    MoqAudio as Audio,
+    MoqAnchor as Anchor,
 )
 from moq_ffi import (
     MoqAudioCodec as AudioCodec,
 )
 from moq_ffi import (
-    MoqAudioDecoderOutput as AudioDecoderOutput,
-)
-from moq_ffi import (
     MoqAudioEncoderInput as AudioEncoderInput,
 )
 from moq_ffi import (
-    MoqAudioEncoderOutput as AudioEncoderOutput,
+    MoqAudioPreset as AudioPreset,
 )
 from moq_ffi import (
-    MoqAudioFormat as AudioFormat,
+    MoqAudioSampleFormat as AudioSampleFormat,
 )
 from moq_ffi import (
-    MoqAudioFrame as AudioFrame,
+    MoqConnectionStatus as ConnectionStatus,
 )
 from moq_ffi import (
-    MoqCatalog as Catalog,
-)
-from moq_ffi import (
-    MoqConnectionStats as ConnectionStats,
-)
-from moq_ffi import (
-    MoqContainer as Container,
-)
-from moq_ffi import (
-    MoqDatagram as Datagram,
-)
-from moq_ffi import (
-    MoqDimensions as Dimensions,
+    MoqErrorScope as ErrorScope,
 )
 from moq_ffi import (
     MoqFetchGroupOptions as FetchGroupOptions,
 )
 from moq_ffi import (
-    MoqFrame as Frame,
+    MoqOrder as Order,
 )
 from moq_ffi import (
-    MoqMediaFrame as MediaFrame,
+    MoqProtocolError as ProtocolError,
+)
+from moq_ffi import (
+    MoqProtocolKind as ProtocolKind,
+)
+from moq_ffi import (
+    MoqRange as Range,
 )
 from moq_ffi import (
     MoqRoute as Route,
 )
 from moq_ffi import (
-    MoqSubscription as Subscription,
-)
-from moq_ffi import (
-    MoqTrackInfo as TrackInfo,
-)
-from moq_ffi import (
-    MoqVideo as Video,
-)
-from moq_ffi import (
     MoqVideoCodec as VideoCodec,
+)
+from moq_ffi import (
+    MoqVideoDecodedFrame as VideoDecodedFrame,
 )
 from moq_ffi import (
     MoqVideoEncoderInput as VideoEncoderInput,
@@ -70,47 +58,39 @@ from moq_ffi import (
     MoqVideoEncoderOutput as VideoEncoderOutput,
 )
 from moq_ffi import (
-    MoqVideoFrame as VideoFrame,
-)
-from moq_ffi import (
-    MoqVideoHint as VideoHint,
+    MoqVideoGop as VideoGop,
 )
 from moq_ffi import (
     MoqVideoPixelFormat as VideoPixelFormat,
 )
-from moq_ffi import (
-    MoqVideoProperties,
-)
 
-VideoProperties = MoqVideoProperties
-"""Video catalog properties shared by every rendition; ``None`` fields clear them."""
+from ._records import Backoff, ConnectionStats, Datagram, Frame, Subscription, TrackInfo
 
 __all__ = [
-    "Audio",
+    "Anchor",
     "AudioCodec",
-    "AudioDecoderOutput",
     "AudioEncoderInput",
-    "AudioEncoderOutput",
-    "AudioFormat",
-    "AudioFrame",
-    "Catalog",
+    "AudioPreset",
+    "AudioSampleFormat",
+    "Backoff",
     "ConnectionStats",
-    "Container",
+    "ConnectionStatus",
     "Datagram",
-    "Dimensions",
+    "ErrorScope",
     "Frame",
     "FetchGroupOptions",
-    "MediaFrame",
+    "Order",
+    "ProtocolError",
+    "ProtocolKind",
+    "Range",
     "Route",
     "Subscription",
     "TrackInfo",
-    "Video",
     "VideoCodec",
     "VideoEncoderInput",
     "VideoEncoderKind",
+    "VideoGop",
     "VideoEncoderOutput",
-    "VideoFrame",
-    "VideoHint",
+    "VideoDecodedFrame",
     "VideoPixelFormat",
-    "VideoProperties",
 ]

@@ -2,20 +2,17 @@
 //! per-source:
 //! - macOS camera -> AVFoundation, screen -> ScreenCaptureKit, both yielding
 //!   zero-copy `CVPixelBuffer` surfaces straight to VideoToolbox.
-//! - Linux camera -> native V4L2 (YUYV / MJPEG -> CPU I420), X11 display and
-//!   window -> X11, Wayland display -> xdg-desktop-portal + PipeWire
-//!   (`pipewire` feature).
-//! - Windows camera -> native Media Foundation (`IMFSourceReader`), screen ->
-//!   DXGI Desktop Duplication, window -> GDI (BGRA -> CPU I420).
+//! - Linux camera -> native V4L2 (YUYV / MJPEG -> CPU I420), or a PipeWire
+//!   camera node (`pipewire` feature), X11 display and window -> X11, Wayland
+//!   display and window -> xdg-desktop-portal + PipeWire (`pipewire` feature).
+//! - Windows camera -> native Media Foundation (`IMFSourceReader`), display and
+//!   window -> Windows.Graphics.Capture (GPU NV12, Windows 10 2004 or newer).
 //!
 //! [`encode::publish_capture`](crate::encode::publish_capture) consumes [`Config`].
 
 use std::sync::Arc;
 
-use crate::Error;
-use crate::frame::Surface;
-
-const MAX_FRAMERATE: u32 = 1_000_000;
+use crate::{Error, Frame, Rate};
 
 mod channel;
 use channel::FrameChannel;
@@ -42,24 +39,28 @@ mod surface;
 // Native V4L2 camera capture on Linux.
 #[cfg(target_os = "linux")]
 mod v4l2;
+// The mode choice V4L2 and PipeWire cameras share.
+#[cfg(target_os = "linux")]
+mod mode;
 // Native X11 display and window capture, including the portal fallback.
 #[cfg(target_os = "linux")]
 mod x11;
 
-// Portal + PipeWire screen capture on Linux.
+// Portal + PipeWire screen capture and PipeWire camera capture on Linux.
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 mod pipewire;
+
+/// System-picked screen or window selection and its restore grant.
+#[cfg(any(all(target_os = "linux", feature = "pipewire"), test))]
+pub mod portal;
 
 // Native Media Foundation camera capture on Windows.
 #[cfg(target_os = "windows")]
 mod mediafoundation;
 
-// DXGI Desktop Duplication screen capture on Windows.
-#[cfg(target_os = "windows")]
-mod desktopduplication;
-// Native GDI window enumeration and capture on Windows.
-#[cfg(target_os = "windows")]
-mod window;
+// The WGC notification state and selector tests also run on headless hosts.
+#[cfg(any(target_os = "windows", test))]
+mod wgc;
 
 // Blocking-device -> async-channel bridge used by V4L2 / Media Foundation.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -71,9 +72,7 @@ mod pump;
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
 mod settle;
 
-/// What to capture. Each variant carries the identifier that selects it, so a
-/// window can't be captured without saying which one, and a camera id can't
-/// reach the display backend.
+/// What to capture, selected by a native identifier or the system picker.
 ///
 /// The identifiers come from [`cameras`], [`displays`], [`windows`], and
 /// [`apps`]; each listed item's `source()` builds the matching variant.
@@ -85,6 +84,14 @@ pub enum Source {
 	/// The identifiers from [`cameras`] are an AVFoundation `uniqueID` on macOS,
 	/// a `/dev/videoN` path on Linux, and a Media Foundation symbolic link on
 	/// Windows. Bare numeric indices remain accepted on Linux and Windows.
+	///
+	/// With the `pipewire` feature, Linux also lists PipeWire camera nodes as
+	/// `pipewire:<node name>`, and `pipewire` alone opens the camera with the
+	/// highest session priority, which the session manager treats as default.
+	/// The id picks the backend: a `/dev/videoN` path always opens V4L2, and a
+	/// `pipewire` id always opens PipeWire. `None` opens `/dev/video0`, except
+	/// inside a sandbox (Flatpak or Snap), where it opens PipeWire's default
+	/// camera through the camera portal.
 	Camera(Option<String>),
 
 	/// A whole display. `None` opens the main display.
@@ -100,6 +107,13 @@ pub enum Source {
 	/// Every window belonging to one application, by the id [`apps`] reports
 	/// (a bundle identifier). Windows that open later are included. macOS only.
 	App(String),
+
+	/// A screen or window chosen through the Linux system picker.
+	///
+	/// Clone the selection for demand-driven reopens; create a new one to ask
+	/// for a different source. Restoration depends on compositor support.
+	#[cfg(all(target_os = "linux", feature = "pipewire"))]
+	Portal(portal::Selection),
 }
 
 /// The default camera, matching the historical `Config::default()`.
@@ -113,19 +127,21 @@ impl Source {
 	/// A short human-readable name for the source, used in logs and as the
 	/// captured device label.
 	///
-	/// macOS-only: one ScreenCaptureKit backend serves display, window, and app,
-	/// so it names the source from the config. The other backends label a stream
+	/// ScreenCaptureKit and WGC serve multiple source kinds, so they name the
+	/// source from the config. The other backends label a stream
 	/// with the device they resolved (`/dev/video0`, a Media Foundation friendly
 	/// name), which the config doesn't know.
-	#[cfg(target_os = "macos")]
+	#[cfg(any(target_os = "macos", target_os = "windows", test))]
 	pub(crate) fn label(&self) -> String {
 		match self {
 			Self::Camera(None) => "camera".to_string(),
 			Self::Camera(Some(id)) => format!("camera:{id}"),
 			Self::Display(None) => "display".to_string(),
-			Self::Display(Some(id)) => format!("display:{id}"),
-			Self::Window(id) => format!("window:{id}"),
+			Self::Display(Some(id)) => format!("display:{}", id.strip_prefix("display:").unwrap_or(id)),
+			Self::Window(id) => format!("window:{}", id.strip_prefix("window:").unwrap_or(id)),
 			Self::App(id) => format!("app:{id}"),
+			#[cfg(all(target_os = "linux", feature = "pipewire"))]
+			Self::Portal(selection) => format!("portal:{:?}", selection.kind()),
 		}
 	}
 }
@@ -143,6 +159,27 @@ impl Camera {
 	/// The [`Source`] that captures this camera.
 	pub fn source(&self) -> Source {
 		Source::Camera(Some(self.id.clone()))
+	}
+}
+
+/// A capture mode a source reports: one frame size and its exact frame rates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mode {
+	/// Frame width in pixels.
+	pub width: u32,
+	/// Frame height in pixels.
+	pub height: u32,
+	/// The exact frame rates offered at this size, highest first.
+	///
+	/// Empty when the driver describes a continuous range instead of listing
+	/// rates, or cannot enumerate intervals for this size.
+	pub framerates: Vec<Rate>,
+}
+
+impl Mode {
+	/// The highest rate this mode offers, or `None` when the driver listed none.
+	pub fn max_framerate(&self) -> Option<Rate> {
+		self.framerates.first().copied()
 	}
 }
 
@@ -222,8 +259,8 @@ pub struct Config {
 	pub width: Option<u32>,
 	/// Preferred output height in pixels.
 	pub height: Option<u32>,
-	/// Preferred frame rate in frames per second, from 1 through 1,000,000.
-	pub framerate: Option<u32>,
+	/// Preferred exact frame rate.
+	pub framerate: Option<Rate>,
 	/// Draw the mouse cursor into captured frames. Screen/window/app sources
 	/// only; ignored by cameras. Defaults to `true`.
 	pub cursor: bool,
@@ -253,12 +290,12 @@ pub struct Stream {
 	chan: Arc<FrameChannel>,
 	width: u32,
 	height: u32,
-	framerate: Option<u32>,
+	framerate: Option<Rate>,
 	color: Option<crate::Color>,
 	label: String,
 	/// First frame captured during [`open`] (some backends learn their geometry
 	/// only from a frame); returned by the first [`read`](Self::read).
-	pending: Option<Surface>,
+	pending: Option<Frame>,
 	/// Keeps the backend alive and releases it on drop. Type-erased because it
 	/// differs per platform (objc session + delegate, or pump-thread guard).
 	_backend: Keepalive,
@@ -270,12 +307,12 @@ impl Stream {
 		chan: Arc<FrameChannel>,
 		width: u32,
 		height: u32,
-		framerate: Option<u32>,
+		framerate: Option<Rate>,
 		label: String,
-		pending: Option<Surface>,
+		pending: Option<Frame>,
 		backend: Keepalive,
 	) -> Self {
-		let color = pending.as_ref().and_then(Surface::color);
+		let color = pending.as_ref().and_then(|frame| frame.surface.color());
 		Self {
 			chan,
 			width,
@@ -297,7 +334,7 @@ impl Stream {
 	///
 	/// Dropping this future cancels only the pending read. Dropping the stream
 	/// releases the capture source.
-	pub async fn read(&mut self) -> Result<Option<Surface>, Error> {
+	pub async fn read(&mut self) -> Result<Option<Frame>, Error> {
 		if let Some(frame) = self.pending.take() {
 			return Ok(Some(frame));
 		}
@@ -315,7 +352,7 @@ impl Stream {
 	}
 
 	/// The negotiated frame rate, or `None` if the source doesn't report one.
-	pub fn framerate(&self) -> Option<u32> {
+	pub fn framerate(&self) -> Option<Rate> {
 		self.framerate
 	}
 
@@ -328,11 +365,55 @@ impl Stream {
 	pub fn label(&self) -> &str {
 		&self.label
 	}
+
+	/// Current time in this stream's private capture timeline.
+	pub(crate) fn now(&self) -> moq_net::Timestamp {
+		self.chan.now()
+	}
+}
+
+/// A test-driven capture device: fixtures push frames at explicit acquisition
+/// instants or device timestamps, standing in for a camera behind a [`Stream`].
+#[cfg(all(test, feature = "openh264"))]
+pub(crate) struct Synthetic {
+	chan: Arc<FrameChannel>,
+}
+
+#[cfg(all(test, feature = "openh264"))]
+impl Synthetic {
+	/// Open a synthetic device with the given geometry, returning it and the stream reading it.
+	pub(crate) fn open(size: crate::Size, framerate: Rate) -> (Self, Stream) {
+		let chan = FrameChannel::new();
+		let stream = Stream::new(
+			chan.clone(),
+			size.width,
+			size.height,
+			Some(framerate),
+			"synthetic".to_string(),
+			None,
+			Box::new(()),
+		);
+		(Self { chan }, stream)
+	}
+
+	/// Deliver a frame acquired at `captured`.
+	pub(crate) fn push_at(&self, surface: crate::frame::Surface, captured: std::time::Instant) {
+		self.chan.push_at(surface, captured);
+	}
+
+	/// Deliver a frame stamped on the device's own timeline, like V4L2 and Media Foundation.
+	pub(crate) fn push_native(&self, surface: crate::frame::Surface, source: moq_net::Timestamp) {
+		self.chan.push_native(surface, source);
+	}
+
+	/// End the stream, as a device that stops delivering does.
+	pub(crate) fn close(&self) {
+		self.chan.close();
+	}
 }
 
 /// Open the capture source described by `config`.
 pub async fn open(config: &Config) -> Result<Stream, Error> {
-	validate(config)?;
 	match &config.source {
 		Source::Camera(device) => {
 			let _ = device;
@@ -342,7 +423,15 @@ pub async fn open(config: &Config) -> Result<Stream, Error> {
 			}
 			#[cfg(target_os = "linux")]
 			{
-				v4l2::open(config, device.as_deref()).await
+				match LinuxCamera::select(device.as_deref(), sandboxed()) {
+					LinuxCamera::V4l2(device) => v4l2::open(config, device).await,
+					#[cfg(feature = "pipewire")]
+					LinuxCamera::PipeWire(node) => pipewire::camera::open(config, node).await,
+					#[cfg(not(feature = "pipewire"))]
+					LinuxCamera::PipeWire(_) => Err(Error::Unsupported(
+						"PipeWire camera capture without the `pipewire` feature".to_string(),
+					)),
+				}
 			}
 			#[cfg(target_os = "windows")]
 			{
@@ -361,14 +450,17 @@ pub async fn open(config: &Config) -> Result<Stream, Error> {
 			}
 			#[cfg(target_os = "windows")]
 			{
-				desktopduplication::open(config, device.as_deref()).await
+				wgc::open(config).await
 			}
 			#[cfg(all(target_os = "linux", feature = "pipewire"))]
 			{
 				if x11::selected(device.as_deref()) {
 					x11::open_display(config, device.as_deref()).await
 				} else {
-					pipewire::open(config, device.as_deref()).await
+					if let Some(device) = device {
+						tracing::debug!(%device, "portal screen capture ignores the device selector; the picker owns selection");
+					}
+					pipewire::open(config, None).await
 				}
 			}
 			#[cfg(all(target_os = "linux", not(feature = "pipewire")))]
@@ -392,13 +484,15 @@ pub async fn open(config: &Config) -> Result<Stream, Error> {
 			}
 			#[cfg(target_os = "windows")]
 			{
-				window::open(config, id).await
+				wgc::open(config).await
 			}
 			#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 			{
 				Err(Error::Unsupported("window capture".to_string()))
 			}
 		}
+		#[cfg(all(target_os = "linux", feature = "pipewire"))]
+		Source::Portal(selection) => pipewire::open(config, Some(selection)).await,
 		Source::App(id) => {
 			let _ = id;
 			#[cfg(target_os = "macos")]
@@ -413,14 +507,13 @@ pub async fn open(config: &Config) -> Result<Stream, Error> {
 	}
 }
 
-fn validate(config: &Config) -> Result<(), Error> {
-	match config.framerate {
-		Some(value) if value == 0 || value > MAX_FRAMERATE => Err(Error::InvalidFramerate(value)),
-		_ => Ok(()),
-	}
-}
-
 /// List the available cameras and the identifiers [`Source::Camera`] accepts.
+///
+/// On Linux, V4L2 lists only devices offering YUYV or MJPEG. With the `pipewire`
+/// feature, PipeWire camera nodes follow, excluding V4L2 paths already listed.
+/// PipeWire-only cameras remain visible. A session without PipeWire lists V4L2
+/// alone. Inside a sandbox the PipeWire nodes come through the camera portal,
+/// which may ask the user for camera access.
 pub async fn cameras() -> Result<Vec<Camera>, Error> {
 	#[cfg(target_os = "macos")]
 	{
@@ -428,7 +521,13 @@ pub async fn cameras() -> Result<Vec<Camera>, Error> {
 	}
 	#[cfg(target_os = "linux")]
 	{
-		blocking(v4l2::cameras).await
+		let cameras = blocking(v4l2::cameras).await?;
+		#[cfg(feature = "pipewire")]
+		let cameras = {
+			let pipewire = pipewire::camera::cameras(&cameras).await?;
+			[cameras, pipewire].concat()
+		};
+		Ok(cameras)
 	}
 	#[cfg(target_os = "windows")]
 	{
@@ -437,6 +536,44 @@ pub async fn cameras() -> Result<Vec<Camera>, Error> {
 	#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 	{
 		Err(Error::Unsupported("listing cameras".to_string()))
+	}
+}
+
+/// List the modes a camera reports, largest size first.
+///
+/// `camera` selects the device exactly as [`Source::Camera`] does. Only the
+/// formats this crate can convert are enumerated, so the modes that come back
+/// are ones [`open`] could negotiate rather than everything the driver
+/// advertises.
+///
+/// Linux only (V4L2, and PipeWire cameras with the `pipewire` feature); other
+/// platforms return [`Error::Unsupported`].
+/// Rates are exact device reports and [`Config::framerate`] accepts the same type.
+/// Both Linux backends prefer the closest geometry, then the accepted rate
+/// nearest that request, then the cheaper conversion format.
+///
+/// An empty list is not a failure: it means the driver enumerated nothing this
+/// crate can convert.
+pub async fn camera_modes(camera: Option<&str>) -> Result<Vec<Mode>, Error> {
+	let _ = camera;
+	#[cfg(target_os = "linux")]
+	{
+		match LinuxCamera::select(camera, sandboxed()) {
+			LinuxCamera::V4l2(camera) => {
+				let camera = camera.map(str::to_string);
+				blocking(move || v4l2::modes(camera.as_deref())).await
+			}
+			#[cfg(feature = "pipewire")]
+			LinuxCamera::PipeWire(node) => pipewire::camera::modes(node).await,
+			#[cfg(not(feature = "pipewire"))]
+			LinuxCamera::PipeWire(_) => Err(Error::Unsupported(
+				"PipeWire camera modes without the `pipewire` feature".to_string(),
+			)),
+		}
+	}
+	#[cfg(not(target_os = "linux"))]
+	{
+		Err(Error::Unsupported("listing camera modes".to_string()))
 	}
 }
 
@@ -452,7 +589,7 @@ pub async fn displays() -> Result<Vec<Display>, Error> {
 	}
 	#[cfg(target_os = "windows")]
 	{
-		blocking(desktopduplication::displays).await
+		blocking(wgc::displays).await
 	}
 	#[cfg(target_os = "linux")]
 	{
@@ -476,7 +613,7 @@ pub async fn windows() -> Result<Vec<Window>, Error> {
 	}
 	#[cfg(target_os = "windows")]
 	{
-		blocking(window::windows).await
+		blocking(wgc::windows).await
 	}
 	#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 	{
@@ -493,6 +630,52 @@ pub async fn apps() -> Result<Vec<App>, Error> {
 	#[cfg(not(target_os = "macos"))]
 	{
 		Err(Error::Unsupported("listing applications".to_string()))
+	}
+}
+
+/// The id prefix of a PipeWire camera, and on its own the default one.
+#[cfg(any(target_os = "linux", test))]
+const PIPEWIRE: &str = "pipewire";
+
+/// The Linux backend a [`Source::Camera`] selector names.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum LinuxCamera<'a> {
+	/// A V4L2 device, by path or index. `None` opens `/dev/video0`.
+	V4l2(Option<&'a str>),
+	/// A PipeWire camera, by `node.name`. `None` picks the camera with the
+	/// highest session priority, the one the session manager links by default.
+	PipeWire(Option<&'a str>),
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl<'a> LinuxCamera<'a> {
+	/// Parse a camera selector. A sandbox has no V4L2 devices to open by
+	/// default, so its default camera is PipeWire's, reached through the portal.
+	fn select(selector: Option<&'a str>, sandboxed: bool) -> Self {
+		match selector {
+			None if sandboxed => Self::PipeWire(None),
+			None => Self::V4l2(None),
+			Some(PIPEWIRE) => Self::PipeWire(None),
+			Some(selector) => match selector.strip_prefix(PIPEWIRE).and_then(|rest| rest.strip_prefix(':')) {
+				Some(name) => Self::PipeWire(Some(name)),
+				None => Self::V4l2(Some(selector)),
+			},
+		}
+	}
+}
+
+/// Whether this process runs in a Flatpak or Snap sandbox. Without the
+/// `pipewire` feature there is no portal to use, so it never matters.
+#[cfg(target_os = "linux")]
+fn sandboxed() -> bool {
+	#[cfg(feature = "pipewire")]
+	{
+		ashpd::is_sandboxed()
+	}
+	#[cfg(not(feature = "pipewire"))]
+	{
+		false
 	}
 }
 
@@ -513,18 +696,48 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn validates_framerate_range() {
-		let mut config = Config::default();
-		assert!(validate(&config).is_ok());
+	fn source_labels_add_the_source_kind() {
+		assert_eq!(Source::Camera(None).label(), "camera");
+		assert_eq!(Source::Camera(Some("camera-id".into())).label(), "camera:camera-id");
+		assert_eq!(Source::Display(None).label(), "display");
+		assert_eq!(Source::Display(Some("0".into())).label(), "display:0");
+		assert_eq!(Source::Window("123".into()).label(), "window:123");
+		assert_eq!(Source::App("com.example.app".into()).label(), "app:com.example.app");
+	}
 
-		config.framerate = Some(1);
-		assert!(validate(&config).is_ok());
-		config.framerate = Some(MAX_FRAMERATE);
-		assert!(validate(&config).is_ok());
+	#[test]
+	fn source_labels_preserve_prefixed_display_ids() {
+		assert_eq!(Source::Display(Some("display:0".into())).label(), "display:0");
+	}
 
-		config.framerate = Some(0);
-		assert!(matches!(validate(&config), Err(Error::InvalidFramerate(0))));
-		config.framerate = Some(MAX_FRAMERATE + 1);
-		assert!(matches!(validate(&config), Err(Error::InvalidFramerate(value)) if value == MAX_FRAMERATE + 1));
+	#[test]
+	fn source_labels_preserve_prefixed_window_ids() {
+		assert_eq!(Source::Window("window:123".into()).label(), "window:123");
+	}
+
+	#[test]
+	fn camera_selectors_name_their_backend() {
+		assert_eq!(LinuxCamera::select(None, false), LinuxCamera::V4l2(None));
+		assert_eq!(LinuxCamera::select(None, true), LinuxCamera::PipeWire(None));
+		for sandboxed in [false, true] {
+			assert_eq!(
+				LinuxCamera::select(Some("/dev/video2"), sandboxed),
+				LinuxCamera::V4l2(Some("/dev/video2"))
+			);
+			assert_eq!(LinuxCamera::select(Some("1"), sandboxed), LinuxCamera::V4l2(Some("1")));
+			assert_eq!(
+				LinuxCamera::select(Some("pipewire"), sandboxed),
+				LinuxCamera::PipeWire(None)
+			);
+			assert_eq!(
+				LinuxCamera::select(Some("pipewire:v4l2_input.pci-0000_00_14.0-usb-0_4_1.0"), sandboxed),
+				LinuxCamera::PipeWire(Some("v4l2_input.pci-0000_00_14.0-usb-0_4_1.0"))
+			);
+		}
+		// Only the whole prefix selects PipeWire; anything else is a device path.
+		assert_eq!(
+			LinuxCamera::select(Some("pipewired"), false),
+			LinuxCamera::V4l2(Some("pipewired"))
+		);
 	}
 }

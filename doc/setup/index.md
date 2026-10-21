@@ -53,7 +53,7 @@ private media.
 ```bash
 # Publish a file, then open https://moq.dev/watch?name=<your-name>
 ffmpeg -re -i video.mp4 -c copy -f mpegts - | \
-    moq --client-connect https://cdn.moq.dev/anon --broadcast <your-name>.hang import ts
+    moq --connect https://cdn.moq.dev/anon --broadcast <your-name>.hang import ts
 ```
 
 Every client, in every language, connects the same way: a relay URL whose path
@@ -63,6 +63,6 @@ broadcasts end in `.hang`.
 ## Next steps
 
 - [Install](/setup/install) the relay and CLI as packages instead of building them.
-- Publish from [OBS](/bin/obs), [GStreamer](/bin/gstreamer), or [RTMP/SRT/WebRTC](/bin/cli).
+- Publish from [OBS](/bin/obs), [GStreamer](/bin/gstreamer), or an [RTMP, SRT, or WebRTC gateway](/bin/#gateways).
 - Embed a player with the [web components](/lib/js/) or pick a [library](/lib/).
 - [Deploy](/setup/prod) a relay with real TLS and authentication.

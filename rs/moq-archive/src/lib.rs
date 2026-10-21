@@ -1,0 +1,52 @@
+//! Versioned hang recording objects on any [`object_store::ObjectStore`].
+//!
+//! The crate owns the portable layout and codecs: percent-encoded track names, `.info` JSON,
+//! the binary segment envelope, and put/get/list/delete. A [`Writer`] records selected tracks of
+//! a broadcast into those objects, and a [`Reader`] serves a recording back through a `moq_net`
+//! broadcast. Callers that need runtime dispatch
+//! supply `Arc<dyn ObjectStore>`; the archive API itself stays generic.
+//!
+//! Every object is keyed by its track and a record sequence:
+//! ```
+//! let key = moq_archive::Key::segments("video", 7)?;
+//! assert_eq!(key.track(), "video");
+//! # Ok::<(), moq_archive::Error>(())
+//! ```
+
+#![warn(missing_docs)]
+
+pub use object_store;
+
+mod error;
+/// The `.info` object holding a track's immutable properties.
+pub mod info;
+#[cfg(test)]
+mod mock;
+mod path;
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+mod proof;
+pub mod reader;
+mod recover;
+/// The binary segment object holding a record's groups and frames.
+pub mod segment;
+/// Put, get, list, and delete recording objects on an object store.
+pub mod store;
+pub mod writer;
+
+pub use error::{Error, Result};
+pub use info::Info;
+pub use path::Key;
+pub use reader::Reader;
+pub use segment::{Frame, Group, Object};
+pub use store::Store;
+pub use writer::Writer;
+
+/// Recording format version written into `.info` and the binary envelope.
+pub const VERSION: u64 = 2;
+
+/// Largest group, segment, or timestamp value the format allows (`2^53 - 1`).
+pub const ID_MAX: u64 = (1 << 53) - 1;
+
+/// Decimal width of segment ID filename fields.
+pub(crate) const ID_WIDTH: usize = 19;

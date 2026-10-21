@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { OriginSchema } from "../origin.ts";
+import { HopSchema } from "../hop.ts";
 import { Reader, Writer } from "../stream.ts";
 import * as Varint from "../varint.ts";
 import { ProbeLevel, Role, Setup } from "./setup.ts";
@@ -10,7 +10,7 @@ import { Version } from "./version.ts";
 const PARAM_PROBE = 0x1n;
 const PARAM_PATH = 0x2n;
 const PARAM_ROLE = 0x3n;
-const PARAM_ORIGIN = 0x5n;
+const PARAM_HOP = 0x5n;
 
 function concat(chunks: Uint8Array[]): Uint8Array {
 	const total = chunks.reduce((sum, c) => sum + c.byteLength, 0);
@@ -23,10 +23,11 @@ function concat(chunks: Uint8Array[]): Uint8Array {
 	return out;
 }
 
-async function bytes(f: (w: Writer) => Promise<void>): Promise<Uint8Array> {
+async function bytes(f: (w: Writer) => Promise<void>, version: Version): Promise<Uint8Array> {
 	const written: Uint8Array[] = [];
 	const writer = new Writer(
 		new WritableStream<Uint8Array>({ write: (chunk) => void written.push(new Uint8Array(chunk)) }),
+		version,
 	);
 	await f(writer);
 	writer.close();
@@ -35,7 +36,11 @@ async function bytes(f: (w: Writer) => Promise<void>): Promise<Uint8Array> {
 }
 
 async function roundTrip(msg: Setup): Promise<Setup> {
-	const reader = new Reader(undefined, await bytes((w) => msg.encode(w, Version.DRAFT_05)));
+	const reader = new Reader(
+		undefined,
+		await bytes((w) => msg.encode(w, Version.DRAFT_05), Version.DRAFT_05),
+		Version.DRAFT_05,
+	);
 	const got = await Setup.decode(reader, Version.DRAFT_05);
 	expect(await reader.done()).toBe(true);
 	return got;
@@ -49,14 +54,14 @@ async function decodeParam(id: bigint, value: Uint8Array): Promise<Setup> {
 		await w.u62(id);
 		await w.u53(value.byteLength);
 		if (value.byteLength > 0) await w.write(value);
-	});
+	}, Version.DRAFT_05);
 
 	const framed = await bytes(async (w) => {
 		await w.u53(body.byteLength); // Message size prefix
 		await w.write(body);
-	});
+	}, Version.DRAFT_05);
 
-	return await Setup.decode(new Reader(undefined, framed), Version.DRAFT_05);
+	return await Setup.decode(new Reader(undefined, framed, Version.DRAFT_05), Version.DRAFT_05);
 }
 
 test("empty SETUP round-trips on draft-05", async () => {
@@ -98,15 +103,18 @@ test("Both is the wire default, so it is omitted rather than encoded", async () 
 	// Both must be the absence of the parameter, so a server that predates it decodes a
 	// Both client back to Both. Assert the empty bag directly: comparing against another
 	// default-constructed Setup would agree with itself even if we encoded Both.
-	const both = await bytes((w) => new Setup({ role: Role.Both }).encode(w, Version.DRAFT_05));
+	const both = await bytes((w) => new Setup({ role: Role.Both }).encode(w, Version.DRAFT_05), Version.DRAFT_05);
 	const emptyBag = await bytes(async (w) => {
 		await w.u53(1); // Message size prefix: one byte of body follows
 		await w.u53(0); // parameter count
-	});
+	}, Version.DRAFT_05);
 	expect(both).toEqual(emptyBag);
 
 	// A directional role is still encoded, so the check above can actually fail.
-	const publisher = await bytes((w) => new Setup({ role: Role.Publisher }).encode(w, Version.DRAFT_05));
+	const publisher = await bytes(
+		(w) => new Setup({ role: Role.Publisher }).encode(w, Version.DRAFT_05),
+		Version.DRAFT_05,
+	);
 	expect(publisher.byteLength).toBeGreaterThan(both.byteLength);
 });
 
@@ -127,25 +135,25 @@ test("unknown probe level saturates to Increase", async () => {
 	expect(got.probe).toBe(ProbeLevel.Increase);
 });
 
-test("SETUP with origin round-trips", async () => {
-	const origin = OriginSchema.parse(42n);
-	const got = await roundTrip(new Setup({ origin }));
-	expect(got.origin).toBe(origin);
+test("SETUP with hop round-trips", async () => {
+	const hop = HopSchema.parse(42n);
+	const got = await roundTrip(new Setup({ hop }));
+	expect(got.hop).toBe(hop);
 });
 
-test("origin 0 decodes as absent", async () => {
+test("hop 0 decodes as absent", async () => {
 	// 0 carries no identity (it cannot be excluded), so it decodes as undefined.
-	const got = await decodeParam(PARAM_ORIGIN, Varint.encode(0));
-	expect(got.origin).toBeUndefined();
+	const got = await decodeParam(PARAM_HOP, Varint.encode(0));
+	expect(got.hop).toBeUndefined();
 });
 
 test("SETUP is rejected before draft-05", async () => {
-	await expect(bytes((w) => new Setup().encode(w, Version.DRAFT_04))).rejects.toThrow();
+	await expect(bytes((w) => new Setup().encode(w, Version.DRAFT_04), Version.DRAFT_04)).rejects.toThrow();
 });
 
 test("SETUP decode is rejected before draft-05", async () => {
-	const framed = await bytes((w) => new Setup().encode(w, Version.DRAFT_05));
-	await expect(Setup.decode(new Reader(undefined, framed), Version.DRAFT_04)).rejects.toThrow();
+	const framed = await bytes((w) => new Setup().encode(w, Version.DRAFT_05), Version.DRAFT_05);
+	await expect(Setup.decode(new Reader(undefined, framed, Version.DRAFT_04), Version.DRAFT_04)).rejects.toThrow();
 });
 
 test("empty path decodes as the root", async () => {
@@ -156,4 +164,22 @@ test("empty path decodes as the root", async () => {
 
 test("SETUP rejects a path with malformed UTF-8", async () => {
 	await expect(decodeParam(PARAM_PATH, new Uint8Array([0xc3, 0x28]))).rejects.toThrow();
+});
+
+test("SETUP encode stops at the 65,535-byte receive limit", async () => {
+	// Count, id, and a 4-byte length varint precede the path.
+	const atLimit = 65_535 - 6;
+	const msg = new Setup({ path: "a".repeat(atLimit) });
+	expect((await roundTrip(msg)).path).toBe(msg.path);
+
+	const over = new Setup({ path: "a".repeat(atLimit + 1) });
+	await expect(bytes((w) => over.encode(w, Version.DRAFT_05), Version.DRAFT_05)).rejects.toThrow("too large");
+});
+
+test("SETUP decode refuses an oversized length before reading the body", async () => {
+	// Only the prefix is present, so reading the body would fail with a different error.
+	const prefix = await bytes((w) => w.u53(65_536), Version.DRAFT_05);
+	await expect(Setup.decode(new Reader(undefined, prefix, Version.DRAFT_05), Version.DRAFT_05)).rejects.toThrow(
+		"too large",
+	);
 });

@@ -1,11 +1,10 @@
+import { type Micro, Milli, Nano } from "@moq/clock";
 import * as Catalog from "@moq/hang/catalog";
 import * as Container from "@moq/hang/container";
 import * as Util from "@moq/hang/util";
 import type * as Moq from "@moq/net";
-import { Time } from "@moq/net";
 import {
 	type Computed,
-	type Dispose,
 	Effect,
 	type Getter,
 	getter,
@@ -14,8 +13,10 @@ import {
 	readonlys,
 	Signal,
 } from "@moq/signals";
+import { rotateVideoDimensions } from "@moq/video";
+import { Producer as ArrivalProducer, type Arrivals, gap } from "../arrivals";
 import { base64ToBytes } from "../base64";
-
+import { type Failure, failureMoved, nextMedia, subscribeMedia } from "../media";
 import type { Sync } from "../sync";
 import {
 	type DecoderConfig,
@@ -24,26 +25,24 @@ import {
 	playbackIdentity,
 	supportCacheKey,
 } from "./config";
-import { caughtUp } from "./playhead";
-import { rotateVideoDimensions } from "./presentation";
+import { caughtUp, renditionJitter, switchJitter } from "./playhead";
+import { Recovery } from "./recovery";
 import type { Source } from "./source";
 
 // The amount of time to wait before considering the video to be buffering.
-const BUFFERING = Time.Milli(500);
+const BUFFERING = Milli(500);
 
 export type DecoderInput = {
-	/** Whether to download the video track. Wired from the renderer's output by the parent. */
+	/** Whether to download the video track. Defaults to true; the parent may wire it from the renderer's output. */
 	enabled: Getter<boolean>;
+};
 
-	/**
-	 * Whether to pace playback off the clock, holding each decoded frame until its presentation
-	 * time. Defaults to true.
-	 *
-	 * False paints on decode instead, trading smooth motion for the lowest latency the display can
-	 * offer. The clock stays wired either way and keeps tracking receipts and rewinds, so anything
-	 * else reading it (captions, the UI) still works and re-enabling this resumes cleanly.
-	 */
-	paced: Getter<boolean>;
+/** Constructor properties for {@link Decoder}. */
+export type DecoderProps = Inputs<DecoderInput> & {
+	/** Rendition selector supplying encoded video. */
+	source: Source;
+	/** Shared playback clock. */
+	sync: Sync;
 };
 
 /** Cumulative video statistics since the decoder started. */
@@ -56,17 +55,22 @@ export interface Stats {
 }
 
 type DecoderOutput = {
+	/** Fatal decode failure, cleared when another source is selected. */
+	error: Signal<Error | undefined>;
 	// The current frame to render.
 	frame: Signal<VideoFrame | undefined>;
 
 	// The timestamp of the current frame.
-	timestamp: Signal<Time.Milli | undefined>;
+	timestamp: Signal<Milli | undefined>;
 
 	// The display size of the video in pixels, ideally sourced from the catalog.
 	display: Signal<{ width: number; height: number } | undefined>;
 
 	stalled: Signal<boolean>;
 	stats: Signal<Stats | undefined>;
+
+	// The rendition delay Sync must cover while switching tracks.
+	jitter: Signal<Milli | undefined>;
 
 	// Combined buffered ranges (network jitter + decode buffer)
 	buffered: Signal<Container.BufferedRanges>;
@@ -79,20 +83,36 @@ export class Decoder {
 	readonly sync: Sync;
 
 	readonly #out: DecoderOutput = {
+		error: new Signal<Error | undefined>(undefined),
 		frame: new Signal<VideoFrame | undefined>(undefined),
-		timestamp: new Signal<Time.Milli | undefined>(undefined),
+		timestamp: new Signal<Milli | undefined>(undefined),
 		display: new Signal<{ width: number; height: number } | undefined>(undefined),
 		stalled: new Signal<boolean>(false),
 		stats: new Signal<Stats | undefined>(undefined),
+		jitter: new Signal<Milli | undefined>(undefined),
 		buffered: new Signal<Container.BufferedRanges>([]),
 	};
 	readonly out = readonlys(this.#out);
 
 	// The current track running, held so we can cancel it when the new track is ready.
 	#active = new Signal<DecoderTrack | undefined>(undefined);
+	// The rendition preparing to replace the active one, with the catalog of the broadcast it
+	// subscribed to. One value so a later source that reuses the track name still notifies:
+	// the name alone would compare equal, and the jitter effect would keep the previous catalog.
+	#pending = new Signal<{ track: string; catalog: Getter<Catalog.Root | undefined> } | undefined>(undefined);
+	// The active track's arrival estimate from its container consumer.
+	#spread = new Signal<Milli | undefined>(undefined);
+	// The path of the media the last rendition read, and its instance. Every handle to one instance
+	// shares `closed`, so it identifies the instance where the handle itself does not.
+	#instance?: { path: Moq.Path.Valid; closed: unknown };
 	readonly #identity: Computed<PlaybackIdentity | undefined>;
 
+	// Fans received frames out to open `arrivals()` handles; retains nothing without one.
+	#arrivals = new ArrivalProducer();
+
 	#signals = new Effect();
+	#selected?: DecoderTrack;
+	#failed?: Failure;
 
 	#clearCurrentFrame(): void {
 		this.#out.frame.update((prev) => {
@@ -102,44 +122,93 @@ export class Decoder {
 		this.#out.timestamp.set(undefined);
 	}
 
-	constructor(source: Source, sync: Sync, props?: Inputs<DecoderInput>) {
+	constructor(props: DecoderProps) {
 		this.in = {
-			enabled: getter(props?.enabled ?? false),
-			paced: getter(props?.paced ?? true),
+			enabled: getter(props?.enabled ?? true),
 		};
 
-		this.source = source;
-		this.sync = sync;
+		this.source = props.source;
+		this.sync = props.sync;
+		// "auto" holds the arrival estimate plus the active rendition's catalog `delay`, floored at the
+		// catalog requirement. The estimate cancels any offset between tracks, so the delay is added
+		// back. The audio frame term has no video counterpart: the rendition jitter already covers a
+		// frame interval.
+		const target = this.#signals.computed((effect) => {
+			const jitter = effect.get(this.out.jitter);
+			const spread = effect.get(this.#spread);
+			if (spread === undefined) return jitter;
+			const active = effect.get(this.#active);
+			const delay = active && effect.get(active.catalog)?.video?.renditions?.[active.track]?.delay;
+			return Milli(Math.max(spread + (delay ?? 0), jitter ?? Milli.zero));
+		});
+		this.#signals.cleanup(this.sync.register(target));
 		this.#identity = this.#signals.computed((effect) => {
 			const config = effect.get(this.source.out.config);
 			return config ? playbackIdentity(config) : undefined;
 		});
 
+		this.#signals.run(this.#runJitter.bind(this));
 		this.#signals.run(this.#runPending.bind(this));
 		this.#signals.run(this.#runActive.bind(this));
 		this.#signals.run(this.#runDisplay.bind(this));
 		this.#signals.run(this.#runBuffering.bind(this));
 	}
 
+	// Read from the full catalog entry, which the decoder config omits, so a rising entry resizes Sync.
+	// Each in-flight rendition stays tied to the catalog it subscribed to: during a source switch the
+	// shared catalog already describes the next broadcast, and the same track name there is a
+	// different rendition.
+	#runJitter(effect: Effect): void {
+		const floor = (track: string | undefined, catalog: Getter<Catalog.Root | undefined> | undefined) => {
+			if (track === undefined || catalog === undefined) return undefined;
+			const config = effect.get(catalog)?.video?.renditions?.[track];
+			return config && renditionJitter(config);
+		};
+		const activeTrack = effect.get(this.#active);
+		const active = floor(activeTrack?.track, activeTrack?.catalog);
+		const pendingTrack = effect.get(this.#pending);
+		const pending = floor(pendingTrack?.track, pendingTrack?.catalog);
+		effect.set(this.#out.jitter, switchJitter({ active, pending }));
+	}
+
 	#runPending(effect: Effect): void {
-		const values = effect.getAll([
-			this.in.enabled,
-			this.source.in.broadcast,
-			this.source.out.track,
-			this.#identity,
-		]);
-		if (!values) {
+		this.#selected = undefined;
+		const enabled = effect.get(this.in.enabled);
+		const broadcast = effect.get(this.source.in.broadcast);
+		const track = effect.get(this.source.out.track);
+		const identity = effect.get(this.#identity);
+
+		// Honor a per-rendition `broadcast` override: subscribe on the resolved source
+		// broadcast instead of the catalog's own broadcast. A disabled decoder resolves it only to
+		// tell whether a failure's source is still selected.
+		const active: Moq.Broadcast.Consumer | undefined =
+			broadcast && track && identity && (enabled || this.#failed)
+				? broadcast.relativeBroadcast(effect, identity.broadcast)
+				: undefined;
+		const key = identity && JSON.stringify(identity);
+
+		// A failure belongs to its source: selecting another clears it, even while disabled.
+		const failed = this.#failed;
+		const selected = broadcast && failed ? effect.get(broadcast.out.active)?.closed : undefined;
+		if (failed && failureMoved(failed, { broadcast: selected, media: active?.closed, track, identity: key })) {
+			this.#failed = undefined;
+			this.#out.error.set(undefined);
+		}
+
+		if (!enabled || !broadcast || !track || !identity) {
 			// Close the active track when disabled (e.g. paused or not visible).
 			// The pending cleanup won't do this because it was already promoted to #active.
 			this.#active.set(undefined);
+			// A paused or hidden player keeps its picture, but with nothing selectable (every rendition
+			// disabled or removed) it shows black rather than a frozen frame.
+			if (enabled && broadcast && !track) {
+				this.#clearCurrentFrame();
+				this.#out.buffered.set([]);
+			}
 			return;
 		}
-		const [_, broadcast, track, identity] = values;
 
-		// Honor a per-rendition `broadcast` override: subscribe on the resolved source
-		// broadcast instead of the catalog's own broadcast.
-		const active: Moq.Broadcast.Consumer | undefined = broadcast.relativeBroadcast(effect, identity.broadcast);
-		if (!active) {
+		if (!active || !key) {
 			// Going offline should clear the last rendered frame.
 			this.#active.set(undefined);
 			this.#clearCurrentFrame();
@@ -147,23 +216,60 @@ export class Decoder {
 			return;
 		}
 
+		// This source already failed; wait for another.
+		if (this.#failed) return;
+
+		// A republish of the media this rendition reads (the catalog's own broadcast, or the one a
+		// `broadcast` override names) is another instance, whose timeline starts over. Waiting for
+		// it to catch up to the old picture would freeze video until it passed the old timestamps,
+		// so switch at once and re-anchor the clock. A rendition switch within one instance, or a
+		// switch to another path, still waits.
+		const republished = this.#instance?.path === active.path && this.#instance.closed !== active.closed;
+		this.#instance = { path: active.path, closed: active.closed };
+		if (republished) this.sync.reset();
+
+		// Only a rendition read from the same path continues the outgoing arrival estimate: another
+		// path's arrivals have nothing to do with what this one learned.
+		const outgoing = this.#active.peek();
+		const predecessor = outgoing?.broadcast.path === active.path ? outgoing.consumer : undefined;
+
 		// Start a new pending effect.
 		let pending: DecoderTrack | undefined = new DecoderTrack({
 			sync: this.sync,
-			paced: this.in.paced,
 			broadcast: active,
 			track,
+			name: Catalog.track(track, identity),
 			config: identity.decoder,
+			identity: key,
 			stats: this.#out.stats,
+			catalog: broadcast.out.catalog,
+			predecessor,
 		});
+		this.#selected = pending;
+		effect.run((inner) => {
+			if (!pending) {
+				inner.close(); // Promoted tracks are observed by their active lifetime.
+				return;
+			}
+			const error = inner.get(pending.error);
+			if (!error) return;
+			this.#recordError(pending, error);
+			pending.close();
+			pending = undefined;
+			this.#pending.set(undefined);
+		});
+		effect.set(this.#pending, { track, catalog: broadcast.out.catalog });
 
 		effect.cleanup(() => pending?.close());
 
 		effect.run((effect) => {
-			if (!pending) return;
+			if (!pending) {
+				effect.close();
+				return;
+			}
 
 			const current = effect.get(this.#active);
-			if (current) {
+			if (current && !republished) {
 				// A zero timestamp is a rendered frame, not a missing one.
 				const pendingTimestamp = effect.get(pending.timestamp);
 				if (pendingTimestamp === undefined) return;
@@ -174,7 +280,10 @@ export class Decoder {
 
 			// Upgrade the pending track to active.
 			// #runActive will be in charge of it now.
+			if (current) current.arrivals = undefined;
+			pending.arrivals = this.#arrivals;
 			this.#active.set(pending);
+			this.#pending.set(undefined);
 			pending = undefined;
 
 			// This effect is done; close it to avoid a useless re-run.
@@ -187,22 +296,50 @@ export class Decoder {
 		if (!active) {
 			// Clear stale data when disabled (e.g. paused or not visible).
 			this.#out.buffered.set([]);
+			this.#spread.set(undefined);
 			return;
 		}
 
 		effect.cleanup(() => active.close());
 
+		effect.run((inner) => {
+			const error = inner.get(active.error);
+			if (!error) return;
+			this.#recordError(active, error);
+			this.#active.set(undefined);
+			this.#clearCurrentFrame();
+		});
+
 		// Clone the frame so we own it independently of the DecoderTrack.
 		// proxy() would share the same reference, allowing the source to close our frame.
 		effect.run((inner) => {
 			const frame = inner.get(active.frame);
+			if (!frame) return; // A promoted track holds the previous picture until its first frame.
+			if (active.error.peek()) return;
+			if (this.#selected === active) {
+				this.#failed = undefined;
+				this.#out.error.set(undefined);
+			}
+			this.#out.timestamp.set(Milli.fromMicro(frame.timestamp as Micro));
 			this.#out.frame.update((prev) => {
 				prev?.close();
-				return frame?.clone();
+				return frame.clone();
 			});
 		});
-		effect.proxy(this.#out.timestamp, active.timestamp);
 		effect.proxy(this.#out.buffered, active.buffered);
+		effect.proxy(this.#spread, active.spread);
+	}
+
+	#recordError(track: DecoderTrack, error: Error): void {
+		// An outgoing failure must not replace the selected rendition's failure latch.
+		if (track !== this.#selected && this.#selected?.error.peek()) return;
+		this.#failed = {
+			broadcast: this.source.in.broadcast.peek()?.out.active.peek()?.closed,
+			media: track.broadcast.closed,
+			track: track.track,
+			identity: track.identity,
+		};
+		this.#out.error.set(error);
 	}
 
 	#runDisplay(effect: Effect): void {
@@ -238,11 +375,17 @@ export class Decoder {
 
 		effect.timer(() => {
 			this.#out.stalled.set(true);
-		}, BUFFERING);
+		}, Nano.fromMilli(BUFFERING));
+	}
+
+	/** Observe every frame and gap the displayed rendition receives until the handle or this decoder closes. */
+	arrivals(): Arrivals {
+		return this.#arrivals.consume();
 	}
 
 	close() {
 		this.#clearCurrentFrame();
+		this.#arrivals.close();
 
 		this.#signals.close();
 	}
@@ -253,94 +396,135 @@ export class Decoder {
 
 interface DecoderTrackProps {
 	sync: Sync;
-	paced: Getter<boolean>;
 	broadcast: Moq.Broadcast.Consumer;
+	// The rendition ID; `name` is its track's name in `broadcast`.
 	track: string;
+	name: string;
 	config: DecoderConfig;
+	identity: string;
+	// The broadcast catalog this subscription started from. Updates on that broadcast still apply;
+	// a later source does not.
+	catalog: Getter<Catalog.Root | undefined>;
+	// The consumer of the rendition on screen when this one was selected from the same path, whose
+	// arrival estimate it continues.
+	predecessor?: Container.Consumer;
 
 	stats: Signal<Stats | undefined>;
 }
 
 class DecoderTrack {
+	error = new Signal<Error | undefined>(undefined);
 	sync: Sync;
-	paced: Getter<boolean>;
 	broadcast: Moq.Broadcast.Consumer;
 	track: string;
+	name: string;
 	config: DecoderConfig;
+	identity: string;
+	catalog: Getter<Catalog.Root | undefined>;
 	stats: Signal<Stats | undefined>;
+	// Set once promoted, so only the rendition feeding the picture reports arrivals.
+	arrivals?: ArrivalProducer;
 
-	timestamp = new Signal<Time.Milli | undefined>(undefined);
+	timestamp = new Signal<Milli | undefined>(undefined);
 	frame = new Signal<VideoFrame | undefined>(undefined);
 
 	// Network jitter + decode buffer.
 	buffered = new Signal<Container.BufferedRanges>([]);
 
+	// How late frames arrive relative to the earliest one, from the container consumer.
+	spread = new Signal<Milli | undefined>(undefined);
+
 	// Decoded frames waiting to be rendered.
 	#buffered = new Signal<Container.BufferedRanges>([]);
 
-	// The container's reorder/skip budget, mirroring the sync buffer. Zero when unpaced,
-	// matching the consumer's own default: don't wait, skip to the live edge.
-	#latency = new Signal<Time.Milli>(Time.Milli.zero);
+	// Codec description from the last configure, reused after a playhead reset.
+	#description?: Uint8Array;
 
-	// The last discontinuity count seen from the container consumer; doubles as a generation
-	// so in-flight decodes from before a rewind can be dropped on output.
-	#discontinuity = 0;
+	// The playhead moved and the next decoded frame decides whether the decoder resets.
+	#resetPending = false;
+
+	// The newest consumer reading this track, whose estimate a replacement continues. The predecessor
+	// is only held until the first one opens.
+	consumer?: Container.Consumer;
+	#predecessor?: Container.Consumer;
 
 	#signals = new Effect();
 
 	constructor(props: DecoderTrackProps) {
 		this.sync = props.sync;
-		this.paced = props.paced;
 		this.broadcast = props.broadcast;
 		this.track = props.track;
+		this.name = props.name;
 		this.config = props.config;
+		this.identity = props.identity;
+		this.catalog = props.catalog;
 		this.stats = props.stats;
-
-		this.#signals.run((effect) => {
-			const paced = effect.get(this.paced);
-			this.#latency.set(paced ? effect.get(this.sync.out.buffer) : Time.Milli.zero);
-		});
+		this.#predecessor = props.predecessor;
 
 		this.#signals.run(this.#run.bind(this));
 	}
 
+	// Reorders groups and frames up to the shared max delay. A rendition switch is not a cold start:
+	// the path's arrivals are what they were, so the estimate continues from whatever read before.
+	#consume(effect: Effect, sub: Moq.Track.Subscriber, format: Container.Format): Container.Consumer {
+		const consumer = new Container.Consumer(sub, {
+			format,
+			maxDelay: this.sync.out.maxDelay,
+			predecessor: this.consumer ?? this.#predecessor,
+		});
+		effect.cleanup(() => consumer.close());
+		this.consumer = consumer;
+		this.#predecessor = undefined;
+		return consumer;
+	}
+
 	#run(effect: Effect): void {
-		const sub = this.broadcast.track(this.track).subscribe({ priority: Catalog.PRIORITY.video });
-		effect.cleanup(() => sub.close());
+		const sub = subscribeMedia(effect, {
+			broadcast: this.broadcast,
+			track: this.name,
+			priority: Catalog.PRIORITY.video,
+			maxDelay: this.sync.out.maxDelay,
+		});
+		if (!sub) return;
 
 		const decoder = new VideoDecoder({
 			output: async (frame: VideoFrame) => {
 				try {
-					// The generation this frame was decoded in. If a rewind bumps it while we wait
-					// below, this frame belongs to the reneged timeline and must be dropped.
-					const generation = this.#discontinuity;
+					// The clock epoch this frame was decoded in. A reset while we wait below (this
+					// track's playhead moving, or a shared reset such as audio's at an utterance
+					// boundary) means the frame belongs to the previous timeline and must be dropped.
+					const epoch = this.sync.epoch;
 
-					const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
+					const timestamp = Milli.fromMicro(frame.timestamp as Micro);
 					if (timestamp < (this.timestamp.peek() ?? 0)) {
 						// Late frame, don't render it.
 						return;
 					}
 
-					if (this.paced.peek()) {
-						// `received()` runs at submit, so a frame is anchored by the time it decodes.
-						// Reaching here unanchored means a rewind reset the clock after this frame's
-						// received(), so it predates the current timeline. Drop it: painting it would
-						// set `timestamp` from the old timeline and late-reject the whole rewind.
-						if (this.sync.out.reference.peek() === undefined) return;
+					// `received()` runs at submit, so a frame is anchored by the time it decodes.
+					// Reaching here unanchored means a reset cleared the clock after this frame's
+					// received(), so it predates the current timeline. Drop it: painting it would
+					// set `timestamp` from the old timeline and late-reject what follows.
+					if (this.sync.out.reference.peek() === undefined) return;
+					// WebCodecs can hold a picture until after another track skipped the playhead past it.
+					if (this.sync.skipped(timestamp)) return;
 
-						if (this.frame.peek() === undefined) {
-							// Render something while we wait for the sync to catch up.
-							this.frame.set(frame.clone());
-						}
+					if (this.frame.peek() === undefined) {
+						// Render something while we wait for the sync to catch up.
+						this.frame.set(frame.clone());
+					}
 
-						if (!(await this.#park(timestamp, effect))) return;
-						if (generation !== this.#discontinuity) return; // a rewind happened while waiting
+					// Returns immediately when the latency is "instant". Closing the track releases it.
+					// Capture the signal: a rerun replaces `effect.abort` before this continuation runs.
+					const signal = effect.abort;
+					await this.sync.wait(timestamp, signal);
+					if (signal.aborted) return;
+					if (epoch !== this.sync.epoch || this.sync.skipped(timestamp)) return;
 
-						if (timestamp < (this.timestamp.peek() ?? 0)) {
-							// Late frame, don't render it.
-							// NOTE: This can happen when the ref is updated, such as on playback start.
-							return;
-						}
+					if (timestamp < (this.timestamp.peek() ?? 0)) {
+						// Late frame, don't render it.
+						// NOTE: This can happen when the ref is updated, such as on playback start.
+						return;
 					}
 
 					this.timestamp.set(timestamp);
@@ -356,9 +540,8 @@ class DecoderTrack {
 					frame.close();
 				}
 			},
-			// TODO bubble up error
 			error: (error) => {
-				console.error(error);
+				this.error.set(error);
 				effect.close();
 			},
 		});
@@ -376,13 +559,10 @@ class DecoderTrack {
 
 	#runLegacy(effect: Effect, sub: Moq.Track.Subscriber, decoder: VideoDecoder): void {
 		const format =
-			this.config.container.kind === "loc" ? new Container.Loc.Format() : new Container.Legacy.Format();
-		// Create consumer that reorders groups/frames up to the provided latency.
-		const consumer = new Container.Consumer(sub, {
-			format,
-			latency: this.#latency,
-		});
-		effect.cleanup(() => consumer.close());
+			this.config.container.kind === "loc"
+				? new Container.Loc.Format("video")
+				: new Container.Legacy.Format(this.config);
+		const consumer = this.#consume(effect, sub, format);
 
 		// Combine network jitter buffer with decode buffer
 		effect.run((inner) => {
@@ -391,32 +571,49 @@ class DecoderTrack {
 			this.buffered.update(() => Container.mergeBufferedRanges(network, decode));
 		});
 
-		decoder.configure({
-			codec: this.config.codec,
-			description: this.config.description ? Util.Hex.toBytes(this.config.description) : undefined,
-			displayAspectWidth: this.config.displayAspectWidth,
-			displayAspectHeight: this.config.displayAspectHeight,
-			optimizeForLatency: this.config.optimizeForLatency,
-			// @ts-expect-error Only supported by Chrome, so the renderer has to flip manually.
-			flip: false,
-		});
+		// Publish the arrival estimate for the "auto" target.
+		effect.run((inner) => this.spread.set(inner.get(consumer.spread)));
 
-		let previous: Time.Micro | undefined;
+		this.#description = this.config.description ? Util.Hex.toBytes(this.config.description) : undefined;
+		this.#configure(decoder);
+
+		let previous: Micro | undefined;
+		let latest: number | undefined;
+		const recovery = new Recovery();
 
 		effect.spawn(async () => {
 			for (;;) {
-				const next = await consumer.next();
+				const next = await nextMedia(consumer);
 				if (!next) break;
 
-				// Publisher rewound: flush queued/in-flight video and re-anchor before decoding.
-				if (this.#onDiscontinuity(next.discontinuity)) previous = undefined;
-
+				// A gap or a declared end breaks the timeline: re-anchor before decoding further, and
+				// never bridge the buffer across it.
+				if (next.kind !== "frame") {
+					if (next.kind === "gap") {
+						recovery.gap();
+						this.arrivals?.write(gap(next));
+					}
+					if (latest !== undefined) this.#onBreak();
+					previous = undefined;
+					continue;
+				}
 				const { frame } = next;
-				if (!frame) continue; // The group is done
 
-				// Mark that we received this frame right now.
-				const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
-				this.sync.received(timestamp, "video");
+				// An older keyframe would replace the codec references needed by live deltas. Group
+				// sequences only grow within a subscription, so a break (which a stale marker can
+				// raise) never resets this guard. Rejected payloads still count as received bytes.
+				const stale = latest !== undefined && next.group < latest;
+				const accepted = !stale && recovery.accept(frame);
+				this.stats.update((current) => ({
+					frameCount: (current?.frameCount ?? 0) + (accepted ? 1 : 0),
+					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
+				}));
+				if (!accepted) continue;
+
+				// Classify ingress before decoder backpressure changes the delivery clock.
+				const timestamp = Milli.fromMicro(frame.timestamp as Micro);
+				const late = this.sync.received(timestamp, "video", frame.arrival);
+				this.arrivals?.write({ kind: "frame", timestamp, arrival: frame.arrival, late });
 
 				const chunk = new EncodedVideoChunk({
 					type: frame.keyframe ? "key" : "delta",
@@ -424,23 +621,19 @@ class DecoderTrack {
 					timestamp: frame.timestamp,
 				});
 
-				// Track both frame count and bytes received for stats in the UI
-				this.stats.update((current) => ({
-					frameCount: (current?.frameCount ?? 0) + 1,
-					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
-				}));
-
 				// Track decode buffer: frames sent to decoder but not yet rendered. Only bridge from
-				// the previous frame when the consumer says nothing is missing in between. Group ids
-				// can't answer that: they aren't required to be sequential (some encoders derive them
-				// from DTS), so adjacency neither proves continuity nor rules out a gap the consumer
-				// skipped, and reporting a skipped span as decoded overstates the buffer.
-				if (previous !== undefined && next.continuous) {
-					this.#addBuffered(Time.Milli.fromMicro(previous), Time.Milli.fromMicro(frame.timestamp));
+				// the previous frame when no gap or end came between them. Group ids can't answer that:
+				// they aren't required to be sequential (some encoders derive them from DTS), so
+				// adjacency neither proves continuity nor rules out a gap the consumer skipped, and
+				// reporting a skipped span as decoded overstates the buffer.
+				if (previous !== undefined) {
+					this.#addBuffered(Milli.fromMicro(previous), Milli.fromMicro(frame.timestamp));
 				}
 
 				previous = frame.timestamp;
 
+				latest = next.group;
+				this.#resetAtKeyframe(decoder, frame.keyframe);
 				decoder.decode(chunk);
 			}
 		});
@@ -454,11 +647,7 @@ class DecoderTrack {
 		const init = Container.Cmaf.decodeInitSegment(initSegment);
 		const description = this.config.description ? Util.Hex.toBytes(this.config.description) : init.description;
 
-		const consumer = new Container.Consumer(sub, {
-			format: new Container.Cmaf.Format(init),
-			latency: this.#latency,
-		});
-		effect.cleanup(() => consumer.close());
+		const consumer = this.#consume(effect, sub, new Container.Cmaf.Format(init));
 
 		// Combine network jitter buffer with decode buffer
 		effect.run((inner) => {
@@ -467,49 +656,61 @@ class DecoderTrack {
 			this.buffered.update(() => Container.mergeBufferedRanges(network, decode));
 		});
 
-		// Configure decoder with description from catalog
-		decoder.configure({
-			codec: this.config.codec,
-			description,
-			displayAspectWidth: this.config.displayAspectWidth,
-			displayAspectHeight: this.config.displayAspectHeight,
-			optimizeForLatency: this.config.optimizeForLatency,
-			// @ts-expect-error Only supported by Chrome, so the renderer has to flip manually.
-			flip: false,
-		});
+		// Publish the arrival estimate for the "auto" target.
+		effect.run((inner) => this.spread.set(inner.get(consumer.spread)));
 
-		let previous: Time.Micro | undefined;
+		// Configure decoder with description from catalog
+		this.#description = description;
+		this.#configure(decoder);
+
+		let previous: Micro | undefined;
+		let latest: number | undefined;
+		const recovery = new Recovery();
 
 		effect.spawn(async () => {
 			for (;;) {
-				const next = await consumer.next();
+				const next = await nextMedia(consumer);
 				if (!next) break;
 
-				// Publisher rewound: flush queued/in-flight video and re-anchor before decoding.
-				if (this.#onDiscontinuity(next.discontinuity)) previous = undefined;
-
+				// A gap or a declared end breaks the timeline (see #runLegacy).
+				if (next.kind !== "frame") {
+					if (next.kind === "gap") {
+						recovery.gap();
+						this.arrivals?.write(gap(next));
+					}
+					if (latest !== undefined) this.#onBreak();
+					previous = undefined;
+					continue;
+				}
 				const { frame } = next;
-				if (!frame) continue;
 
-				// Mark that we received this frame right now.
-				const timestamp = Time.Milli.fromMicro(frame.timestamp);
-				this.sync.received(timestamp, "video");
-
-				// Track stats
+				// An older keyframe would replace the codec references needed by live deltas. Group
+				// sequences only grow within a subscription, so a break (which a stale marker can
+				// raise) never resets this guard. Rejected payloads still count as received bytes.
+				const stale = latest !== undefined && next.group < latest;
+				const accepted = !stale && recovery.accept(frame);
 				this.stats.update((current) => ({
-					frameCount: (current?.frameCount ?? 0) + 1,
+					frameCount: (current?.frameCount ?? 0) + (accepted ? 1 : 0),
 					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
 				}));
+				if (!accepted) continue;
 
-				// Track decode buffer (see #runLegacy: bridge on the consumer's continuity signal,
+				// Classify ingress before decoder backpressure changes the delivery clock.
+				const timestamp = Milli.fromMicro(frame.timestamp);
+				const late = this.sync.received(timestamp, "video", frame.arrival);
+				this.arrivals?.write({ kind: "frame", timestamp, arrival: frame.arrival, late });
+
+				// Track decode buffer (see #runLegacy: bridge only when no gap or end came between,
 				// never on group adjacency, which proves nothing about the timeline).
-				if (previous !== undefined && next.continuous) {
-					this.#addBuffered(Time.Milli.fromMicro(previous), Time.Milli.fromMicro(frame.timestamp));
+				if (previous !== undefined) {
+					this.#addBuffered(Milli.fromMicro(previous), Milli.fromMicro(frame.timestamp));
 				}
 
 				previous = frame.timestamp;
 
 				if (decoder.state === "closed") break;
+				latest = next.group;
+				this.#resetAtKeyframe(decoder, frame.keyframe);
 				decoder.decode(
 					new EncodedVideoChunk({
 						type: frame.keyframe ? "key" : "delta",
@@ -521,54 +722,54 @@ class DecoderTrack {
 		});
 	}
 
-	// React to the container consumer's discontinuity counter. On a change the publisher has
-	// rewound the timeline, so drop what's queued downstream and re-anchor the shared clock
-	// before the new utterance. Clearing `timestamp` is load-bearing: otherwise its stale high
-	// value would late-reject the rewound (lower-timestamp) frames at the output guard. Bumping
-	// the generation drops in-flight decodes on output. The held frame is left in place so the
-	// last picture shows until the new keyframe renders, instead of flashing empty. Returns true
-	// if a rewind was handled.
-	#onDiscontinuity(count: number): boolean {
-		if (count === this.#discontinuity) return false;
-		this.#discontinuity = count;
+	// The container read a gap or a declared end after media. Re-anchor and let the next decoded
+	// frame decide the decoder reset (see #resetAtKeyframe). Clearing `timestamp` keeps a stale
+	// high value from late-rejecting the following frames, which may overlap the previous group's
+	// tail. The held picture stays until the new keyframe renders.
+	#onBreak(): void {
 		this.timestamp.set(undefined);
 		this.#buffered.set([]);
 		this.sync.reset();
-		return true;
+		this.#resetPending = true;
 	}
 
-	// Sleep until the clock says to paint this frame, waking early if pacing is turned off or the
-	// run is torn down. Returns false when the frame should be dropped.
-	//
-	// Turning pacing off has to release parked frames, otherwise a deep buffer holds them (and their
-	// GPU memory) until deadlines that no longer apply. They paint rather than drop: a parked frame
-	// is early, not stale, so it is the freshest picture available the moment pacing stops.
-	//
-	// Dispose the registration once the race settles: one that outlives the frame retains an entry
-	// per decoded frame for as long as the track lives, which is unbounded during steady playback.
-	async #park(timestamp: Time.Milli, effect: Effect): Promise<boolean> {
-		let release: Dispose | undefined;
-		try {
-			const released = new Promise<boolean>((resolve) => {
-				release = this.paced.changed(() => resolve(!this.paced.peek()));
-			});
-			const wait = this.sync.wait(timestamp).then(() => true);
-			return (await Promise.race([wait, released, effect.cancel])) ?? false;
-		} finally {
-			release?.();
-		}
+	// Call before each decode. After a break, a keyframe starts a new timeline, so drop the
+	// pictures still queued in the decoder: one from later in a group that restarts would
+	// otherwise come out above the new keyframe and late-reject it. A delta continues a group the
+	// break interrupted (a stale marker or a max-delay hole), so it keeps the decoder's references;
+	// a reset would make WebCodecs require a key chunk and throw. `reset()` cannot cancel an
+	// output callback that already holds a frame; the clock epoch it captured rejects that one.
+	#resetAtKeyframe(decoder: VideoDecoder, keyframe: boolean): void {
+		if (!this.#resetPending) return;
+		this.#resetPending = false;
+		// A closed decoder throws on reset.
+		if (!keyframe || decoder.state === "closed") return;
+		decoder.reset();
+		this.#configure(decoder);
+	}
+
+	#configure(decoder: VideoDecoder): void {
+		decoder.configure({
+			codec: this.config.codec,
+			description: this.#description,
+			displayAspectWidth: this.config.displayAspectWidth,
+			displayAspectHeight: this.config.displayAspectHeight,
+			optimizeForLatency: this.config.optimizeForLatency,
+			// @ts-expect-error Only supported by Chrome, so the renderer has to flip manually.
+			flip: false,
+		});
 	}
 
 	// Add a range to the decode buffer (decoded, waiting to render)
-	#addBuffered(start: Time.Milli, end: Time.Milli): void {
+	#addBuffered(start: Milli, end: Milli): void {
 		if (start > end) return;
 
 		this.#buffered.mutate((current) => {
 			for (const range of current) {
 				// Check if there's any overlap, then merge
 				if (range.start <= end && range.end >= start) {
-					range.start = Time.Milli.min(range.start, start);
-					range.end = Time.Milli.max(range.end, end);
+					range.start = Milli(Math.min(range.start, start));
+					range.end = Milli(Math.max(range.end, end));
 					return;
 				}
 			}
@@ -579,11 +780,11 @@ class DecoderTrack {
 	}
 
 	// Trim the decode buffer up to the rendered timestamp
-	#trimBuffered(timestamp: Time.Milli): void {
+	#trimBuffered(timestamp: Milli): void {
 		this.#buffered.mutate((current) => {
 			while (current.length > 0) {
 				if (current[0].end >= timestamp) {
-					current[0].start = Time.Milli.max(current[0].start, timestamp);
+					current[0].start = Milli(Math.max(current[0].start, timestamp));
 					break;
 				}
 				current.shift();

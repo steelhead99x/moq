@@ -1,77 +1,102 @@
-# Contributing
+# Commits
 
-How a change lands in this repo: branch targeting, commits, PR descriptions, reviews, and releases. Coding conventions live in [CLAUDE.md](CLAUDE.md) and the per-directory guides; this file covers the mechanics around the code.
+PRs into `main` are squash-merged through the merge queue, so the PR title becomes the commit subject and the PR description becomes the body in `git log`.
+The one exception is the maintainer's pre-release merge of `release` into `main`, which lands as a merge commit (see [Releases](#releases)).
+PRs into `release` use a merge commit, so their history survives until they land.
 
-## Branch Targeting
-
-Two long-lived branches. The split is about **semver breakage of a published API, not size or novelty**: `dev` is only for changes that break the API contract consumers compile against. Everything else (bug fixes, new behavior, new/additive APIs, docs, refactors, wire-protocol work) goes to `main`, however large.
-
-- **`main`**: the default. Bug fixes, new behavior, new/additive APIs, docs, and refactors that preserve the existing public API. A change that only *adds* is additive and lands here even when it is big: a new `pub` item, a new option, or a parser accepting a broader set of inputs it previously rejected. Changing what a component does with input it *already* takes (e.g. recognizing a media pattern it used to mishandle) is a fix, not a break, so it also lands here.
-
-  Wire-protocol and format work lands here too, including `moq-lite` / `moq-transport` framing, a new draft version, a field added to or removed from an in-progress one, and catalog/container format changes in `rs/hang` or `js/hang`. Versions are negotiated per session, so a peer keeps speaking whatever version it already supports; the change reaches it only once both ends offer the new one. Ship it behind a version gate (see the Version matching section of [`rs/CLAUDE.md`](rs/CLAUDE.md)) and update the matching draft under `drafts/` in the same PR.
-- **`dev`**: reserved for changes that violate semver by breaking a published API. That means a renamed, removed, or signature-changed `pub` (Rust) or exported (TS) item, or anything else that stops existing caller code compiling, such as adding a field to a struct consumers build with a literal. A newly *added* item is additive and goes to `main`.
-
-  This covers **every package someone can depend on a released version of**, not a shortlist of the well-known ones: the `rs/` crates release-plz publishes, the `@moq/*` packages under `js/`, and the language wrappers under `swift/`, `kt/`, `go/`, `py/`. `libmoq` counts through its C ABI too, so a `moq.h` break is a `dev` change even though nothing depends on the crate.
-
-  **`0.0.x` packages are the exception: break them on `main`.** Cargo and npm treat every `0.0.x` release as its own incompatible version, so such a package makes no compatibility promise and has no contract to violate. That covers `moq-audio`, `moq-video`, `moq-transcode`, and `moq-nvenc` today. The same goes for anything marked `publish = false` or `private` (`moq-bench`, `moq-wasm`, `@moq/wasm`, `@moq/clock`), which isn't published at all. Reshape their surface freely, and prefer doing so before a package leaves `0.0.x`, since that is the last cheap moment to fix a shape.
-
-  A wire change usually needs no API break to land, since the version gate is internal. If yours does, that break is what sends the PR to `dev`, not the wire change itself.
-
-`dev` periodically merges into `main` (or vice versa) when the batch is ready to ship. When in doubt, check the package's version before its name: `0.0.x` means break it on `main`, anything else means `dev`. Reviewers will redirect a PR that turns out to break a published API. CI (`pull_request:` workflows) runs on PRs against either branch, so no extra setup is needed when you switch the base.
-
-## Commit Messages
-
-PRs are squash-merged, so the PR title becomes the commit subject and the PR description becomes the body in `git log`. Write both for that reader.
-
-- Use conventional-commit subjects (`feat(watch): ...`, `fix: ...`, `chore: ...`, `docs: ...`); release-plz derives crate changelogs from them.
+- Use conventional-commit subjects (`feat(watch): ...`, `fix: ...`, `chore: ...`, `docs: ...`)
 - AI commit attribution goes in a `Co-Authored-By:` trailer, not the commit body.
-- Never hand-bump a `version =` field in a feature PR. release-plz owns Rust version bumps; a manual bump breaks the Release RS workflow. (`py/moq-rs` is the exception: its version is bumped by hand.)
-- Never commit binaries or build artifacts (`.a`, `.so`, `.dylib`, `.dll`, wheels). Release artifacts flow through GitHub Actions to mirror repos or Release assets.
+- Never commit binaries or build artifacts (`.a`, `.so`, `.dylib`, `.dll`, wheels).
 
-## PR Descriptions
+# PRs
 
-Keep the body short and structured, not narrated:
+Keep the body short and structured, not narrated.
+Have at least these sections:
 
-- **Summary**: a few bullets on what changed and why. For a bug fix, state the root cause (see Root Cause First in [CLAUDE.md](CLAUDE.md)).
-- **Public API changes**: every new/renamed/removed/signature-changed `pub` item in `rs/moq-*` and `js/*`, with breaking ones called out per [Branch Targeting](#branch-targeting). Distinguish genuinely public surface from `pub(crate)`/private.
-- **Test plan**: what was run and verified.
-- If you skip a [Cross-Package Sync](CLAUDE.md#cross-package-sync) row, say why.
+- **Problem**: a summary of the problem and why this PR is needed.
+- **Approach**: a summary of the approach taken to solve the problem.
+- **Impact**: a bullet point for every public API/wire change made. A breaking one also gets a `MIGRATE.md` entry in each affected package.
+- **Alternatives**: any alternative approaches considered.
+- **Follow-ups**: any issues encountered or quests created.
 
-Skip file-by-file narration of the diff; the diff already says that.
+When pushing additional commits to an existing PR, update the title and description if needed.
+When taking over someone else's PR, push commits on top of theirs so they keep credit.
 
-### Keep the title and description fresh
+Create a draft PR.
+Run `just ci` before switching it to "Ready for review" and before every push.
+Fix any merge conflicts and failing CI checks.
 
-When pushing additional commits to an existing PR, check whether the title and description still describe the change accurately. They often go stale during review iterations: a flag gets renamed, an API gets reshaped, an extra fix lands. A stale title/body means a misleading entry in `git log` forever. Update with `gh pr edit <num> --title "..." --body "..."` whenever the scope shifts, watching for:
+# Merge queue
 
-- Flags, file names, or public APIs renamed in later commits but still referenced by their old name in the body.
-- Summary bullets describing behavior the latest commits have changed or removed.
-- The test-plan checklist lagging behind newly added tests.
+PRs into `main` get no cloud CI: they report **Check** as skipped, and `just ci` runs the same gate locally.
+The merge queue runs Check on the PR combined with the latest `main` and the PRs queued ahead of it.
+Enqueue with `gh pr merge <number>` once the review is clean.
+Both select only what the diff touches, so a break can reach `main`; `just gate` runs the full suite, and it, the feature matrix, optimized binding builds, macOS, Windows, and the other optional workflows run nightly on `main` and on PRs into `release`.
 
-## AI Contributions
+A dequeued PR means the combination failed checks, timed out, or no longer meets the ruleset.
+Read the removal reason in the PR timeline and the merge group run, fix the cause, and enqueue again.
 
-AI-assisted issues, pull requests, reviews, and comments are welcome. If the right solution is not obvious, open an issue before writing code so contributors and maintainers can brainstorm the approach together.
+Never bypass the queue with `--admin`, with one exception: the maintainer's pre-release merge of `release` into `main`, since the queue would squash it.
 
-Every piece of LLM-authored prose posted to GitHub ends with the agent model, e.g. `(Written by GPT-5)`. That covers PR descriptions, issue bodies, review summaries, review replies, and any comment on a PR, issue, or discussion. Keep the marker when editing a body you authored, so readers still know it wasn't human-written.
+# AI
 
-The marker never goes in the codebase itself: no code comments, doc comments, or `/doc` pages (see Comment Conventions in [CLAUDE.md](CLAUDE.md)). GitHub prose is read once, in context, by someone deciding how much to trust it; source markers just rot in place. Commits are the other exception: attribution belongs in a `Co-Authored-By:` trailer, not a marker in the body.
+AI-assisted issues, pull requests, reviews, and comments are welcome.
+Especially bug reports; dive deep into the root issue before proposing a solution.
 
-## Reviews
+GitHub issues are the public front door for brainstorming.
+Prefer a quest for work needing durable scope or coordination.
 
-Before merging, run the `/review` skill locally against the PR. Push high-confidence, unambiguous fixes directly. Escalate anything ambiguous, architectural, or open to interpretation by asking first rather than guessing.
+# Reviews
 
-Reply to review comments as you address them, saying what changed or why you disagree, so the reviewer doesn't have to diff the branch to find out. Replies are GitHub prose like any other, so they carry the [AI Contributions](#ai-contributions) marker.
+AI agents review pushes on their own, skipping ones they judge trivial.
+Never explicitly request a review.
 
-When reviewing a PR, always include the same public API changes list described above, and call out anything breaking per [Branch Targeting](#branch-targeting).
+For each finding:
 
-Don't silently drop a real finding just because it's pre-existing or outside
-the PR's diff. If the review surfaces a genuine problem (a bug, a footgun, a
-convention the repo now violates) that you're not fixing in this PR, CREATE OR
-UPDATE A QUEST for it (see [quest/AGENTS.md](quest/AGENTS.md)). "Out of scope"
-is a reason to defer the fix, never a reason to forget it.
+- If you don't agree with it, reply to the finding and move on.
+- If it's a relatively easy improvement, fix it and push. Update the summary if needed.
 
-## Releases
+Wait for a review from any reviewer other than Grok.
+Codex (OpenAI) reacts with a thumbs up when it has no findings; that counts as a review.
+A push that gets no new review once CI finishes was judged trivial, so the earlier review still covers it.
+Skipped or rate-limited reviews do not count.
+For a fork with no automatic non-Grok review, ask the maintainer to arrange one.
+Merge only when that review has no findings, or every finding is fixed or replied to.
 
-- **Rust**: release-plz opens release PRs and publishes to crates.io on merge to `main` (`release-rs.yml`). `moq-relay` and `moq-cli` take patch bumps even for breaking changes (no external consumers yet). `moq-cli` is the one crate bumped by hand, in a dedicated chore PR rather than a feature PR, since release-plz can't see CLI surface changes.
-- **JS**: `release-js.yml` publishes `@moq/*` packages (per-package build + `common/release.ts`).
-- **Python**: `moq-ffi` releases on `moq-ffi-v*` tags; `moq-rs` publishes on merge to `main` when its hand-bumped version isn't already on PyPI. See `py/CLAUDE.md`.
-- **Binding mirrors**: CI mirrors the `swift`/`kt`/`go` source skeletons to `moq-dev/moq-{swift,kotlin,go}` on each `moq-ffi-v*` tag.
+# CI
+
+Workflow steps run `just` recipes, never a script path; `just gh check` enforces it.
+
+# Follow-ups
+
+If you encounter issues, or findings that are out of scope, create follow-up quests.
+Focus on the core problem, offering a potential solution only if its obvious.
+For non-trivial tasks, file an issue or offer to run `/quest-plan`.
+
+# Forks
+
+`rs/moq-quic` is our hard fork of quinn, the QUIC stack MoQ builds on; iroh keeps upstream noq.
+It never merges upstream: fixes are cherry-picked by hand, and each carried change is listed in its README with its upstream PR, or the reason it has none.
+For an advisory against Quinn, follow the advisory triage in [`rs/moq-quic/README.md`](rs/moq-quic/README.md).
+
+# Releases
+
+`main` is the trunk; `release` is what ships, and release-plz and every branch-triggered publish run only there.
+
+- A release is cut by hand: a PR merging `main` into `release`, with a merge commit.
+- A breaking cut first renames, on `main`, each changed `MIGRATE.md`'s `## Unreleased` to its version transition (`## 0.3 -> 0.4`), leaving an empty `## Unreleased` above it.
+- Suggest a `release` backport for any serious bug fix (crash, security, data loss, broken interop), whether found on `main` or reported against a release. Land it on `main` first, then port it onto `release` as a separate PR that keeps the published API, so it ships as a patch.
+- After any release publishes, patch or breaking, run `just test wire-compat --remeasure` on `main` and land the rewritten `test/interop/compat/planned-breaks.json` with refreshed reasons. Otherwise the nightly wire-compat check fails on the stale pins.
+- Nothing merges `release` into `main` automatically. Before cutting a minor or breaking release, the maintainer merges `release` into `main` once, so trunk carries the published versions, CHANGELOGs, and any `release`-only commits. It lands as a merge commit with `--admin`, never squashed, so the cut starts from an advanced merge base.
+
+# Versions
+
+Releases are cut separately; bump only when asked. Each package's version lives in one place:
+
+- **Rust**: release-plz owns crate versions and Rust dependency requirements.
+- **JavaScript**: `js/*/package.json` packages with a `scripts.release` entry (skip private ones like `@moq/wasm`), plus the matching workspace version in `bun.lock`.
+- **Python**: `py/moq-rs/pyproject.toml`, plus the matching `moq-rs` entry in the root `uv.lock`; `py/moq-ffi` follows the `moq-ffi-v*` tag and Rust crate.
+- **Swift**: `swift/VERSION`. **Kotlin**: `moq.version` in `kt/gradle.properties`. **Dart**: `version` in `dart/moq/pubspec.yaml`. Their FFI counterparts track the Rust crate.
+- **Go**: `go/wrapper/VERSION` holds a human-owned `MAJOR.MINOR` line; CI derives the patch, so only edit it for a breaking API. Leave the placeholder FFI version in `go.mod` alone.
+- **C++**: `cpp/moq/VERSION`, human-owned; a `cpp-v<version>` tag releases it.
+- **OBS**: `cpp/obs/VERSION`, human-owned; each C++ release also cuts `obs-moq-v<version>`, and refuses one whose version already names an earlier release.

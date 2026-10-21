@@ -1,0 +1,346 @@
+name: Release Cpp
+
+# Builds the moq C++ package (cpp/moq) for every target and publishes one archive per
+# target to a cpp-v<version> GitHub release. The vcpkg and Conan packages fetch these.
+
+on:
+  push:
+    tags:
+      - "cpp-v*"
+  # Dry-run: build everything, publish nothing. Nightly calls every release
+  # workflow this way so a broken build surfaces before the tag is cut.
+  workflow_call:
+    inputs:
+      reuse-native:
+        description: "Use this run's native input after its installed-consumer gate succeeds"
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      prebuilt-test:
+        description: "Validate the same-revision shared default-feature input on all four hosts"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    if: github.event_name == 'workflow_dispatch' && inputs.prebuilt-test
+    uses: ./.github/workflows/release-ffi.yml
+    with:
+      language: default
+      bindings: false
+      targets: '["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]'
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [native]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/just
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # aws-lc-rs assembles its x86_64 crypto with NASM on Windows.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # The tag flake.nix pins; see the comment there.
+      - name: Install uniffi-bindgen-cpp
+        shell: bash
+        run: cargo install uniffi-bindgen-cpp --locked --git https://github.com/kixelated/uniffi-bindgen-cpp --tag v0.11.0-kixelated.5+v0.32.2
+
+      # The package version lives in cpp/moq/VERSION; a tag that disagrees is a mistake.
+      - name: Check version
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(tr -d '[:space:]' < cpp/moq/VERSION)
+          if [[ "$TAG" != "cpp-v$version" ]]; then
+            echo "::error::tag $TAG does not match cpp/moq/VERSION ($version)"
+            exit 1
+          fi
+
+      - name: Refuse same-run input for a release tag
+        if: inputs.reuse-native && github.ref_type == 'tag'
+        run: |
+          echo "::error::cpp-v releases must use their immutable FFI_VERSION pin"
+          exit 1
+
+      - name: Download validated same-run input
+        if: inputs.reuse-native
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: cpp-native-${{ matrix.target }}
+          path: native-archive
+
+      - name: Parse prebuilt FFI version
+        if: inputs.reuse-native || (github.event_name == 'workflow_dispatch' && inputs.prebuilt-test)
+        id: ffi-version
+        run: just gh release parse-version moq-ffi
+
+      - name: Download shared input for compatibility check
+        if: github.event_name == 'workflow_dispatch' && inputs.prebuilt-test
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: default-lib-${{ matrix.target }}
+          path: native-library
+
+      - name: Stage shared input
+        if: github.event_name == 'workflow_dispatch' && inputs.prebuilt-test
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.native.outputs.version }}
+        run: just cpp ffi stage --version "$VERSION" --target "$TARGET" --library native-library --output native-stage
+
+      - name: Check installed consumers with shared input
+        if: github.event_name == 'workflow_dispatch' && inputs.prebuilt-test
+        shell: bash
+        run: just cpp check --ffi-dir "$GITHUB_WORKSPACE/native-stage"
+
+      - name: Archive checked input
+        if: github.event_name == 'workflow_dispatch' && inputs.prebuilt-test
+        run: just cpp ffi archive --directory native-stage --output native-archive
+
+      - name: Verify and extract validated input
+        if: inputs.reuse-native || (github.event_name == 'workflow_dispatch' && inputs.prebuilt-test)
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.ffi-version.outputs.version }}
+        run: just cpp ffi extract --version "$VERSION" --target "$TARGET" --directory native-archive --output native-input
+
+      - name: Build and package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PREBUILT_INPUT: ${{ inputs.reuse-native || (github.event_name == 'workflow_dispatch' && inputs.prebuilt-test) }}
+        run: |
+          args=(--target "$TARGET" --output dist)
+          if [[ "$PREBUILT_INPUT" == true ]]; then
+            args+=(--ffi-dir "$GITHUB_WORKSPACE/native-input")
+          fi
+          just cpp package "${args[@]}"
+
+      - name: Check packaged archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          version=$(tr -d '[:space:]' < cpp/moq/VERSION)
+          extension=tar.gz
+          [[ "$TARGET" == *-windows-* ]] && extension=zip
+          just cpp check --archive "dist/moq-cpp-$version-$TARGET.$extension"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: moq-cpp-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: Release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/just
+
+      - name: Parse version
+        id: parse
+        run: just gh release parse-version cpp
+
+      - name: Find previous tag
+        id: prev_tag
+        run: just gh release prev-tag cpp
+
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TITLE: "moq C++ v${{ steps.parse.outputs.version }}"
+          RELEASE_PREV_TAG: ${{ steps.prev_tag.outputs.tag }}
+        run: just gh release create artifacts
+
+  # The OBS plugin (cpp/obs) statically links the C++ package, so it ships with
+  # every release: rebuild it against the release just published (no second
+  # cargo build, guaranteed-matching bindings) and cut a parallel
+  # obs-moq-v<version> release. The plugin's version is its own,
+  # cpp/obs/VERSION. Tags wait for `release` so downloads are live; dry runs
+  # consume this run's checked local archive without publishing anything.
+  obs-build:
+    name: OBS plugin (${{ matrix.target }})
+    needs: [build, release]
+    if: ${{ always() && !cancelled() && needs.build.result == 'success' && (github.ref_type != 'tag' || needs.release.result == 'success') }}
+    runs-on: ${{ matrix.os }}
+
+    # macOS + Windows only. These link the ffmpeg the obs-deps bundle ships
+    # (the same one OBS uses), so the binaries are portable. A Linux build
+    # would link nix/distro ffmpeg and not be portable, so Linux is
+    # build-from-source (see doc/bin/obs.md) and ships no prebuilt binary.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            # The plugin preset uses the Visual Studio 17 2022 generator.
+            os: windows-2022
+
+    steps:
+      # Shallow: this job only compiles, it never reads git history or tags.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/just
+
+      # The build job already checked the tag against this file.
+      - name: Read C++ version
+        id: parse
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < cpp/moq/VERSION)" >>"$GITHUB_OUTPUT"
+
+      - name: Download local C++ archive
+        if: github.ref_type != 'tag'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: moq-cpp-${{ matrix.target }}
+          path: cpp-archive
+
+      # Native Xcode / Visual Studio; libobs/Qt6/ffmpeg come from the obs-deps
+      # bundle and C++ comes from the checked local archive, or the published tag.
+      # build.sh versions the plugin from cpp/obs/VERSION.
+      - name: Build and package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          MOQ_RELEASE: ${{ steps.parse.outputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          args=(--moq-release "$MOQ_RELEASE")
+          if [[ "$REF_TYPE" != tag ]]; then
+            extension=tar.gz
+            [[ "$TARGET" == *-windows-* ]] && extension=zip
+            args=(--moq-archive "$GITHUB_WORKSPACE/cpp-archive/moq-cpp-$MOQ_RELEASE-$TARGET.$extension")
+          fi
+          just obs package --target "$TARGET" "${args[@]}" --output dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: obs-moq-${{ matrix.target }}
+          path: dist/*
+
+  obs-release:
+    name: OBS plugin release
+    needs: obs-build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/just
+
+      - name: Read plugin version
+        id: parse
+        run: echo "version=$(tr -d '[:space:]' < cpp/obs/VERSION)" >>"$GITHUB_OUTPUT"
+
+      # An obs-moq tag names one build. A later C++ release without a plugin
+      # version bump would overwrite that release's archives, so refuse it; a
+      # re-run of this same release finds its tag on this commit and carries on.
+      - name: Refuse a reused plugin version
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          tag="obs-moq-v${VERSION}"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null &&
+              [ "$(git rev-parse "refs/tags/$tag^{commit}")" != "$(git rev-parse HEAD)" ]; then
+              echo "::error::$tag already names another commit; bump cpp/obs/VERSION"
+              exit 1
+          fi
+
+      # Only the obs-moq archives: the moq-cpp-* artifacts from the build job
+      # belong to the C++ release, not this one.
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: artifacts
+          pattern: obs-moq-*
+          merge-multiple: true
+
+      # `just gh release prev-tag` keys off the current tag, but the trigger here is a
+      # cpp-v* tag, so it can't find the previous obs-moq tag. Take the newest
+      # existing obs-moq tag (excluding this version, for safe re-runs) so the
+      # release notes span only since the last obs-moq release.
+      - name: Find previous obs-moq tag
+        id: prev_tag
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          cur="obs-moq-v${VERSION}"
+          # awk (not grep -vx | head) so an empty result is exit 0, not 1:
+          # under `set -eo pipefail` the inaugural release has no prior tag and
+          # grep's exit 1 would fail the step. Empty tag is fine downstream.
+          prev=$(git tag --list 'obs-moq-v*' --sort=-v:refname | awk -v cur="$cur" '$0 != cur { print; exit }')
+          echo "tag=${prev}" >>"$GITHUB_OUTPUT"
+
+      # Cut a parallel obs-moq-v<version> release at this commit (gh creates
+      # the tag).
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: "obs-moq-v${{ steps.parse.outputs.version }}"
+          RELEASE_TITLE: "obs-moq v${{ steps.parse.outputs.version }}"
+          RELEASE_PREV_TAG: ${{ steps.prev_tag.outputs.tag }}
+        run: just gh release create artifacts

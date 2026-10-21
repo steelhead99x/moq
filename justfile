@@ -1,11 +1,10 @@
 #!/usr/bin/env just --justfile
 # Using Just: https://github.com/casey/just?tab=readme-ov-file#installation
+#
+# Every recipe is a menu entry: one line that runs a tool, or a script under
+# sh/. Logic belongs in the script.
 
 set unstable
-
-# Plain `cargo` unless set. See rs/justfile for the local wrapper option.
-_rust_cargo := env_var_or_default("RUST_CARGO", "cargo")
-cargo_compile := if _rust_cargo == "" { "cargo" } else { _rust_cargo }
 
 # Per-language modules. Language-specific recipes live in their own justfiles.
 mod js
@@ -15,9 +14,11 @@ mod kt
 mod swift
 mod go
 mod dart
+# The C++ package over moq-ffi.
+mod cpp
 # OBS Studio plugin (C++). See doc/bin/obs.md.
 mod obs 'cpp/obs'
-# Unit tests per language (`just test`).
+# Cross-language tests (`just test interop`, `just test drill`, ...).
 mod test
 # Demos and infra.
 mod demo
@@ -28,14 +29,11 @@ mod drafts
 mod gh '.github'
 # Shortcuts to avoid `demo::` prefix.
 mod boy 'demo/boy'
+mod carla 'demo/carla'
 mod pub 'demo/pub'
 mod relay 'demo/relay'
 mod sub 'demo/sub'
 mod web 'demo/web'
-
-# Byte budget for a changed-file list, sized so it survives being passed as a
-# single argv/env string on every hop of the dispatch. See `_changed`.
-changed_max := '65536'
 
 # Run the demo by default.
 default:
@@ -47,598 +45,94 @@ dev:
 
 # Benchmark the current tree, or compare it with a commit: `just bench origin/main`.
 bench $BASE="":
-    #!/usr/bin/env bash
-    exec rs/scripts/bench.sh "$BASE"
+    bench/run.sh "$BASE"
+
+# Benchmark selected wrappers against two Rust baselines on this machine.
+[positional-arguments]
+bench-ffi *runners:
+    bench/ffi.sh "$@"
+
+# Compare BoltFFI with UniFFI on one moq-ffi slice. STEPS: build, bench, size, or all.
+bench-ffi-gen *STEPS:
+    bench/ffi-gen/run.sh {{ STEPS }}
+
+# Measure audio group sizes across relay publisher/subscriber and fanout shapes.
+bench-audio:
+    bench/run.sh --audio
+
+# Compare one multi-threaded Tokio runtime with independent Tokio/epoll and
+# io_uring workers; WORKERS defaults to every logical CPU.
+# Example: `just bench-runtime 5 16`.
+bench-runtime $ROUNDS="3" $WORKERS="":
+    MOQ_BENCH_RUNTIME_ROUNDS="$ROUNDS" MOQ_BENCH_RUNTIME_WORKERS="$WORKERS" bench/run.sh --runtime
+
+# Sweep the relay's QUIC shard count against room and fanout connection counts;
+# 0 shards is the shared runtime. Example: `just bench-shard "0 1 8" "64 512"`.
+bench-shard $SHARDS="0 1 4 16" $CONNECTIONS="16 64 256":
+    MOQ_BENCH_SHARD_COUNTS="$SHARDS" MOQ_BENCH_SHARD_CONNECTIONS="$CONNECTIONS" bench/run.sh --shard
+
+# Profile the relay at each worker count: std mutex waits by stack (lock), CPU
+# stacks (cpu), or jemalloc heap and churn (heap). Example: `just bench-profile "cpu heap" fanout-heavy 4`.
+bench-profile $MODES $WORKLOAD="fanout" $WORKERS="1 4 16":
+    MOQ_BENCH_PROFILE="$MODES" MOQ_BENCH_PROFILE_WORKLOAD="$WORKLOAD" MOQ_BENCH_PROFILE_WORKERS="$WORKERS" bench/run.sh --profile
+
+# Real-browser transport, CMAF, and publish/watch costs, optionally against a base:
+# `just bench-browser origin/main`. `--smoke` is the bounded correctness lane.
+[positional-arguments]
+bench-browser *args:
+    bench/browser/run.sh "$@"
 
 # Install repo-wide tooling. Per-language deps install on first check.
 install:
     bun install
-    cargo install --locked cargo-shear cargo-sort cargo-upgrades cargo-edit cargo-semver-checks release-plz
+    cargo install --locked cargo-shear cargo-sort cargo-semver-checks release-plz
 
-# Reports the base it picked on stderr, so a surprising scope is traceable.
-#
-# LIMIT is the byte budget for the printed list, and exists as a parameter so
-# `_changed-test` can force the oversized path without a synthetic 30k-file diff.
+# Lints, compiles, and tests only the packages the branch changed plus
+# everything depending on them; `check --all` is the unscoped suite. BASE
+# defaults to the PR base, then a main/release upstream, then origin/main.
+# Rust compiles once: its test build doubles
+# as the clippy gate (see `rs check-test`).
 
-# Print the files this branch changed relative to BASE, one per line, or `ALL`.
-[private]
-_changed $BASE $LIMIT=changed_max:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    # Resolve BASE: arg > $GITHUB_BASE_REF > upstream > origin/main. A branch's
-    # upstream is the branch it merges into, which is the base a `dev`-targeted
-    # branch needs. `git push -u` repoints upstream at the branch's own remote
-    # copy, which would diff HEAD against itself, so ignore that case (see
-    # CLAUDE.md). GITHUB_BASE_REF outranks the upstream because a PR checkout
-    # has no upstream configured, and the branch being merged into is exactly
-    # the base GitHub is asking about.
-    base="$BASE"
-    if [[ -z "$base" && -n "${GITHUB_BASE_REF:-}" ]]; then
-    	base="origin/${GITHUB_BASE_REF}"
-    fi
-    if [[ -z "$base" ]]; then
-    	base=$(git rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)
-    	if [[ -z "$base" || "$base" == */"$(git branch --show-current)" ]]; then
-    		base="origin/main"
-    	fi
-    fi
-
-    merge_base=$(git merge-base "$base" HEAD) || {
-    	echo "error: cannot resolve merge-base against $base (is full history fetched?)" >&2
-    	exit 1
-    }
-    echo "base: $base" >&2
-
-    # Untracked files count too: a brand new crate or module is the whole change.
-    files=$({
-    	git diff --name-only "$merge_base"
-    	git ls-files --others --exclude-standard
-    } | sort -u)
-
-    # Assigned rather than tested inline, so a failing `_changed-cap` aborts here
-    # under `set -e`. Inside `[[ ]]` its exit status is discarded, and the caller
-    # would then scope to a list that never got budgeted -- straight back into the
-    # E2BIG this exists to prevent.
-    cap=$(printf '%s' "$files" | just _changed-cap "$LIMIT")
-    if [[ "$cap" == ALL ]]; then
-    	echo ALL
-    	exit 0
-    fi
-
-    # Guarded because a bare printf of an empty list prints a newline, and the
-    # callers test the result for emptiness to decide whether anything changed.
-    if [[ -n "$files" ]]; then
-    	printf '%s\n' "$files"
-    fi
-
-# Every hop of the dispatch takes the changed-file list as one argument, and
-# just exports recipe parameters into the child's environment, so the whole list
-# has to fit in a single execve string. Linux caps one string at MAX_ARG_STRLEN
-# (32 pages, 131072 bytes) however large ARG_MAX is, so past that each hop dies
-# with E2BIG, which just reports as exit code 126 and no mention of the diff. A
-# diff that large selects most of the workspace anyway, so the callers widen to
-# the unscoped suite, which passes no list at all.
-#
-# Split out from `_changed` so `_changed-test` can drive the decision with a
-# synthetic list, rather than needing the working tree to hold a diff of a
-# particular size.
-#
-# The list arrives on stdin, which is both the only channel that can carry an
-# oversized one and the only way to measure it honestly: `${#var}` counts
-# CHARACTERS under a UTF-8 locale while execve counts BYTES, so a path set of
-# 3-byte characters would read as a third of its real size and sail past a
-# budget it actually blows.
-
-# Print `ALL` when the changed-file list on stdin is too long for one argument.
-[private]
-_changed-cap $LIMIT=changed_max:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    [[ "$LIMIT" =~ ^[0-9]+$ ]] || {
-    	echo "changed: not a byte count: $LIMIT" >&2
-    	exit 2
-    }
-
-    bytes=$(wc -c | tr -d '[:space:]')
-    if ((bytes > LIMIT)); then
-    	echo "changed: $bytes bytes of paths exceeds the $LIMIT budget; selecting everything." >&2
-    	echo ALL
-    fi
-
-# Guards the thing that fails LOUDLY but unhelpfully: past the budget every
-# `just` hop dies with "Argument list too long" and exit 126, naming neither the
-# diff nor the recipe that could not receive it. Both halves matter -- a budget
-# that never trips scopes nothing, and one above what execve accepts still dies.
-
-# Check that an oversized diff widens to `ALL`, and that the budget fits in argv.
-[private]
-_changed-test $LIMIT=changed_max:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    fail() { echo "changed: _changed-test: $1" >&2; exit 1; }
-
-    # Synthetic sizes rather than whatever the working tree happens to hold: a
-    # clean checkout has no diff at all, and `check-all` runs there (cache.yml
-    # warms the cache from `main`), so a test keyed on the real list would take
-    # down the one job allowed to write the shared Rust cache.
-    [[ "$(printf 'aaaa' | just _changed-cap 3)" == ALL ]] || fail "over budget must print ALL"
-    [[ -z "$(printf 'aaa' | just _changed-cap 3)" ]] || fail "at budget must print nothing"
-    [[ -z "$(printf '' | just _changed-cap 3)" ]] || fail "an empty diff must print nothing"
-
-    # The smallest nonempty list there is, against the only budget below it.
-    [[ "$(printf 'x' | just _changed-cap 0)" == ALL ]] || fail "a 1-byte list must exceed a 0 budget"
-
-    # execve counts bytes, so the budget has to as well. Spelled as raw bytes
-    # rather than as characters: this is one CJK character, 3 bytes wide, which
-    # `${#var}` would count as 1 under a UTF-8 locale and let past a 2-byte
-    # budget it actually blows.
-    [[ "$(printf '\xe6\x97\xa5' | just _changed-cap 2)" == ALL ]] \
-    	|| fail "the budget must count bytes, not characters"
-
-    # A byte count is the whole input, so anything else is a caller bug, not a
-    # reason to silently scope to nothing.
-    ! printf '' | just _changed-cap not-a-number 2> /dev/null || fail "a bad budget must be rejected"
-
-    # ...and that rejection has to reach the caller. A swallowed one would hand
-    # back an unbudgeted list, which is the failure this whole recipe prevents.
-    ! just _changed "" not-a-number 2> /dev/null || fail "a rejected budget must fail _changed"
-
-    # Linux caps a single argv/env string at MAX_ARG_STRLEN (32 pages), whatever
-    # ARG_MAX says, and the list travels as one string. Asserted rather than
-    # probed because this repo's CI is the Linux host and a dev box may be laxer.
-    ((LIMIT <= 131072)) || fail "budget $LIMIT exceeds Linux MAX_ARG_STRLEN"
-
-    # The budget still has to survive the hop it was sized for, which the checks
-    # above cannot show: they never pass a list that big to anything.
-    payload=$(head -c "$LIMIT" /dev/zero | tr '\0' x)
-    [[ "$(just _echo "$payload" | wc -c)" -eq $((LIMIT + 1)) ]] \
-    	|| fail "a $LIMIT-byte list does not survive an argv hop"
-
-    # End to end, but only when there is a diff to be oversized: see above. The
-    # budget is zero rather than one because the real list is whatever the
-    # checkout holds, and a single one-character root path is a one-byte list
-    # that a one-byte budget does not exceed. Zero is below every nonempty list.
-    if [[ -n "$(just _changed "" 100000000)" ]]; then
-    	[[ "$(just _changed "" 0)" == ALL ]] || fail "a diff over budget must print ALL"
-    fi
-
-    echo "changed: budget ok"
-
-# Print an argument back, to measure what survives a `just` invocation.
-[private]
-_echo $VALUE:
-    @printf '%s\n' "$VALUE"
-
-# Tools every scope guards with `command -v`, so an incomplete local toolchain
-# checks less instead of failing. That trade is wrong in CI, where a skip is
-# indistinguishable from a pass, so CI exports MOQ_STRICT=1 and this turns the
-# required set into a precondition. Checked up front, and as one list, so a
-# missing tool is reported before a long compile rather than after it.
-#
-# Required per scope, mirroring what `check` actually dispatches for a given
-# diff: demanding gradle on a docs-only PR would fail a run that was never going
-# to invoke it. Takes the same file list as the dispatch, or `ALL` to require
-# everything (`check-all`).
-#
-# One deliberate absence: swift exists only on macOS, and `swift check` skips
-# off-macOS by design; swift.yml is its real gate.
-
-# Fail when a tool the diff's scopes need is missing. No-op unless MOQ_STRICT.
-[private]
-_tools $FILES="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    [[ -n "${MOQ_STRICT:-}" ]] || exit 0
-
-    scoped() { [[ "$FILES" == ALL ]] || grep -qE "$1" <<< "$FILES"; }
-
-    # `_check-common` runs on every invocation, so its tools are unconditional.
-    tools=(actionlint bun jq nix nixfmt shellcheck shfmt taplo)
-    scoped '^(quest/|rs/|Cargo\.(toml|lock)$|rust-toolchain\.toml$)' && tools+=(cargo envsubst)
-    scoped '^(py/|pyproject\.toml$|uv\.lock$|rs/moq-ffi/)'     && tools+=(uv)
-    scoped '^(kt/|rs/moq-ffi/)'                                && tools+=(gradle java)
-    # cargo because `go check` builds moq-ffi for the host, and skips on a
-    # missing cargo the same way it skips on a missing go. rsync because the
-    # publish scripts stage the mirror tree with it, so the publisher test skips
-    # without it, and a skip that keeps `just check` green is what MOQ_STRICT is
-    # here to prevent.
-    scoped '^(go/|rs/moq-ffi/)'                                && tools+=(go uniffi-bindgen-go cargo rsync)
-    scoped '^(dart/|rs/moq-ffi/)'                              && tools+=(cargo dart uniffi_bindgen_dart)
-    # Two obs recipes with two dispatch scopes, so two lines: over-requiring
-    # would fail a diff that never runs the recipe. `just obs compile` needs
-    # cargo to regenerate moq.h and pkg-config to locate Qt6 and ffmpeg. Every
-    # platform: the plugin type-checks against headers, and the dev shell ships
-    # those even on Darwin, where obs-studio can't build.
-    scoped '^(cpp/obs/|rs/libmoq/|flake\.nix$)' && tools+=(pkg-config cargo)
-    # `just obs check` lints with clang-format and gersemi, validates the CMake
-    # release configuration, and compares the three OBS pins, one of which moves
-    # on a flake.lock bump alone.
-    scoped '^(cpp/obs/|flake\.(nix|lock)$)' && tools+=(clang-format gersemi cmake)
-
-    # Scopes overlap (rs/moq-ffi/ is in five of them), so the same tool can land
-    # in the list twice and be reported missing twice. Splitting on whitespace is
-    # safe: every entry is a bare command name.
-    tools=($(printf '%s\n' "${tools[@]}" | sort -u))
-
-    missing=()
-    for tool in "${tools[@]}"; do
-    	command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
-    done
-    if ((${#missing[@]})); then
-    	echo "error: MOQ_STRICT is set but these tools are missing: ${missing[*]}" >&2
-    	echo "       run inside 'nix develop', or unset MOQ_STRICT to skip what isn't installed" >&2
-    	exit 1
-    fi
-
-# Lints and compiles only the packages the branch changed plus everything
-# depending on them, so several worktrees can build at once. This is also what
-# CI runs (with MOQ_STRICT=1), so there is no second, drifting definition of
-# "checked". Tests are the sibling `just test`; `check-all` is the unscoped suite.
-
-# Lint and compile what the branch changed since BASE, plus its dependents.
+# Lint, compile, and test what the branch changed since BASE, plus its dependents.
 check $BASE="":
-    #!/usr/bin/env bash
-    set -euo pipefail
+    sh/dispatch.sh check "$BASE"
 
-    files=$(just _changed "$BASE")
+# The merge queue runs this gate in one job. The test build also enforces
+# default-feature clippy; distinct feature permutations and optimized binding
+# builds run nightly and on release PRs. Missing tools fail under MOQ_STRICT.
 
-    # `_changed` says ALL when the list outgrew what argv can carry. The unscoped
-    # suite is the path that passes no list at all, so it is the one that works.
-    if [[ "$files" == ALL ]]; then
-    	just check-all
-    	exit 0
-    fi
+# Run the merge queue's Linux gate over the branch diff against BASE.
+ci $BASE="":
+    MOQ_STRICT=1 NEXTEST_PROFILE=ci sh/dispatch.sh ci "$BASE"
 
-    just _tools "$files"
+# Run the queue's Linux gate over every package.
+gate:
+    just ci --all
 
-    # The dispatch below lives in these two files, and neither matches any
-    # language scope, so a PR that rewrites how CI dispatches would otherwise
-    # validate none of it. Hand off to the unscoped suite instead.
-    if grep -qE '^(justfile|test/justfile)$' <<< "$files"; then
-    	echo "check: root orchestration changed; checking everything." >&2
-    	just check-all
-    	exit 0
-    fi
+# Report what CI selects before installing the dev shell or build caches.
+ci-select $BASE="":
+    sh/dispatch.sh ci "$BASE" --query
 
-    # An empty list means "force-run" to the per-lang recipes, which is the
-    # wrong semantic here, so don't dispatch at all.
-    if [[ -n "$files" ]]; then
-        just js check "$files"
-        just rs check-changed "$files"
-        # Quest documents form one graph, so validate the whole living tree when
-        # either a quest or its validator changes.
-        if echo "$files" | grep -qE '^(quest/|rs/quest/)'; then
-            cargo run --quiet --locked --package quest -- check
-        fi
-        just py check "$files"
-        just kt check "$files"
-        just swift check "$files"
-        just go check "$files"
-        just dart check "$files"
-    	# Type-checking the plugin needs only headers, so it runs here rather
-    	# than waiting for obs.yml to link it on Linux. libmoq is in scope
-    	# because the plugin calls through its generated C header, and flake.nix
-    	# because it owns the libobs headers this compiles against -- obs.yml
-    	# links against nixpkgs' obs-studio instead, so nothing else would notice
-    	# that package going bad.
-    	if echo "$files" | grep -qE '^(cpp/obs/|rs/libmoq/|flake\.nix$)'; then
-    		just obs compile
-    	fi
-    	# flake.nix is in scope because `just obs check` is what compares the OBS
-    	# version pinned there against buildspec.json, and either side can move.
-        # flake.lock too, because the third OBS the guard compares is nixpkgs'
-        # obs-studio, the one `just obs ci` links: it moves on a lock bump alone,
-        # and that bump is the change that opens the gap.
-        if echo "$files" | grep -qE '^(cpp/obs/|flake\.(nix|lock)$)'; then
-    		just obs check
-    	fi
-    	# Validates flake eval + dev shell build; it no longer compiles the
-    	# workspace, so it's cheap. Gated anyway: a pure doc/JS PR can't
-    	# affect flake eval.
-    	if echo "$files" | grep -qE '(^rs/|^Cargo\.(toml|lock)$|^flake\.lock$|\.nix$)'; then
-    		just _flake
-    	fi
-    else
-    	echo "check: nothing changed."
-    fi
-
-    just _check-common
-
-# Check every package in every language, plus moq-wasm.
-check-all *args:
-    just _tools ALL
-    just js check
-    just rs check --workspace {{ args }}
-    cargo run --quiet --locked --package quest -- check
-    # Not covered by the line above: moq-wasm only exists on the wasm32 target.
-    just rs wasm
-    just py check
-    just kt check
-    just swift check
-    just go check
-    just dart check
-    just obs check
-    just obs compile
-    just _flake
-    just _check-common
-
-# Skips when nix is absent: the flake is not a precondition for working on the
-# repo, and `_tools` already makes it required under MOQ_STRICT.
-
-# Validate flake evaluation and the dev shell build.
-[private]
-_flake:
-    @if command -v nix >/dev/null 2>&1; then nix flake check; fi
-
-# Repository-wide non-compiling checks shared by `check` and `check-all`.
-# Optional shell, workflow, TOML, Nix, and justfile lints skip if missing.
-#
-# `bun install` because remark-cli lives in node_modules and `just js check` is
-# where it would otherwise be installed, which a Rust-only diff skips.
-
-# Run shell checks or formatting over tracked files that exist in the worktree.
-[private]
-_shell $ACTION:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    if ! command -v shfmt >/dev/null 2>&1; then
-        exit 0
-    fi
-    if [[ "$ACTION" == "check" ]] && ! command -v shellcheck >/dev/null 2>&1; then
-        exit 0
-    fi
-
-    scripts_file=$(mktemp)
-    trap 'rm -f "$scripts_file"' EXIT
-    shfmt -f=0 . > "$scripts_file"
-
-    scripts=()
-    while IFS= read -r -d '' file; do
-        if git --literal-pathspecs ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
-            scripts+=("$file")
-        fi
-    done < "$scripts_file"
-    ((${#scripts[@]})) || exit 0
-
-    case "$ACTION" in
-        check)
-            shfmt --diff "${scripts[@]}"
-            shellcheck "${scripts[@]}"
-            ;;
-        fix)
-            shfmt --write "${scripts[@]}"
-            ;;
-        *)
-            echo "invalid shell action: $ACTION" >&2
-            exit 2
-            ;;
-    esac
-
-# remark-cli has no `--check`. `--frail` raises the exit code on lint messages,
-# and only `--output` formats, so a file that is merely misformatted passes both
-# ways. Format a scratch mirror and diff that, so the check stays read-only
-# while `fix` still writes in place.
-
-# Run Markdown lints over the worktree, either checking formatting or applying it.
-[private]
-_markdown $ACTION:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    case "$ACTION" in
-        check) ;;
-        fix)
-            bun remark . --quiet --output
-            exit 0
-            ;;
-        *)
-            echo "invalid markdown action: $ACTION" >&2
-            exit 2
-            ;;
-    esac
-
-    mirror=$(mktemp -d)
-    trap 'rm -rf "$mirror"' EXIT
-
-    extension_list=$(bun -e \
-        'import extensions from "markdown-extensions"; console.log(extensions.join("\n"))')
-    patterns=()
-    while IFS= read -r extension; do
-        [[ -n "$extension" ]] && patterns+=("*.$extension")
-    done <<< "$extension_list"
-    ((${#patterns[@]})) || {
-        echo "error: remark reported no Markdown extensions" >&2
-        exit 1
-    }
-
-    # Untracked files are in scope so a new doc is linted before it is staged;
-    # --exclude-standard keeps build output out.
-    files=()
-    while IFS= read -r -d '' file; do
-        [[ -f "$file" ]] || continue
-        files+=("$file")
-        mkdir -p "$mirror/$(dirname "$file")"
-        cp "$file" "$mirror/$file"
-    done < <(git ls-files -z --cached --others --exclude-standard -- "${patterns[@]}")
-    ((${#files[@]})) || exit 0
-
-    # The config rides along so every .remarkignore pattern resolves against the
-    # mirror root exactly as it does here, and node_modules is where the plugins
-    # named by .remarkrc.mjs come from.
-    cp .remarkrc.mjs .remarkignore "$mirror/"
-    ln -s "$PWD/node_modules" "$mirror/node_modules"
-
-    status=0
-    (cd "$mirror" && bun remark . --quiet --frail --output) || status=$?
-
-    stale=()
-    for file in "${files[@]}"; do
-        cmp -s "$file" "$mirror/$file" || stale+=("$file")
-    done
-
-    if ((${#stale[@]})); then
-        echo "error: these files are not formatted, run 'just fix':" >&2
-        printf '       %s\n' "${stale[@]}" >&2
-        status=1
-    fi
-
-    exit "$status"
-
-# Check Markdown formatting detection without touching the caller's worktree.
-[private]
-_markdown-test:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    fail() { echo "markdown: _markdown-test: $1" >&2; exit 1; }
-
-    repo=$PWD
-    fixture=$(mktemp -d)
-    trap 'rm -rf "$fixture"' EXIT
-
-    git -C "$fixture" init --quiet
-    cp .remarkrc.mjs .remarkignore "$fixture/"
-    ln -s "$repo/node_modules" "$fixture/node_modules"
-    for file in dirty.md dirty.markdown; do
-        printf '# dirty_heading\n' > "$fixture/$file"
-        git -C "$fixture" add "$file"
-    done
-
-    original='# dirty_heading'
-    if just --justfile "$repo/justfile" --working-directory "$fixture" \
-        _markdown check > "$fixture/check.log" 2>&1; then
-        fail "formatter-only drift must fail the check"
-    fi
-    for file in dirty.md dirty.markdown; do
-        [[ "$(<"$fixture/$file")" == "$original" ]] \
-            || fail "the check modified $file"
-        grep -q "$file" "$fixture/check.log" \
-            || fail "the check did not name $file"
-    done
-
-    just --justfile "$repo/justfile" --working-directory "$fixture" _markdown fix
-    for file in dirty.md dirty.markdown; do
-        [[ "$(<"$fixture/$file")" == '# dirty\_heading' ]] \
-            || fail "the fix did not format $file"
-    done
-    just --justfile "$repo/justfile" --working-directory "$fixture" _markdown check
-
-    echo "markdown: check/fix regression ok"
-
-# Repository-wide lints, shared by `check` and `check-all`.
-[private]
-_check-common:
-    just _changed-test
-    bun install --frozen-lockfile
-    just _markdown-test
-    just _markdown check
-    just _shell check
-    @if command -v taplo >/dev/null 2>&1; then RUST_LOG=error taplo format --check; fi
-    @if command -v nixfmt >/dev/null 2>&1; then nixfmt --check $(find . -name '*.nix' -not -path './node_modules/*' -not -path './target/*' -not -path './.venv/*' -not -path './.direnv/*'); fi
-    @for f in $(find . -name justfile -not -path './node_modules/*' -not -path './target/*' -not -path './.venv/*' -not -path './.direnv/*'); do just --fmt --check --justfile "$f"; done
-    just gh check
-
-# Scoped exactly like `check`, because `clippy --fix` compiles what it fixes.
-# `fix-all` is the unscoped version.
+# Report the native platform suites before installing their toolchains.
+ci-select-platform $BASE="":
+    sh/dispatch.sh ci-platform "$BASE" --query
 
 # Auto-fix lint and formatting for what the branch changed since BASE.
 fix $BASE="":
-    #!/usr/bin/env bash
-    set -euo pipefail
+    sh/dispatch.sh fix "$BASE"
 
-    files=$(just _changed "$BASE")
-
-    # Mirrors `check`: too long for argv means fix everything instead.
-    if [[ "$files" == ALL ]]; then
-    	just fix-all
-    	exit 0
-    fi
-
-    if [[ -n "$files" ]]; then
-    	just js fix "$files"
-    	just rs fix-changed "$files"
-    	just py fix "$files"
-    	just dart fix "$files"
-    	if echo "$files" | grep -q '^cpp/obs/'; then
-    		just obs fix
-    	fi
-    else
-    	echo "fix: nothing changed."
-    fi
-
-    just _fix-common
-
-# Auto-fix every JavaScript workspace and every default Rust member.
-fix-all:
-    just js fix
-    just rs fix --workspace
-    just py fix
-    just dart fix
-    just obs fix
-    just _fix-common
-
-# Optional tools skip if missing locally. `bun install` for the same reason as
-# `_check-common`.
-
-# Repository-wide fixes, shared by `fix` and `fix-all`.
-[private]
-_fix-common:
-    bun install
-    just _markdown fix
-    just _shell fix
-    @if command -v taplo >/dev/null 2>&1; then RUST_LOG=error taplo format; fi
-    @if command -v nixfmt >/dev/null 2>&1; then nixfmt $(find . -name '*.nix' -not -path './node_modules/*' -not -path './target/*' -not -path './.venv/*' -not -path './.direnv/*'); fi
-    @for f in $(find . -name justfile -not -path './node_modules/*' -not -path './target/*' -not -path './.venv/*' -not -path './.direnv/*'); do just --fmt --justfile "$f"; done
+# Build .oss-scanner/ with Anthropic's OSS Scanner tools/check: `just oss-scanner [REF] [REPO]`. REF must be pushed.
+[positional-arguments]
+oss-scanner *args:
+    sh/oss-scanner.sh "$@"
 
 # Build the packages.
 build:
     just js build
     just rs build
-    if command -v uv &> /dev/null; then just py build; fi
-    if command -v wasm-bindgen &> /dev/null; then just wasm; fi
+    just py build
+    just js wasm
 
-# Build browser/WASM bindings into @moq/wasm using the pinned wasm-bindgen toolchain.
-wasm:
-    {{ cargo_compile }} build --locked -p moq-wasm --target wasm32-unknown-unknown --profile wasm-release
-    wasm-bindgen --target web --out-name moq \
-    	--out-dir js/wasm/dist "${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/wasm-release/moq_wasm.wasm"
-
-# Delete build artifacts and caches, including per-language outputs and agent worktrees.
-clean:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    just rs clean
-    just js clean
-    just py clean
-    just kt clean
-    just swift clean
-    just go clean
-    just dart clean
-
-    # Caches not owned by any one language: nix build result, direnv, wrangler.
-    rm -rf result .direnv
-    find . -name .claude -prune -o -type d -name .wrangler -prune -exec rm -rf {} +
-
-    # Agent worktrees each carry their own artifacts now that the shared
-    # target dir is gone. Worktrees don't nest, so this recurses exactly one
-    # level. Tolerate stale worktrees on branches that predate this recipe.
-    for wt in .claude/worktrees/*/; do
-    	[ -f "${wt}justfile" ] || continue
-    	echo "==> cleaning ${wt}"
-    	(cd "$wt" && just clean) || echo "    (skipped: just clean failed in ${wt})"
-    done
-
-# Upgrade any tooling
-update:
-    just js update
-    just rs update
-    nix flake update
-
-# Serve the documentation locally.
-doc:
-    cd doc && bun run dev
+# Delete this checkout's build artifacts and caches; `all` includes agent worktrees.
+clean SCOPE="here":
+    sh/clean.sh {{ SCOPE }}

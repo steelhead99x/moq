@@ -7,7 +7,7 @@
 [![npm](https://img.shields.io/npm/v/@moq/publish)](https://www.npmjs.com/package/@moq/publish)
 [![TypeScript](https://img.shields.io/badge/TypeScript-ready-blue.svg)](https://www.typescriptlang.org/)
 
-Publish media to [Media over QUIC](https://moq.dev/) (MoQ) broadcasts, built on top of [@moq/hang](../hang) and [@moq/net](../lite).
+Publish media to [Media over QUIC](https://moq.dev/) (MoQ) broadcasts, built on top of [@moq/hang](../hang) and [@moq/net](../net).
 
 ## Installation
 
@@ -38,7 +38,7 @@ import map required:
 ```
 
 Pin a version range in the URL for production, e.g.
-`https://esm.sh/@moq/publish@0.2/element`. jsDelivr's `+esm` endpoint
+`https://esm.sh/@moq/publish@0.5/element`. jsDelivr's `+esm` endpoint
 (`https://cdn.jsdelivr.net/npm/@moq/publish/element.js/+esm`) works the same way
 if you prefer it.
 
@@ -54,10 +54,7 @@ The simplest way to publish a stream:
     import "@moq/publish/element";
 </script>
 
-<moq-publish
-    url="https://relay.example.com/anon"
-    path="room/alice.hang"
-    audio video controls>
+<moq-publish url="https://relay.example.com/anon" name="room/alice.hang" source="camera">
     <video muted autoplay></video>
 </moq-publish>
 ```
@@ -72,29 +69,84 @@ The simplest way to publish a stream:
 | `muted`     | boolean | false    | Mute audio capture              |
 | `invisible` | boolean | false    | Disable video capture           |
 | `preview`   | string  | `"source"` | What the preview renders: `"source"`, `"encoded"`, `"none"` |
-| `announce`  | string  | `"source"` | When to publish: `"always"`, `"never"`, `"source"` (once a source is selected) |
+| `backend`   | string  | `"auto"` | Graphics API for a `<canvas>` preview: `"auto"`, `"webgpu"`, `"2d"` |
+| `announce`  | string  | `"source"` | When to advertise: `"always"`, `"never"`, `"source"` (once media is captured). A camera source waits for every enabled track, and `"source"` waits until each captured track's config resolves or fails, so the first catalog lists every rendition. The broadcast is created while connected either way. |
+
+A nested `<video>` shows the raw capture; a `<canvas>` is drawn by the element.
+Camera and microphone failures are observable through `el.sources.video`
+and `el.sources.audio`. When those signals hold a `Source.Camera` or
+`Source.Microphone`, read its `out.error` signal. It contains an `Error` (for
+example, a `NotAllowedError` when permission is refused). A refused capture is not retried until permission, device selection,
+constraints, or the source's enabled state changes. `<moq-publish-ui>` shows
+capture failures in its status badge.
 
 ## JavaScript API
 
-For more control:
+For more control, `Broadcast` owns the network broadcast and the catalog. Renditions are
+registered by the encoders themselves, one per track name, so simulcast is just
+more encoders:
+
+Standalone components start enabled when `enabled` is omitted. Camera and microphone sources may
+request permission immediately. Create an enabled screen source during the user gesture that
+authorizes screen capture, or pass a live input that is false until that gesture. Audio capture
+that starts before the page's first click or keypress waits for one: browsers suspend Web Audio
+until then, and the audio rendition stays out of the catalog until samples flow.
 
 ```typescript
 import * as Publish from "@moq/publish";
 
-const publish = new Publish.Broadcast(connection, {
+const connection = new Publish.Net.Connection({
+    url: new URL("https://relay.example.com/anon"),
     enabled: true,
-    name: "alice.hang",
-    video: { enabled: true },
-    audio: { enabled: true },
 });
 
-// Change source at runtime
-publish.source.camera.enabled.set(true);
+// Capture, then encode. The orientation turns a phone's landscape frames upright
+// while it is held in portrait.
+const camera = new Publish.Source.Camera({ enabled: true });
+const video = new Publish.Signals.Computed((effect) => effect.get(camera.out.source)?.video);
+const capture = new Publish.Video.Capture({ source: video, orientation: camera.out.orientation });
+
+const broadcast = new Publish.Broadcast({
+    origin: connection.origin,
+    enabled: true,
+    name: Publish.Net.Path.from("room/alice.hang"),
+    display: capture.out.display,
+    rotation: capture.out.rotation,
+});
+
+// Each encoder registers its rendition on the broadcast and encodes only while
+// someone is subscribed.
+
+const hd = new Publish.Video.Encoder("video/hd", { broadcast, capture, enabled: true });
+const sd = new Publish.Video.Encoder("video/sd", { broadcast, capture, enabled: true, config: { maxScale: 0.25 } });
+
+// Tune an encoder at any time; undefined fields are auto-sized.
+hd.config.set({ codec: "vp09.00.10.08", maxBitrate: 4_000_000 });
+
+const microphone = new Publish.Source.Microphone({ enabled: true });
+const audioSource = new Publish.Signals.Computed((effect) => effect.get(microphone.out.source)?.audio);
+const audioCapture = new Publish.Audio.Capture({ source: audioSource });
+const audio = new Publish.Audio.Encoder("audio", { broadcast, capture: audioCapture, enabled: true });
+audio.volume.set(0.8);
 ```
+
+Video encoders prefer hardware encoding, including on Firefox 143 and newer. AV1 is only
+considered with hardware acceleration; software selection starts with H.264.
+Screen capture passes `{ track, get scale() { ... } }` as its video source, reading
+the current `screenPixelRatio` for each captured frame. Custom sources can use a
+fixed `scale: 2` or a live property getter.
+Encoders default to logical resolution when the browser supplies
+`screenPixelRatio` and native dimensions: a 5120×2880 surface at 2× encodes at
+2560×1440. Browsers without that metadata keep the captured resolution.
+Explicit `maxPixels`, `maxScale`, or source width/height limits override this
+default; `maxScale: 1` preserves the captured resolution.
+
+Serve application tracks alongside the media with `broadcast.net`, the
+underlying producer, and advertise them with `broadcast.catalog.mutate(...)`.
 
 ## UI Web Component
 
-`@moq/publish` includes a Web Component UI overlay (`<moq-publish-ui>`) with source selection (camera, screen, file, microphone) and status indicator. It is built on top of `@moq/signals` with no framework dependency.
+`@moq/publish` includes a Web Component UI overlay (`<moq-publish-ui>`) with source selection (camera, screen, file, microphone), audio/video toggles, a status badge, fullscreen, and a stats panel. It is built on top of `@moq/signals` with no framework dependency.
 
 ```html
 <script type="module">
@@ -103,7 +155,7 @@ publish.source.camera.enabled.set(true);
 </script>
 
 <moq-publish-ui>
-    <moq-publish url="https://relay.example.com/anon" path="room/alice.hang" audio video>
+    <moq-publish url="https://relay.example.com/anon" name="room/alice.hang" source="camera">
         <video muted autoplay></video>
     </moq-publish>
 </moq-publish-ui>
@@ -113,13 +165,13 @@ The `<moq-publish-ui>` element automatically discovers the nested `<moq-publish>
 
 ## Features
 
-- **Camera & microphone** — Capture from user devices
-- **Screen sharing** — Capture display or window
-- **File playback** — Publish from a media file
-- **WebCodecs encoding** — Hardware-accelerated video and audio encoding
-- **Reactive state** — All properties are signals from `@moq/signals`
-- **Chat** — Publish text chat messages
-- **Location** — Publish peer position and window tracking
+- **Camera & microphone**: Capture from user devices
+- **Screen sharing**: Capture display or window
+- **File playback**: Publish from a media file
+- **WebCodecs encoding**: Hardware-accelerated video and audio encoding
+- **Reactive state**: All properties are signals from `@moq/signals`
+- **Simulcast**: Any number of renditions, each its own encoder and track
+- **Custom tracks**: Application tracks and catalog sections ride alongside the media
 
 ## License
 

@@ -10,6 +10,10 @@ on:
   push:
     tags:
       - "moq-ffi-v*"
+  # Dry-run: build everything, publish nothing. Nightly calls every release
+  # workflow this way so a broken build surfaces before the tag is cut.
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -30,15 +34,18 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: ./.github/actions/just
+
       - name: Parse version
         id: parse
-        run: .github/scripts/release.sh parse-version moq-ffi
+        run: just gh release parse-version moq-ffi
 
       # Maturin reads the wheel version from rs/moq-ffi/Cargo.toml (via
       # `dynamic = ["version"]` in pyproject.toml). If a tag is pushed by
       # hand without bumping Cargo.toml first, the wheel would ship with
       # the previous version and PyPI would reject the duplicate upload.
       - name: Verify Cargo.toml matches tag
+        if: github.ref_type == 'tag'
         env:
           TAG_VERSION: ${{ steps.parse.outputs.version }}
         run: |
@@ -58,15 +65,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # manylinux_2_28 (AlmaLinux 8) on both Linux targets: manylinux2014
+          # (CentOS 7) only packages clang 3.4, too old for the bindgen that
+          # moq-vaapi and v4l2-sys run at build time.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            # Use manylinux_2_28 for aarch64-linux to get a newer GCC.
-            # manylinux2014 ships GCC 4.8.5 which can't compile aws-lc-sys.
             manylinux: 2_28
-            # The cross image sets TARGET_CC/CXX which leaks into host builds.
-            before-script-linux: "unset TARGET_CC TARGET_CXX"
+          - target: aarch64-unknown-linux-gnu
+            # Native headers and compiler keep bindgen on the target ABI.
+            os: ubuntu-24.04-arm
+            manylinux: 2_28
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
@@ -90,10 +98,11 @@ jobs:
           args: --locked --release --out dist
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          before-script-linux: ${{ matrix.before-script-linux || '' }}
+          # moq-vaapi and v4l2-sys generate bindings inside the container.
+          before-script-linux: yum install -y clang-devel
 
       - name: Upload wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: python-${{ matrix.target }}
           path: py/moq-ffi/dist/*.whl
@@ -120,7 +129,7 @@ jobs:
           args: --out dist
 
       - name: Upload sdist
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: python-sdist
           path: py/moq-ffi/dist/*.tar.gz
@@ -128,6 +137,7 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: [build, sdist]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -137,7 +147,7 @@ jobs:
 
     steps:
       - name: Download wheels
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: python-*
           path: dist

@@ -38,6 +38,7 @@ pub struct AV1 {
 }
 
 impl AV1 {
+	/// The codec string prefix that identifies AV1.
 	pub const PREFIX: &'static str = "av01";
 }
 
@@ -78,10 +79,11 @@ impl std::fmt::Display for AV1 {
 	}
 }
 
-lazy_static::lazy_static! {
-	static ref AV1_REGEX: regex::Regex = regex::Regex::new(&r"
+static AV1_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+	regex::Regex::new(
+		&r"
 		^av01
-		\.(?<profile>[01])
+		\.(?<profile>[0-2])
 		\.(?<level>\d{2})(?<tier>\w)
 		\.(?<bitdepth>\d{2})
 		(?<extra>
@@ -92,9 +94,11 @@ lazy_static::lazy_static! {
 			\.(?<matrix>\d{2})
 			\.(?<full>[01])
 		)?
-		$".replace(['\n', ' ', '\t'], "")
-	).unwrap();
-}
+		$"
+		.replace(['\n', ' ', '\t'], ""),
+	)
+	.unwrap()
+});
 
 impl std::str::FromStr for AV1 {
 	type Err = Error;
@@ -151,7 +155,7 @@ impl Default for AV1 {
 mod test {
 	use std::str::FromStr;
 
-	use crate::catalog::VideoCodec;
+	use crate::catalog::{VideoCodec, VideoConfig};
 
 	use super::*;
 
@@ -198,5 +202,34 @@ mod test {
 
 		let output = decoded.to_string();
 		assert_eq!(output, encoded);
+	}
+
+	#[test]
+	fn test_av1_profiles_roundtrip() {
+		for (encoded, profile) in [
+			("av01.0.00M.08", 0),
+			("av01.1.00M.10.0.000.01.01.01.0", 1),
+			("av01.2.00M.12", 2),
+			("av01.2.00M.08.0.100.02.02.02.0", 2),
+			("av01.2.00M.10.0.100.09.16.09.0", 2),
+			("av01.2.00M.12.0.100.09.16.09.0", 2),
+			("av01.2.00M.12.0.000.09.16.09.0", 2),
+		] {
+			let decoded = VideoCodec::from_str(encoded).expect("failed to parse");
+			assert!(matches!(&decoded, VideoCodec::AV1(av1) if av1.profile == profile));
+			assert_eq!(decoded.to_string(), encoded);
+
+			let config = VideoConfig::new(decoded);
+			let json = serde_json::to_string(&config).unwrap();
+			let output: VideoConfig = serde_json::from_str(&json).unwrap();
+			assert_eq!(output, config);
+		}
+	}
+
+	#[test]
+	fn test_av1_invalid_profile() {
+		for profile in 3..=9 {
+			assert!(VideoCodec::from_str(&format!("av01.{profile}.00M.08")).is_err());
+		}
 	}
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Time } from "@moq/net";
+import { Micro, Milli } from "@moq/clock";
 import { allocSharedRingBuffer, SharedRingBuffer, type SharedRingBufferInit } from "./shared-ring-buffer";
 
 function create(props?: { rate?: number; channels?: number; capacity?: number; latency?: number }) {
@@ -29,7 +29,25 @@ function insert(
 		channel.fill(opts?.value ?? 1.0);
 		data.push(channel);
 	}
-	buffer.insert(Time.Micro.fromMilli(timestampMs as Time.Milli), data);
+	buffer.insert(Micro.fromMilli(timestampMs as Milli), data);
+}
+
+/**
+ * Insert `samples` as a run of `chunk`-sized inserts starting at `timestampMs`.
+ *
+ * The skip band is one chunk wide, so a test that wants a skip has to arrive the way a decoder
+ * does: many small chunks, not one big one. The rate is 1000 in these tests, so a sample is a ms.
+ */
+function insertChunks(
+	buffer: SharedRingBuffer,
+	timestampMs: number,
+	samples: number,
+	chunk: number,
+	opts?: { channels?: number; value?: number },
+): void {
+	for (let i = 0; i < samples; i += chunk) {
+		insert(buffer, timestampMs + i, Math.min(chunk, samples - i), opts);
+	}
 }
 
 function read(buffer: SharedRingBuffer, samples: number, channelCount?: number): Float32Array[] {
@@ -52,7 +70,7 @@ describe("initialization", () => {
 		expect(init.capacity).toBe(128);
 		expect(init.rate).toBe(1000);
 		expect(init.samples.byteLength).toBe(2 * 128 * 4); // 2 channels * 128 samples * Float32
-		expect(init.control.byteLength).toBe(3 * 4); // 3 control slots * Int32
+		expect(init.control.byteLength).toBe(6 * 4); // 6 control slots * Int32
 		expect(init.state.byteLength).toBe(8); // packed epoch + read cursor
 	});
 
@@ -185,7 +203,7 @@ describe("insert", () => {
 	it("should throw on wrong channel count", () => {
 		const buffer = create({ channels: 2 });
 		expect(() => {
-			buffer.insert(0 as Time.Micro, [new Float32Array(10)]); // only 1 channel
+			buffer.insert(0 as Micro, [new Float32Array(10)]); // only 1 channel
 		}).toThrow(/wrong number of channels/);
 	});
 });
@@ -407,11 +425,11 @@ describe("overflow", () => {
 });
 
 describe("latency skip", () => {
-	it("should skip READ when buffered exceeds LATENCY", () => {
+	it("should skip READ when buffered exceeds LATENCY plus a chunk", () => {
 		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 20 });
 
-		// Fill 60 samples — exceeds LATENCY of 20
-		insert(buffer, 0, 60, { channels: 1, value: 1.0 });
+		// Fill 60 samples in 10-sample chunks — a whole chunk past the 20 sample LATENCY.
+		insertChunks(buffer, 0, 60, 10, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// Read should skip ahead to maintain LATENCY distance from WRITE
@@ -419,6 +437,18 @@ describe("latency skip", () => {
 
 		// Should only get LATENCY (20) samples, skipping the first 40
 		expect(output[0].length).toBe(20);
+	});
+
+	it("should tolerate one chunk above LATENCY", () => {
+		// A ring sitting on the target is a chunk above it the moment the next chunk lands, so
+		// skipping on that overshoot would discard audio on every single insert.
+		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 20 });
+
+		insertChunks(buffer, 0, 40, 20, { channels: 1, value: 1.0 });
+		expect(buffer.stalled).toBe(false);
+
+		const output = read(buffer, 128, 1);
+		expect(output[0].length).toBe(40);
 	});
 
 	it("should not skip when buffered is within LATENCY", () => {
@@ -443,14 +473,14 @@ describe("timestamp getter", () => {
 		expect(buffer.stalled).toBe(false);
 
 		// Initially at 0
-		expect(buffer.timestamp).toBe(0 as Time.Micro);
+		expect(buffer.timestamp).toBe(0 as Micro);
 
 		// Read 50 samples
 		read(buffer, 50, 1);
 
 		// Timestamp should reflect READ = 50 at rate 1000
 		// 50 / 1000 = 0.05 seconds = 50000 microseconds
-		expect(buffer.timestamp).toBe(50000 as Time.Micro);
+		expect(buffer.timestamp).toBe(50000 as Micro);
 	});
 });
 
@@ -458,8 +488,8 @@ describe("setLatency", () => {
 	it("should dynamically change latency affecting skip behavior", () => {
 		const buffer = create({ rate: 1000, channels: 1, capacity: 100, latency: 50 });
 
-		// Fill 80 samples
-		insert(buffer, 0, 80, { channels: 1, value: 1.0 });
+		// Fill 80 samples, in chunks so the skip band stays narrow.
+		insertChunks(buffer, 0, 80, 10, { channels: 1, value: 1.0 });
 		expect(buffer.stalled).toBe(false);
 
 		// With LATENCY=50, reading should skip to 30 (80-50)
@@ -467,7 +497,7 @@ describe("setLatency", () => {
 		expect(output1[0].length).toBe(50);
 
 		// Write more
-		insert(buffer, 80, 80, { channels: 1, value: 2.0 });
+		insertChunks(buffer, 80, 80, 10, { channels: 1, value: 2.0 });
 
 		// Change latency to 20
 		buffer.setLatency(20);
@@ -475,6 +505,159 @@ describe("setLatency", () => {
 		// Now reading should skip more aggressively
 		const output2 = read(buffer, 128, 1);
 		expect(output2[0].length).toBe(20);
+	});
+
+	// Video holds a deeper floor on its own, so audio has to park for the difference or it runs
+	// ahead. Flushing instead cost the whole floor in silence for every rise, however small.
+	it("parks a playing ring until the deeper floor refills, keeping what it buffered", () => {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 100 });
+		insert(buffer, 0, 100, { channels: 1, value: 1.0 });
+		expect(buffer.stalled).toBe(false);
+		read(buffer, 50, 1);
+
+		buffer.setLatency(110);
+		expect(buffer.stalled).toBe(true);
+		expect(read(buffer, 128, 1)[0].length).toBe(0);
+
+		// Refilling to the 110-sample floor takes 60 more samples, not the whole floor.
+		insert(buffer, 100, 59, { channels: 1, value: 2.0 });
+		expect(buffer.stalled).toBe(true);
+		insert(buffer, 159, 1, { channels: 1, value: 2.0 });
+		expect(buffer.stalled).toBe(false);
+
+		// Playback resumes where it parked rather than at the refill.
+		expect(Milli.fromMicro(buffer.timestamp)).toBe(50 as Milli);
+		expect(read(buffer, 1, 1)[0][0]).toBe(1.0);
+	});
+
+	it("silences a quantum already in flight when the floor rises", () => {
+		const init = allocSharedRingBuffer(1, 256, 1000);
+		const main = new SharedRingBuffer(init);
+		main.setLatency(100);
+		insert(main, 0, 100, { channels: 1, value: 1.0 });
+		const worklet = new SharedRingBuffer(init);
+		const out = [new Float32Array(50).fill(-1)];
+
+		// Raise the floor from inside the read's LATENCY load: past the STALLED check, before the
+		// copy and publish, which is where the worklet sits whenever the two threads overlap.
+		const LATENCY = 1;
+		let fired = false;
+		const realLoad = Atomics.load;
+		const atomics = Atomics as { load: unknown };
+		atomics.load = (arr: Int32Array | BigInt64Array, idx: number) => {
+			const value = realLoad(arr as Int32Array, idx);
+			if (!fired && arr instanceof Int32Array && idx === LATENCY) {
+				fired = true;
+				main.setLatency(110);
+			}
+			return value;
+		};
+
+		let result = -1;
+		try {
+			result = worklet.read(out);
+		} finally {
+			atomics.load = realLoad;
+		}
+		expect(fired).toBe(true);
+
+		// The quantum raced the park, so none of it renders and the playhead stays put.
+		expect(result).toBe(0);
+		expect(out[0]).toEqual(new Float32Array(50));
+		expect(Milli.fromMicro(main.timestamp)).toBe(0 as Milli);
+
+		insert(main, 100, 10, { channels: 1, value: 2.0 });
+		expect(main.stalled).toBe(false);
+		expect(read(worklet, 1, 1)[0][0]).toBe(1.0);
+	});
+
+	it("keeps playing through a shallower floor", () => {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 100 });
+		insert(buffer, 0, 100, { channels: 1, value: 1.0 });
+		read(buffer, 50, 1);
+
+		buffer.setLatency(90);
+		expect(buffer.stalled).toBe(false);
+	});
+
+	it("keeps playing through a deeper floor the buffer already covers", () => {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 100 });
+		insert(buffer, 0, 40, { channels: 1, value: 1.0 });
+		insert(buffer, 40, 110, { channels: 1, value: 2.0 });
+
+		buffer.setLatency(110);
+		expect(buffer.stalled).toBe(false);
+		// 150 buffered sits within a chunk of the new floor, so nothing is skipped either.
+		expect(read(buffer, 1, 1)[0][0]).toBe(1.0);
+	});
+
+	it("resumes a refill once a shallower floor is already covered", () => {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 100 });
+		insert(buffer, 0, 100, { channels: 1, value: 1.0 });
+		read(buffer, 50, 1);
+
+		buffer.setLatency(110);
+		expect(buffer.stalled).toBe(true);
+
+		// No further frame arrives, as when the source stops, so only the lower floor can resume it.
+		buffer.setLatency(50);
+		expect(buffer.stalled).toBe(false);
+		expect(read(buffer, 1, 1)[0][0]).toBe(1.0);
+	});
+});
+
+describe("re-buffer", () => {
+	it("re-stalls and refills to the target after running dry", () => {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 40 });
+
+		insertChunks(buffer, 0, 40, 20, { channels: 1, value: 1.0 });
+		expect(buffer.stalled).toBe(false);
+
+		// Drain it.
+		expect(read(buffer, 40, 1)[0].length).toBe(40);
+		expect(buffer.length).toBe(0);
+
+		// The next read finds nothing and parks playback rather than handing the worklet a quantum
+		// of silence and trying again on the next one.
+		expect(read(buffer, 20, 1)[0].length).toBe(0);
+		expect(buffer.stalled).toBe(true);
+		expect(buffer.underruns).toBe(1);
+
+		// A single chunk is not the target, so playback stays parked.
+		insert(buffer, 40, 20, { channels: 1, value: 2.0 });
+		expect(buffer.stalled).toBe(true);
+		expect(read(buffer, 20, 1)[0].length).toBe(0);
+
+		// Reaching the target resumes it, and nothing buffered in the meantime was lost.
+		insert(buffer, 60, 20, { channels: 1, value: 2.0 });
+		expect(buffer.stalled).toBe(false);
+		expect(read(buffer, 40, 1)[0].length).toBe(40);
+	});
+
+	it("counts a quantum it could only partly fill as an underrun", () => {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 40 });
+
+		insertChunks(buffer, 0, 40, 20, { channels: 1, value: 1.0 });
+		expect(read(buffer, 30, 1)[0].length).toBe(30);
+
+		// Ten samples remain against a quantum of twenty: the rest of the quantum is silence, which
+		// is an underrun whether or not a chunk lands before the next read. It is not a stall: a
+		// refill would cost the whole target to cover a gap shorter than one quantum.
+		expect(read(buffer, 20, 1)[0].length).toBe(10);
+		expect(buffer.stalled).toBe(false);
+		expect(buffer.underruns).toBe(1);
+
+		// A chunk landing before the next read keeps playback going.
+		insert(buffer, 40, 20, { channels: 1, value: 2.0 });
+		expect(read(buffer, 20, 1)[0].length).toBe(20);
+		expect(buffer.underruns).toBe(1);
+	});
+
+	it("does not count an underrun while parked", () => {
+		const buffer = create({ rate: 1000, channels: 1, capacity: 256, latency: 40 });
+		read(buffer, 20, 1);
+		read(buffer, 20, 1);
+		expect(buffer.underruns).toBe(0);
 	});
 });
 
@@ -523,7 +706,7 @@ describe("i32 wrap epoch", () => {
 		buffer.setLatency(32);
 
 		insert(buffer, 0, 32, { channels: 1, value: 0.5 });
-		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe(0 as Time.Milli);
+		expect(Milli.fromMicro(buffer.timestamp)).toBe(0 as Milli);
 
 		// Step READ up to the boundary and over it, observing each time. Production gets these
 		// observations from the 50ms poll in `buffer.ts`.
@@ -602,7 +785,7 @@ describe("i32 wrapping", () => {
 
 		expect(buffer.stalled).toBe(false);
 		// The anchor is preserved, so media time survives the wrap rather than reading negative.
-		expect(buffer.timestamp).toBe(Time.Micro.fromMilli(startMs as Time.Milli));
+		expect(buffer.timestamp).toBe(Micro.fromMilli(startMs as Milli));
 		const output = read(buffer, 128, 1);
 		expect(output[0].length).toBe(128);
 		expect(output[0][0]).toBeCloseTo(0.5, 5);
@@ -675,7 +858,7 @@ describe("buffered mode", () => {
 		const buffer = createBuffered(50);
 		// First frame at a future timestamp; READ should snap to it, not gap-fill from 0.
 		insert(buffer, 2000, 100, { channels: 1, value: 0.1 });
-		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe(2000 as Time.Milli);
+		expect(Milli.fromMicro(buffer.timestamp)).toBe(2000 as Milli);
 		expect(buffer.stalled).toBe(false); // 100 buffered >= 50 latency
 	});
 
@@ -690,7 +873,7 @@ describe("buffered mode", () => {
 		// Read the oldest frame first; a non-buffered ring would have skipped to write-latency.
 		const first = read(buffer, 100, 1);
 		expect(first[0][0]).toBeCloseTo(0.1, 5);
-		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe(2100 as Time.Milli);
+		expect(Milli.fromMicro(buffer.timestamp)).toBe(2100 as Milli);
 
 		const second = read(buffer, 100, 1);
 		expect(second[0][0]).toBeCloseTo(0.2, 5);
@@ -706,7 +889,7 @@ describe("buffered mode", () => {
 
 		// A new utterance with its own timestamps anchors fresh.
 		insert(buffer, 500, 100, { channels: 1, value: 0.9 });
-		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe(500 as Time.Milli);
+		expect(Milli.fromMicro(buffer.timestamp)).toBe(500 as Milli);
 		const out = read(buffer, 100, 1);
 		expect(out[0][0]).toBeCloseTo(0.9, 5);
 	});
@@ -722,7 +905,7 @@ describe("buffered mode", () => {
 		insert(buffer, 256, 128, { channels: 1, value: 0.3 }); // exceeds cap; drops [0, 128)
 
 		// READ skipped forward to stay within the cap; oldest frame is gone.
-		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe(128 as Time.Milli);
+		expect(Milli.fromMicro(buffer.timestamp)).toBe(128 as Milli);
 		expect(read(buffer, 128, 1)[0][0]).toBeCloseTo(0.2, 5);
 		expect(read(buffer, 128, 1)[0][0]).toBeCloseTo(0.3, 5);
 	});
@@ -736,7 +919,7 @@ describe("buffered mode", () => {
 
 		// A successor track takes over at 2200 with 100ms of its own audio. Writing it only overwrites
 		// [2200, 2300); without the truncate, [2300, 3000) of the old track still plays after it.
-		buffer.truncate(Time.Micro.fromMilli(2200 as Time.Milli));
+		buffer.truncate(Micro.fromMilli(2200 as Milli));
 		insert(buffer, 2200, 100, { channels: 1, value: 0.9 });
 
 		expect(buffer.stalled).toBe(false); // truncate keeps playing, unlike reset()
@@ -752,9 +935,103 @@ describe("buffered mode", () => {
 
 		// A successor whose first frame predates the playhead: those samples are already due, so WRITE
 		// floors there rather than going backwards.
-		buffer.truncate(Time.Micro.fromMilli(1000 as Time.Milli));
+		buffer.truncate(Micro.fromMilli(1000 as Milli));
 		expect(buffer.length).toBe(0);
 		expect(read(buffer, 100, 1)[0].length).toBe(0);
+	});
+});
+
+describe("truncate races the reader", () => {
+	// The worklet snapshots WRITE, copies, and only then publishes, so a `truncate` on the main
+	// thread lands mid-read whenever the two threads overlap. Driving the retreat from inside one
+	// of the read's own atomics is the only way to put it there on purpose.
+	const WRITE = 0;
+	const LATENCY = 1;
+
+	// A successor takes over at 2100: [2000, 2100) is already due, [2100, 2200) is the tail the
+	// truncate drops. The output is sized to the whole buffered span, so a read that copies the
+	// tail fills every slot the assertions look at.
+	function stage(): { main: SharedRingBuffer; worklet: SharedRingBuffer; out: Float32Array[] } {
+		const init = allocSharedRingBuffer(1, 512, 1000, true);
+		const main = new SharedRingBuffer(init);
+		main.setLatency(50);
+		insert(main, 2000, 100, { channels: 1, value: 0.1 });
+		insert(main, 2100, 100, { channels: 1, value: 0.9 });
+
+		// Pre-filled with a sentinel and checked at full length: the `read` helper slices to the
+		// sample count, so an empty slice would pass whatever the ring left behind.
+		return { main, worklet: new SharedRingBuffer(init), out: [new Float32Array(200).fill(-1)] };
+	}
+
+	it("silences a quantum whose tail a concurrent truncate drops", () => {
+		const { main, worklet, out } = stage();
+
+		let fired = false;
+		const realLoad = Atomics.load;
+		const atomics = Atomics as { load: unknown };
+		atomics.load = (arr: Int32Array | BigInt64Array, idx: number) => {
+			const value = realLoad(arr as Int32Array, idx);
+			// The last load before the copy: WRITE is already snapshotted, so the retreat lands in
+			// exactly the window where the reader would otherwise copy the tail it drops.
+			if (!fired && arr instanceof Int32Array && idx === LATENCY) {
+				fired = true;
+				main.truncate(Micro.fromMilli(2100 as Milli));
+			}
+			return value;
+		};
+
+		let result = 0;
+		try {
+			result = worklet.read(out);
+		} finally {
+			atomics.load = realLoad;
+		}
+		expect(fired).toBe(true);
+
+		// The quantum raced the retreat, so none of it is published or rendered.
+		expect(result).toBe(0);
+		expect(out[0]).toEqual(new Float32Array(200));
+
+		// The playhead never moved, so what survived the truncate still plays.
+		expect(read(worklet, 100, 1)[0]).toEqual(new Float32Array(100).fill(0.1));
+		expect(read(worklet, 100, 1)[0].length).toBe(0);
+	});
+
+	it("renders nothing while a truncate is mid-retreat", () => {
+		const { main, worklet, out } = stage();
+
+		let result = -1;
+		let fired = false;
+		const realExchange = Atomics.compareExchange;
+		const atomics = Atomics as { compareExchange: unknown };
+		atomics.compareExchange = (
+			arr: Int32Array | BigInt64Array,
+			idx: number,
+			expected: never,
+			replacement: never,
+		) => {
+			// Caught between the truncate's two epoch steps, with WRITE still describing the tail.
+			if (!fired && arr instanceof Int32Array && idx === WRITE) {
+				fired = true;
+				result = worklet.read(out);
+			}
+			return realExchange(arr as Int32Array, idx, expected, replacement);
+		};
+
+		try {
+			main.truncate(Micro.fromMilli(2100 as Milli));
+		} finally {
+			atomics.compareExchange = realExchange;
+		}
+		expect(fired).toBe(true);
+
+		// The reader could not tell the tail apart from the audio still due, so it copied nothing.
+		expect(result).toBe(0);
+		expect(out[0]).toEqual(new Float32Array(200).fill(-1));
+
+		// And the window closes: the next quantum plays what the truncate kept.
+		expect(read(worklet, 100, 1)[0]).toEqual(new Float32Array(100).fill(0.1));
+		expect(read(worklet, 100, 1)[0].length).toBe(0);
 	});
 });
 
@@ -771,6 +1048,71 @@ describe("packed state", () => {
 		const replacement = new SharedRingBuffer(dst.init, src);
 		expect(replacement.length).toBe(48);
 	});
+
+	it("carries the consumed cursor across a replacement truncate", () => {
+		const src = create({ rate: 1000, channels: 1, capacity: 64, latency: 64 });
+		src.insert(0 as Micro, [Float32Array.from({ length: 64 }, (_, i) => i + 1)]);
+		const dst = src.resize(256);
+		expect(read(src, 16, 1)[0]).toEqual(Float32Array.from({ length: 16 }, (_, i) => i + 1));
+		dst.truncate(Micro.fromMilli(48 as Milli));
+
+		const replacement = new SharedRingBuffer(dst.init, src);
+		expect(replacement.length).toBe(32);
+		expect(read(replacement, 64, 1)[0]).toEqual(Float32Array.from({ length: 32 }, (_, i) => i + 17));
+		expect(read(replacement, 64, 1)[0].length).toBe(0);
+	});
+
+	for (const operation of ["truncate", "re-anchor"] as const) {
+		for (const point of ["state", "timeline", "exchange"] as const) {
+			it(`preserves the timeline when ${operation} races handoff at ${point}`, () => {
+				const src = create({ rate: 1000, channels: 1, capacity: 64, latency: 64 });
+				insert(src, 0, 64, { channels: 1, value: 1 });
+				const dst = src.resize(256);
+				read(src, 16, 1);
+				let fired = false;
+				const mutate = () => {
+					fired = true;
+					if (operation === "truncate") {
+						dst.truncate(Micro.fromMilli(48 as Milli));
+					} else {
+						dst.reset();
+						insert(dst, 1000, 64, { channels: 1, value: 2 });
+					}
+				};
+				const realLoad = Atomics.load;
+				const realExchange = Atomics.compareExchange;
+				const atomics = Atomics as { load: unknown; compareExchange: unknown };
+				atomics.load = (arr: Int32Array | BigInt64Array, idx: number) => {
+					const value = realLoad(arr as Int32Array, idx);
+					if (
+						!fired &&
+						((point === "state" && arr.buffer === dst.init.state) ||
+							(point === "timeline" && arr.buffer === dst.init.control && idx === 3))
+					)
+						mutate();
+					return value;
+				};
+				atomics.compareExchange = (arr: BigInt64Array, idx: number, expected: bigint, next: bigint) => {
+					if (!fired && point === "exchange" && arr.buffer === dst.init.state) mutate();
+					return realExchange(arr, idx, expected, next);
+				};
+				let replacement: SharedRingBuffer;
+				try {
+					replacement = new SharedRingBuffer(dst.init, src);
+				} finally {
+					atomics.load = realLoad;
+					atomics.compareExchange = realExchange;
+				}
+				expect(fired).toBe(true);
+				const count = operation === "truncate" ? 32 : 64;
+				expect(replacement.length).toBe(count);
+				expect(read(replacement, 64, 1)[0]).toEqual(
+					new Float32Array(count).fill(operation === "truncate" ? 1 : 2),
+				);
+				expect(read(replacement, 64, 1)[0].length).toBe(0);
+			});
+		}
+	}
 
 	it("drops the carried cursor when the replacement re-anchored first", () => {
 		// A different timeline: the cursor describes audio the replacement has never played.
@@ -871,7 +1213,8 @@ describe("re-anchor store ordering", () => {
 			if (!halfway) {
 				halfway = true;
 				// The first half of a re-anchor: new epoch and a zeroed cursor, WRITE untouched.
-				const epoch = (Number(realLoad(state, 0) >> 32n) | 0) + 1;
+				// Stepping by two matches `insert`, which leaves odd epochs to `truncate`.
+				const epoch = (Number(realLoad(state, 0) >> 32n) | 0) + 2;
 				Atomics.store(state, 0, BigInt(epoch >>> 0) << 32n);
 			}
 			return value;

@@ -2,102 +2,32 @@
 
 from __future__ import annotations
 
-import json
-from typing import TYPE_CHECKING, Any
+from datetime import timedelta
+from typing import TYPE_CHECKING
 
 from moq_ffi import (
-    MoqAudioProducer,
     MoqBroadcastDynamic,
     MoqBroadcastProducer,
+    MoqGroupDemand,
     MoqGroupProducer,
     MoqGroupRequest,
-    MoqInit,
-    MoqJsonSnapshotConfig,
-    MoqJsonSnapshotProducer,
-    MoqJsonStreamConfig,
-    MoqJsonStreamProducer,
-    MoqMediaProducer,
-    MoqMediaStreamProducer,
+    MoqTrackDemand,
     MoqTrackDynamic,
     MoqTrackProducer,
     MoqTrackRequest,
-    MoqVideoProducer,
 )
 
+from ._records import _subscription, _track_info
+from ._stream import _Stream
 from .types import (
-    AudioEncoderInput,
-    AudioEncoderOutput,
-    AudioFrame,
     Frame,
     Route,
     Subscription,
     TrackInfo,
-    VideoEncoderInput,
-    VideoEncoderOutput,
-    VideoFrame,
-    VideoHint,
-    VideoProperties,
 )
 
 if TYPE_CHECKING:
     from .subscribe import BroadcastConsumer, GroupConsumer, TrackConsumer
-
-
-def _media_init(format: str, init: bytes, video: VideoHint | None) -> MoqInit:
-    return MoqInit(format=format, data=init, video=video)
-
-
-class MediaProducer:
-    """Publish encoded media frames on a single track, one payload at a time.
-
-    Built via :meth:`BroadcastProducer.publish_media`. Push each encoded frame
-    with :meth:`write_frame`, then :meth:`finish` when the stream ends.
-    """
-
-    def __init__(self, inner: MoqMediaProducer) -> None:
-        self._inner = inner
-
-    @property
-    def name(self) -> str:
-        """The generated media track name."""
-        return self._inner.name()
-
-    async def used(self) -> None:
-        """Wait until this media track has at least one active subscriber."""
-        await self._inner.used()
-
-    async def unused(self) -> None:
-        """Wait until this media track has no active subscribers."""
-        await self._inner.unused()
-
-    def write_frame(self, payload: bytes, timestamp_us: int = 0) -> None:
-        """Write one encoded frame with a presentation timestamp in microseconds."""
-        self._inner.write_frame(Frame(payload=payload, timestamp_us=timestamp_us))
-
-    def finish(self) -> None:
-        """Finish publishing and flush a clean end to subscribers."""
-        self._inner.finish()
-
-
-class MediaStreamProducer:
-    """Wraps MoqMediaStreamProducer: feed a raw byte stream (e.g. Annex-B
-    H.264) and let the importer infer frame boundaries.
-
-    Built via :meth:`BroadcastProducer.publish_media_stream`. Unlike
-    :class:`MediaProducer`, no per-frame timestamps are needed; just push
-    encoder bytes as they arrive.
-    """
-
-    def __init__(self, inner: MoqMediaStreamProducer) -> None:
-        self._inner = inner
-
-    def write(self, payload: bytes) -> None:
-        """Push raw stream bytes; whole frames are emitted as they complete."""
-        self._inner.write(payload)
-
-    def finish(self) -> None:
-        """Finish publishing and flush a clean end to subscribers."""
-        self._inner.finish()
 
 
 class GroupProducer:
@@ -117,17 +47,49 @@ class GroupProducer:
 
         return GroupConsumer(self._inner.consume())
 
-    def write_frame(self, payload: bytes, timestamp_us: int = 0) -> None:
-        """Write a frame with a presentation timestamp in microseconds."""
-        self._inner.write_frame(Frame(payload=payload, timestamp_us=timestamp_us))
+    def write_frame(self, payload: bytes, timestamp: timedelta | None = None) -> None:
+        """Write a frame with its presentation timestamp."""
+        self._inner.write_frame(Frame(payload, timestamp)._ffi())
 
     def finish(self) -> None:
-        """Close this group cleanly, marking it complete for subscribers."""
+        """Close this group cleanly, marking it complete for subscribers.
+
+        The handle remains so :meth:`abort` can still run.
+        """
         self._inner.finish()
 
     def abort(self, error_code: int) -> None:
         """Abort this group with an application error code."""
         self._inner.abort(error_code)
+
+
+class TrackDemand:
+    """A watch-only handle to the group a published track's subscribers want next.
+
+    Returned by a producer's ``demand()``. Weak: holding it neither keeps the
+    track open nor locks the producer, so a wait can park here while the
+    producer keeps publishing. Waits raise ``moq.Error.Closed`` once the track
+    is released.
+    """
+
+    def __init__(self, inner: MoqTrackDemand) -> None:
+        self._inner = inner
+
+    @property
+    def name(self) -> str:
+        """The name of the track this watches."""
+        return self._inner.name()
+
+    def wanted(self) -> int | None:
+        """The group subscribers want next, or None while nobody subscribes.
+
+        A value past the newest group asks for a new group now, typically a keyframe.
+        """
+        return self._inner.wanted()
+
+    async def wanted_changed(self) -> int | None:
+        """Wait for ``wanted`` to change and return it. The first call returns at once."""
+        return await self._inner.wanted_changed()
 
 
 class TrackProducer:
@@ -139,18 +101,9 @@ class TrackProducer:
     def __init__(self, inner: MoqTrackProducer) -> None:
         self._inner = inner
 
-    @property
-    def name(self) -> str:
-        """The track name."""
-        return self._inner.name()
-
-    async def used(self) -> None:
-        """Wait until this track has at least one active subscriber."""
-        await self._inner.used()
-
-    async def unused(self) -> None:
-        """Wait until this track has no active subscribers."""
-        await self._inner.unused()
+    def demand(self) -> TrackDemand:
+        """A watch-only handle to this track's name and whether it has subscribers."""
+        return TrackDemand(self._inner.demand())
 
     def dynamic(self) -> TrackDynamic:
         """Serve fetches for groups that are not currently cached."""
@@ -164,33 +117,36 @@ class TrackProducer:
         """Create a group with an explicit sequence number."""
         return GroupProducer(self._inner.create_group(sequence))
 
-    def write_frame(self, payload: bytes, timestamp_us: int = 0) -> None:
-        """Write a single-frame group with a timestamp in microseconds."""
-        self._inner.write_frame(Frame(payload=payload, timestamp_us=timestamp_us))
+    def write_frame(self, payload: bytes, timestamp: timedelta | None = None) -> None:
+        """Write a single-frame group with its presentation timestamp."""
+        self._inner.write_frame(Frame(payload, timestamp)._ffi())
 
-    def append_datagram(self, payload: bytes, timestamp_us: int = 0) -> int:
+    def append_datagram(self, payload: bytes, timestamp: timedelta | None = None) -> int:
         """Send a best-effort datagram and return its sequence number.
 
         Payloads are capped at 1200 bytes. Datagram delivery requires a datagram-capable
         transport and wire version; there is no stream fallback.
         """
-        return self._inner.append_datagram(Frame(payload=payload, timestamp_us=timestamp_us))
+        return self._inner.append_datagram(Frame(payload, timestamp)._ffi())
 
     def consume(self, subscription: Subscription | None = None) -> TrackConsumer:
         """Create a consumer that reads directly from this producer's track.
 
-        ``subscription`` tunes delivery priority, group ordering priority, and group range; omit for defaults.
+        ``subscription`` tunes delivery priority, group range, and staleness; omit for defaults.
         """
         from .subscribe import TrackConsumer
 
-        return TrackConsumer(self._inner.consume(subscription))
+        return TrackConsumer(self._inner.consume(_subscription(subscription)))
 
     def abort(self, error_code: int) -> None:
         """Abort this track with an application error code."""
         self._inner.abort(error_code)
 
     def finish(self) -> None:
-        """Finish publishing and flush a clean end to subscribers."""
+        """Finish publishing and flush a clean end to subscribers.
+
+        The handle remains so :meth:`abort` can still run.
+        """
         self._inner.finish()
 
     def finish_at(self, final_sequence: int) -> None:
@@ -201,8 +157,9 @@ class TrackProducer:
 class TrackRequest:
     """A subscriber-requested track that hasn't been accepted yet.
 
-    Accept it for raw writes, hand it to :meth:`BroadcastProducer.publish_media_on_track`
-    to publish media (the importer accepts it), or abort it to reject the subscriber.
+    Accept it for raw writes, hand it to :class:`~moq.media.Requested` for :meth:`~moq.media.TrackProducer.audio`
+    or :meth:`~moq.media.TrackProducer.video` to publish media (the importer
+    accepts it), or abort it to reject the subscriber.
     """
 
     def __init__(self, inner: MoqTrackRequest) -> None:
@@ -216,9 +173,13 @@ class TrackRequest:
     def accept(self, info: TrackInfo | None = None) -> TrackProducer:
         """Accept the request as a raw track.
 
-        ``info`` fixes the track's timescale, priority, ordering priority, and cache; omit for defaults.
+        ``info`` fixes the track's timescale, priority, and cache; omit for defaults.
         """
-        return TrackProducer(self._inner.accept(info))
+        return TrackProducer(self._inner.accept(_track_info(info)))
+
+    def demand(self) -> TrackDemand:
+        """Watch this track's subscribers, including after accepting it."""
+        return TrackDemand(self._inner.demand())
 
     def dynamic(self) -> TrackDynamic:
         """Create a fetch handler before accepting this requested track."""
@@ -227,6 +188,37 @@ class TrackRequest:
     def abort(self, error_code: int) -> None:
         """Reject the request with an application error code."""
         self._inner.abort(error_code)
+
+
+class GroupDemand:
+    """A watch-only handle to the callers waiting on a requested group.
+
+    Returned by ``GroupRequest.demand()``. Weak: holding it does not keep the
+    request alive. The last caller to leave withdraws the request, so once
+    unused, demand never returns: drop the request. Waits raise
+    ``moq.Error.Closed`` after the request is accepted or dropped, and keep
+    the rejection reason after it is rejected.
+    """
+
+    def __init__(self, inner: MoqGroupDemand) -> None:
+        self._inner = inner
+
+    @property
+    def sequence(self) -> int:
+        """The sequence of the group this watches."""
+        return self._inner.sequence()
+
+    def is_used(self) -> bool:
+        """Whether the group has at least one waiting caller right now."""
+        return self._inner.is_used()
+
+    async def used(self) -> None:
+        """Wait until the group has at least one waiting caller."""
+        await self._inner.used()
+
+    async def unused(self) -> None:
+        """Wait until the group has no waiting callers."""
+        await self._inner.unused()
 
 
 class GroupRequest:
@@ -245,6 +237,10 @@ class GroupRequest:
         """The consumer's delivery priority for this fetch."""
         return self._inner.priority()
 
+    def demand(self) -> GroupDemand:
+        """A watch-only handle to whether any caller still wants this group."""
+        return GroupDemand(self._inner.demand())
+
     def accept(self) -> GroupProducer:
         """Accept the request and return a producer for the group."""
         return GroupProducer(self._inner.accept())
@@ -254,16 +250,16 @@ class GroupRequest:
         self._inner.abort(error_code)
 
 
-class TrackDynamic:
-    """Async source of uncached group requests for one track."""
+class TrackDynamic(_Stream[GroupRequest]):
+    """Async source of uncached group requests for one track.
+
+    Usable as an async context manager that cancels on exit.
+    """
 
     def __init__(self, inner: MoqTrackDynamic) -> None:
         self._inner = inner
 
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self) -> GroupRequest:
+    async def _next(self) -> GroupRequest:
         return await self.requested_group()
 
     async def requested_group(self) -> GroupRequest:
@@ -275,151 +271,17 @@ class TrackDynamic:
         self._inner.cancel()
 
 
-class JsonSnapshotProducer:
-    """Publish a JSON value that consumers see as a single latest state (lossy).
-
-    Built via :meth:`BroadcastProducer.publish_json_snapshot`. Each :meth:`update` supersedes the
-    last; a late joiner only sees the newest value. Values are any JSON-serializable Python
-    object, encoded as snapshots and merge-patch deltas automatically.
-    """
-
-    def __init__(self, inner: MoqJsonSnapshotProducer) -> None:
-        self._inner = inner
-
-    def update(self, value: Any) -> None:
-        """Publish a new value. A no-op if unchanged from the previous update."""
-        self._inner.update(json.dumps(value))
-
-    def finish(self) -> None:
-        """Finish the track, closing any open group."""
-        self._inner.finish()
-
-
-class JsonStreamProducer:
-    """Publish an ordered log of JSON records (lossless).
-
-    Built via :meth:`BroadcastProducer.publish_json_stream`. Every :meth:`append` is
-    preserved and delivered in order. Records are any JSON-serializable Python object.
-    """
-
-    def __init__(self, inner: MoqJsonStreamProducer) -> None:
-        self._inner = inner
-
-    def append(self, value: Any) -> None:
-        """Append one record to the log."""
-        self._inner.append(json.dumps(value))
-
-    def finish(self) -> None:
-        """Finish the track, closing the group."""
-        self._inner.finish()
-
-
-class AudioProducer:
-    """Publish raw PCM and let libopus encode it on the way out.
-
-    Built via :meth:`BroadcastProducer.publish_audio`. PCM layout
-    (format / sample rate / channels / bitrate / frame duration) is
-    fixed at construction; each :meth:`write` call passes only bytes
-    and a presentation timestamp.
-    """
-
-    def __init__(self, inner: MoqAudioProducer) -> None:
-        self._inner = inner
-
-    @property
-    def name(self) -> str:
-        """The audio track name."""
-        return self._inner.name()
-
-    async def used(self) -> None:
-        """Wait until this audio track has at least one active subscriber."""
-        await self._inner.used()
-
-    async def unused(self) -> None:
-        """Wait until this audio track has no active subscribers."""
-        await self._inner.unused()
-
-    def reset_epoch(self) -> None:
-        """Re-anchor the timeline to the next frame after an idle gap."""
-        self._inner.reset_epoch()
-
-    def write(self, frame: AudioFrame) -> None:
-        """Push one frame of PCM in the configured input format."""
-        self._inner.write(frame)
-
-    def finish(self) -> None:
-        """Flush any pending samples and finalize the track."""
-        self._inner.finish()
-
-
-class VideoProducer:
-    """Publish raw pictures and let a native encoder compress them on the way out.
-
-    Built via :meth:`BroadcastProducer.publish_video`. Pixel format,
-    resolution, and framerate are fixed at construction; each
-    :meth:`write` call passes only pixels and a presentation timestamp.
-    """
-
-    def __init__(self, inner: MoqVideoProducer) -> None:
-        self._inner = inner
-
-    @property
-    def name(self) -> str:
-        """The video track name."""
-        return self._inner.name()
-
-    async def used(self) -> None:
-        """Wait until this video track has at least one active subscriber."""
-        await self._inner.used()
-
-    async def unused(self) -> None:
-        """Wait until this video track has no active subscribers."""
-        await self._inner.unused()
-
-    def write(self, frame: VideoFrame) -> None:
-        """Encode and publish one frame in the configured input format.
-
-        A hardware encoder pipelines, so a call that puts nothing on the wire
-        is normal rather than an error.
-        """
-        self._inner.write(frame)
-
-    def cut(self) -> None:
-        """Start a new group at the next written frame.
-
-        Optional: the encoder keyframes every ``gop`` frames on its own, and
-        each of those cuts a group, so a subscriber can always join without
-        this. Reach for it only to place the boundaries yourself.
-        """
-        self._inner.cut()
-
-    def set_bitrate(self, bitrate: int) -> None:
-        """Retune the live encoder, in bits per second.
-
-        Cheap enough to drive from a congestion controller: no keyframe is
-        forced. Raises if this backend cannot retune while running. That is
-        not fatal: the encoder keeps its current rate.
-        """
-        self._inner.set_bitrate(bitrate)
-
-    def finish(self) -> None:
-        """Flush any frames the codec is holding and finalize the track."""
-        self._inner.finish()
-
-
-class BroadcastDynamic:
+class BroadcastDynamic(_Stream[TrackRequest]):
     """Async source of tracks requested by subscribers.
 
     Hold this object while subscriptions to unknown tracks should be accepted.
+    Usable as an async context manager that cancels on exit.
     """
 
     def __init__(self, inner: MoqBroadcastDynamic) -> None:
         self._inner = inner
 
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self) -> TrackRequest:
+    async def _next(self) -> TrackRequest:
         return await self.requested_track()
 
     async def requested_track(self) -> TrackRequest:
@@ -453,135 +315,22 @@ class BroadcastProducer:
         """Accept subscriptions to tracks that are not published yet."""
         return BroadcastDynamic(self._inner.dynamic())
 
-    def set_route(self, route: Route) -> None:
-        """Update the broadcast's route: the hop chain, cost, and liveness it advertises.
+    def announce(self, route: Route | None = None) -> None:
+        """Advertise this broadcast's exact path as a route.
 
-        Use this as conditions shift (e.g. a standby transcoder lowering its
-        ``cost`` once warm); consumers observe the change via
-        :meth:`BroadcastConsumer.route_changed`.
+        Announcing again re-prices the route in place. Until announced, the
+        broadcast is invisible and unroutable for local consumers and peers alike.
         """
-        self._inner.set_route(route)
+        self._inner.announce(route if route is not None else Route())
 
-    def set_announce(self, announce: bool) -> None:
-        """Set whether the broadcast is announced, keeping the rest of its route.
-
-        The origin advertises the path only while announced; an unannounced
-        broadcast stays reachable by exact path for subscribes and fetches. This is
-        how a publisher goes on and off the air without tearing down the broadcast.
-        """
-        self._inner.set_announce(announce)
-
-    def set_video_properties(self, properties: VideoProperties) -> None:
-        """Replace the catalog properties shared by every video rendition."""
-        self._inner.set_video_properties(properties)
-
-    def publish_media(
-        self,
-        format: str,
-        init: bytes = b"",
-        video: VideoHint | None = None,
-    ) -> MediaProducer:
-        """Publish a single media track. `format` selects the codec (e.g. "opus", "avc3"); `init` is
-        its codec init bytes (required for audio formats). `video` seeds catalog fields the stream
-        can't reveal (bitrate) or publishes the catalog before the first keyframe. See
-        :class:`VideoHint`."""
-        return MediaProducer(self._inner.publish_media(_media_init(format, init, video)))
-
-    def publish_media_on_track(
-        self,
-        request: TrackRequest,
-        format: str,
-        init: bytes = b"",
-        video: VideoHint | None = None,
-    ) -> MediaProducer:
-        """Publish media onto a requested track. See :meth:`publish_media` for the arguments."""
-        return MediaProducer(self._inner.publish_media_on_track(request._inner, _media_init(format, init, video)))
-
-    def publish_media_stream(
-        self,
-        format: str,
-        video: VideoHint | None = None,
-    ) -> MediaStreamProducer:
-        """Publish a media track fed by a raw byte stream (unknown frame
-        boundaries). `format` is a stream format (avc3, hev1, av01, fmp4, mkv).
-        `video` seeds catalog fields as in :meth:`publish_media`."""
-        return MediaStreamProducer(self._inner.publish_media_stream(_media_init(format, b"", video)))
-
-    def publish_audio(
-        self,
-        name: str,
-        input: AudioEncoderInput,
-        output: AudioEncoderOutput,
-    ) -> AudioProducer:
-        """Publish a raw-audio track with an in-process Opus encoder."""
-        return AudioProducer(self._inner.publish_audio(name, input, output))
-
-    def publish_video(
-        self,
-        input: VideoEncoderInput,
-        output: VideoEncoderOutput,
-    ) -> VideoProducer:
-        """Publish a raw-video track with an in-process H.264/H.265 encoder.
-
-        Set ``output.track`` to choose the track name; otherwise one is derived
-        from the codec (``.avc3`` / ``.hev1``). The catalog rendition is
-        published immediately so subscribers can discover it before the first
-        frame exists.
-        """
-        return VideoProducer(self._inner.publish_video(input, output))
+    def unannounce(self) -> None:
+        """Retract this broadcast's advertisement, if any, from local consumers and peers alike."""
+        self._inner.unannounce()
 
     def publish_track(self, name: str, info: TrackInfo | None = None) -> TrackProducer:
         """Create a track. Send any bytes, no codec validation. ``info`` sets track
         properties (priority, cache, timescale); omit for defaults."""
-        return TrackProducer(self._inner.publish_track(name, info))
-
-    def publish_json_snapshot(
-        self, name: str, *, delta_ratio: int | None = None, compression: bool = False
-    ) -> JsonSnapshotProducer:
-        """Publish a JSON snapshot track (lossy latest-value).
-
-        Each update supersedes the last; a late joiner only sees the newest value.
-        ``delta_ratio`` controls how aggressively deltas are emitted instead of full
-        snapshots (0 disables deltas); ``None`` uses the binding's default. Set
-        ``compression`` to DEFLATE-compress each group; the consumer must pass the same
-        flag. Advertise the track with :meth:`set_catalog_section` if consumers should
-        discover it.
-        """
-        # Let the record supply delta_ratio's default rather than restating it here.
-        config = (
-            MoqJsonSnapshotConfig(compression=compression)
-            if delta_ratio is None
-            else MoqJsonSnapshotConfig(delta_ratio=delta_ratio, compression=compression)
-        )
-        return JsonSnapshotProducer(self._inner.publish_json_snapshot(name, config))
-
-    def publish_json_stream(self, name: str, *, compression: bool = False) -> JsonStreamProducer:
-        """Publish a JSON stream track (lossless append-log).
-
-        Every appended record is preserved and delivered in order. Set ``compression`` to
-        DEFLATE-compress the group; the consumer must pass the same flag.
-        """
-        config = MoqJsonStreamConfig(compression=compression)
-        return JsonStreamProducer(self._inner.publish_json_stream(name, config))
-
-    def set_catalog_section(self, name: str, value: Any) -> None:
-        """Set or replace an untyped application section in the catalog.
-
-        `value` is any JSON-serializable Python object; it lands as a top-level catalog
-        key alongside `video`/`audio` and reaches subscribers via `Catalog.sections`.
-        `name` must not be a reserved media section ("video"/"audio"). The catalog is
-        republished automatically. Use this to advertise a side-channel track (e.g. a
-        transcript or captions track) that the catalog doesn't model natively.
-        """
-        self._inner.set_catalog_section(name, json.dumps(value))
-
-    def remove_catalog_section(self, name: str) -> None:
-        """Remove an untyped application section from the catalog by name.
-
-        A no-op if no section with that name exists. The catalog is republished
-        automatically.
-        """
-        self._inner.remove_catalog_section(name)
+        return TrackProducer(self._inner.publish_track(name, _track_info(info)))
 
     def consume(self) -> BroadcastConsumer:
         """Create a consumer that reads from this broadcast's tracks."""
@@ -589,6 +338,9 @@ class BroadcastProducer:
 
         return BroadcastConsumer(self._inner.consume())
 
-    def finish(self) -> None:
-        """Finish the broadcast, closing its tracks and unpublishing it."""
-        self._inner.finish()
+    def close(self) -> None:
+        """End the broadcast for good: retract it and serve no new tracks.
+
+        Tracks already subscribed carry on to their own end. Closing again is a no-op.
+        """
+        self._inner.close()

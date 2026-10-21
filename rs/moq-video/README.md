@@ -12,9 +12,10 @@ swapping or bumping a backend crate is not a breaking change.
 
 ## Capture
 
-The default-on `capture` feature exposes the device APIs and their per-platform
-backends. Disable it for a codec-only build that accepts frames supplied by the
-caller without pulling Linux V4L2 and libclang build dependencies.
+The opt-in `capture` feature exposes the device APIs and their per-platform
+backends. Enable it with `cargo add moq-video --features capture`; the default
+codec-only build accepts frames supplied by the caller and compiles none of the
+device backends. Nothing is needed on the build host either way.
 
 Per-platform, picked at compile time:
 
@@ -26,15 +27,25 @@ Per-platform, picked at compile time:
   feature), with native X11 monitor/window selection and capture as the X11
   fallback. The Wayland picker dialog chooses the screen, and the portal's
   restore token is reused so demand-driven reopens don't re-prompt.
-- **Windows**: native Media Foundation (camera; `IMFSourceReader`) and DXGI
-  Desktop Duplication (display), plus GDI single-window capture. Both convert
-  BGRA to CPU I420 and use the ids returned by the enumerators.
+- **Windows**: native Media Foundation (camera; `IMFSourceReader`) and
+  Windows.Graphics.Capture (display and window; Windows 10 2004/build 19041
+  or newer). Screen capture honors `Config::cursor` and converts BGRA to an
+  owned NV12 texture on the GPU, shared with the Media Foundation encoder;
+  software encoding downloads that texture. Odd screen edges are cropped to
+  even dimensions. Builds before 19041 return `Error::Unsupported`, with no
+  older capture fallback. The system capture border remains unless borderless
+  access is available (build 20348+) and granted.
 
 `capture::cameras()` lists AVFoundation, V4L2, or Media Foundation cameras with
 identifiers accepted by `capture::Source::Camera`. `capture::displays()` does
 the same for macOS, Windows, and X11 displays. `capture::windows()` lists macOS,
 Windows, and X11 windows. Wayland display selection stays in the desktop portal
 picker, which does not expose a stable display identifier.
+
+Windows `display:N` selectors are enumeration indices, not persistent monitor
+identities. Switching from Desktop Duplication to WGC can change which monitor
+a saved selector names. Run `moq devices` again and reselect the intended display
+after upgrading.
 
 Embedded applications can consume raw capture without creating a MoQ
 broadcast:
@@ -44,8 +55,9 @@ let mut config = moq_video::capture::Config::default();
 config.source = moq_video::capture::Source::Display(None);
 
 let mut capture = moq_video::capture::open(&config).await?;
-while let Some(surface) = capture.read().await? {
-    // Encode, render, or inspect the newest captured surface.
+while let Some(frame) = capture.read().await? {
+    // Encode, render, or inspect the newest captured frame; `frame.surface`
+    // holds the pixels and `frame.timestamp` the capture time.
 }
 ```
 
@@ -54,6 +66,23 @@ drops rather than latency. `read` ends with `None` when the source stopped for
 a benign reason, such as a window resize, so reopen to follow it. Permission
 denial and a source disappearing are terminal, reported as
 `Error::PermissionDenied` and `Error::SourceUnavailable`.
+On Windows, opening an already minimized window returns `Error::SourceUnavailable`.
+After capture starts, receiving no usable first frame within five seconds also
+returns `Error::SourceUnavailable` and releases the capture session.
+An established capture pauses while the window is minimized. Unchanged Windows
+content repeats the last owned GPU texture at the configured frame rate, with
+advancing presentation timestamps, so a static share remains live.
+
+On a Windows desktop, `just rs test -p moq-video --features capture --run-ignored only -E 'test(wgc_)'` runs the opt-in WGC hardware exercises.
+Set `MOQ_WGC_WINDOW=window:HWND` to a visible, odd-sized window from
+`moq devices` first. These tests capture each monitor and the selected window
+with cursor capture on and off, reopen sessions, verify owned NV12 pixels after
+pool reuse, and check SD/HD conversion and encoder color descriptions. They
+require a GPU video processor and a hardware H.264 encoder; unsupported
+hardware fails rather than silently skipping the exercise. Cursor appearance,
+resize/close/minimize behavior, hybrid-GPU monitors, and border permissions
+still need visual checks. The conversion workload prints submission time and
+batch completion time including one final readback, not end-to-end latency.
 
 ## Encode
 
@@ -63,7 +92,7 @@ choice (`Auto` / `Hardware` / `Software` / a named backend).
 
 | Codec | Software | macOS | Windows | Linux | Android |
 |---|---|---|---|---|---|
-| H.264 | openh264 (vendored, static) | VideoToolbox | Media Foundation | NVENC (feature `nvidia`), VAAPI (feature `vaapi`) | MediaCodec (feature `mediacodec`, API 26+) |
+| H.264 | OpenH264 (feature `openh264`) | VideoToolbox | Media Foundation | NVENC (feature `nvidia`), VAAPI (feature `vaapi`) | MediaCodec (feature `mediacodec`, API 26+) |
 | H.265 | none | VideoToolbox | Media Foundation | NVENC (feature `nvidia`) | MediaCodec (feature `mediacodec`, API 26+) |
 
 Every backend emits Annex-B with in-band parameter sets (SPS/PPS, plus VPS for
@@ -72,61 +101,146 @@ registration directly. There is no software H.265 encoder (it's hardware-only).
 
 `encode::Encoder::encode` takes a raw `Frame` (a timestamp plus a `Surface`
 holding the pixels) and returns `encode::Encoded`s: one whole access unit each,
-carrying the timestamp of the picture it was encoded from. That matters for a
+carrying the timestamp of the picture it was encoded from and whether it is a
+keyframe, forced by `cut()` or on the GOP cadence. The timestamp matters for a
 backend that buffers, which hands back an earlier frame's access unit while a
 later one goes in, and for the tail `finish()` drains. Bring your own pixels with
 `Surface::rgba(...)`, or feed a frame straight from capture or `decode`.
 
-Keyframes are automatic, at the `Config::gop` interval, so an application never
-has to think about them. `Encoder::keyframe()` asks for one at the next frame when
-something outside the encoder needs a decodable starting point there: opening a
-new group, or resuming after an idle gap. The request is held until a frame
-arrives, so it is safe to call before you have one.
+Group boundaries are automatic: `Config::gop` says how the stream is divided
+(`Gop::Keyframe { interval }` places a keyframe every so many frames, and an
+interval of zero is refused at open), so an application never has to think
+about them. `Encoder::cut()` opens a group at the next frame when something
+outside the encoder needs a decodable starting point there: a source group
+boundary, a scene change, a source switch. The request is held until a frame
+arrives, so it is safe to call before you have one. It fails with
+`Error::CutUnsupported` on a backend that cannot force a boundary (a V4L2
+driver without the force-keyframe control), and queues nothing then: groups
+keep falling where `Config::gop` puts them. `encode::Sink` answers the same
+way, awaited.
 
-Two public entry points:
+Public entry points:
 
 - `encode::publish_capture(...)` captures a webcam, encodes it, and publishes on
   demand: the track and catalog are advertised up front, but the camera opens
   only while a subscriber is watching and is released when the last one leaves.
+- `encode::Control::new(...)` does the same but returns a `Control` handle with
+  the `Driver` that runs it, like `moq-audio`'s. `Control::cut()` asks for a
+  keyframe: requests coalesce, any keyframe serves them (the GOP cadence
+  included), and a forced one lands at least 500ms after any other. On a
+  backend that cannot force one it returns `Error::CutUnsupported` and the
+  publish carries on. Dropping the last `Control` ends the `Driver` promptly,
+  even mid-open.
 - `encode::Producer` publishes frames you encoded yourself (`publish(&[Encoded])`),
   handling the catalog and framing. Each is published at its own timestamp.
 
-The NVENC and VAAPI backends are Linux-only, behind the default-on `nvidia` and
-`vaapi` features. Both `dlopen` the vendor driver at runtime (and fall back to
-software where the driver is absent), so the binary still links on a GPU-less
-builder and still starts on a GPU-less machine.
+The default features are `nvidia` and `mediacodec`, so a default build has no
+software encoder. `openh264` adds the software H.264 fallback, the only H.264
+encoder on a GPU-less host, at the cost of compiling vendored C++; enable it
+wherever that fallback is expected. `nvidia` is Linux-only, `dlopen`s the
+driver at runtime, and needs no build-time toolkit. `vaapi` is opt-in because
+its bindgen needs libclang on the build host, while `v4l2` is opt-in only by
+convention, since `moq-v4l` checks its bindings in. `vpx` is opt-in because
+libvpx comes from the build host through pkg-config (set `VPX_STATIC=1` to link
+the archive, as the Nix dev shell does). `render` is also opt-in so codec-only
+consumers do not compile wgpu.
+
+### External Vulkan producers
+
+External Linux Vulkan producers construct `frame::vulkan::Slot` from exported
+memory and timeline FDs, an `Image` describing the format, allocation, and
+memory handle type, and a guard retaining the producer's allocation. Device
+and driver UUIDs identify the exporter; opaque memory also carries its original
+memory type index, while DMA-BUF memory carries its DRM modifier and explicit
+plane offsets and row pitches, including producer padding.
+
+Set `encode::Config::input` to the image's device before opening or probing the
+encoder. `Kind::Auto` selects an importing backend on that device and refuses
+unsupported devices without a CPU fallback. Feed each published image through
+`Surface::Vulkan`; NVENC privately imports it into CUDA, shares one full-size
+NV12 conversion per capture and color space, and scales each rendition on the
+GPU. Pin `Config::color` when renditions cross the SD/HD color-inference boundary.
+
+`Slot::publish` consumes the producer slot and `Completion::wait` returns it
+only after the last reader finishes its GPU work. Publish only what you will
+encode: an unconsumed or failed frame fails completion and loses its slot for
+good, since nothing signalled its timeline, so drop excess captures before
+publishing. Non-exportable application images need a GPU copy into an exportable
+slot. External Vulkan images have no CPU mapping or download fallback.
+
+External DMA-BUF producers use `DmaBuf::new` with an owned FD, `DmaBufLayout`,
+and a release guard; their buffers also refuse CPU download.
+
+Run `just rs gpu` for the opt-in native hardware exercise. It creates a
+Vulkan image independently of Unreal, imports it once into CUDA, checks repeated
+slot reuse and held-reader ordering, and tears down through cancellation; a
+second test converts RGBA and BGRA uploads to NV12, scales them, fills the pool,
+and encodes both renditions through NVENC. A third runs the target workload,
+three 1280x720 views at 30 fps, and prints per-stage latency and CPU time
+instead of asserting a threshold.
 
 ## Decode
 
 `decode::Consumer` (the mirror of `moq_audio::decode::Consumer`) subscribes to an
-H.264, H.265, or AV1 track and returns raw `Frame`s. A hardware-decoded frame stays
+H.264, H.265, AV1, VP8, or VP9 track and returns raw `Frame`s. A hardware-decoded frame stays
 on the GPU: feeding it back to a compatible hardware `encode::Encoder` on the
 same device keeps it there (the transcode path), while `into_i420()` downloads
 it. An encoder that can't take that surface (openh264, or a different device)
 downloads it through I420 for you. Every frame carries a `Surface`, a
-`#[non_exhaustive]` enum naming where the pixels live (`PixelBuffer` on macOS,
-`Texture` on Windows, `Cuda` on Linux, `HardwareBuffer` on Android, or CPU
-`I420`). Match it to take a zero-copy path for a representation you recognize, and fall back to
-`Surface::into_i420()`, which always works. On macOS `Surface::into_pixel_buffer()`
+`#[non_exhaustive]` enum naming where the pixels live (`PixelBuffer` on macOS and iOS,
+`Texture` on Windows, `Vulkan` and `Cuda` on Linux, `HardwareBuffer` on Android,
+or CPU `I420`). Match
+it to take a GPU path for a representation you recognize, and fall back to
+`Surface::into_i420()` for readback-capable surfaces. GPU-only
+`Surface::Vulkan` refuses CPU conversion. On macOS `Surface::into_pixel_buffer()`
 is the mirror: free for a hardware-decoded frame, an upload for a CPU one.
-`Surface::into_rgba()` is the portable exit for CPU image and UI toolkits,
-returning owned, tightly packed RGBA8 pixels with the surface's color metadata
-applied.
+`Surface::into_i420()` returns typed pixels with size and color intact;
+`I420::into_data()` explicitly extracts the packed bytes. `Surface::to_rgba(config)`
+and `Surface::to_bgra(config)` are the portable exits for CPU
+image and UI toolkits, returning owned, tightly packed pixels with the surface's
+color metadata applied. Both orders are there because toolkits disagree and the
+conversion is a full pass over the frame: producing the order the caller wants
+costs nothing extra, while producing the other one and swapping two channels
+afterwards costs a second pass. They borrow the surface, so a frame held behind
+an `Arc` shared with something else converts without being unwrapped first.
 Backends are tried hardware-first, like encode:
 
 | Codec | Software | macOS | Windows | Linux | Android |
 |---|---|---|---|---|---|
-| H.264 | openh264 (vendored, static) | VideoToolbox | Media Foundation (DXVA) | NVDEC (feature `nvidia`) | MediaCodec (feature `mediacodec`, API 26+) |
+| H.264 | OpenH264 (feature `openh264`) | VideoToolbox | Media Foundation (DXVA) | NVDEC (feature `nvidia`), VAAPI (feature `vaapi`) | MediaCodec (feature `mediacodec`, API 26+) |
 | H.265 | none | VideoToolbox | Media Foundation (DXVA) | NVDEC (feature `nvidia`) | MediaCodec (feature `mediacodec`, API 26+) |
 | AV1 | none | none | none | NVDEC (feature `nvidia`) | MediaCodec (feature `mediacodec`, when the device provides it) |
+| VP8, VP9 | libvpx (feature `vpx`) | none | none | none | none |
 
-On macOS VideoToolbox decodes H.264 and H.265 on hardware, pulling the parameter
+On macOS and iOS VideoToolbox decodes H.264 and H.265 on hardware, pulling the parameter
 sets (SPS/PPS, plus VPS for H.265) out of each keyframe to build the format
 description. On Windows the Microsoft decoder MFT runs synchronously with a
 Direct3D11 device bound to it, so the decode happens on the GPU through DXVA
-(NVDEC / Intel / AMD). H.264 falls back to openh264 on a GPU-less host; H.265 has
+(NVDEC / Intel / AMD). H.264 falls back to openh264 (with the `openh264` feature) on a GPU-less host; H.265 has
 no software decoder, so it needs the GPU path (on Windows, an HEVC decoder MFT:
 the inbox HEVC Video Extensions or a vendor one). On Linux, NVDEC decodes H.264,
 H.265, and 8-bit 4:2:0 AV1 to CUDA NV12 frames; AV1 is decode-only and is useful
-for AV1 source to H.264/H.265 transcode rungs. A non-H.264/H.265/AV1 rendition
-yields `Error::UnsupportedCodec`.
+for AV1 source to H.264/H.265 transcode rungs. VAAPI decodes H.264 to DMA-BUF
+surfaces the renderer imports without a download. libvpx decodes VP8 and VP9
+profile 0 to CPU I420 on every platform; other VP9 profiles (4:4:4, 10-bit) are
+refused rather than narrowed to 8-bit 4:2:0. Any other rendition yields
+`Error::UnsupportedCodec`.
+
+`decode::Config::output` says where decoded pictures live: `Output::Native`
+(the default) hands back whatever the backend decoded into, a GPU surface or
+CPU pixels, and `Output::Cpu` delivers every picture as `Surface::I420`,
+decoded straight to system memory where the backend can and downloaded where it
+cannot. `decode::Config::scale_hint` asks a decoder with a hardware scaler
+(NVDEC) to emit that size; it is a hint, so check `Frame::size` and use
+`Frame::resize` for the exact size. `decode::Consumer` takes `decode::Options`,
+which pairs that config with the subscription's `start` and `max_delay`.
+
+Common feature sets:
+
+```bash
+cargo add moq-video                                      # native defaults, no software fallback or renderer
+cargo add moq-video --features openh264                  # add the OpenH264 software fallback
+cargo add moq-video --no-default-features --features openh264  # software H.264 only
+cargo add moq-video --no-default-features --features nvidia    # Linux NVIDIA only
+cargo add moq-video --features render                    # add the wgpu renderer
+```

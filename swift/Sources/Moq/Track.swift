@@ -14,7 +14,8 @@ public final class TrackConsumer: AsyncSequence, Sendable {
     }
 
     /// The next group in sequence order, skipping forward on fall-behind. `nil`
-    /// once the track ends.
+    /// once the track ends. Shares the sequence cursor with `readFrame`: a group
+    /// one method has already taken is not returned by the other.
     public func nextGroup() async throws -> GroupConsumer? {
         (try await ffi.nextGroup()).map(GroupConsumer.init)
     }
@@ -25,8 +26,10 @@ public final class TrackConsumer: AsyncSequence, Sendable {
         (try await ffi.recvGroup()).map(GroupConsumer.init)
     }
 
-    /// Read the first timestamped frame of the next group. Convenience for
-    /// one-frame-per-group tracks (status/command style). `nil` once the track ends.
+    /// Read the first raw frame of the next group. Convenience for
+    /// one-frame-per-group tracks (status/command style). Completed empty groups
+    /// are skipped. `nil` only once the track ends. Cancelling one call keeps
+    /// the current group so a later `readFrame` or `nextGroup` still sees it.
     public func readFrame() async throws -> Frame? {
         try await ffi.readFrame()
     }
@@ -75,9 +78,9 @@ public final class TrackConsumer: AsyncSequence, Sendable {
     }
 }
 
-/// Read side of a single group. Iterating yields timestamped raw frames.
+/// Read side of a single group. Iterating yields raw frames.
 public final class GroupConsumer: AsyncSequence, Sendable {
-    /// The timestamped frame emitted by this sequence.
+    /// The raw frame emitted by this sequence.
     public typealias Element = Frame
 
     let ffi: MoqGroupConsumer
@@ -91,7 +94,7 @@ public final class GroupConsumer: AsyncSequence, Sendable {
         ffi.sequence()
     }
 
-    /// The next timestamped frame, or `nil` once the group ends.
+    /// The next raw frame, or `nil` once the group ends.
     public func readFrame() async throws -> Frame? {
         try await ffi.readFrame()
     }
@@ -109,6 +112,35 @@ public final class GroupConsumer: AsyncSequence, Sendable {
     }
 }
 
+/// A watch-only handle to whether a published track has subscribers.
+///
+/// Returned by a producer's `demand()`. Weak: holding it neither keeps the track open nor locks
+/// the producer, so a wait can park here while the producer keeps publishing. Waits throw
+/// `MoqError.Closed` once the track is released.
+public final class TrackDemand: Sendable {
+    let ffi: MoqTrackDemand
+
+    init(_ ffi: MoqTrackDemand) {
+        self.ffi = ffi
+    }
+
+    /// The name of the track this watches.
+    public var name: String {
+        ffi.name()
+    }
+
+    /// The group subscribers want next, or nil while nobody subscribes. A value past the
+    /// newest group asks for a new group now, typically a keyframe.
+    public var wanted: UInt64? {
+        ffi.wanted()
+    }
+
+    /// Suspend until `wanted` changes and return it. The first call returns at once.
+    public func wantedChanged() async throws -> UInt64? {
+        try await ffi.wantedChanged()
+    }
+}
+
 /// Write side of a raw track.
 public final class TrackProducer: Sendable {
     let ffi: MoqTrackProducer
@@ -117,25 +149,15 @@ public final class TrackProducer: Sendable {
         self.ffi = ffi
     }
 
-    /// The track's name.
-    public var name: String {
-        get throws { try ffi.name() }
-    }
-
     /// A read handle for this track (local pub/sub, no origin needed).
-    /// `subscription` tunes delivery priority, group ordering priority, and group range; omit for defaults.
+    /// `subscription` tunes delivery priority, group range, and staleness; omit for defaults.
     public func consume(subscription: Subscription? = nil) throws -> TrackConsumer {
         TrackConsumer(try ffi.consume(subscription: subscription))
     }
 
-    /// Suspend until the track has at least one active consumer.
-    public func used() async throws {
-        try await ffi.used()
-    }
-
-    /// Suspend until the track has no active consumers.
-    public func unused() async throws {
-        try await ffi.unused()
+    /// A watch-only handle to the track's name and whether it has subscribers.
+    public func demand() throws -> TrackDemand {
+        TrackDemand(try ffi.demand())
     }
 
     /// Serve fetches for groups that are not currently cached.
@@ -154,7 +176,7 @@ public final class TrackProducer: Sendable {
     }
 
     /// Write a single-frame group with a timestamp in microseconds.
-    public func writeFrame(_ payload: Data, timestampUs: UInt64 = 0) throws {
+    public func writeFrame(_ payload: Data, timestampUs: UInt64? = nil) throws {
         try ffi.writeFrame(frame: Frame(payload: payload, timestampUs: timestampUs))
     }
 
@@ -162,7 +184,7 @@ public final class TrackProducer: Sendable {
     ///
     /// `timestampUs` is the presentation timestamp in microseconds. Payloads are
     /// capped at 1200 bytes. There is no stream fallback.
-    public func appendDatagram(_ payload: Data, timestampUs: UInt64 = 0) throws -> UInt64 {
+    public func appendDatagram(_ payload: Data, timestampUs: UInt64? = nil) throws -> UInt64 {
         try ffi.appendDatagram(frame: Frame(payload: payload, timestampUs: timestampUs))
     }
 
@@ -202,7 +224,7 @@ public final class GroupProducer: Sendable {
     }
 
     /// Write a frame with a timestamp in microseconds.
-    public func writeFrame(_ payload: Data, timestampUs: UInt64 = 0) throws {
+    public func writeFrame(_ payload: Data, timestampUs: UInt64? = nil) throws {
         try ffi.writeFrame(frame: Frame(payload: payload, timestampUs: timestampUs))
     }
 

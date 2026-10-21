@@ -12,25 +12,44 @@ concurrency:
 on:
   push:
     branches:
-      - main
+      - release
+    # A run costs the better part of an hour and they serialize on the
+    # concurrency group above, so a push that can't change a crate's version
+    # or its API shouldn't queue one.
+    paths:
+      - "rs/**"
+      - "justfile"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "flake.nix"
+      - "flake.lock"
+      - ".release-plz.toml"
+      - ".github/workflows/release-rs.yml"
+  # Releasing by hand, e.g. after a skipped push. Dispatch it
+  # on `release`; the job refuses any other ref.
+  workflow_dispatch:
 
 jobs:
   release:
     name: Plz
 
     runs-on: ubuntu-latest
-    if: ${{ github.repository_owner == 'moq-dev' }}
+    if: ${{ github.repository_owner == 'moq-dev' && github.ref == 'refs/heads/release' }}
+
+    env:
+      # release-plz copies each crate into its own temp directory to compare it
+      # against the registry, so cargo-semver-checks would otherwise build
+      # rustdoc for every crate, baseline and current, into a throwaway target
+      # directory. Pin one absolute path instead so the ~30 crates share their
+      # dependency builds.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main
-        with:
-          tool-cache: false
-
       # Generating a GitHub token, so that PRs and tags created by
       # the release-plz-action can trigger actions workflows.
       - name: Generate GitHub token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         id: generate-token
         with:
           client-id: ${{ secrets.APP_CLIENT_ID }}
@@ -43,9 +62,19 @@ jobs:
           token: ${{ steps.generate-token.outputs.token }}
 
       # Install Nix for system dependencies (e.g. ffmpeg).
-      - uses: DeterminateSystems/nix-installer-action@1d87d45818068401a10cf16bdc5f00b24994a83f # main
+      - uses: ./.github/actions/nix
+
+      # Read only: `release` is not a writer. Crates publish as
+      # source, so nothing this reads ends up in a release.
+      #
+      # The action's shim is what gets mbx in here at all. release-plz spawns
+      # Cargo and cargo-semver-checks itself, so no environment variable reaches
+      # them; a `cargo` ahead of the dev shell's toolchain does.
+      - name: Rust cache
+        uses: ./.github/actions/rust-cache
         with:
-          determinate: false
+          access-key-id: ${{ secrets.MBX_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MBX_R2_SECRET_ACCESS_KEY }}
 
       - name: Release
         run: nix develop --command just rs release

@@ -1,0 +1,104 @@
+[package]
+name = "moq-uring"
+description = "Experimental Linux io_uring support for Media over QUIC"
+authors = ["Luke Curley <kixelated@gmail.com>"]
+repository = "https://github.com/moq-dev/moq"
+license = "MIT OR Apache-2.0"
+
+version = "0.0.12"
+edition = "2024"
+rust-version.workspace = true
+
+keywords = ["quic", "io-uring", "networking", "linux"]
+categories = ["asynchronous", "network-programming", "os::linux-apis"]
+
+[features]
+default = ["quic"]
+# QUIC and WebTransport on moq-quic, with TLS through rustls.
+quic = ["dep:moq-quic", "dep:rustls", "dep:rustls-platform-verifier"]
+# Capture qlog traces (`quic::Transport::qlog`). Off by default: it compiles the
+# qlog crate and its serde_json encoder into moq-quic, which a production build has
+# no use for.
+qlog = ["moq-quic?/qlog"]
+# Workers created inside a tokio runtime with a `moq_clock::Manual` clock installed
+# run on that clock, so a test decides when their time passes. For test builds.
+manual = ["moq-clock/manual"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bytes = "1"
+http = "1"
+io-uring = { workspace = true }
+kio = { workspace = true }
+libc = { workspace = true }
+# The worker is a moq-clock backend: its turn's instant is the ambient clock.
+moq-clock = { workspace = true }
+moq-net = { workspace = true }
+moq-quic = { workspace = true, features = ["bloom", "rustls-aws-lc-rs"], optional = true }
+moq-sock = { workspace = true }
+rustc-hash = { workspace = true }
+rustls = { version = "0.23", optional = true }
+# OS-native server-cert verifier for the rustls backends. Version matched to
+# the copy moq-tokio pulls in, to avoid duplication.
+rustls-platform-verifier = { version = "0.7", optional = true }
+# Runtime thread checks for the session moq-transport's `Send` drivers capture.
+send_wrapper = { workspace = true }
+slab = "0.4"
+thiserror = "2"
+tracing = "0.1"
+url = "2"
+web-transport-proto = { workspace = true }
+web-transport-trait = { workspace = true }
+
+[dev-dependencies]
+anyhow = "1"
+bytes = { workspace = true }
+criterion = { workspace = true }
+moq-net = { path = "../moq-net" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+web-transport-trait = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+io-uring = { workspace = true }
+libc = { workspace = true }
+moq-tokio = { path = "../moq-tokio", default-features = false, features = ["quic", "aws-lc-rs"] }
+# Tests run workers on a manual clock.
+moq-uring = { path = ".", features = ["manual"] }
+nix = { workspace = true }
+rcgen = { workspace = true, features = ["pem", "aws_lc_rs"] }
+rustls = "0.23"
+# The qlog test parses every record of a trace, which is what catches a
+# truncated or interleaved write.
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tracing = "0.1"
+
+[[bench]]
+name = "udp_tokio"
+harness = false
+
+[[bench]]
+name = "udp_uring"
+harness = false
+
+[[bench]]
+name = "echo_quic"
+harness = false
+required-features = ["quic"]
+
+[[bench]]
+name = "session_lite"
+harness = false
+
+[[bench]]
+name = "worker_turns"
+harness = false
+
+[[bench]]
+name = "unreachable_dials"
+harness = false
+required-features = ["quic"]
+
+[[bench]]
+name = "timers"
+harness = false

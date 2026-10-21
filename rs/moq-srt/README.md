@@ -8,7 +8,9 @@ by its stream id `m=` mode:
 - `m=publish` (the default): ingest. Demux the connection's transport stream
   with [`moq-mux`](../moq-mux) and publish it into a MoQ origin as an ordinary
   broadcast. The contribution-ingest analogue of `moq-cli` HLS import and
-  `moq-rtc`'s WHIP.
+  `moq-rtc`'s WHIP. Once a second it logs the importer's per-stream counters
+  the way `moq import ts` does, so a PID that goes silent behind a running mux
+  is named.
 - `m=request`: egress. Re-mux a broadcast from the origin back to MPEG-TS and
   stream it to the caller, so `vlc srt://...` and `ffmpeg -i srt://...` can play
   any broadcast the origin carries (H.264/H.265 video, AAC/AC-3/MP2 audio).
@@ -25,7 +27,7 @@ directly (see [Auth](#auth) below).
 ```rust
 let mut srt = moq_srt::Config::default();
 srt.listen = Some("0.0.0.0:9000".parse()?);
-srt.prefix = "live/".to_string();
+srt.prefix = "live".into();
 
 // `origin` is your relay's local origin (e.g. `cluster.origin.clone()`).
 tokio::select! {
@@ -37,9 +39,10 @@ tokio::select! {
 ## CLI
 
 A command-line interface is provided by the [`moq-cli`](../moq-cli) binary, on
-top of this library.
+top of this library. Its listener bridges the single `--broadcast` and ignores
+the stream id; see [`doc/bin/srt.md`](../../doc/bin/srt.md).
 
-Feed any SRT source:
+Feed any SRT source into a `run` listener with prefix `live`:
 
 ```bash
 # Publish: lands at broadcast `live/cam0`.
@@ -56,22 +59,28 @@ the publisher does.
 
 ## Routing
 
-Each connection's broadcast path and direction come from its SRT stream id:
+Under `run`, each connection's broadcast path and direction come from its SRT
+stream id:
 
 - Standard form `#!::r=<resource>,m=<mode>` -> `<resource>`, with `m=request`
   selecting egress and anything else (including absent) selecting ingest.
 - Otherwise the raw stream id (e.g. OBS-style `app/key`), always ingest.
 
-`--srt-prefix` is prepended to namespace a listener's streams. First publisher on
+`Config::prefix` is prepended to namespace a listener's streams. First publisher on
 a path wins; a second publish of the same path is rejected. Requests don't claim
 a path, so any number of players can pull the same broadcast.
+
+A multi-program feed is refused unless `Config::program` picks one program
+(`Program::One(n)`) or every program (`Program::All`), which publishes each on
+its own broadcast under the path: `live/cam0/1`, `live/cam0/2`, and so on. To
+choose per connection, drive `Server` and call `Publish::with_program`.
 
 ## Auth
 
 `run` is unauthenticated: anyone who can reach the UDP port can publish or
 request any broadcast. Gate it with a host firewall or a private network, or
 bring your own auth by driving `Server` / `Request` directly, mirroring
-`moq-native`'s `Server` / `Request`:
+`moq-tokio`'s `Server` / `Request`:
 
 ```rust
 let mut server = moq_srt::Server::bind("0.0.0.0:9000".parse()?, None).await?;
@@ -86,8 +95,8 @@ while let Some(request) = server.accept().await {
             tokio::spawn(subscribe.accept(&consumer, "live/cam0"));
         }
     }
-    // ...or call `.reject()` on the `Publish` / `Subscribe` instead of `.accept()`
-    // to deny it.
+    // ...or call `.reject(moq_srt::Reject::Forbidden)` on the `Publish` /
+    // `Subscribe` instead of `.accept()` to deny it.
 }
 ```
 

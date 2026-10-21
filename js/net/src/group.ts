@@ -3,17 +3,28 @@
  *
  * @module
  */
-import { type GetPromise, type Getter, Once, Signal } from "@moq/signals";
-import { Timestamp } from "./time.ts";
+import { Instant, now } from "@moq/clock";
+import { type Dispose, type GetPromise, type Getter, Once, race, Signal } from "@moq/signals";
+import {
+	FrameTooLarge,
+	GroupTooLarge,
+	ProtocolViolation,
+	StreamCode,
+	StreamError,
+	TimestampMismatch,
+	TooFarBehind,
+} from "./error.ts";
+import { type Expiry, type GroupRecover, hooks, type ReadGroupFrame, type Replacement } from "./internal.ts";
+import type { Timestamp } from "./time.ts";
 
-/** Maximum bytes of frames cached in a group before old frames are evicted from the front. */
+/** Maximum bytes of frames in a group. A write that would exceed this aborts with {@link GroupTooLarge}. */
 export const MAX_GROUP_CACHE_BYTES = 32 * 1024 * 1024;
 
-/** Maximum number of frames cached in a group before old frames are evicted from the front. */
-export const MAX_GROUP_FRAMES = 1024;
+/** Maximum number of frames in a group. 8192 is the largest legal group; the 8193rd write is {@link GroupTooLarge}. */
+export const MAX_GROUP_FRAMES = 8192;
 
 /**
- * A frame buffered in a group: its presentation {@link Timestamp} and payload bytes.
+ * A frame buffered in a group: its presentation {@link Timestamp}, if any, and payload bytes.
  *
  * The timestamp carries its own scale, so a track can pick its units; the wire layer
  * converts it into the track's negotiated timescale.
@@ -22,10 +33,11 @@ export interface Frame {
 	/** The frame payload. */
 	payload: Uint8Array;
 	/**
-	 * Presentation timestamp. Required: for a payload with no presentation time of its own
-	 * (a JSON catalog, control state) pass {@link Timestamp.now} explicitly.
+	 * Presentation timestamp, present exactly when the track has a timescale. A frame on a
+	 * track without one is untimed and omits it; a write that disagrees with its track is
+	 * refused with {@link TimestampMismatch}.
 	 */
-	timestamp: Timestamp;
+	timestamp?: Timestamp;
 }
 
 /** Options for a sequence-aware frame read. */
@@ -33,9 +45,8 @@ export interface ReadOptions {
 	/**
 	 * The lowest sequence number the caller wants; defaults to the whole group.
 	 *
-	 * Frames below it are discarded instead of returned, and frames evicted below it are not
-	 * a gap: the read resumes at the next retained frame rather than throwing {@link Lagged}.
-	 * An eviction at or above it still throws, because the caller asked for that frame.
+	 * Frames below it are discarded instead of returned. The group still starts at frame 0,
+	 * so this is a reader filter, not a missing prefix.
 	 */
 	from?: number;
 }
@@ -46,17 +57,6 @@ export interface Info {
 	sequence: number;
 }
 
-/**
- * Thrown by a frame read when the reader fell behind the group's eviction window: frames
- * it had not yet read were dropped to stay under the cache cap, so the stream has a gap.
- */
-export class Lagged extends Error {
-	constructor() {
-		super("lagged: frames were evicted before being read");
-		this.name = "Lagged";
-	}
-}
-
 /** Reactive backing state shared by the group producer and one consumer. */
 class GroupState {
 	readonly sequence: number;
@@ -64,40 +64,88 @@ class GroupState {
 	closed = new Once<Error | null>();
 	total = new Signal<number>(0); // The total number of frames in the group thus far
 
-	// Absolute sequence of the frame at the front of `frames`, advanced by a read and by an
-	// eviction alike: the sequence the next read returns.
+	// Absolute sequence of the frame at the front of `frames`, advanced by a read: the
+	// sequence the next read returns.
 	start = 0;
 
-	// One past the newest frame the cache cap evicted before it could be read, or 0 when
-	// none was. A read that wanted a frame below it has a gap, so it throws Lagged rather
-	// than skipping silently; a read that starts above it never asked for the missing
-	// frames, so it proceeds.
-	evicted = 0;
-
 	cacheBytes = 0;
+	// Whether the owning track has a timescale, so every frame must carry a timestamp (true)
+	// or none may (false). Undefined for a group no track has claimed yet, which takes either.
+	timed?: boolean;
+	// The first frame's timestamp, retained after reads. Media time only: an untimed group
+	// never has one, so it says nothing about whether a frame was written.
+	timestamp?: Timestamp;
+	// The newest frame's timestamp: where a reader that has taken every frame sits.
+	latest?: Timestamp;
+	// Accepted below the track's eviction watermark, where nothing proves where it starts,
+	// so this mirror drives no media-time expiry.
+	unverified = false;
+	// When the group joined the track this mirror belongs to, at this hop: the wall clock a
+	// superseded predecessor ages from. Per track, since one group can join several.
+	arrived = Instant.zero;
+	// Called with the frame count on every write, synchronously: a track's largest must not
+	// trail a write that already returned, as a batched `total` notification would.
+	progress = new Set<(total: number) => void>();
 
 	constructor(sequence: number) {
 		this.sequence = sequence;
 	}
 }
 
+// Refuse a frame whose timedness disagrees with the track's.
+function checkTimed(timed: boolean | undefined, frame: Frame) {
+	if (timed !== undefined && timed !== (frame.timestamp !== undefined)) throw new TimestampMismatch();
+}
+
 function appendFrame(state: GroupState, frame: Frame) {
 	if (state.closed.peek() !== undefined) throw new Error("group is closed");
 
+	state.timestamp ??= frame.timestamp;
+	state.latest = frame.timestamp;
 	state.cacheBytes += frame.payload.byteLength;
 	state.frames.mutate((frames) => {
 		frames.push(frame);
-
-		while (frames.length > MAX_GROUP_FRAMES || state.cacheBytes > MAX_GROUP_CACHE_BYTES) {
-			const evicted = frames.shift();
-			if (!evicted) break;
-			state.cacheBytes -= evicted.payload.byteLength;
-			state.start++;
-			state.evicted = state.start;
-		}
 	});
 
 	state.total.update((total) => total + 1);
+	for (const fn of state.progress) fn(state.total.peek());
+}
+
+let makeDemand: (sequence: number, used: Getter<boolean>, state: GroupState) => Demand;
+
+/** A watch-only view of a group's mirror readers, including coalesced fetches. */
+export class Demand {
+	/** The group sequence this handle watches. */
+	readonly sequence: number;
+	#used: Getter<boolean>;
+	#state: GroupState;
+
+	private constructor(sequence: number, used: Getter<boolean>, state: GroupState) {
+		this.sequence = sequence;
+		this.#used = used;
+		this.#state = state;
+	}
+
+	static {
+		makeDemand = (sequence, used, state) => new Demand(sequence, used, state);
+	}
+
+	/** Whether any mirror reader is attached. */
+	get used(): Getter<boolean> {
+		return this.#used;
+	}
+
+	/** Wait until all mirror readers leave or the group closes. */
+	async unused(): Promise<void> {
+		while (this.#used.peek() && this.#state.closed.peek() === undefined) {
+			await Signal.race(this.#used, this.#state.closed);
+		}
+	}
+
+	/** The group's clean close or abort error. */
+	get closed(): GetPromise<Error | null> {
+		return this.#state.closed;
+	}
 }
 
 /**
@@ -112,14 +160,75 @@ export class Producer {
 	#state: GroupState;
 	#mirrors?: Set<GroupState>;
 
-	// Whether any mirror reader is attached (see {@link used}). Fetch coalescing watches it to
+	// Whether any mirror reader is attached (see {@link Demand.used}). Fetch coalescing watches it to
 	// cancel an abandoned download; a group can stay open indefinitely (a catalog or JSON stream),
 	// so this is what stops a reader-less fetch instead of the stream ending on its own.
 	#used = new Signal<boolean>(false);
+	#demand: Demand;
+
+	// Exclusive cap on the frame count, set when the track ends inside this group: a write
+	// past the track's end is refused rather than served as content that does not exist.
+	#limit?: number;
+
+	// When the group was created or last written. Retention ages a group from this,
+	// not from its creation, so a group still being filled is never reclaimed.
+	#activity = now();
+
+	// The tracks this group joined before its first frame, each checking that frame's
+	// timestamp against its neighbors' starts.
+	#admits?: ((start: Timestamp) => () => void)[];
 
 	constructor(sequence: number) {
 		this.#state = new GroupState(sequence);
 		this.sequence = sequence;
+		this.#demand = makeDemand(sequence, this.#used, this.#state);
+	}
+
+	static {
+		hooks.groupProgress = (group, fn) => {
+			const state = group.#state;
+			fn(state.total.peek());
+			state.progress.add(fn);
+			return () => state.progress.delete(fn);
+		};
+		hooks.bindGroupTimed = (group, timed) => {
+			const state = group.#state;
+			if (state.timed === timed) return;
+			// Another track already holds it to the opposite timedness, empty or not.
+			if (state.timed !== undefined) throw new TimestampMismatch();
+			for (const frame of state.frames.peek()) checkTimed(timed, frame);
+			state.timed = timed;
+		};
+		hooks.admitGroupStart = (group, admit) => {
+			group.#admits ??= [];
+			group.#admits.push(admit);
+		};
+		hooks.groupStart = (group) => (group.#state.total.peek() > 0 ? group.#state.timestamp : undefined);
+		hooks.overRefresh = (group, ratio) => {
+			const state = group.#state;
+			const first = state.frames.peek()[0];
+			// Without its first frame the cache cannot measure the group, so it asks for nothing.
+			if (state.start !== 0 || first === undefined) return false;
+			const head = first.payload.byteLength;
+			return state.cacheBytes - head > head * ratio;
+		};
+		hooks.limitGroup = (group, frames) => {
+			// A closed group takes no more frames, but one already past the cap still
+			// contradicts the end.
+			if (group.#state.total.peek() > frames) {
+				throw new ProtocolViolation(`group ${group.sequence} already holds a frame past the track's end`);
+			}
+			group.#limit = frames;
+		};
+	}
+
+	/**
+	 * When the group was created or last written, on the installed clock.
+	 *
+	 * @internal Idle cache eviction only.
+	 */
+	get activity(): Instant {
+		return this.#activity;
 	}
 
 	/**
@@ -135,6 +244,7 @@ export class Producer {
 		return makeConsumer(this.#state);
 	}
 
+	// pending: /quest/m1/public-model/deferred.md
 	/**
 	 * Create an independent read handle that receives every frame written here.
 	 *
@@ -145,9 +255,10 @@ export class Producer {
 	 */
 	mirror(): Consumer {
 		const dst = new GroupState(this.sequence);
+		dst.timestamp = this.#state.timestamp;
+		dst.latest = this.#state.latest;
 		for (const frame of this.#state.frames.peek()) appendFrame(dst, frame);
 		dst.start = this.#state.start;
-		dst.evicted = this.#state.evicted;
 		// The replay only covers what is still buffered, so the count has to come from the
 		// source: it is what names a frame's absolute sequence, and what a publisher reads
 		// to resolve the live edge.
@@ -175,33 +286,54 @@ export class Producer {
 		return makeConsumer(dst);
 	}
 
-	/**
-	 * Whether any mirror reader is currently attached.
-	 *
-	 * Pairs with {@link unused}. Fetch coalescing watches it to cancel a download once every reader
-	 * has gone: a group can stay open indefinitely (a catalog track, a JSON stream), so it can't
-	 * rely on the stream ending on its own.
-	 *
-	 * @internal Track fan-out and fetch coalescing only.
-	 */
-	get used(): Getter<boolean> {
-		return this.#used;
-	}
-
-	/**
-	 * Resolves once no mirror reader remains (or the group closes).
-	 *
-	 * @internal Track fan-out and fetch coalescing only.
-	 */
-	async unused(): Promise<void> {
-		while (this.#used.peek() && this.#state.closed.peek() === undefined) {
-			await Signal.race(this.#used, this.#state.closed);
-		}
+	/** Watch the mirror readers attached to this group. */
+	demand(): Demand {
+		return this.#demand;
 	}
 
 	/** Writes a frame to the group. */
 	writeFrame(frame: Frame) {
+		// Closed first: a write after a clean close at the cap would otherwise take the
+		// overflow path, wipe committed frames, and leave readers with an empty success.
+		if (this.#state.closed.peek() !== undefined) throw new Error("group is closed");
+		// A frame past the cache cap would make the group exceed its budget by itself, so
+		// accepting it would report success for a write nothing can ever read. Rust rejects
+		// it up front with `Error::FrameTooLarge`; do the same rather than silently dropping it.
+		if (frame.payload.byteLength > MAX_GROUP_CACHE_BYTES) throw new FrameTooLarge();
+		checkTimed(this.#state.timed, frame);
+		if (this.#limit !== undefined && this.#state.total.peek() >= this.#limit) {
+			throw new Error(`frame ${this.#state.total.peek()} is past the track's end`);
+		}
+		// Frame 0 must fit between its neighbors in every track it joined, checked before
+		// any of them records it, so a refusal leaves the group and its tracks as they were.
+		let commits: (() => void)[] | undefined;
+		if (this.#admits && frame.timestamp !== undefined && this.#state.total.peek() === 0) {
+			const start = frame.timestamp;
+			commits = this.#admits.map((admit) => admit(start));
+		}
+		if (
+			this.#state.total.peek() >= MAX_GROUP_FRAMES ||
+			this.#state.cacheBytes + frame.payload.byteLength > MAX_GROUP_CACHE_BYTES
+		) {
+			const err = new GroupTooLarge();
+			this.#state.frames.set([]);
+			this.#state.cacheBytes = 0;
+			if (this.#mirrors) {
+				for (const mirror of this.#mirrors) {
+					mirror.frames.set([]);
+					mirror.cacheBytes = 0;
+				}
+			}
+			this.close(err);
+			throw err;
+		}
+
+		this.#activity = now();
 		appendFrame(this.#state, frame);
+		if (commits) {
+			this.#admits = undefined;
+			for (const commit of commits) commit();
+		}
 
 		if (this.#mirrors) {
 			for (const mirror of this.#mirrors) {
@@ -209,21 +341,6 @@ export class Producer {
 				else appendFrame(mirror, frame);
 			}
 		}
-	}
-
-	/** Write a string as a single UTF-8 encoded frame, stamped with {@link Timestamp.now}. */
-	writeString(str: string) {
-		this.writeFrame({ payload: new TextEncoder().encode(str), timestamp: Timestamp.now() });
-	}
-
-	/** Write a value as a single JSON-encoded frame, stamped with {@link Timestamp.now}. */
-	writeJson(json: unknown) {
-		this.writeString(JSON.stringify(json));
-	}
-
-	/** Write a boolean as a single one-byte frame, stamped with {@link Timestamp.now}. */
-	writeBool(bool: boolean) {
-		this.writeFrame({ payload: new Uint8Array([bool ? 1 : 0]), timestamp: Timestamp.now() });
 	}
 
 	/** True once the group has been closed. */
@@ -247,6 +364,99 @@ export class Producer {
 
 let makeConsumer: (state: GroupState) => Consumer;
 
+// A replacement copy asked for on behalf of one consumer, settled or still out.
+interface Attempt {
+	/** Asked for a copy that failed, rather than one that stalled. */
+	failed: boolean;
+	abort: AbortController;
+	result: Promise<void>;
+	settled: boolean;
+	replacement?: Replacement;
+}
+
+// A consumer can finish from its own expiry verdict or from the shared group state. Keep
+// one stable public handle while letting peek() observe either source synchronously, before
+// signal subscribers run in the next microtask. The source is re-read on every check, since a
+// recovered group moves to another copy's state, and `final` says whether its value ends the
+// consumer: a failure recovery can still continue does not.
+class CombinedClosed implements GetPromise<Error | null> {
+	#preferred: Once<Error | null>;
+	#source: () => Once<Error | null>;
+	#final: (value: Error | null) => boolean;
+	#value = new Once<Error | null>();
+	#watched?: Once<Error | null>;
+	// The watcher on `#watched`, replaced when a recovery moves to another copy's state.
+	#unwatch?: Dispose;
+	#dispose: Dispose[] = [];
+
+	constructor(
+		preferred: Once<Error | null>,
+		source: () => Once<Error | null>,
+		final: (value: Error | null) => boolean,
+	) {
+		this.#preferred = preferred;
+		this.#source = source;
+		this.#final = final;
+		if (this.#sync()) return;
+		this.#dispose.push(preferred.changed(() => this.#sync()));
+	}
+
+	#sync(): boolean {
+		if (this.#value.peek() !== undefined) return true;
+		const preferred = this.#preferred.peek();
+		const source = this.#source();
+		const current = source.peek();
+		const value =
+			preferred !== undefined ? preferred : current !== undefined && this.#final(current) ? current : undefined;
+		if (value === undefined) {
+			if (this.#watched !== source) {
+				this.#unwatch?.();
+				this.#watched = source;
+				this.#unwatch = source.changed(() => this.#sync());
+			}
+			return false;
+		}
+
+		this.#value.set(value);
+		for (const dispose of this.#dispose) dispose();
+		this.#dispose = [];
+		this.#unwatch?.();
+		this.#unwatch = undefined;
+		this.#watched = undefined;
+		return true;
+	}
+
+	refresh() {
+		this.#sync();
+	}
+
+	peek(): Error | null | undefined {
+		this.#sync();
+		return this.#value.peek();
+	}
+
+	changed(): Promise<Error | null | undefined>;
+	changed(fn: (value: Error | null | undefined) => void): Dispose;
+	changed(fn?: (value: Error | null | undefined) => void): Promise<Error | null | undefined> | Dispose {
+		this.#sync();
+		return fn ? this.#value.changed(fn) : this.#value.changed();
+	}
+
+	subscribe(fn: (value: Error | null | undefined) => void): Dispose {
+		this.#sync();
+		return this.#value.subscribe(fn);
+	}
+
+	// biome-ignore lint/suspicious/noThenProperty: CombinedClosed is intentionally awaitable.
+	then<R1 = Error | null, R2 = never>(
+		onFulfilled?: ((value: Error | null) => R1 | PromiseLike<R1>) | null,
+		onRejected?: ((reason: unknown) => R2 | PromiseLike<R2>) | null,
+	): PromiseLike<R1 | R2> {
+		this.#sync();
+		return this.#value.then(onFulfilled, onRejected);
+	}
+}
+
 /**
  * The read side of an ordered stream of frames within a track.
  *
@@ -260,6 +470,20 @@ export class Consumer {
 	readonly sequence: number;
 
 	#state: GroupState;
+	#expiry?: Expiry;
+	// Carries the group across its logical track's route changes; see `resume.ts`.
+	#recover?: GroupRecover;
+	// A replacement asked for while the copy being read stalls, raced against that copy.
+	#attempt?: Attempt;
+	// The frame a replacement copy resumes at: frames below it were read from an earlier copy.
+	#skip = 0;
+	// Sticky failure, set once, including a budget that gave up on the group.
+	#terminal?: Error;
+	#verdict = new Once<Error | null>();
+	#closed?: CombinedClosed;
+	#pendingFrames = 0;
+	// Closed by its reader, which ends it whatever is left unread.
+	#released = false;
 
 	private constructor(state: GroupState) {
 		this.#state = state;
@@ -267,43 +491,266 @@ export class Consumer {
 	}
 
 	/**
-	 * Settles once the group closes: `null` on a clean close, or the abort {@link Error}.
+	 * Settles when this consumer reaches a terminal state: `null` after a clean close has no
+	 * unread or in-flight frames, or the terminal {@link Error}.
 	 * Peek it synchronously (`undefined` while open), observe it reactively, or `await` it.
 	 */
 	get closed(): GetPromise<Error | null> {
-		return this.#state.closed;
+		this.#closed ??= new CombinedClosed(
+			this.#verdict,
+			() => this.#state.closed,
+			(value) =>
+				value instanceof Error
+					? !this.#recovers(value)
+					: this.#released || (this.#bufferedFrames().length === 0 && this.#pendingFrames === 0),
+		);
+		return this.#closed;
+	}
+
+	// Whether a failure of the copy being read may still be continued from another route.
+	#recovers(failed: Error): boolean {
+		return !this.#terminal && this.#recover?.wants(failed) === true;
 	}
 
 	static {
 		makeConsumer = (state) => new Consumer(state);
+		hooks.groupTimestamp = (group) => (group.#state.unverified ? undefined : group.#state.timestamp);
+		hooks.groupLatest = (group) => (group.#state.unverified ? undefined : group.#state.latest);
+		hooks.unverifyGroup = (group) => {
+			group.#state.unverified = true;
+		};
+		hooks.groupArrived = (group) => group.#state.arrived;
+		hooks.arriveGroup = (group, at) => {
+			group.#state.arrived = at;
+		};
+		hooks.expireGroup = (group, expiry) => {
+			group.#expiry = expiry;
+		};
+		hooks.recoverGroup = (group, recover) => {
+			group.#recover = recover;
+			// A track's drift scan may have read `closed` already, latching a failure recovery can
+			// now continue: derive it again with the recovery in view.
+			if (group.#closed?.peek() instanceof Error && group.#verdict.peek() === undefined)
+				group.#closed = undefined;
+		};
+		hooks.guardGroup = (group, operation) => group.#guard(operation);
+		hooks.readGroupFrame = (group, from) => group.#readFramePosition(true, from);
+		hooks.evictGroup = (group) => {
+			group.#evict();
+		};
 	}
 
-	#readBufferedFrame(): { sequence: number; frame: Frame } | undefined {
-		const frames = this.#state.frames.peek();
-		const frame = frames.shift();
-		if (!frame) return undefined;
+	// Evaluate the drift budget for a read that has nothing buffered and is about to
+	// wait. A group with frames in hand is always drained: the budget bounds a group
+	// that has stalled while the live edge moved on, not a reader slower than the wire.
+	// Returns true if a verdict was just reached, so the caller re-checks.
+	//
+	// A reader that took every frame still fails with Old: the producer never finished
+	// the group, so a clean end would pass the prefix off as the whole group.
+	#expire(): boolean {
+		if (this.#terminal) return false;
+		if (this.#state.closed.peek() instanceof Error) return false;
+		if (!this.#expiry?.expired()) return false;
 
-		this.#state.cacheBytes -= frame.payload.byteLength;
-		return { sequence: this.#state.start++, frame };
+		this.#terminal = new StreamError(StreamCode.Old, {
+			message: "group exceeded the subscription max delay budget",
+		});
+		if (this.#verdict.peek() === undefined) this.#verdict.set(this.#terminal);
+		return true;
+	}
+
+	// Takes a thunk rather than a started promise, so a group already past its budget
+	// never begins the write: an abandoned write would reject later with no handler.
+	#guard<T>(operation: () => Promise<T>): Promise<T> {
+		this.#expire();
+		if (this.#terminal) return Promise.reject(this.#terminal);
+		const expiry = this.#expiry;
+		if (!expiry) return operation();
+
+		return new Promise<T>((resolve, reject) => {
+			let settled = false;
+			const disposes: Dispose[] = [];
+			const finish = (fn: () => void) => {
+				if (settled) return;
+				settled = true;
+				for (const dispose of disposes) dispose();
+				fn();
+			};
+			const check = () => {
+				this.#expire();
+				if (this.#terminal) {
+					const error = this.#terminal;
+					finish(() => reject(error));
+				}
+			};
+
+			for (const changed of expiry.changed) disposes.push(changed.subscribe(check));
+			operation().then(
+				(value) => finish(() => resolve(value)),
+				(error: unknown) => finish(() => reject(error)),
+			);
+			check();
+		});
+	}
+
+	#evict() {
+		const frames = this.#bufferedFrames();
+		if (frames.length > 0) {
+			// Unread content is going away either way. If the budget had already given up
+			// on this group that is the more specific reason, so ask it first; otherwise
+			// the reader simply lagged behind the cache.
+			this.#expire();
+			if (!this.#terminal) {
+				this.#terminal = new TooFarBehind();
+				if (this.#verdict.peek() === undefined) this.#verdict.set(this.#terminal);
+			}
+		}
+		if (frames.length > 0) {
+			this.#state.start += frames.length;
+		}
+		this.#state.cacheBytes = 0;
+		this.#state.frames.set([]);
+	}
+
+	// The next change a parked read waits for.
+	#changed(): GetPromise<unknown> {
+		const changed: Getter<unknown>[] = [this.#state.frames, this.#state.closed];
+		if (this.#expiry) changed.push(...this.#expiry.changed);
+		if (this.#recover) changed.push(this.#recover.changed);
+		return Signal.race(...changed);
+	}
+
+	// Continue from the serving route's copy once the one being read failed with `failed`, or
+	// stalled (no `failed`) while a newer route serves. Returns whether the read should look
+	// again; throws the error that ends the group once nothing can continue it.
+	async #resume(failed: Error | undefined): Promise<boolean> {
+		const recover = this.#recover;
+		if (!recover?.wants(failed)) return false;
+		// A stall's attempt learns nothing of a failure since: ask again with it.
+		if (failed && this.#attempt && !this.#attempt.failed) this.#abandon();
+		let attempt = this.#attempt;
+		if (!attempt) {
+			const abort = new AbortController();
+			const started: Attempt = { failed: failed !== undefined, abort, result: Promise.resolve(), settled: false };
+			started.result = recover.replace(this.#index(), failed, abort.signal).then(
+				(replacement) => {
+					started.settled = true;
+					// Abandoned while it was out: nobody reads it.
+					if (abort.signal.aborted) replacement.discard();
+					else started.replacement = replacement;
+				},
+				(err: unknown) => {
+					started.settled = true;
+					if (abort.signal.aborted) return;
+					this.#terminal ??= err instanceof Error ? err : new Error(String(err));
+					if (this.#verdict.peek() === undefined) this.#verdict.set(this.#terminal);
+				},
+			);
+			attempt = started;
+			this.#attempt = attempt;
+		}
+		// A stalled copy may still deliver first; a failed one never will.
+		if (failed) await attempt.result;
+		else await race([attempt.result, this.#changed()]);
+		// The copy being read moved first: look again, keeping the attempt out.
+		if (!attempt.settled) return true;
+		if (this.#attempt === attempt) this.#attempt = undefined;
+		// Taken once: a concurrent read awaiting the same attempt looks again instead.
+		const replacement = attempt.replacement;
+		attempt.replacement = undefined;
+		if (!replacement) return true;
+		if (!failed && (this.#bufferedFrames().length > 0 || this.#state.closed.peek() !== undefined)) {
+			// The copy being read delivered or ended meanwhile; keep reading it.
+			replacement.discard();
+			return true;
+		}
+		this.#adopt(replacement);
+		return true;
+	}
+
+	// The next frame this consumer reads: past what it read, and what a copy it adopted repeats.
+	#index(): number {
+		return Math.max(this.#state.start, this.#skip);
+	}
+
+	// Give up a replacement still being asked for, or one nobody adopted: the group ended without it.
+	#abandon(): void {
+		const attempt = this.#attempt;
+		if (!attempt) return;
+		this.#attempt = undefined;
+		attempt.abort.abort();
+		attempt.replacement?.discard();
+	}
+
+	// Read the rest of the group from `replacement`, from the frame this one reached.
+	#adopt(replacement: Replacement): void {
+		const next = replacement.group.#state;
+		const index = this.#index();
+		if (next.start > index) {
+			replacement.discard();
+			this.#terminal ??= new Error(`group ${this.sequence} cannot resume at frame ${index}`);
+			if (this.#verdict.peek() === undefined) this.#verdict.set(this.#terminal);
+			return;
+		}
+		replacement.adopt();
+		// The copy left behind stops teeing into the state this consumer read.
+		if (this.#state.closed.peek() === undefined) this.#state.closed.set(null);
+		this.#state = next;
+		this.#expiry = replacement.expiry;
+		this.#skip = index;
+		this.#closed?.refresh();
+	}
+
+	// The unread frames. Every look at the buffer goes through here, so readiness, reads and
+	// `done` agree on what is left.
+	#bufferedFrames(): Frame[] {
+		const frames = this.#state.frames.peek();
+		// A resumed copy repeats the frames an earlier one already delivered.
+		while (this.#state.start < this.#skip && frames.length > 0) {
+			frames.shift();
+			this.#state.start++;
+		}
+		return frames;
+	}
+
+	#readBufferedFrame(pending = false): ReadGroupFrame | undefined {
+		const frames = this.#bufferedFrames();
+		const buffered = frames.shift();
+		if (!buffered) return undefined;
+
+		const sequence = this.#state.start++;
+		if (pending) this.#pendingFrames++;
+		let completed = false;
+		return {
+			sequence,
+			frame: buffered,
+			complete: () => {
+				if (completed) return;
+				completed = true;
+				if (pending) this.#pendingFrames--;
+				this.#closed?.refresh();
+			},
+		};
 	}
 
 	/** True once no further frames can be read: the group has closed and every buffered frame is read. */
 	get done(): boolean {
-		return this.#state.frames.peek().length === 0 && this.#state.closed.peek() !== undefined;
+		return this.#terminal !== undefined || (this.#bufferedFrames().length === 0 && this.#settled());
 	}
 
 	/** True once the group has been closed, regardless of whether buffered frames remain unread. Synchronous complement to the {@link closed} promise. */
 	get isClosed(): boolean {
-		return this.#state.closed.peek() !== undefined;
+		return this.#terminal !== undefined || this.#settled();
 	}
 
-	/** True if frames were evicted from the front of this group before being read. */
-	get skipped(): boolean {
-		return this.#state.evicted > 0;
+	// Whether the copy being read ended, for good: a failure recovery may continue is not an end.
+	#settled(): boolean {
+		const closed = this.#state.closed.peek();
+		return closed !== undefined && !(closed instanceof Error && this.#recovers(closed));
 	}
 
 	/**
-	 * How many frames the group has held, including any already read or evicted.
+	 * How many frames the group has held, including any already read.
 	 *
 	 * It is also the next frame's sequence number, so `frameCount - 1` names the newest
 	 * frame written so far. A publisher snapshots it to resolve the track's live edge.
@@ -320,23 +767,42 @@ export class Consumer {
 	 * end-of-group: check {@link done} to tell "no frame buffered yet" from "finished".
 	 */
 	tryReadFrame(): Frame | undefined {
+		if (this.#terminal) return undefined;
 		const read = this.#readBufferedFrame();
+		read?.complete();
 		return read?.frame;
 	}
 
 	/** Like {@link tryReadFrame} but also reports the frame's sequence number within the group. */
 	tryReadFrameSequence(): ({ sequence: number } & Frame) | undefined {
+		if (this.#terminal) return undefined;
 		const read = this.#readBufferedFrame();
 		if (!read) return undefined;
+		read.complete();
 		return { sequence: read.sequence, payload: read.frame.payload, timestamp: read.frame.timestamp };
 	}
 
 	/** Resolves once {@link readFrame} would not block. */
 	async readable(): Promise<void> {
 		for (;;) {
-			if (this.#state.frames.peek().length > 0) return;
-			if (this.#state.closed.peek() !== undefined) return;
-			await Signal.race(this.#state.frames, this.#state.closed);
+			if (this.#terminal) {
+				this.#abandon();
+				return;
+			}
+			if (this.#bufferedFrames().length > 0) return;
+			const closed = this.#state.closed.peek();
+			if (closed instanceof Error && (await this.#resume(closed))) continue;
+			if (closed !== undefined) {
+				this.#abandon();
+				this.#closed?.refresh();
+				return;
+			}
+			if (this.#expire()) return;
+			if (this.#recover?.wants(undefined)) {
+				await this.#resume(undefined);
+				continue;
+			}
+			await this.#changed();
 		}
 	}
 
@@ -345,17 +811,48 @@ export class Consumer {
 	 * Treat the returned frame bytes as read-only; they are shared with other consumers.
 	 */
 	async readFrame(): Promise<Frame | undefined> {
-		for (;;) {
-			if (this.#state.evicted > 0) throw new Lagged();
+		return (await this.#readFramePosition())?.frame;
+	}
 
-			const read = this.#readBufferedFrame();
-			if (read) return read.frame;
+	async #readFramePosition(pending = false, from = 0): Promise<ReadGroupFrame | undefined> {
+		for (;;) {
+			if (this.#terminal) {
+				this.#abandon();
+				throw this.#terminal;
+			}
+
+			const read = this.#readBufferedFrame(pending);
+			if (read) {
+				if (read.sequence < from) {
+					read.complete();
+					continue;
+				}
+				if (!pending) read.complete();
+				return read;
+			}
 
 			const closed = this.#state.closed.peek();
-			if (closed instanceof Error) throw closed;
-			if (closed !== undefined) return;
+			if (closed instanceof Error) {
+				if (await this.#resume(closed)) continue;
+				this.#abandon();
+				throw closed;
+			}
+			if (closed !== undefined) {
+				// The copy finished the group: a replacement asked for meanwhile is moot.
+				this.#abandon();
+				this.#closed?.refresh();
+				return;
+			}
 
-			await Signal.race(this.#state.frames, this.#state.closed);
+			// Nothing buffered and the group is still open: this wait is the stall the
+			// drift budget bounds, and the only place it applies.
+			if (this.#expire()) continue;
+			// A stall while a newer route serves looks there too.
+			if (this.#recover?.wants(undefined)) {
+				await this.#resume(undefined);
+				continue;
+			}
+			await this.#changed();
 		}
 	}
 
@@ -364,23 +861,9 @@ export class Consumer {
 	 * Treat the returned frame bytes as read-only; they are shared with other consumers.
 	 */
 	async readFrameSequence(options?: ReadOptions): Promise<({ sequence: number } & Frame) | undefined> {
-		const from = options?.from ?? 0;
-
-		for (;;) {
-			if (this.#state.evicted > from) throw new Lagged();
-
-			const read = this.#readBufferedFrame();
-			if (read) {
-				if (read.sequence < from) continue;
-				return { sequence: read.sequence, payload: read.frame.payload, timestamp: read.frame.timestamp };
-			}
-
-			const closed = this.#state.closed.peek();
-			if (closed instanceof Error) throw closed;
-			if (closed !== undefined) return;
-
-			await Signal.race(this.#state.frames, this.#state.closed);
-		}
+		const read = await this.#readFramePosition(false, options?.from ?? 0);
+		if (!read) return undefined;
+		return { sequence: read.sequence, payload: read.frame.payload, timestamp: read.frame.timestamp };
 	}
 
 	/** Reads the next frame and decodes its payload as a UTF-8 string. */
@@ -403,7 +886,11 @@ export class Consumer {
 
 	/** Closes the group, optionally with an error to abort readers. Idempotent. */
 	close(abort?: Error) {
-		if (this.#state.closed.peek() !== undefined) return; // already closed
-		this.#state.closed.set(abort ?? null);
+		this.#abandon();
+		this.#recover = undefined;
+		// Closing is terminal for this reader, even with frames still unread.
+		this.#released = true;
+		if (this.#state.closed.peek() === undefined) this.#state.closed.set(abort ?? null);
+		this.#closed?.refresh();
 	}
 }

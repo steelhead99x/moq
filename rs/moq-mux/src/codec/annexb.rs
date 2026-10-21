@@ -17,6 +17,12 @@ pub enum Error {
 
 	#[error("truncated length-prefixed NAL unit")]
 	Truncated,
+
+	#[error("NAL too large for a 4-byte length prefix")]
+	NalTooLarge,
+
+	#[error("keyframe has no {0}, in the access unit or earlier in the track")]
+	MissingParameterSet(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -44,9 +50,23 @@ pub(crate) fn length_prefixed_nals(data: &[u8], length_size: usize) -> Result<Le
 }
 
 /// The iterator [`length_prefixed_nals`] returns.
+#[derive(Clone)]
 pub(crate) struct LengthPrefixedNals<'a> {
 	data: &'a [u8],
 	length_size: usize,
+}
+
+impl<'a> LengthPrefixedNals<'a> {
+	/// Take a leading access unit delimiter, which must stay ahead of injected parameter sets.
+	pub(crate) fn take_delimiter(&mut self, codec: InBandCodec) -> Result<Option<&'a [u8]>> {
+		if let Some(nal) = self.clone().next().transpose()?
+			&& !nal.is_empty()
+			&& codec.nal_type(nal) == codec.delimiter()
+		{
+			return self.next().transpose();
+		}
+		Ok(None)
+	}
 }
 
 impl<'a> Iterator for LengthPrefixedNals<'a> {
@@ -73,19 +93,29 @@ impl<'a> Iterator for LengthPrefixedNals<'a> {
 }
 
 /// Convert a length-prefixed NALU payload (avc1 / hvc1 wire shape) to Annex-B,
-/// optionally prepending `prefix` bytes (typically VPS/SPS/PPS NAL units already
-/// in Annex-B form, for keyframe parameter-set injection).
+/// injecting `prefix` bytes (typically VPS/SPS/PPS NAL units already in Annex-B
+/// form) after a leading access unit delimiter, or before the other NAL units.
 pub fn from_length_prefixed(payload: &[u8], length_size: usize, prefix: Option<&[u8]>) -> Result<Bytes> {
 	let mut out = BytesMut::with_capacity(payload.len() + prefix.map(|p| p.len()).unwrap_or(0) + 16);
-	if let Some(p) = prefix {
-		out.extend_from_slice(p);
+	let mut nals = length_prefixed_nals(payload, length_size)?;
+	if let Some(prefix) = prefix {
+		let codec = after_start_code(prefix)
+			.ok()
+			.flatten()
+			.and_then(|start| prefix.get(start))
+			.and_then(|&header| InBandCodec::of_parameter_set(header));
+		if let Some(codec) = codec
+			&& let Some(aud) = nals.take_delimiter(codec)?
+		{
+			out.extend_from_slice(&START_CODE);
+			out.extend_from_slice(aud);
+		}
+		out.extend_from_slice(prefix);
 	}
-
-	for nal in length_prefixed_nals(payload, length_size)? {
+	for nal in nals {
 		out.extend_from_slice(&START_CODE);
 		out.extend_from_slice(nal?);
 	}
-
 	Ok(out.freeze())
 }
 
@@ -115,6 +145,149 @@ pub(crate) fn push_distinct(set: &mut Vec<Bytes>, nal: &Bytes) -> bool {
 	}
 	set.push(nal.clone());
 	true
+}
+
+/// The NAL syntax an [`InBand`] transform reads.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InBandCodec {
+	H264,
+	H265,
+}
+
+impl InBandCodec {
+	/// The parameter-set NAL types, each referencing only those before it.
+	fn parameter_sets(self) -> &'static [(u8, &'static str)] {
+		match self {
+			Self::H264 => &[(7, "SPS"), (8, "PPS")],
+			Self::H265 => &[(32, "VPS"), (33, "SPS"), (34, "PPS")],
+		}
+	}
+
+	/// The codec whose parameter-set NAL begins with `header`.
+	///
+	/// NAL headers overlap between codecs (an H.265 slice can look like an H.264 AUD), so
+	/// only a parameter set identifies one.
+	fn of_parameter_set(header: u8) -> Option<Self> {
+		match (header & 0x1f, (header >> 1) & 0x3f) {
+			(7 | 8, _) => Some(Self::H264),
+			(_, 32..=34) => Some(Self::H265),
+			_ => None,
+		}
+	}
+
+	fn delimiter(self) -> u8 {
+		match self {
+			Self::H264 => 9,
+			Self::H265 => 35,
+		}
+	}
+
+	fn nal_type(self, nal: &[u8]) -> u8 {
+		match self {
+			Self::H264 => nal[0] & 0x1f,
+			Self::H265 => (nal[0] >> 1) & 0x3f,
+		}
+	}
+
+	/// A coded slice, so the access unit is a picture.
+	fn is_vcl(self, nal: &[u8]) -> bool {
+		match self {
+			Self::H264 => (1..=5).contains(&self.nal_type(nal)),
+			Self::H265 => self.nal_type(nal) < 32,
+		}
+	}
+}
+
+/// Length-prefixes Annex-B access units with their parameter sets kept in the
+/// sample, for an avc3 or hev1 track whose sample entry lists none.
+///
+/// A keyframe is the only place a receiver can join, so it always carries every
+/// parameter-set type, in dependency order (VPS, SPS, PPS) right after any access
+/// unit delimiter. A type the access unit omitted is the last one seen. A type it
+/// carried replaces every cached set of that type, so a source that spreads several
+/// PPS ids across access units keeps only the last.
+pub(crate) struct InBand {
+	codec: InBandCodec,
+	/// The active sets of each type, in [`InBandCodec::parameter_sets`] order.
+	active: [Vec<Bytes>; 3],
+}
+
+impl InBand {
+	pub fn new(codec: InBandCodec) -> Self {
+		Self {
+			codec,
+			active: Default::default(),
+		}
+	}
+
+	/// Returns `None` for an access unit with no coded slice, as `Avc1` and `Hvc1`
+	/// do; its parameter sets are kept for the next keyframe.
+	pub fn transform(&mut self, payload: Bytes, keyframe: bool) -> Result<Option<Bytes>> {
+		let codec = self.codec;
+		let kinds = codec.parameter_sets();
+		let mut buf = payload;
+		let mut iter = NalIterator::new(&mut buf);
+		let mut nals = Vec::new();
+		while let Some(nal) = iter.next().transpose()? {
+			nals.push(nal);
+		}
+		nals.extend(iter.flush()?);
+		nals.retain(|nal| !nal.is_empty());
+
+		let kind = |nal: &Bytes| {
+			let nal_type = codec.nal_type(nal);
+			kinds.iter().position(|(t, _)| *t == nal_type)
+		};
+		let mut sets: [Vec<Bytes>; 3] = Default::default();
+		for nal in &nals {
+			if let Some(index) = kind(nal) {
+				push_distinct(&mut sets[index], nal);
+			}
+		}
+		for (active, set) in self.active.iter_mut().zip(sets) {
+			if !set.is_empty() {
+				*active = set;
+			}
+		}
+		if !nals.iter().any(|nal| codec.is_vcl(nal)) {
+			return Ok(None);
+		}
+
+		let mut out = BytesMut::with_capacity(nals.iter().map(|nal| nal.len() + 4).sum());
+		if !keyframe {
+			for nal in &nals {
+				length_prefix(&mut out, nal)?;
+			}
+			return Ok(Some(out.freeze()));
+		}
+
+		let delimiter = codec.delimiter();
+		for nal in nals.iter().filter(|nal| codec.nal_type(nal) == delimiter) {
+			length_prefix(&mut out, nal)?;
+		}
+		for ((_, name), active) in kinds.iter().zip(&self.active) {
+			if active.is_empty() {
+				return Err(Error::MissingParameterSet(name));
+			}
+			for nal in active {
+				length_prefix(&mut out, nal)?;
+			}
+		}
+		for nal in nals
+			.iter()
+			.filter(|nal| kind(nal).is_none() && codec.nal_type(nal) != delimiter)
+		{
+			length_prefix(&mut out, nal)?;
+		}
+		Ok(Some(out.freeze()))
+	}
+}
+
+fn length_prefix(out: &mut BytesMut, nal: &[u8]) -> Result<()> {
+	let len = u32::try_from(nal.len()).map_err(|_| Error::NalTooLarge)?;
+	out.extend_from_slice(&len.to_be_bytes());
+	out.extend_from_slice(nal);
+	Ok(())
 }
 
 /// Reconcile the retained parameter sets with what a keyframe access unit carried
@@ -275,21 +448,60 @@ mod tests {
 	}
 
 	#[test]
-	fn from_length_prefixed_multiple_nals_with_prefix() {
-		// Two NALs in one frame: AUD then IDR slice. Prefix gets prepended once.
-		let prefix = build_prefix([&Bytes::from_static(&[0x67, 0x42])]);
-		let payload = &[
-			0, 0, 0, 2, 0x09, 0x10, // AUD
-			0, 0, 0, 2, 0x65, 0x88, // IDR slice
-		];
-		let out = from_length_prefixed(payload, 4, Some(&prefix)).unwrap();
+	fn from_length_prefixed_keeps_aud_first() {
+		for (params, aud, slice) in [
+			(
+				vec![vec![0x67, 0x42], vec![0x68, 0xce]],
+				vec![0x09, 0x10],
+				vec![0x65, 0x88],
+			),
+			(
+				vec![vec![0x40, 1], vec![0x42, 1], vec![0x44, 1]],
+				vec![0x46, 1, 0x10],
+				vec![0x26, 1, 0x88],
+			),
+		] {
+			let params: Vec<Bytes> = params.into_iter().map(Bytes::from).collect();
+			let prefix = build_prefix(&params);
+			for length_size in 1..=4 {
+				for leading in [None, Some(aud.as_slice())] {
+					let mut payload = Vec::new();
+					for nal in leading.into_iter().chain([slice.as_slice()]) {
+						payload.extend_from_slice(&(nal.len() as u32).to_be_bytes()[4 - length_size..]);
+						payload.extend_from_slice(nal);
+					}
+					let mut expected = Vec::new();
+					if let Some(aud) = leading {
+						expected.extend_from_slice(&START_CODE);
+						expected.extend_from_slice(aud);
+					}
+					expected.extend_from_slice(&prefix);
+					expected.extend_from_slice(&START_CODE);
+					expected.extend_from_slice(&slice);
+					let out = from_length_prefixed(&payload, length_size, Some(&prefix)).unwrap();
+					assert_eq!(out.as_ref(), expected.as_slice());
+					let mut without_prefix = Vec::new();
+					for nal in leading.into_iter().chain([slice.as_slice()]) {
+						without_prefix.extend_from_slice(&START_CODE);
+						without_prefix.extend_from_slice(nal);
+					}
+					assert_eq!(
+						from_length_prefixed(&payload, length_size, None).unwrap(),
+						without_prefix
+					);
+				}
+			}
+		}
+	}
 
-		// Single prefix followed by both NALs in Annex-B order.
-		let mut expected = Vec::new();
-		expected.extend_from_slice(&prefix);
-		expected.extend_from_slice(&[0, 0, 0, 1, 0x09, 0x10]); // AUD
-		expected.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88]); // IDR
-		assert_eq!(out.as_ref(), expected.as_slice());
+	#[test]
+	fn from_length_prefixed_distinguishes_codec_headers() {
+		// H.265 TSA_N with nuh_layer_id 32 has the same first byte as an H.264 AUD.
+		let prefix = build_prefix([&Bytes::from_static(&[0x40, 1])]);
+		let payload = &[0, 0, 0, 3, 0x09, 1, 0x80];
+		let mut expected = prefix.to_vec();
+		expected.extend_from_slice(&[0, 0, 0, 1, 0x09, 1, 0x80]);
+		assert_eq!(from_length_prefixed(payload, 4, Some(&prefix)).unwrap(), expected);
 	}
 
 	#[test]
@@ -702,5 +914,92 @@ mod tests {
 
 		let final_nal = iter.flush().unwrap().unwrap();
 		assert_eq!(final_nal.len(), 0);
+	}
+
+	fn annexb(nals: &[&[u8]]) -> Bytes {
+		build_prefix(
+			nals.iter()
+				.map(|nal| Bytes::copy_from_slice(nal))
+				.collect::<Vec<_>>()
+				.iter(),
+		)
+	}
+
+	fn length_prefixed(nals: &[&[u8]]) -> Vec<u8> {
+		let mut out = Vec::new();
+		for nal in nals {
+			out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+			out.extend_from_slice(nal);
+		}
+		out
+	}
+
+	#[test]
+	fn in_band_h264_keyframes_carry_sps_then_pps() {
+		let aud = &[0x09, 0xf0][..];
+		let sps = &[0x67, 0x42, 0xc0, 0x1f, 0xde][..];
+		let pps = &[0x68, 0xce, 0x3c, 0x80][..];
+		let idr = &[0x65, 0x88, 0x84, 0x21][..];
+		let sei = &[0x06, 0x05, 0xff][..];
+		let sps2 = &[0x67, 0x42, 0xc0, 0x1f, 0xaa][..];
+		let delta = &[0x61, 0xe0, 0x12][..];
+
+		let mut tx = InBand::new(InBandCodec::H264);
+		assert!(tx.transform(annexb(&[aud, sps, pps]), true).unwrap().is_none());
+		let full = tx.transform(annexb(&[sps, pps, idr]), true).unwrap().unwrap();
+		assert_eq!(full.as_ref(), length_prefixed(&[sps, pps, idr]));
+
+		// A partial keyframe gets the cached sets, never a PPS ahead of its SPS.
+		let pps_only = tx.transform(annexb(&[pps, idr]), true).unwrap().unwrap();
+		assert_eq!(pps_only.as_ref(), length_prefixed(&[sps, pps, idr]));
+		let reordered = tx.transform(annexb(&[pps, sps2, idr]), true).unwrap().unwrap();
+		assert_eq!(reordered.as_ref(), length_prefixed(&[sps2, pps, idr]));
+
+		// The delimiter stays first, and SEI follows the sets it may reference.
+		let sei_first = tx.transform(annexb(&[aud, sei, idr]), true).unwrap().unwrap();
+		assert_eq!(sei_first.as_ref(), length_prefixed(&[aud, sps2, pps, sei, idr]));
+
+		// Delta frames are not given parameter sets.
+		let delta_out = tx.transform(annexb(&[delta]), false).unwrap().unwrap();
+		assert_eq!(delta_out.as_ref(), length_prefixed(&[delta]));
+	}
+
+	#[test]
+	fn in_band_h265_keyframes_carry_vps_sps_pps() {
+		let vps = &[0x40, 0x01, 0x0c][..];
+		let sps = &[0x42, 0x01, 0x01, 0x60][..];
+		let pps = &[0x44, 0x01, 0xc0][..];
+		let idr = &[0x26, 0x01, 0xaa][..];
+		let sei = &[0x4e, 0x01, 0x05][..];
+		let sps2 = &[0x42, 0x01, 0x01, 0x61][..];
+
+		// An access unit with no slice is not a sample; its sets wait for the next keyframe.
+		let mut tx = InBand::new(InBandCodec::H265);
+		assert!(tx.transform(annexb(&[vps, sps, pps]), true).unwrap().is_none());
+		assert!(tx.transform(annexb(&[sei]), true).unwrap().is_none());
+		let bare = tx.transform(annexb(&[idr]), true).unwrap().unwrap();
+		assert_eq!(bare.as_ref(), length_prefixed(&[vps, sps, pps, idr]));
+
+		// A new SPS alone still follows the VPS it references.
+		let replaced = tx.transform(annexb(&[sps2, idr]), true).unwrap().unwrap();
+		assert_eq!(replaced.as_ref(), length_prefixed(&[vps, sps2, pps, idr]));
+
+		let sei_first = tx.transform(annexb(&[sei, idr]), true).unwrap().unwrap();
+		assert_eq!(sei_first.as_ref(), length_prefixed(&[vps, sps2, pps, sei, idr]));
+	}
+
+	#[test]
+	fn in_band_keyframe_without_parameter_sets_fails() {
+		let sps = &[0x42, 0x01, 0x01, 0x60][..];
+		let pps = &[0x44, 0x01, 0xc0][..];
+		let idr = &[0x26, 0x01, 0xaa][..];
+
+		let mut tx = InBand::new(InBandCodec::H265);
+		let err = tx.transform(annexb(&[sps, pps, idr]), true).unwrap_err();
+		assert!(matches!(err, Error::MissingParameterSet("VPS")), "{err}");
+
+		let mut tx = InBand::new(InBandCodec::H264);
+		let err = tx.transform(annexb(&[&[0x65, 0x88][..]]), true).unwrap_err();
+		assert!(matches!(err, Error::MissingParameterSet("SPS")), "{err}");
 	}
 }

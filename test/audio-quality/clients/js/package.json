@@ -1,0 +1,23 @@
+{
+	"name": "@moq/audio-quality",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"check": "tsc --noEmit",
+		"test": "bun test --only-failures"
+	},
+	"dependencies": {
+		"@moq/clock": "workspace:*",
+		"@moq/hang": "workspace:*",
+		"@moq/net": "workspace:*",
+		"@moq/publish": "workspace:*",
+		"@moq/signals": "workspace:*",
+		"@moq/watch": "workspace:*"
+	},
+	"devDependencies": {
+		"@types/audioworklet": "^0.0.100",
+		"playwright": "^1.64.0",
+		"rolldown": "^1.2.13",
+		"vite": "^8.3.4"
+	}
+}

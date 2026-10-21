@@ -9,7 +9,8 @@
 
 use std::task::Poll;
 
-use moq_json::snapshot::{Consumer, ConsumerConfig, Producer, ProducerConfig};
+use moq_json::Compression;
+use moq_json::snapshot::{self, Consumer, Producer};
 use serde_json::{Value, json};
 
 /// One second of telemetry for a fleet device: a big static core plus a few moving numbers.
@@ -75,23 +76,28 @@ fn telemetry(tick: u64) -> Value {
 }
 
 /// Total wire bytes of every frame across every group for a full run under `config`.
-fn wire_bytes(config: ProducerConfig, ticks: u64) -> usize {
+fn wire_bytes(config: snapshot::Config, ticks: u64) -> usize {
 	let track = moq_net::broadcast::Info::new()
 		.produce()
-		.create_track("telemetry", None)
+		.create_track(
+			"telemetry",
+			moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI),
+		)
 		.unwrap();
 	let consumer = track.subscribe(None);
 	let mut producer = Producer::<Value>::new(track, config);
 
 	for tick in 0..ticks {
-		producer.update(&telemetry(tick)).unwrap();
+		producer
+			.update(moq_net::Timed::from(&telemetry(tick)).at(moq_net::Timestamp::now()))
+			.unwrap();
 	}
 	producer.finish().unwrap();
 
 	// Drain the raw stored frames (compressed if the producer compressed them) and sum their sizes.
 	let waiter = kio::Waiter::noop();
 	let mut total = 0;
-	let mut track = consumer;
+	let mut track = consumer.ordered();
 	while let Poll::Ready(Ok(Some(mut group))) = track.poll_next_group(&waiter) {
 		while let Poll::Ready(Ok(Some(frame))) = group.poll_read_frame(&waiter) {
 			total += frame.payload.len();
@@ -102,26 +108,31 @@ fn wire_bytes(config: ProducerConfig, ticks: u64) -> usize {
 
 /// Drive a producer and a live consumer in lockstep, asserting that EVERY tick reconstructs to the
 /// exact input value after decompression and delta application (not just the final one).
-fn verify(producer_config: ProducerConfig, ticks: u64) {
+fn verify(producer_config: snapshot::Config, ticks: u64) {
 	let track = moq_net::broadcast::Info::new()
 		.produce()
-		.create_track("telemetry", None)
+		.create_track(
+			"telemetry",
+			moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI),
+		)
 		.unwrap();
 	let consumer = track.subscribe(None);
 	let mut producer = Producer::<Value>::new(track, producer_config.clone());
 
-	let mut consumer_config = ConsumerConfig::default();
+	let mut consumer_config = snapshot::consumer::Config::default();
 	consumer_config.compression = producer_config.compression;
 	let mut consumer = Consumer::<Value>::new(consumer, consumer_config);
 	let waiter = kio::Waiter::noop();
 
 	for tick in 0..ticks {
 		let expected = telemetry(tick);
-		producer.update(&expected).unwrap();
+		producer
+			.update(moq_net::Timed::from(&expected).at(moq_net::Timestamp::now()))
+			.unwrap();
 		// The producer emits exactly one frame per update, so the live consumer yields exactly one
 		// reconstructed value: it must match the input byte-for-byte after decompression + patching.
-		match consumer.poll_next(&waiter) {
-			Poll::Ready(Ok(Some(value))) => assert_eq!(value, expected, "tick {tick} reconstruction mismatch"),
+		match consumer.poll_latest(&waiter) {
+			Poll::Ready(Ok(Some(value))) => assert_eq!(value.value, expected, "tick {tick} reconstruction mismatch"),
 			other => panic!("tick {tick}: expected a value, got {other:?}"),
 		}
 	}
@@ -129,7 +140,7 @@ fn verify(producer_config: ProducerConfig, ticks: u64) {
 
 	// Drain: nothing left and the stream ends cleanly.
 	assert!(
-		matches!(consumer.poll_next(&waiter), Poll::Ready(Ok(None))),
+		matches!(consumer.poll_latest(&waiter), Poll::Ready(Ok(None))),
 		"stream did not end cleanly"
 	);
 }
@@ -140,26 +151,31 @@ fn verify(producer_config: ProducerConfig, ticks: u64) {
 ///
 /// Returns how many values the late joiner surfaced to the application: with backlog collapsing this
 /// is far below `ticks`, since stale intermediate reconstructions are applied internally but skipped.
-fn verify_late_joiner(producer_config: ProducerConfig, ticks: u64) -> usize {
+fn verify_late_joiner(producer_config: snapshot::Config, ticks: u64) -> usize {
 	let track = moq_net::broadcast::Info::new()
 		.produce()
-		.create_track("telemetry", None)
+		.create_track(
+			"telemetry",
+			moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI),
+		)
 		.unwrap();
 	let consumer = track.subscribe(None);
 	let mut producer = Producer::<Value>::new(track, producer_config.clone());
 	for tick in 0..ticks {
-		producer.update(&telemetry(tick)).unwrap();
+		producer
+			.update(moq_net::Timed::from(&telemetry(tick)).at(moq_net::Timestamp::now()))
+			.unwrap();
 	}
 	producer.finish().unwrap();
 
-	let mut consumer_config = ConsumerConfig::default();
+	let mut consumer_config = snapshot::consumer::Config::default();
 	consumer_config.compression = producer_config.compression;
 	let mut consumer = Consumer::<Value>::new(consumer, consumer_config);
 	let waiter = kio::Waiter::noop();
 	let mut last = None;
 	let mut yielded = 0;
-	while let Poll::Ready(Ok(Some(value))) = consumer.poll_next(&waiter) {
-		last = Some(value);
+	while let Poll::Ready(Ok(Some(value))) = consumer.poll_latest(&waiter) {
+		last = Some(value.value);
 		yielded += 1;
 	}
 	assert_eq!(
@@ -170,10 +186,14 @@ fn verify_late_joiner(producer_config: ProducerConfig, ticks: u64) -> usize {
 	yielded
 }
 
-fn cfg(delta_ratio: u32, compression: bool) -> ProducerConfig {
-	let mut config = ProducerConfig::default();
+fn cfg(delta_ratio: u32, compression: bool) -> snapshot::Config {
+	let mut config = snapshot::Config::default();
 	config.delta_ratio = delta_ratio;
-	config.compression = compression;
+	config.compression = if compression {
+		Compression::Deflate
+	} else {
+		Compression::None
+	};
 	config
 }
 
