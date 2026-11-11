@@ -155,6 +155,8 @@ WRAPPER_PKG="$STAGE_WRAPPER/moq-go-${WRAPPER_LINE}-wrapper"
 
 cd "$WRAPPER_PKG"
 export CGO_ENABLED=1 GOFLAGS=-mod=mod
+# Log the toolchain actually used (go.mod pins toolchain go1.27.3).
+echo "go check: $(go version)"
 echo "go check: go vet ./..."
 go vet ./...
 echo "go check: go build ./..."

@@ -293,6 +293,10 @@
         # Go toolchain (go/) so `just go check` regenerates the bindings and
         # runs `go test -race` on the wrapper instead of skipping. Cross-platform:
         # the check builds moq-ffi for the host and runs on Linux and macOS.
+        # pkgs.go is older than 1.27.3 at the locked nixpkgs; go/ffi and
+        # go/wrapper pin `toolchain go1.27.3`, so the go command auto-switches
+        # (GOTOOLCHAIN=auto) to 1.27.3 for the crypto/x509 eMudhra CA block
+        # (CVE-2026-111943). Drop this note once nixpkgs ships 1.27.3/1.26.10.
         goDeps = [
           pkgs.go
           uniffi-bindgen-go
