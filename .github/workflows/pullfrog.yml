@@ -1,0 +1,42 @@
+# PULLFROG ACTION — DO NOT EDIT EXCEPT WHERE INDICATED
+# The indicated edits are the pinned actions and the optional fallback key.
+# The review agent is Codex. Its ChatGPT credential stays in Pullfrog's
+# encrypted store (`npx pullfrog auth codex --repo steelhead99x/moq`).
+# This file does not pin a model.
+# https://docs.pullfrog.com/codex-auth
+name: Pullfrog
+run-name: ${{ inputs.name || github.workflow }}
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        type: string
+        description: Agent prompt
+      name:
+        type: string
+        description: Run name
+
+permissions:
+  contents: read
+
+jobs:
+  pullfrog:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Run agent
+        uses: pullfrog/pullfrog@44b58efe7fe431053c58aafa05e51e190f969685 # v0.1.130
+        with:
+          prompt: ${{ inputs.prompt }}
+        # Fallback only. The ChatGPT Codex credential from
+        # `npx pullfrog auth codex` stays in Pullfrog's encrypted store.
+        # This file does not create a secret; an unset OPENAI_API_KEY is empty.
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

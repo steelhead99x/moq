@@ -69,6 +69,10 @@ convention the repo now violates) that you're not fixing in this PR, CREATE OR
 UPDATE A QUEST for it (see [quest/AGENTS.md](quest/AGENTS.md)). "Out of scope"
 is a reason to defer the fix, never a reason to forget it.
 
+## Pullfrog
+
+Pullfrog reviews pull requests on Codex. Link the ChatGPT Codex credential with `npx pullfrog auth codex --repo steelhead99x/moq`. That credential stays in Pullfrog's encrypted store. [`.github/workflows/pullfrog.yml`](.github/workflows/pullfrog.yml) passes the existing `OPENAI_API_KEY` repository secret through only as an optional fallback. The workflow leaves the model unpinned.
+
 ## Releases
 
 - **Rust**: release-plz opens release PRs and publishes to crates.io on merge to `main` (`release-rs.yml`). `moq-relay` and `moq-cli` take patch bumps even for breaking changes (no external consumers yet). `moq-cli` is the one crate bumped by hand, in a dedicated chore PR rather than a feature PR, since release-plz can't see CLI surface changes.
