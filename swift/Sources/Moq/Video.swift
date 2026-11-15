@@ -56,6 +56,10 @@ public enum Video {
 
         /// The decoder's platform surface, or `nil` when the frame is in CPU memory.
         public func surface() -> Surface? { ffi.surface().map(Surface.init) }
+
+        /// The color space of these samples, or `nil` when the stream left it unspecified.
+        /// Guess BT.601 limited at or below 576 lines, and BT.709 limited above that.
+        public func color() -> MoqVideoColor? { ffi.color() }
     }
 
     /// The platform image backing a `DecodedFrame`, when `DecoderOutput` asked for one.
@@ -192,6 +196,9 @@ public enum Video {
         public func cancel() {
             ffi.cancel()
         }
+
+        /// The decoder backend, for example `"openh264"` or `"videotoolbox"`.
+        public func name() -> String { ffi.name() }
 
         /// Create an iterator that cancels native reads when iteration ends.
         public func makeAsyncIterator() -> AsyncThrowingStream<Read, Swift.Error>.Iterator {

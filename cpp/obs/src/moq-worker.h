@@ -13,7 +13,7 @@
 // The thread one output or source runs its moq continuations on, in order.
 //
 // Owning one per object keeps continuations off the moq-ffi runtime, lets a slow
-// one (an FFmpeg decode, an OBS signal the frontend handles inline) delay only its
+// one (a video decode, an OBS signal the frontend handles inline) delay only its
 // own object, and gives teardown a hard boundary: once Stop() returns from another
 // thread, none of this object's continuations is running or will run.
 class MoQWorker {

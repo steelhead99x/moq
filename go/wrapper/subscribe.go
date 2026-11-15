@@ -212,6 +212,13 @@ func (f *VideoDecodedFrame) Surface() VideoSurface {
 	return videoSurface(f.inner.Surface())
 }
 
+// Color is the color space of these samples, or nil when the stream left it
+// unspecified. Guess BT.601 limited at or below 576 lines, and BT.709 limited
+// above that.
+func (f *VideoDecodedFrame) Color() *VideoColor {
+	return f.inner.Color()
+}
+
 // VideoSurface is a decoded frame's platform surface: VideoSurfacePixelBuffer on macOS and iOS.
 // Switch on it with a default case, since new platforms add kinds.
 type VideoSurface interface {

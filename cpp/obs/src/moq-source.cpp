@@ -9,7 +9,11 @@
 #include <moq/moq.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -22,57 +26,23 @@
 #include <variant>
 #include <vector>
 
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#include <CoreVideo/CoreVideo.h>
+#include <IOSurface/IOSurface.h>
+#include <VideoToolbox/VideoToolbox.h>
+#endif
+
 #ifdef _WIN32
 #define strncasecmp _strnicmp
 #endif
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/pixdesc.h>
-#include <libswscale/swscale.h>
-}
 
 #include "moq-implementation.h"
+#include "moq-source-present.h"
 #include "moq-source.h"
 #include "moq-url.h"
 #include "moq-worker.h"
 #include "logger.h"
-
-// Map a catalog video codec string to an FFmpeg codec ID
-static AVCodecID codec_string_to_id(const char *codec, size_t len)
-{
-	if (!codec || len == 0) {
-		return AV_CODEC_ID_NONE;
-	}
-
-	// H.264/AVC
-	if ((len >= 4 && strncasecmp(codec, "h264", 4) == 0) || (len >= 3 && strncasecmp(codec, "avc", 3) == 0)) {
-		return AV_CODEC_ID_H264;
-	}
-
-	// HEVC/H.265
-	if ((len >= 4 && strncasecmp(codec, "hevc", 4) == 0) || (len >= 4 && strncasecmp(codec, "h265", 4) == 0) ||
-	    (len >= 4 && strncasecmp(codec, "hev1", 4) == 0) || (len >= 4 && strncasecmp(codec, "hvc1", 4) == 0)) {
-		return AV_CODEC_ID_HEVC;
-	}
-
-	// VP9
-	if ((len >= 3 && strncasecmp(codec, "vp9", 3) == 0) || (len >= 4 && strncasecmp(codec, "vp09", 4) == 0)) {
-		return AV_CODEC_ID_VP9;
-	}
-
-	// AV1
-	if ((len >= 3 && strncasecmp(codec, "av1", 3) == 0) || (len >= 4 && strncasecmp(codec, "av01", 4) == 0)) {
-		return AV_CODEC_ID_AV1;
-	}
-
-	// VP8
-	if (len >= 3 && strncasecmp(codec, "vp8", 3) == 0) {
-		return AV_CODEC_ID_VP8;
-	}
-
-	return AV_CODEC_ID_NONE;
-}
 
 namespace {
 
@@ -84,33 +54,6 @@ static uint64_t moq_source_nanoseconds(const moq::Timestamp &timestamp)
 {
 	return util_mul_div64(timestamp.value, 1'000'000'000, timestamp.scale);
 }
-
-enum class Decoded { Pending, Ready, Failed };
-// Full: the decoder refused the packet until its pending pictures are taken.
-enum class Sent { Accepted, Full, Failed };
-
-// A track owns its codec and converted output, including while it is only a candidate.
-struct VideoDecoder {
-	AVCodecContext *codec_ctx = nullptr;
-	AVPixelFormat current_pix_fmt = AV_PIX_FMT_NONE;
-	SwsContext *sws_ctx = nullptr;
-	bool got_keyframe = false;
-	// End can precede the old encoder's final packets, whose timestamps are below it.
-	std::optional<uint64_t> end_ns;
-	uint32_t frames_waiting_for_keyframe = 0;
-	uint32_t consecutive_decode_errors = 0;
-	obs_source_frame frame = {};
-	uint8_t *frame_buffer = nullptr;
-
-	~VideoDecoder()
-	{
-		if (sws_ctx)
-			sws_freeContext(sws_ctx);
-		if (codec_ctx)
-			avcodec_free_context(&codec_ctx);
-		bfree(frame_buffer);
-	}
-};
 
 // How a decoded audio rendition reaches OBS: the channel count moq-audio remixes to, the
 // OBS layout that places those channels, and the rate moq-audio resamples to.
@@ -126,6 +69,15 @@ struct AudioSelection {
 	size_t next = 0;
 };
 
+// Same shape as audio: a refusal opens the next rendition instead of stopping.
+struct VideoSelection {
+	std::vector<std::pair<std::string, moq::Video>> candidates;
+	size_t next = 0;
+};
+
+// Codecs moq-video decodes, codecs it will decode later, and everything else.
+enum class VideoSupport { Decode, Deferred, Unknown };
+
 // One subscribed track: what it is, the consumer once subscribed, and the pending
 // call that subscribes or reads its next frame. Dropping it cancels that call.
 struct Track {
@@ -140,13 +92,17 @@ struct Track {
 	// The rendition the decoder was built from.
 	std::optional<moq::Video> video_config;
 	std::optional<moq::Audio> audio_config;
-	std::unique_ptr<VideoDecoder> video_decoder;
 	AudioLayout audio_layout;
 	uint64_t audio_frames = 0;
+	// Ask moq-video to keep the decoder surface. macOS only; a refusal retries on the CPU.
+	bool surface = false;
+	// Set once the first picture of this track has been shown.
+	bool started = false;
 
-	// Video reads encoded frames to decode here; audio reads PCM moq-audio decoded.
-	std::shared_ptr<moq::MediaTrackConsumer> consumer;
+	// Video reads pictures moq-video decoded; audio reads PCM moq-audio decoded.
+	std::shared_ptr<moq::VideoConsumer> video_consumer;
 	std::shared_ptr<moq::AudioConsumer> audio_consumer;
+	std::shared_ptr<VideoSelection> video_selection;
 	std::shared_ptr<AudioSelection> audio_selection;
 	std::optional<moq::Continuation> call;
 };
@@ -201,8 +157,44 @@ struct moq_source {
 	// again. Zero when OBS has no audio output. Set once at create.
 	uint32_t sample_rate = 0;
 
+	// How many video decoders this source has opened. A replacement instance opens one
+	// of its own while the previous instance is still playing.
+	std::atomic<int> video_subscriptions{0};
+
+	// Guards the presentation queue, its stats, and (on macOS) the texture. Take it
+	// only while already holding `mutex`, or from the graphics thread on its own.
+	// Never take `mutex` while holding this.
+	std::mutex present_mutex;
+	PresentQueue present;
+	DelayStats video_delay;
+	std::string video_decoder_name;
+	std::string video_path;
+
 	// Runs every continuation; destroy stops it before freeing the source.
 	MoQWorker worker;
+
+#ifdef __APPLE__
+	struct AppleHeld {
+		PresentItem item;
+		std::shared_ptr<moq::VideoDecodedFrame> frame;
+		CVPixelBufferRef converted = nullptr;
+		std::chrono::steady_clock::time_point arrived{};
+	};
+
+	std::unordered_map<uint64_t, AppleHeld> apple_waiting;
+	std::optional<AppleHeld> apple_showing;
+	std::optional<AppleHeld> apple_retired;
+	// Pictures the worker retired. The graphics thread destroys the texture, then releases these.
+	std::vector<AppleHeld> apple_doomed;
+	gs_texture_t *apple_texture = nullptr;
+	VTPixelTransferSessionRef apple_transfer = nullptr;
+	uint32_t display_width = 0;
+	uint32_t display_height = 0;
+	uint64_t media_base_pts = 0;
+	uint64_t tick_base_ns = 0;
+	uint64_t tick_ns = 0;
+	bool media_clock = false;
+#endif
 };
 
 } // namespace
@@ -230,17 +222,27 @@ static void moq_source_on_state(struct moq_source *ctx, const std::shared_ptr<Co
 static void moq_source_on_catalog(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
 				  moq::expected<std::optional<moq::Catalog>> result);
 static void moq_source_next_catalog(struct moq_source *ctx, const std::shared_ptr<Connection> &conn);
-static std::unique_ptr<VideoDecoder> moq_source_prepare_decoder(const moq::Video &config);
 static void moq_source_clear_video_locked(struct moq_source *ctx);
 static void moq_source_subscribe_video(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
 				       const moq::Catalog &catalog);
+static void moq_source_try_video(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
+				 const std::shared_ptr<VideoSelection> &selection);
+static void moq_source_open_video(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
+				  const std::shared_ptr<Track> &track);
+#ifdef __APPLE__
+static void moq_source_apple_release_frames_locked(struct moq_source *ctx);
+static void moq_source_apple_queue(struct moq_source *ctx, const std::shared_ptr<moq::VideoDecodedFrame> frame);
+static void moq_source_apple_shutdown(struct moq_source *ctx);
+static void moq_source_video_tick(void *data, float seconds);
+static void moq_source_video_render(void *data, gs_effect_t *effect);
+static uint32_t moq_source_get_width(void *data);
+static uint32_t moq_source_get_height(void *data);
+#endif
 static void moq_source_clear_audio_locked(struct moq_source *ctx);
 static void moq_source_subscribe_audio(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
 				       const moq::Catalog &catalog);
 static void moq_source_try_audio(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
 				 const std::shared_ptr<AudioSelection> &selection);
-static Sent moq_source_send_packet(VideoDecoder &decoder, const moq::MediaFrame &frame_data);
-static Decoded moq_source_receive_frame(VideoDecoder &decoder);
 
 // Wraps a continuation so it runs under ctx->mutex, and only while `conn` is still
 // the source's connection. Dropping a connection cancels its calls, but a result
@@ -306,6 +308,13 @@ static void moq_source_destroy(void *data)
 	// once it returns.
 	ctx->worker.Stop();
 
+#ifdef __APPLE__
+	// The texture belongs to the graphics thread. Shutdown destroys it, then the frames.
+	obs_enter_graphics();
+	moq_source_apple_shutdown(ctx);
+	obs_leave_graphics();
+#endif
+
 	delete ctx;
 }
 
@@ -356,9 +365,23 @@ static void moq_source_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "quic_keylog", false);
 }
 
+static std::string moq_source_video_stats_locked(struct moq_source *ctx)
+{
+	std::string text = ctx->video_decoder_name.empty() ? "waiting" : ctx->video_decoder_name;
+	if (!ctx->video_path.empty())
+		text += " / " + ctx->video_path;
+	if (!ctx->present.fallback().empty())
+		text += " / " + ctx->present.fallback();
+	if (auto p50 = ctx->video_delay.p50())
+		text += " / p50 " + std::to_string(*p50 / 1000000) + " ms";
+	if (auto p95 = ctx->video_delay.p95())
+		text += " / p95 " + std::to_string(*p95 / 1000000) + " ms";
+	return text;
+}
+
 static obs_properties_t *moq_source_properties(void *data)
 {
-	UNUSED_PARAMETER(data);
+	auto *ctx = static_cast<struct moq_source *>(data);
 
 	obs_properties_t *props = obs_properties_create();
 
@@ -367,6 +390,14 @@ static obs_properties_t *moq_source_properties(void *data)
 	// Writes TLS session secrets to the file SSLKEYLOGFILE names, to decrypt a packet
 	// capture; without SSLKEYLOGFILE the dial fails.
 	obs_properties_add_bool(props, "quic_keylog", "TLS key log");
+	// OBS copies this label when the dialog opens. It names the decoder, the path
+	// (CPU or GPU), a fallback reason, and the handoff delay.
+	std::string stats = "waiting";
+	if (ctx) {
+		std::lock_guard<std::mutex> present(ctx->present_mutex);
+		stats = moq_source_video_stats_locked(ctx);
+	}
+	obs_properties_add_text(props, "video_stats", stats.c_str(), OBS_TEXT_INFO);
 
 	return props;
 }
@@ -632,14 +663,14 @@ moq_source_candidates(std::vector<const CatalogEntry<Rendition> *> ranked)
 	return ranked;
 }
 
-static void moq_source_on_subscribed(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
-				     const std::shared_ptr<Track> &track,
-				     moq::expected<std::shared_ptr<moq::MediaTrackConsumer>> result);
-static void moq_source_read_track(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
+static void moq_source_on_video_subscribed(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
+					   const std::shared_ptr<Track> &track,
+					   moq::expected<std::shared_ptr<moq::VideoConsumer>> result);
+static void moq_source_read_video(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
 				  const std::shared_ptr<Track> &track);
-static void moq_source_on_frame(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
+static void moq_source_on_video(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
 				const std::shared_ptr<Track> &track,
-				moq::expected<std::optional<moq::MediaRead>> result);
+				moq::expected<std::optional<moq::VideoRead>> result);
 
 // The track, while it is still the connection's current video or audio track.
 static std::shared_ptr<Track> moq_source_track(const Connection &conn, const std::weak_ptr<Track> &weak)
@@ -677,67 +708,197 @@ static void moq_source_discard_candidate(const std::shared_ptr<Connection> &conn
 		conn->pending_audio.reset();
 }
 
-static void moq_source_on_subscribed(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
-				     const std::shared_ptr<Track> &track,
-				     moq::expected<std::shared_ptr<moq::MediaTrackConsumer>> result)
+// moq-video decodes H.264, HEVC, and AV1. VP8 and VP9 are refused here so a later
+// rendition can play; handing them to the decoder would fail the same way, later.
+static VideoSupport moq_source_video_support(const std::string &codec)
+{
+	auto starts = [&](const char *prefix) {
+		const size_t length = std::strlen(prefix);
+		return codec.size() >= length && strncasecmp(codec.c_str(), prefix, length) == 0;
+	};
+	if (starts("h264") || starts("avc"))
+		return VideoSupport::Decode;
+	if (starts("hevc") || starts("h265") || starts("hev1") || starts("hvc1"))
+		return VideoSupport::Decode;
+	if (starts("av01") || starts("av1"))
+		return VideoSupport::Decode;
+	if (starts("vp09") || starts("vp9") || starts("vp8"))
+		return VideoSupport::Deferred;
+	return VideoSupport::Unknown;
+}
+
+static std::optional<PresentColor> moq_source_present_color(const moq::VideoDecodedFrame &frame)
+{
+	const auto color = frame.color();
+	if (!color)
+		return std::nullopt;
+	PresentColor out;
+	switch (color->matrix) {
+	case moq::VideoColorMatrix::kBt601:
+		out.matrix = PresentMatrix::Bt601;
+		break;
+	case moq::VideoColorMatrix::kBt709:
+		out.matrix = PresentMatrix::Bt709;
+		break;
+	case moq::VideoColorMatrix::kBt2020:
+		out.matrix = PresentMatrix::Bt2020;
+		break;
+	default:
+		return std::nullopt;
+	}
+	switch (color->range) {
+	case moq::VideoColorRange::kLimited:
+		out.range = PresentRange::Limited;
+		break;
+	case moq::VideoColorRange::kFull:
+		out.range = PresentRange::Full;
+		break;
+	default:
+		return std::nullopt;
+	}
+	switch (color->transfer) {
+	case moq::VideoColorTransfer::kBt709:
+		out.transfer = PresentTransfer::Bt709;
+		break;
+	case moq::VideoColorTransfer::kPq:
+		out.transfer = PresentTransfer::Pq;
+		break;
+	case moq::VideoColorTransfer::kHlg:
+		out.transfer = PresentTransfer::Hlg;
+		break;
+	default:
+		return std::nullopt;
+	}
+	return out;
+}
+
+// `known` wins. Otherwise the height picks BT.601 or BT.709, both limited.
+static void moq_source_apply_color(obs_source_frame &out, const std::optional<PresentColor> &known, uint32_t height)
+{
+	const PresentOutput mapped = present_output(known, height);
+	enum video_colorspace space = VIDEO_CS_709;
+	switch (mapped.space) {
+	case PresentSpace::Bt601:
+		space = VIDEO_CS_601;
+		break;
+	case PresentSpace::Bt709:
+		space = VIDEO_CS_709;
+		break;
+	case PresentSpace::Pq:
+		space = VIDEO_CS_2100_PQ;
+		break;
+	case PresentSpace::Hlg:
+		space = VIDEO_CS_2100_HLG;
+		break;
+	}
+	const enum video_range_type range = mapped.full_range ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
+	video_format_get_parameters(space, range, out.color_matrix, out.color_range_min, out.color_range_max);
+	out.full_range = mapped.full_range;
+	switch (mapped.transfer) {
+	case PresentTransfer::Pq:
+		out.trc = VIDEO_TRC_PQ;
+		break;
+	case PresentTransfer::Hlg:
+		out.trc = VIDEO_TRC_HLG;
+		break;
+	case PresentTransfer::Bt709:
+		out.trc = VIDEO_TRC_DEFAULT;
+		break;
+	}
+}
+
+// A new track's first picture retires whatever the previous rendition had queued.
+static void moq_source_begin_track(struct moq_source *ctx, const std::shared_ptr<Track> &track)
+{
+	std::lock_guard<std::mutex> present(ctx->present_mutex);
+	if (track->video_consumer)
+		ctx->video_decoder_name = track->video_consumer->name();
+	ctx->present.restart();
+#ifdef __APPLE__
+	moq_source_apple_release_frames_locked(ctx);
+	ctx->display_width = 0;
+	ctx->display_height = 0;
+	ctx->media_clock = false;
+#endif
+}
+
+#ifndef __APPLE__
+// Windows and Linux have no decoder surface OBS can import, so the picture is I420 in
+// the stream's color space. OBS copies it before this returns. The delay sample is the
+// handoff, from this callback to that return: decode already finished inside next().
+static bool moq_source_output_i420(struct moq_source *ctx, const moq::VideoDecodedFrame &frame)
+{
+	const auto arrived = std::chrono::steady_clock::now();
+	auto pixels = frame.pixels(moq::VideoPixelFormat::kI420);
+	const uint32_t width = frame.width();
+	const uint32_t height = frame.height();
+	if (!pixels || width == 0 || height == 0 || (width % 2) != 0 || (height % 2) != 0)
+		return false;
+	const size_t luma = static_cast<size_t>(width) * height;
+	const size_t chroma = static_cast<size_t>(width / 2) * (height / 2);
+	if (pixels->size() < luma + 2 * chroma)
+		return false;
+
+	obs_source_frame out = {};
+	out.data[0] = pixels->data();
+	out.data[1] = pixels->data() + luma;
+	out.data[2] = pixels->data() + luma + chroma;
+	out.linesize[0] = width;
+	out.linesize[1] = width / 2;
+	out.linesize[2] = width / 2;
+	out.width = width;
+	out.height = height;
+	out.timestamp = moq_source_nanoseconds(frame.timestamp());
+	out.format = VIDEO_FORMAT_I420;
+	moq_source_apply_color(out, moq_source_present_color(frame), height);
+	obs_source_output_video(ctx->source, &out);
+
+	std::lock_guard<std::mutex> present(ctx->present_mutex);
+	ctx->video_path = "CPU I420";
+	const auto held = std::chrono::steady_clock::now() - arrived;
+	ctx->video_delay.add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(held).count()));
+	return true;
+}
+#endif
+
+static void moq_source_on_video_subscribed(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
+					   const std::shared_ptr<Track> &track,
+					   moq::expected<std::shared_ptr<moq::VideoConsumer>> result)
 {
 	if (!result) {
 		LOG_ERROR("Failed to subscribe to %s track: %s", track->kind, result.error().to_string().c_str());
+		// A build with no platform surface refuses surface=true. Retry this rendition on the CPU
+		// once, rather than skipping to a different rendition.
+		if (track->surface && std::holds_alternative<moq::Error::kUnsupported>(result.error().get_variant())) {
+			track->surface = false;
+			moq_source_open_video(ctx, conn, track);
+			return;
+		}
 		moq_source_discard_candidate(conn, track);
+		if (std::holds_alternative<moq::Error::kUnsupportedConfig>(result.error().get_variant()))
+			moq_source_try_video(ctx, conn, track->video_selection);
 		return;
 	}
-	track->consumer = *result;
+	track->video_selection.reset();
+	track->video_consumer = *result;
 	LOG_INFO("Subscribed to %s track successfully", track->kind);
-	moq_source_read_track(ctx, conn, track);
+	moq_source_read_video(ctx, conn, track);
 }
 
-// Reads the track one frame at a time into its decoder.
-static void moq_source_read_track(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
+static void moq_source_read_video(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
 				  const std::shared_ptr<Track> &track)
 {
-	track->call = track->consumer->next().then(
-		ctx->worker.Executor(), moq_source_track_current<moq::expected<std::optional<moq::MediaRead>>>(
-						ctx, conn, track, moq_source_on_frame));
+	track->call = track->video_consumer->next().then(
+		ctx->worker.Executor(), moq_source_track_current<moq::expected<std::optional<moq::VideoRead>>>(
+						ctx, conn, track, moq_source_on_video));
 }
 
-// Hands OBS every picture the decoder has ready, in presentation order. False when a
-// picture failed to decode or convert.
-static bool moq_source_output_video(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
-				    const std::shared_ptr<Track> &track)
-{
-	for (;;) {
-		switch (moq_source_receive_frame(*track->video_decoder)) {
-		case Decoded::Pending:
-			return true;
-		case Decoded::Failed:
-			return false;
-		case Decoded::Ready:
-			// Commit only after decode and conversion succeed, under the same lock as output.
-			if (track == conn->pending_video)
-				conn->video = std::move(conn->pending_video);
-			obs_source_output_video(ctx->source, &track->video_decoder->frame);
-			break;
-		}
-	}
-}
-
-// Drain pictures from the old encoder before either kind of boundary.
-static void moq_source_drain_video(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
-				   const std::shared_ptr<Track> &track)
-{
-	AVCodecContext *codec = track->video_decoder->codec_ctx;
-	int ended = avcodec_send_packet(codec, nullptr);
-	if (ended == AVERROR(EAGAIN)) {
-		moq_source_output_video(ctx, conn, track);
-		ended = avcodec_send_packet(codec, nullptr);
-	}
-	if (ended == 0)
-		moq_source_output_video(ctx, conn, track);
-}
-
-static void moq_source_on_frame(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
+// One decoded read. moq-video already reordered it and already flushed the pictures it was
+// holding before a gap, an end, or the track closing, so those are not pictures to show.
+// Closing a candidate that never showed a picture leaves the current rendition playing.
+static void moq_source_on_video(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
 				const std::shared_ptr<Track> &track,
-				moq::expected<std::optional<moq::MediaRead>> result)
+				moq::expected<std::optional<moq::VideoRead>> result)
 {
 	if (!result) {
 		LOG_ERROR("%s track error: %s", track->kind, result.error().to_string().c_str());
@@ -746,50 +907,40 @@ static void moq_source_on_frame(struct moq_source *ctx, const std::shared_ptr<Co
 	}
 	if (!*result) {
 		LOG_DEBUG("%s track closed cleanly", track->kind);
-		// An ended candidate must not replace playback that may still be live.
 		if (track == conn->pending_video && conn->video) {
 			moq_source_discard_candidate(conn, track);
 			return;
 		}
-		// The decoder holds reordered pictures back until it learns the stream ended. Like a
-		// packet, the end is refused while pictures are pending, so take them first.
-		moq_source_drain_video(ctx, conn, track);
 		moq_source_discard_candidate(conn, track);
 		return;
 	}
-	auto &decoder = *track->video_decoder;
-	const auto &variant = (*result)->get_variant();
-	if (const auto *end = std::get_if<moq::MediaRead::kEnd>(&variant)) {
-		decoder.end_ns = moq_source_nanoseconds(end->end);
-		moq_source_read_track(ctx, conn, track);
-		return;
-	}
-	const auto *read = std::get_if<moq::MediaRead::kFrame>(&variant);
-	if (!read || (decoder.end_ns && moq_source_nanoseconds(read->frame.timestamp) >= *decoder.end_ns)) {
-		// A gap loses references immediately. An end does so only at the fresh encoder,
-		// after all old tail packets below its endpoint have entered the decoder.
-		moq_source_drain_video(ctx, conn, track);
-		avcodec_flush_buffers(decoder.codec_ctx);
-		decoder.got_keyframe = false;
-		decoder.end_ns.reset();
-	}
+
+	const auto *read = std::get_if<moq::VideoRead::kFrame>(&(*result)->get_variant());
 	if (!read) {
-		moq_source_read_track(ctx, conn, track);
+		moq_source_read_video(ctx, conn, track);
 		return;
 	}
-	Sent sent = moq_source_send_packet(*track->video_decoder, read->frame);
-	bool drained = true;
-	if (sent == Sent::Full) {
-		// A drain that failed partway left pictures behind; take them so the packet fits.
-		drained = moq_source_output_video(ctx, conn, track);
-		sent = moq_source_send_packet(*track->video_decoder, read->frame);
-	}
-	const bool decoded = sent == Sent::Accepted && moq_source_output_video(ctx, conn, track) && drained;
-	if (!decoded && track == conn->pending_video) {
-		moq_source_discard_candidate(conn, track);
+
+#ifndef __APPLE__
+	if (!moq_source_output_i420(ctx, *read->frame)) {
+		if (!track->started && track == conn->pending_video) {
+			moq_source_discard_candidate(conn, track);
+			return;
+		}
+		moq_source_read_video(ctx, conn, track);
 		return;
 	}
-	moq_source_read_track(ctx, conn, track);
+#endif
+	const bool first = !track->started;
+	if (track == conn->pending_video)
+		conn->video = std::move(conn->pending_video);
+	track->started = true;
+	if (first)
+		moq_source_begin_track(ctx, track);
+#ifdef __APPLE__
+	moq_source_apple_queue(ctx, read->frame);
+#endif
+	moq_source_read_video(ctx, conn, track);
 }
 
 // Stops a failed audio track, leaving a pending replacement to take over.
@@ -966,18 +1117,7 @@ static bool moq_source_same_audio(const Track *track, const std::string &id, con
 	       old.channel_count == config.channel_count && moq_source_same_container(old.container, config.container);
 }
 
-// Subscribes to the rendition (following its broadcast and track), then reads it, each
-// as a call `track` owns, so replacing or dropping the track cancels whichever one is pending.
-static void moq_source_subscribe_track(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
-				       const std::shared_ptr<Track> &track, moq::Rendition rendition)
-{
-	track->call = moq::MediaTrackConsumer::subscribe(conn->consumer, {std::move(rendition)})
-			      .then(ctx->worker.Executor(),
-				    moq_source_track_current<moq::expected<std::shared_ptr<moq::MediaTrackConsumer>>>(
-					    ctx, conn, track, moq_source_on_subscribed));
-}
-
-// Subscribe to the best video rendition FFmpeg can decode. The current track keeps
+// Subscribe to the best video rendition moq-video can decode. The current track keeps
 // playing until a replacement delivers, and for good when no rendition can replace it.
 static void moq_source_subscribe_video(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
 				       const moq::Catalog &catalog)
@@ -990,29 +1130,63 @@ static void moq_source_subscribe_video(struct moq_source *ctx, const std::shared
 		return;
 	}
 
-	for (const auto *rendition : candidates) {
+	auto selection = std::make_shared<VideoSelection>();
+	selection->candidates.reserve(candidates.size());
+	for (const auto *rendition : candidates)
+		selection->candidates.emplace_back(rendition->first, rendition->second);
+	moq_source_try_video(ctx, conn, selection);
+}
+
+static void moq_source_open_video(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
+				  const std::shared_ptr<Track> &track)
+{
+	ctx->video_subscriptions.fetch_add(1, std::memory_order_relaxed);
+	moq::VideoDecoderOutput output{};
+	output.surface = track->surface;
+	track->call = moq::VideoConsumer::subscribe(conn->consumer, track->id, *track->video_config, output)
+			      .then(ctx->worker.Executor(),
+				    moq_source_track_current<moq::expected<std::shared_ptr<moq::VideoConsumer>>>(
+					    ctx, conn, track, moq_source_on_video_subscribed));
+}
+
+static void moq_source_try_video(struct moq_source *ctx, const std::shared_ptr<Connection> &conn,
+				 const std::shared_ptr<VideoSelection> &selection)
+{
+	while (selection->next < selection->candidates.size()) {
+		const auto *rendition = &selection->candidates[selection->next++];
 		const auto &id = rendition->first;
-		if (moq_source_same_video(conn->video.get(), id, rendition->second) &&
-		    conn->video->instance == conn->instance) {
+		const auto &config = rendition->second;
+		if (moq_source_same_video(conn->video.get(), id, config) && conn->video->instance == conn->instance) {
 			conn->pending_video.reset();
 			return;
 		}
-		if (moq_source_same_video(conn->pending_video.get(), id, rendition->second))
+		if (moq_source_same_video(conn->pending_video.get(), id, config)) {
+			if (!conn->pending_video->video_consumer)
+				conn->pending_video->video_selection = selection;
 			return;
-
-		// An undecodable rendition falls through to the next one.
-		auto decoder = moq_source_prepare_decoder(rendition->second);
-		if (!decoder) {
-			LOG_ERROR("Failed to initialize decoder for video rendition %s", id.c_str());
-			continue;
 		}
 
+		switch (moq_source_video_support(config.codec)) {
+		case VideoSupport::Deferred:
+			LOG_ERROR("%s is not decoded by moq-video yet", config.codec.c_str());
+			continue;
+		case VideoSupport::Unknown:
+			LOG_ERROR("Unknown or unsupported codec: '%s'", config.codec.c_str());
+			continue;
+		case VideoSupport::Decode:
+			break;
+		}
+
+		LOG_INFO("Subscribing to video track (%s)", config.codec.c_str());
 		auto track = std::make_shared<Track>("Video", id);
 		track->instance = conn->instance;
-		track->video_config = rendition->second;
-		track->video_decoder = std::move(decoder);
+		track->video_config = config;
+		track->video_selection = selection;
+#ifdef __APPLE__
+		track->surface = true;
+#endif
 		conn->pending_video = track;
-		moq_source_subscribe_track(ctx, conn, track, moq::Rendition::kVideo{id, rendition->second});
+		moq_source_open_video(ctx, conn, track);
 		return;
 	}
 	conn->pending_video.reset();
@@ -1082,7 +1256,7 @@ static void moq_source_try_audio(struct moq_source *ctx, const std::shared_ptr<C
 		output.format = moq::AudioSampleFormat::kF32Planar;
 		output.sample_rate = layout->sample_rate;
 		output.channels = layout->channels;
-		// Follows the rendition's broadcast and track itself, like moq_source_subscribe_track.
+		// Follows the rendition's broadcast and track itself, like moq_source_open_video.
 		track->call =
 			moq::AudioConsumer::subscribe(conn->consumer, id, config, output)
 				.then(ctx->worker.Executor(),
@@ -1116,282 +1290,21 @@ static void moq_source_disconnect_locked(struct moq_source *ctx)
 	ctx->connection.reset();
 }
 
-// Blanks the video preview by outputting a NULL frame
+// Blanks the video preview and retires any picture still queued for the previous rendition.
 static void moq_source_blank_video(struct moq_source *ctx)
 {
-	// Passing NULL to obs_source_output_video clears the current frame
+	// Passing NULL to obs_source_output_video clears the async frame. On macOS the
+	// custom render draws from the queue instead, so that queue is retired too.
 	obs_source_output_video(ctx->source, NULL);
+	std::lock_guard<std::mutex> present(ctx->present_mutex);
+	ctx->present.restart();
+#ifdef __APPLE__
+	moq_source_apple_release_frames_locked(ctx);
+	ctx->display_width = 0;
+	ctx->display_height = 0;
+	ctx->media_clock = false;
+#endif
 	LOG_DEBUG("Video preview blanked");
-}
-
-static std::unique_ptr<VideoDecoder> moq_source_prepare_decoder(const moq::Video &config)
-{
-	// Map codec string to FFmpeg codec ID dynamically
-	AVCodecID codec_id = codec_string_to_id(config.codec.data(), config.codec.size());
-	if (codec_id == AV_CODEC_ID_NONE) {
-		LOG_ERROR("Unknown or unsupported codec: '%s'", config.codec.c_str());
-		return nullptr;
-	}
-
-	// Find decoder for the codec
-	const AVCodec *codec = avcodec_find_decoder(codec_id);
-	if (!codec) {
-		LOG_ERROR("Decoder not found for codec ID: %d", codec_id);
-		return nullptr;
-	}
-
-	auto decoder = std::make_unique<VideoDecoder>();
-	decoder->codec_ctx = avcodec_alloc_context3(codec);
-	if (!decoder->codec_ctx) {
-		LOG_ERROR("Failed to allocate codec context");
-		return nullptr;
-	}
-
-	// Get dimensions from config - required for buffer allocation. Absent means the
-	// catalog didn't declare it; the codec context keeps its own.
-	if (config.coded && config.coded->width > 0) {
-		decoder->codec_ctx->width = (int)config.coded->width;
-	}
-	if (config.coded && config.coded->height > 0) {
-		decoder->codec_ctx->height = (int)config.coded->height;
-	}
-
-	// Use codec description as extradata (contains SPS/PPS for H.264, VPS/SPS/PPS for HEVC, etc.)
-	if (config.description && !config.description->empty()) {
-		const auto &description = *config.description;
-		decoder->codec_ctx->extradata =
-			(uint8_t *)av_mallocz(description.size() + AV_INPUT_BUFFER_PADDING_SIZE);
-		if (decoder->codec_ctx->extradata) {
-			memcpy(decoder->codec_ctx->extradata, description.data(), description.size());
-			decoder->codec_ctx->extradata_size = static_cast<int>(description.size());
-		}
-	}
-
-	// Packets carry the frame's timestamp in OBS's nanoseconds, which the decoder hands back
-	// on the picture it belongs to.
-	decoder->codec_ctx->pkt_timebase = AVRational{1, 1'000'000'000};
-
-	// Open codec
-	if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
-		LOG_ERROR("Failed to open codec");
-		return nullptr;
-	}
-
-	return decoder;
-}
-
-// Feeds one frame to the decoder.
-//
-// NOTE: Caller must hold ctx->mutex when calling this function.
-static Sent moq_source_send_packet(VideoDecoder &decoder, const moq::MediaFrame &frame_data)
-{
-	if (!decoder.codec_ctx)
-		return Sent::Failed;
-
-	// Skip non-keyframes until we get the first one
-	if (!decoder.got_keyframe && !frame_data.keyframe) {
-		decoder.frames_waiting_for_keyframe++;
-		if (decoder.frames_waiting_for_keyframe == 1 || (decoder.frames_waiting_for_keyframe % 30) == 0) {
-			LOG_INFO("Waiting for keyframe... (skipped %u frames so far)",
-				 decoder.frames_waiting_for_keyframe);
-		}
-		return Sent::Accepted;
-	}
-
-	// Mark that we've received a keyframe from the stream
-	if (frame_data.keyframe) {
-		if (!decoder.got_keyframe) {
-			LOG_INFO("Got keyframe after waiting for %u frames, payload_size=%zu",
-				 decoder.frames_waiting_for_keyframe, frame_data.payload.size());
-			// Flush decoder to ensure clean state when starting from keyframe
-			avcodec_flush_buffers(decoder.codec_ctx);
-		}
-		decoder.got_keyframe = true;
-		decoder.frames_waiting_for_keyframe = 0;
-		decoder.consecutive_decode_errors = 0;
-	}
-
-	// Create AVPacket from frame data
-	AVPacket *packet = av_packet_alloc();
-	if (!packet) {
-		return Sent::Failed;
-	}
-
-	packet->data = const_cast<uint8_t *>(frame_data.payload.data());
-	packet->size = static_cast<int>(frame_data.payload.size());
-	// The decoder hands this back on the picture it belongs to. Decode order has no
-	// timestamp of its own here, so dts stays unset.
-	packet->pts = static_cast<int64_t>(moq_source_nanoseconds(frame_data.timestamp));
-
-	// Send packet to decoder
-	int ret = avcodec_send_packet(decoder.codec_ctx, packet);
-	av_packet_free(&packet);
-
-	if (ret < 0) {
-		if (ret != AVERROR(EAGAIN)) {
-			decoder.consecutive_decode_errors++;
-			char errbuf[AV_ERROR_MAX_STRING_SIZE];
-			av_strerror(ret, errbuf, sizeof(errbuf));
-
-			// If too many consecutive errors, flush decoder and wait for next keyframe
-			if (decoder.consecutive_decode_errors >= 5) {
-				LOG_WARNING("Too many send errors (%u), flushing decoder and waiting for keyframe",
-					    decoder.consecutive_decode_errors);
-				avcodec_flush_buffers(decoder.codec_ctx);
-				decoder.got_keyframe = false;
-				decoder.consecutive_decode_errors = 0;
-			} else if (decoder.consecutive_decode_errors == 1) {
-				LOG_ERROR("Error sending packet to decoder: %s", errbuf);
-			}
-		}
-		return ret == AVERROR(EAGAIN) ? Sent::Full : Sent::Failed;
-	}
-	return Sent::Accepted;
-}
-
-// Takes the decoder's next picture into decoder.frame, stamped with that picture's own
-// timestamp: with B-frames it belongs to an earlier packet than the one just sent.
-// Pending once the decoder needs more input or has drained.
-//
-// NOTE: Caller must hold ctx->mutex when calling this function.
-static Decoded moq_source_receive_frame(VideoDecoder &decoder)
-{
-	// Receive decoded frames
-	AVFrame *frame = av_frame_alloc();
-	if (!frame) {
-		return Decoded::Failed;
-	}
-
-	int ret = avcodec_receive_frame(decoder.codec_ctx, frame);
-	if (ret < 0) {
-		const bool done = ret == AVERROR(EAGAIN) || ret == AVERROR_EOF;
-		if (!done) {
-			decoder.consecutive_decode_errors++;
-			char errbuf[AV_ERROR_MAX_STRING_SIZE];
-			av_strerror(ret, errbuf, sizeof(errbuf));
-
-			// If too many consecutive errors, flush decoder and wait for next keyframe
-			if (decoder.consecutive_decode_errors >= 5) {
-				LOG_WARNING("Too many decode errors (%u), flushing decoder and waiting for keyframe",
-					    decoder.consecutive_decode_errors);
-				avcodec_flush_buffers(decoder.codec_ctx);
-				decoder.got_keyframe = false;
-				decoder.consecutive_decode_errors = 0;
-			} else if (decoder.consecutive_decode_errors == 1) {
-				// Only log first error in a sequence
-				LOG_ERROR("Error receiving frame from decoder: %s", errbuf);
-			}
-		}
-		av_frame_free(&frame);
-		return done ? Decoded::Pending : Decoded::Failed;
-	}
-
-	// Successfully decoded a frame - reset error counter
-	decoder.consecutive_decode_errors = 0;
-
-	if (frame->best_effort_timestamp == AV_NOPTS_VALUE) {
-		LOG_ERROR("Decoded video frame has no timestamp");
-		av_frame_free(&frame);
-		return Decoded::Failed;
-	}
-
-	// Check if we need to (re)initialize the scaler - either first frame, dimension change, or pixel format change
-	enum AVPixelFormat decoded_pix_fmt = (enum AVPixelFormat)frame->format;
-	bool dimensions_changed =
-		(frame->width != (int)decoder.frame.width || frame->height != (int)decoder.frame.height);
-	bool pix_fmt_changed = (decoded_pix_fmt != decoder.current_pix_fmt);
-	bool need_reinit = (!decoder.sws_ctx || !decoder.frame_buffer || dimensions_changed || pix_fmt_changed);
-
-	if (need_reinit) {
-		if (dimensions_changed) {
-			LOG_INFO("Decoded frame dimensions changed: %ux%u -> %dx%d", decoder.frame.width,
-				 decoder.frame.height, frame->width, frame->height);
-		}
-		if (pix_fmt_changed) {
-			LOG_INFO("Decoded frame pixel format changed: %d -> %d (%s)", decoder.current_pix_fmt,
-				 decoded_pix_fmt,
-				 av_get_pix_fmt_name(decoded_pix_fmt) ? av_get_pix_fmt_name(decoded_pix_fmt)
-								      : "unknown");
-		}
-
-		// Validate that dimensions are positive and reasonable
-		if (frame->width <= 0 || frame->height <= 0 || frame->width > 16384 || frame->height > 16384) {
-			LOG_ERROR("Invalid decoded frame dimensions: %dx%d", frame->width, frame->height);
-			av_frame_free(&frame);
-			return Decoded::Failed;
-		}
-
-		// Validate pixel format is supported by swscale
-		if (decoded_pix_fmt == AV_PIX_FMT_NONE) {
-			LOG_ERROR("Invalid decoded frame pixel format: %d", decoded_pix_fmt);
-			av_frame_free(&frame);
-			return Decoded::Failed;
-		}
-
-		// Free old sws context
-		if (decoder.sws_ctx) {
-			sws_freeContext(decoder.sws_ctx);
-			decoder.sws_ctx = NULL;
-		}
-
-		// Create new scaling context with the actual pixel format from the decoded frame
-		struct SwsContext *new_sws_ctx = sws_getContext(frame->width, frame->height, decoded_pix_fmt,
-								frame->width, frame->height, AV_PIX_FMT_RGBA,
-								SWS_BILINEAR, NULL, NULL, NULL);
-		if (!new_sws_ctx) {
-			LOG_ERROR("Failed to create scaling context for %dx%d pix_fmt=%d (%s)", frame->width,
-				  frame->height, decoded_pix_fmt,
-				  av_get_pix_fmt_name(decoded_pix_fmt) ? av_get_pix_fmt_name(decoded_pix_fmt)
-								       : "unknown");
-			av_frame_free(&frame);
-			return Decoded::Failed;
-		}
-
-		// Reallocate frame buffer for new dimensions (width * height * 4 for RGBA)
-		size_t new_buffer_size = (size_t)frame->width * (size_t)frame->height * 4;
-		uint8_t *new_frame_buffer = (uint8_t *)bmalloc(new_buffer_size);
-		if (!new_frame_buffer) {
-			LOG_ERROR("Failed to allocate frame buffer for %dx%d (%zu bytes)", frame->width, frame->height,
-				  new_buffer_size);
-			sws_freeContext(new_sws_ctx);
-			av_frame_free(&frame);
-			return Decoded::Failed;
-		}
-
-		// Free old frame buffer
-		if (decoder.frame_buffer) {
-			bfree(decoder.frame_buffer);
-		}
-
-		// Install new state
-		decoder.sws_ctx = new_sws_ctx;
-		decoder.current_pix_fmt = decoded_pix_fmt;
-		decoder.frame_buffer = new_frame_buffer;
-		decoder.frame.width = frame->width;
-		decoder.frame.height = frame->height;
-		decoder.frame.linesize[0] = frame->width * 4;
-		decoder.frame.data[0] = new_frame_buffer;
-
-		LOG_INFO("Scaler initialized for %dx%d pix_fmt=%s", frame->width, frame->height,
-			 av_get_pix_fmt_name(decoded_pix_fmt) ? av_get_pix_fmt_name(decoded_pix_fmt) : "unknown");
-	}
-
-	// Convert YUV420P to RGBA
-	uint8_t *dst_data[4] = {decoder.frame_buffer, NULL, NULL, NULL};
-	int dst_linesize[4] = {static_cast<int>(decoder.frame.width * 4), 0, 0, 0};
-
-	if (sws_scale(decoder.sws_ctx, (const uint8_t *const *)frame->data, frame->linesize, 0, decoder.frame.height,
-		      dst_data, dst_linesize) != static_cast<int>(decoder.frame.height)) {
-		LOG_ERROR("Failed to convert decoded video frame");
-		av_frame_free(&frame);
-		return Decoded::Failed;
-	}
-
-	// Packets already carry the nanoseconds OBS expects.
-	decoder.frame.timestamp = static_cast<uint64_t>(frame->best_effort_timestamp);
-	decoder.frame.format = VIDEO_FORMAT_RGBA;
-	av_frame_free(&frame);
-	return Decoded::Ready;
 }
 
 // NOTE: caller holds ctx->mutex.
@@ -1403,6 +1316,284 @@ static void moq_source_clear_audio_locked(struct moq_source *ctx)
 	}
 }
 
+#ifdef __APPLE__
+static void moq_source_apple_release_held(moq_source::AppleHeld &held)
+{
+	if (held.converted)
+		CVPixelBufferRelease(held.converted);
+	held.converted = nullptr;
+	held.frame.reset();
+}
+
+// Present mutex is held. Safe from any thread: the graphics thread is the one that
+// destroys the texture and then releases what this moved aside.
+static void moq_source_apple_release_frames_locked(struct moq_source *ctx)
+{
+	for (auto &entry : ctx->apple_waiting)
+		ctx->apple_doomed.push_back(std::move(entry.second));
+	ctx->apple_waiting.clear();
+	if (ctx->apple_showing) {
+		ctx->apple_doomed.push_back(std::move(*ctx->apple_showing));
+		ctx->apple_showing.reset();
+	}
+	if (ctx->apple_retired) {
+		ctx->apple_doomed.push_back(std::move(*ctx->apple_retired));
+		ctx->apple_retired.reset();
+	}
+}
+
+static void moq_source_apple_shutdown(struct moq_source *ctx)
+{
+	std::lock_guard<std::mutex> present(ctx->present_mutex);
+	if (ctx->apple_texture)
+		gs_texture_destroy(ctx->apple_texture);
+	ctx->apple_texture = nullptr;
+	if (ctx->apple_transfer)
+		CFRelease(ctx->apple_transfer);
+	ctx->apple_transfer = nullptr;
+	moq_source_apple_release_frames_locked(ctx);
+	for (auto &held : ctx->apple_doomed)
+		moq_source_apple_release_held(held);
+	ctx->apple_doomed.clear();
+}
+
+static uint64_t moq_source_media_now_locked(const struct moq_source *ctx)
+{
+	if (!ctx->media_clock || ctx->tick_ns < ctx->tick_base_ns)
+		return ctx->media_clock ? ctx->media_base_pts : 0;
+	return ctx->media_base_pts + (ctx->tick_ns - ctx->tick_base_ns);
+}
+
+static void moq_source_apple_queue(struct moq_source *ctx, std::shared_ptr<moq::VideoDecodedFrame> frame)
+{
+	std::lock_guard<std::mutex> present(ctx->present_mutex);
+	PresentItem item;
+	item.generation = ctx->present.generation();
+	item.timestamp = moq_source_nanoseconds(frame->timestamp());
+	item.width = frame->width();
+	item.height = frame->height();
+	std::vector<PresentItem> dropped;
+	const uint64_t id = ctx->present.push(item, dropped);
+	for (const auto &late : dropped) {
+		auto it = ctx->apple_waiting.find(late.id);
+		if (it == ctx->apple_waiting.end())
+			continue;
+		moq_source_apple_release_held(it->second);
+		ctx->apple_waiting.erase(it);
+	}
+	if (!id)
+		return;
+	if (!ctx->media_clock) {
+		ctx->media_base_pts = item.timestamp;
+		ctx->tick_base_ns = ctx->tick_ns;
+		ctx->media_clock = true;
+	}
+	ctx->display_width = item.width;
+	ctx->display_height = item.height;
+	moq_source::AppleHeld held;
+	held.item = item;
+	held.item.id = id;
+	held.frame = std::move(frame);
+	held.arrived = std::chrono::steady_clock::now();
+	ctx->apple_waiting.emplace(id, std::move(held));
+}
+
+static void moq_source_apple_fail_locked(struct moq_source *ctx, const char *reason, uint32_t width, uint32_t height)
+{
+	if (ctx->apple_texture) {
+		gs_texture_destroy(ctx->apple_texture);
+		ctx->apple_texture = nullptr;
+	}
+	if (!ctx->present.gpu_blocked(width, height))
+		LOG_INFO("Video delivery fell back: %s", reason);
+	ctx->present.fail_gpu(reason, width, height);
+	ctx->video_path = "CPU RGBA";
+}
+
+static bool moq_source_apple_upload_locked(struct moq_source *ctx, moq_source::AppleHeld &held)
+{
+	if (!held.frame)
+		return false;
+	auto pixels = held.frame->pixels(moq::VideoPixelFormat::kRgba);
+	const uint32_t width = held.item.width;
+	const uint32_t height = held.item.height;
+	if (!pixels || pixels->size() < static_cast<size_t>(width) * height * 4)
+		return false;
+	const uint8_t *plane = pixels->data();
+	if (ctx->apple_texture)
+		gs_texture_destroy(ctx->apple_texture);
+	ctx->apple_texture = gs_texture_create(width, height, GS_RGBA, 1, &plane, 0);
+	held.frame.reset();
+	ctx->video_path = "CPU RGBA";
+	return ctx->apple_texture != nullptr;
+}
+
+// Copy a non-BGRA decoder buffer into an IOSurface-backed BGRA buffer. The source
+// frame can be released once this returns; `dst` is owned by the caller.
+static CVPixelBufferRef moq_source_apple_transfer_locked(struct moq_source *ctx, CVPixelBufferRef src, uint32_t width,
+							 uint32_t height)
+{
+	if (!ctx->apple_transfer && VTPixelTransferSessionCreate(kCFAllocatorDefault, &ctx->apple_transfer) != noErr)
+		return nullptr;
+	CFMutableDictionaryRef io_props = CFDictionaryCreateMutable(
+		kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	const void *keys[] = {kCVPixelBufferIOSurfacePropertiesKey};
+	const void *values[] = {io_props};
+	CFDictionaryRef attrs = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
+						   &kCFTypeDictionaryValueCallBacks);
+	CVPixelBufferRef dst = nullptr;
+	const CVReturn created =
+		CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &dst);
+	CFRelease(attrs);
+	CFRelease(io_props);
+	if (created != kCVReturnSuccess || !dst)
+		return nullptr;
+	if (VTPixelTransferSessionTransferImage(ctx->apple_transfer, src, dst) != noErr) {
+		CVPixelBufferRelease(dst);
+		return nullptr;
+	}
+	return dst;
+}
+
+static bool moq_source_apple_bind_locked(struct moq_source *ctx, moq_source::AppleHeld &held)
+{
+	const uint32_t width = held.item.width;
+	const uint32_t height = held.item.height;
+	if (ctx->present.gpu_blocked(width, height))
+		return moq_source_apple_upload_locked(ctx, held);
+
+	CVPixelBufferRef buffer = nullptr;
+	bool borrowed = false;
+	if (held.frame) {
+		if (const auto surface = held.frame->surface()) {
+			if (const auto *pixel = std::get_if<moq::VideoSurface::kPixelBuffer>(&surface->get_variant())) {
+				auto *src = reinterpret_cast<CVPixelBufferRef>(static_cast<uintptr_t>(pixel->pointer));
+				if (src && CVPixelBufferGetPixelFormatType(src) == kCVPixelFormatType_32BGRA) {
+					buffer = src;
+					borrowed = true;
+				} else if (src) {
+					buffer = moq_source_apple_transfer_locked(ctx, src, width, height);
+					if (buffer)
+						held.converted = buffer;
+				}
+			}
+		}
+	} else {
+		buffer = held.converted;
+	}
+	if (!buffer) {
+		moq_source_apple_fail_locked(ctx, "no decoder surface", width, height);
+		return moq_source_apple_upload_locked(ctx, held);
+	}
+	IOSurfaceRef io = CVPixelBufferGetIOSurface(buffer);
+	if (!io) {
+		moq_source_apple_fail_locked(ctx, "IOSurface missing", width, height);
+		return moq_source_apple_upload_locked(ctx, held);
+	}
+	if (ctx->apple_texture && !gs_texture_rebind_iosurface(ctx->apple_texture, io)) {
+		gs_texture_destroy(ctx->apple_texture);
+		ctx->apple_texture = nullptr;
+	}
+	if (!ctx->apple_texture)
+		ctx->apple_texture = gs_texture_create_from_iosurface(io);
+	if (!ctx->apple_texture) {
+		moq_source_apple_fail_locked(ctx, "OBS texture import failed", width, height);
+		return moq_source_apple_upload_locked(ctx, held);
+	}
+	ctx->video_path = "GPU IOSurface";
+	// The transfer owns its BGRA buffer now, so the decoder surface can go back.
+	if (!borrowed)
+		held.frame.reset();
+	return true;
+}
+
+// Graphics thread, present mutex held. Releases the picture that stopped being sampled
+// on the previous tick, then shows the newest picture due at the media clock.
+static void moq_source_apple_sample_locked(struct moq_source *ctx)
+{
+	if (!ctx->apple_doomed.empty()) {
+		if (ctx->apple_texture) {
+			gs_texture_destroy(ctx->apple_texture);
+			ctx->apple_texture = nullptr;
+		}
+		for (auto &held : ctx->apple_doomed)
+			moq_source_apple_release_held(held);
+		ctx->apple_doomed.clear();
+	}
+	if (ctx->apple_retired) {
+		moq_source_apple_release_held(*ctx->apple_retired);
+		ctx->apple_retired.reset();
+	}
+
+	const auto selection = ctx->present.select(moq_source_media_now_locked(ctx));
+	for (const auto &late : selection.dropped) {
+		auto it = ctx->apple_waiting.find(late.id);
+		if (it == ctx->apple_waiting.end())
+			continue;
+		moq_source_apple_release_held(it->second);
+		ctx->apple_waiting.erase(it);
+	}
+	if (selection.retire && ctx->apple_showing && ctx->apple_showing->item.id == selection.retire->id) {
+		ctx->apple_retired = std::move(*ctx->apple_showing);
+		ctx->apple_showing.reset();
+	}
+	if (!selection.changed || !selection.show)
+		return;
+	auto it = ctx->apple_waiting.find(selection.show->id);
+	if (it == ctx->apple_waiting.end())
+		return;
+	ctx->apple_showing = std::move(it->second);
+	ctx->apple_waiting.erase(it);
+	moq_source_apple_bind_locked(ctx, *ctx->apple_showing);
+	const auto held = std::chrono::steady_clock::now() - ctx->apple_showing->arrived;
+	ctx->video_delay.add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(held).count()));
+	ctx->display_width = ctx->apple_showing->item.width;
+	ctx->display_height = ctx->apple_showing->item.height;
+}
+
+static void moq_source_video_tick(void *data, float seconds)
+{
+	auto *ctx = static_cast<struct moq_source *>(data);
+	std::lock_guard<std::mutex> present(ctx->present_mutex);
+	if (seconds > 0.f)
+		ctx->tick_ns += static_cast<uint64_t>(static_cast<double>(seconds) * 1000000000.0);
+	moq_source_apple_sample_locked(ctx);
+}
+
+static void moq_source_video_render(void *data, gs_effect_t *effect)
+{
+	UNUSED_PARAMETER(effect);
+	auto *ctx = static_cast<struct moq_source *>(data);
+	std::lock_guard<std::mutex> present(ctx->present_mutex);
+	if (!ctx->apple_showing || ctx->apple_showing->item.generation != ctx->present.generation() ||
+	    !ctx->apple_texture)
+		return;
+	gs_effect_t *draw = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	gs_eparam_t *image = draw ? gs_effect_get_param_by_name(draw, "image") : nullptr;
+	if (!image)
+		return;
+	gs_effect_set_texture(image, ctx->apple_texture);
+	const uint32_t width = ctx->apple_showing->item.width;
+	const uint32_t height = ctx->apple_showing->item.height;
+	while (gs_effect_loop(draw, "Draw"))
+		gs_draw_sprite(ctx->apple_texture, 0, width, height);
+}
+
+static uint32_t moq_source_get_width(void *data)
+{
+	auto *ctx = static_cast<struct moq_source *>(data);
+	std::lock_guard<std::mutex> present(ctx->present_mutex);
+	return ctx->display_width;
+}
+
+static uint32_t moq_source_get_height(void *data)
+{
+	auto *ctx = static_cast<struct moq_source *>(data);
+	std::lock_guard<std::mutex> present(ctx->present_mutex);
+	return ctx->display_height;
+}
+#endif
+
 // Registration function
 void register_moq_source()
 {
@@ -1410,6 +1601,15 @@ void register_moq_source()
 	info.id = "moq_source";
 	info.type = OBS_SOURCE_TYPE_INPUT;
 	info.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE;
+#ifdef __APPLE__
+	// A custom render replaces the async draw, so macOS draws both the IOSurface and
+	// the CPU fallback itself. Other platforms leave this unset and stay on async I420.
+	info.output_flags |= OBS_SOURCE_CUSTOM_DRAW;
+	info.video_tick = moq_source_video_tick;
+	info.video_render = moq_source_video_render;
+	info.get_width = moq_source_get_width;
+	info.get_height = moq_source_get_height;
+#endif
 	info.get_name = [](void *) -> const char * {
 		return "Moq Source (MoQ)";
 	};

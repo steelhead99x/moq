@@ -7,8 +7,8 @@ set -euo pipefail
 #
 # The required toolchain must already be on PATH; this script only drives
 # CMake. Per platform:
-#   Linux   - run inside `nix develop` (provides cmake/ninja/obs-studio/qt6/ffmpeg)
-#   macOS   - full Xcode, run OUTSIDE nix (libobs/Qt6/ffmpeg all come from the
+#   Linux   - run inside `nix develop` (provides cmake/ninja/obs-studio/qt6)
+#   macOS   - full Xcode, run OUTSIDE nix (libobs/Qt6 come from the
 #             obs-deps bundle downloaded by buildspec.json at configure time)
 #   Windows - Visual Studio 2022; run from Git Bash with cmake on PATH
 #             (libobs/Qt6 downloaded by buildspec.json)

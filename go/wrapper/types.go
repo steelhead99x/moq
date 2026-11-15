@@ -79,6 +79,8 @@ type (
 	VideoCodec = ffi.MoqVideoCodec
 	// VideoPixelFormat is a CPU pixel layout (I420 or RGBA): written to video.Producer, or read from a VideoDecodedFrame.
 	VideoPixelFormat = ffi.MoqVideoPixelFormat
+	// VideoColor is the color space a decoded picture named, when the stream named one.
+	VideoColor = ffi.MoqVideoColor
 	// VideoEncoderInput declares the pixel layout, resolution, and framerate of frames written to a video producer.
 	VideoEncoderInput = ffi.MoqVideoEncoderInput
 	// VideoEncoderOutput configures the video codec, bitrate, keyframe interval, and backend preference.

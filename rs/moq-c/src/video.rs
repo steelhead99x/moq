@@ -199,8 +199,10 @@ pub struct moq_video_decoder_output {
 ///
 /// The pixel layout is what [`moq_video_decoder_output`]'s `format` asked
 /// for: I420 is the Y plane (`width * height`), then U, then V (`width/2 *
-/// height/2` each), no row padding, BT.601 limited range; RGBA is tightly
-/// packed `width * height * 4` bytes, no row padding.
+/// height/2` each), no row padding, still in the stream's color space; RGBA is
+/// tightly packed `width * height * 4` bytes, no row padding. The space is
+/// [`moq_decode_video_color`], and it is unspecified when that call reports
+/// `known` false.
 ///
 /// The read id owns the decoded picture, and the pixels are produced from it
 /// on the first [`moq_decode_video_read`] call for that id. `data` stays valid
@@ -224,6 +226,63 @@ pub struct moq_video_frame {
 	/// belongs to the decoder's pool, valid until the read is freed, so keep the read until
 	/// every GPU command reading the surface has completed.
 	pub surface: *const c_void,
+}
+
+/// The color space of one decoded picture, from [`moq_decode_video_color`].
+///
+/// `known` is false when the stream left the space unspecified, or this read is
+/// not a frame. The other fields are then zero. A player guesses BT.601 limited
+/// at or below 576 lines and BT.709 limited above that.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct moq_video_color {
+	/// Nonzero when `matrix`, `range`, `primaries`, and `transfer` are set.
+	pub known: bool,
+	/// 1 is BT.601, 2 is BT.709, 3 is BT.2020.
+	pub matrix: u32,
+	/// 1 is limited (studio) swing, 2 is full swing.
+	pub range: u32,
+	/// 1 is SMPTE 170M, 2 is BT.470 B/G, 3 is BT.709, 4 is BT.2020.
+	pub primaries: u32,
+	/// 1 is BT.709, 2 is PQ, 3 is HLG.
+	pub transfer: u32,
+}
+
+fn video_color(color: Option<moq_video::Color>) -> moq_video_color {
+	use moq_video::color::{Matrix, Primaries, Range, Transfer};
+	let Some(color) = color else {
+		return moq_video_color::default();
+	};
+	let matrix = match color.matrix {
+		Matrix::Bt601 => 1,
+		Matrix::Bt709 => 2,
+		Matrix::Bt2020 => 3,
+		_ => return moq_video_color::default(),
+	};
+	let range = match color.range {
+		Range::Limited => 1,
+		Range::Full => 2,
+	};
+	let primaries = match color.primaries {
+		Primaries::Smpte170m => 1,
+		Primaries::Bt470bg => 2,
+		Primaries::Bt709 => 3,
+		Primaries::Bt2020 => 4,
+		_ => return moq_video_color::default(),
+	};
+	let transfer = match color.transfer {
+		Transfer::Bt709 => 1,
+		Transfer::Pq => 2,
+		Transfer::Hlg => 3,
+		_ => return moq_video_color::default(),
+	};
+	moq_video_color {
+		known: true,
+		matrix,
+		range,
+		primaries,
+		transfer,
+	}
 }
 
 /// One read from [`moq_decode_video`]: a decoded picture, or a break between them.
@@ -1442,6 +1501,29 @@ pub unsafe extern "C" fn moq_decode_video_read(id: u32, dst: *mut moq_video_read
 	})
 }
 
+/// Write the color space of read `id` into `dst`.
+///
+/// `known` is false for a gap or an end, and for a frame whose bitstream left
+/// the space unspecified. The id stays allocated; free it with
+/// [`moq_decode_video_read_free`].
+///
+/// # Safety
+/// - `dst` must point to a writable [`moq_video_color`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moq_decode_video_color(id: u32, dst: *mut moq_video_color) -> i32 {
+	ffi::enter(move || {
+		let id = ffi::parse_id(id)?;
+		let dst = unsafe { dst.as_mut() }.ok_or(Error::InvalidPointer)?;
+		let read = State::lock().video.read(id)?;
+		let color = match &read {
+			Read::Frame(frame) => frame.frame.surface.color(),
+			_ => None,
+		};
+		*dst = video_color(color);
+		Ok(())
+	})
+}
+
 /// Free a read previously delivered through the decode callback, releasing a
 /// frame's decoded picture back to the decoder. Required for every delivered read
 /// id; closing the parent consumer is not enough, and a decoder whose frames are
@@ -1457,6 +1539,17 @@ pub extern "C" fn moq_decode_video_read_free(id: u32) -> i32 {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn video_color_reports_a_named_space_and_omits_an_unknown_one() {
+		let named = video_color(Some(moq_video::Color::BT709));
+		assert!(named.known);
+		assert_eq!(named.matrix, 2);
+		assert_eq!(named.range, 1);
+		assert_eq!(named.primaries, 3);
+		assert_eq!(named.transfer, 1);
+		assert_eq!(video_color(None), moq_video_color::default());
+	}
 
 	/// A video track wired up without an encoder, plus a subscriber on it: enough
 	/// to pin what [`finalize`] shows the far end.

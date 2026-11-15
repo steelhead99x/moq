@@ -21,6 +21,8 @@ MoQ Source plays the best enabled audio and video rendition it can decode and pl
 
 The source plays Opus, AAC-LC (mono or stereo), and PCM audio. A channel count names its speakers by the WAVE convention: 1, 2, 3 (2.1), 6 (5.1), and 8 (7.1) play on the matching OBS layout, while quad and 5.0 are upmixed to 5.1 and 6.1 to 7.1, which OBS lacks. Other counts are refused.
 
+Video is decoded by moq-video: H.264, HEVC, and AV1. VP8 and VP9 are refused, and the next rendition is tried. On macOS the picture stays on the VideoToolbox surface and is drawn from an IOSurface when that import works; a failed import stays on the CPU for that size until the size changes or the source restarts. Windows and Linux hand OBS I420 in the stream's color space. The source properties name the decoder, whether delivery is the GPU surface or the CPU, a fallback reason, and the delay from the decoded picture being ready to OBS taking it.
+
 Enter a relay URL explicitly. On the shared anonymous relay, use a unique path
 such as `https://cdn.moq.dev/anon/your-stream`. A URL with `?jwt=` fills the
 token field. Editing the token while live presents the new one without

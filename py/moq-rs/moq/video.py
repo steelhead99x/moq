@@ -189,6 +189,10 @@ class Consumer(_Stream[Read]):
         """Cancel the subscription and stop delivering video frames."""
         self._inner.cancel()
 
+    def name(self) -> str:
+        """The decoder backend, for example ``openh264`` or ``videotoolbox``."""
+        return self._inner.name()
+
 
 class Encoder:
     """Encode raw pictures without publishing them."""

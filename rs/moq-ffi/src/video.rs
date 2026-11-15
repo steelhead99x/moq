@@ -1114,6 +1114,96 @@ pub struct MoqVideoDecoderOutput {
 	pub start: Option<crate::media::MoqDecodeStart>,
 }
 
+/// The matrix between RGB and Y'CbCr.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MoqVideoColorMatrix {
+	/// BT.601, the standard-definition matrix.
+	Bt601,
+	/// BT.709, the high-definition matrix.
+	Bt709,
+	/// BT.2020 non-constant luminance.
+	Bt2020,
+}
+
+/// The numeric range of the samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MoqVideoColorRange {
+	/// Studio swing: 8-bit luma spans 16..235.
+	Limited,
+	/// Full swing: every 8-bit code is used.
+	Full,
+}
+
+/// The chromaticities of the RGB primaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MoqVideoColorPrimaries {
+	/// SMPTE 170M, the 525-line BT.601 primaries.
+	Smpte170m,
+	/// BT.470 System B/G, the 625-line BT.601 primaries.
+	Bt470bg,
+	/// BT.709, which sRGB shares.
+	Bt709,
+	/// BT.2020.
+	Bt2020,
+}
+
+/// The curve between linear light and the coded values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MoqVideoColorTransfer {
+	/// The SDR curve BT.709 defines.
+	Bt709,
+	/// SMPTE ST 2084 perceptual quantizer.
+	Pq,
+	/// ARIB STD-B67 hybrid log-gamma.
+	Hlg,
+}
+
+/// The color space a decoded picture's samples are in, when the stream named one.
+///
+/// Absent from [`MoqVideoDecodedFrame::color`] means the bitstream left it
+/// unspecified. Players then guess BT.601 limited at or below 576 lines and
+/// BT.709 limited above that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct MoqVideoColor {
+	/// The matrix between RGB and Y'CbCr.
+	pub matrix: MoqVideoColorMatrix,
+	/// The numeric range of the samples.
+	pub range: MoqVideoColorRange,
+	/// The chromaticities of the RGB primaries.
+	pub primaries: MoqVideoColorPrimaries,
+	/// The curve between linear light and the coded values.
+	pub transfer: MoqVideoColorTransfer,
+}
+
+fn video_color(color: moq_video::Color) -> Option<MoqVideoColor> {
+	use moq_video::color::{Matrix, Primaries, Range, Transfer};
+	Some(MoqVideoColor {
+		matrix: match color.matrix {
+			Matrix::Bt601 => MoqVideoColorMatrix::Bt601,
+			Matrix::Bt709 => MoqVideoColorMatrix::Bt709,
+			Matrix::Bt2020 => MoqVideoColorMatrix::Bt2020,
+			_ => return None,
+		},
+		range: match color.range {
+			Range::Limited => MoqVideoColorRange::Limited,
+			Range::Full => MoqVideoColorRange::Full,
+		},
+		primaries: match color.primaries {
+			Primaries::Smpte170m => MoqVideoColorPrimaries::Smpte170m,
+			Primaries::Bt470bg => MoqVideoColorPrimaries::Bt470bg,
+			Primaries::Bt709 => MoqVideoColorPrimaries::Bt709,
+			Primaries::Bt2020 => MoqVideoColorPrimaries::Bt2020,
+			_ => return None,
+		},
+		transfer: match color.transfer {
+			Transfer::Bt709 => MoqVideoColorTransfer::Bt709,
+			Transfer::Pq => MoqVideoColorTransfer::Pq,
+			Transfer::Hlg => MoqVideoColorTransfer::Hlg,
+			_ => return None,
+		},
+	})
+}
+
 /// A borrowed platform handle to a decoded frame's surface, from
 /// [`MoqVideoDecodedFrame::surface`].
 ///
@@ -1177,6 +1267,15 @@ impl MoqVideoDecodedFrame {
 		.map_err(|err| MoqError::Codec {
 			reason: err.to_string(),
 		})
+	}
+
+	/// The color space these samples are in, when the stream named one.
+	///
+	/// `None` means the bitstream left it unspecified, not that the samples are
+	/// colorless. Guess from the picture height then: BT.601 limited at or below
+	/// 576 lines, BT.709 limited above that.
+	pub fn color(&self) -> Option<MoqVideoColor> {
+		self.frame.surface.color().and_then(video_color)
 	}
 
 	/// A borrowed handle to the decoder's surface, or `None` when the frame is
@@ -1255,6 +1354,8 @@ impl VideoConsumerInner {
 #[derive(uniffi::Object)]
 pub struct MoqVideoConsumer {
 	task: crate::ffi::Task<VideoConsumerInner>,
+	/// Decoder backend name, captured when the consumer opens.
+	name: String,
 }
 
 #[uniffi::export]
@@ -1270,6 +1371,11 @@ impl MoqVideoConsumer {
 	/// Frames already returned stay valid until they are released.
 	pub fn cancel(&self) {
 		self.task.cancel();
+	}
+
+	/// The decoder backend in use, such as `"openh264"` or `"videotoolbox"`.
+	pub fn name(&self) -> String {
+		self.name.clone()
 	}
 }
 
@@ -1376,7 +1482,9 @@ impl MoqVideoConsumer {
 			.watch(async { Ok(moq_video::decode::Consumer::new(&resolved, &cfg, id, options).await?) })
 			.await?;
 
+		let name = consumer.name().to_owned();
 		Ok(Arc::new(MoqVideoConsumer {
+			name,
 			task: crate::ffi::Task::new(VideoConsumerInner { consumer }).supervised(broadcast.driver.clone()),
 		}))
 	}
@@ -1444,6 +1552,34 @@ mod decode_tests {
 	fn video_config_rejects_an_unknown_codec() {
 		let error = video_config(catalog_video("nope")).unwrap_err();
 		assert!(matches!(error, MoqError::UnsupportedConfig { .. }));
+	}
+
+	fn picture(color: Option<moq_video::Color>) -> MoqVideoDecodedFrame {
+		let size = moq_video::Size::new(64, 64);
+		let mut i420 = moq_video::I420::new(size, vec![0; moq_video::I420::len(size).unwrap()]).unwrap();
+		if let Some(color) = color {
+			i420 = i420.with_color(color);
+		}
+		MoqVideoDecodedFrame {
+			frame: moq_video::Frame::new(
+				moq_video::Surface::I420(i420),
+				moq_net::Timestamp::from_micros(0).unwrap(),
+			),
+		}
+	}
+
+	#[test]
+	fn decoded_frame_reports_a_named_color() {
+		let color = picture(Some(moq_video::Color::BT709)).color().unwrap();
+		assert_eq!(color.matrix, MoqVideoColorMatrix::Bt709);
+		assert_eq!(color.range, MoqVideoColorRange::Limited);
+		assert_eq!(color.primaries, MoqVideoColorPrimaries::Bt709);
+		assert_eq!(color.transfer, MoqVideoColorTransfer::Bt709);
+	}
+
+	#[test]
+	fn decoded_frame_omits_an_unnamed_color() {
+		assert!(picture(None).color().is_none());
 	}
 }
 
