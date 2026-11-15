@@ -103,7 +103,13 @@ fn documents() {
 	type Parse = fn(Value) -> Result<(), String>;
 	let parsers: [(&str, Vec<Case>, Parse); 3] = [
 		("jwk", corpus.jwk, |jwk| {
-			Key::from_str(&jwk.to_string()).map(drop).map_err(|err| err.to_string())
+			// A string case is the raw document, so a repeated member is not collapsed
+			// by the corpus parser before the key parser sees it.
+			let text = match jwk {
+				Value::String(raw) => raw,
+				other => other.to_string(),
+			};
+			Key::from_str(&text).map(drop).map_err(|err| err.to_string())
 		}),
 		("sets", corpus.sets, |jwks| {
 			KeySet::from_str(&jwks.to_string())

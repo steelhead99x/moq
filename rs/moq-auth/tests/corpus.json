@@ -329,6 +329,38 @@
 				"d": ""
 			},
 			"valid": false
+		},
+		{
+			"name": "duplicate_member",
+			"jwk": "{\"kty\":\"oct\",\"alg\":\"HS256\",\"k\":\"c2hvcnQ\",\"k\":\"Fp8kipWUJeUFqeSqWym_tRC_tyI8z-QpqopIGrbrD68\"}",
+			"valid": false
+		},
+		{
+			"name": "nonzero_trailing_bits",
+			"jwk": {
+				"kty": "oct",
+				"alg": "HS256",
+				"k": "Fp8kipWUJeUFqeSqWym_tRC_tyI8z-QpqopIGrbrD69="
+			},
+			"valid": false
+		},
+		{
+			"name": "whitespace_in_a_key_field",
+			"jwk": {
+				"kty": "oct",
+				"alg": "HS256",
+				"k": " Fp8kipWUJeUFqeSqWym_tRC_tyI8z-QpqopIGrbrD68"
+			},
+			"valid": false
+		},
+		{
+			"name": "standard_alphabet",
+			"jwk": {
+				"kty": "oct",
+				"alg": "HS256",
+				"k": "Fp8kipWUJeUFqeSqWym/tRC/tyI8z+QpqopIGrbrD68"
+			},
+			"valid": false
 		}
 	],
 	"sets": [

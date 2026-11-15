@@ -18,6 +18,15 @@ test("parse - parses a JWKS", async () => {
 	expect(KeySet.find(loaded, "nope")).toBeUndefined();
 });
 
+test("parse - refuses a repeated member", () => {
+	const key = JSON.stringify({
+		kty: "oct",
+		alg: "HS256",
+		k: "Fp8kipWUJeUFqeSqWym_tRC_tyI8z-QpqopIGrbrD68",
+	});
+	expect(() => KeySet.parse(`{"keys":[${key}],"keys":[${key}]}`)).toThrow(/duplicate member/);
+});
+
 test("parse - rejects invalid JSON and invalid keys", () => {
 	expect(() => KeySet.parse("not json")).toThrow(/invalid JSON/);
 	expect(() => KeySet.parse(`{"keys":[{"kty":"oct","alg":"HS256"}]}`)).toThrow(/Failed to validate JWKS/);

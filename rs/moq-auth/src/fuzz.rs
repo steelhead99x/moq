@@ -339,7 +339,12 @@ pub fn seeds() -> Vec<Seed> {
 		push("jwk", 0, &jwk.to_string());
 	}
 	for case in corpus["jwk"].as_array().expect("jwk cases") {
-		push("jwk", 0, &case["jwk"].to_string());
+		// A string case is the raw document. Value::to_string would quote it.
+		let text = match &case["jwk"] {
+			Value::String(raw) => raw.clone(),
+			other => other.to_string(),
+		};
+		push("jwk", 0, &text);
 	}
 	for case in corpus["sets"].as_array().expect("set cases") {
 		push("jwk", 1, &case["jwks"].to_string());

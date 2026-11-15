@@ -3,6 +3,7 @@ import * as jose from "jose";
 import * as z from "zod/mini";
 import { type Algorithm, AlgorithmSchema } from "./algorithm.ts";
 import { type Claims, ClaimsSchema, ScopeSchema, scopeAllows } from "./claims.ts";
+import { parseJson } from "./json.ts";
 import * as Path from "./path.ts";
 import { encodeGrants, nestRates } from "./wire.ts";
 
@@ -35,7 +36,7 @@ const EC_ALGORITHM_TO_CURVE: Record<"ES256" | "ES384", "P-256" | "P-384"> = {
 
 const Base64FieldSchema = z.string().check(
 	z.minLength(1),
-	z.refine((value) => decodeBase64Flexible(value) !== null, {
+	z.refine((value) => decodeBase64Url(value) !== null, {
 		message: "Field must be valid base64url data",
 	}),
 );
@@ -128,30 +129,21 @@ function toPublic(key: Key): PublicKey {
 	return copy as PublicKey;
 }
 
-/** Parse a key from a string, auto-detecting JSON or base64url encoding. */
+/** Parse a key from a string, auto-detecting JSON or base64url encoding. A repeated member is refused. */
 function parse(jwk: string): Key {
 	const trimmed = jwk.trim();
 
 	let data: unknown;
 	if (trimmed.startsWith("{")) {
-		// Plain JSON
-		try {
-			data = JSON.parse(trimmed);
-		} catch {
-			throw new Error("Failed to parse JWK: invalid JSON format");
-		}
+		data = parseJson(trimmed, "JWK", "Failed to parse JWK: invalid JSON format");
 	} else {
-		// Base64url encoded JSON
+		// Base64url-encoded JSON. This only unwraps the document; key fields are checked below.
 		const decoded = decodeBase64Flexible(trimmed);
 		if (!decoded) {
 			throw new Error("Failed to decode JWK: invalid base64url encoding");
 		}
-		try {
-			const jsonString = new TextDecoder().decode(decoded);
-			data = JSON.parse(jsonString);
-		} catch {
-			throw new Error("Failed to parse JWK: invalid JSON format after base64url decode");
-		}
+		const jsonString = new TextDecoder().decode(decoded);
+		data = parseJson(jsonString, "JWK", "Failed to parse JWK: invalid JSON format after base64url decode");
 	}
 
 	try {
@@ -388,7 +380,7 @@ function getHashForAlgorithm(alg: Algorithm): "SHA-256" | "SHA-384" | "SHA-512" 
  * The counterpart of the Rust `moq-auth` crate's `Key`.
  */
 export const Key = {
-	/** Parse a key from JSON or base64url-encoded JSON. */
+	/** Parse a key from JSON or base64url-encoded JSON. A repeated member is refused, and each key field is canonical base64url. */
 	parse,
 	/** Derive a verify-only copy, dropping the private material. Throws on a symmetric (oct) key, which has no public half, and on a key that cannot verify. */
 	public: toPublic,
@@ -413,7 +405,7 @@ function keyIssue(
 	switch (key.kty) {
 		case "oct": {
 			if (!HMAC_ALGORITHMS.has(key.alg)) return `Algorithm ${key.alg} is incompatible with oct keys`;
-			const secret = decodeBase64Flexible(key.k);
+			const secret = decodeBase64Url(key.k);
 			if (!secret || secret.byteLength < MIN_HMAC_SECRET_BYTES) {
 				return `Secret must be at least ${MIN_HMAC_SECRET_BYTES} bytes when decoded`;
 			}
@@ -427,10 +419,7 @@ function keyIssue(
 			const expectedCurve = EC_ALGORITHM_TO_CURVE[key.alg];
 			if (key.crv !== expectedCurve) return `Algorithm ${key.alg} requires curve ${expectedCurve}`;
 			const length = key.crv === "P-256" ? 32 : 48;
-			if (
-				decodeBase64Flexible(key.x)?.byteLength !== length ||
-				decodeBase64Flexible(key.y)?.byteLength !== length
-			) {
+			if (decodeBase64Url(key.x)?.byteLength !== length || decodeBase64Url(key.y)?.byteLength !== length) {
 				return `Coordinates must be ${length} bytes for ${key.crv}`;
 			}
 			return;
@@ -481,6 +470,25 @@ async function importJoseKey(key: Key | PublicKey): Promise<CryptoKey | Uint8Arr
 	const jwk = { ...key } as jose.JWK;
 	delete jwk.key_ops;
 	return jose.importJWK(jwk, key.alg);
+}
+
+// moq-auth's decode_base64url: unpadded base64url, or padded with canonical trailing
+// bits. Re-encoding the bytes refuses a trim, `+` or `/`, and nonzero trailing bits,
+// because each of those spells bytes whose canonical form differs.
+function decodeBase64Url(value: string): Uint8Array | null {
+	if (!/^[A-Za-z0-9_-]*={0,2}$/.test(value)) return null;
+	const body = value.replace(/=+$/, "");
+	if (body.length === 0 || body.length % 4 === 1) return null;
+	let bytes: Uint8Array;
+	try {
+		bytes = jose.base64url.decode(body);
+	} catch {
+		return null;
+	}
+	const canonical = jose.base64url.encode(bytes).replace(/=+$/, "");
+	const pad = (4 - (canonical.length % 4)) % 4;
+	if (value !== canonical && value !== canonical + "=".repeat(pad)) return null;
+	return bytes;
 }
 
 function decodeBase64Flexible(value: string): Uint8Array | null {

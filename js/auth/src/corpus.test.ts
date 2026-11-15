@@ -54,9 +54,15 @@ describe("tokens", () => {
 	}
 });
 
+// A string case is the raw document. JSON.parse would collapse a repeated member, so the
+// corpus keeps that document as text and both replays hand it to the parser unchanged.
+function document(value: unknown): string {
+	return typeof value === "string" ? value : JSON.stringify(value);
+}
+
 const sections: [string, Case[], (input: unknown) => unknown][] = [
-	["jwk", corpus.jwk, (jwk) => Key.parse(JSON.stringify(jwk))],
-	["sets", corpus.sets, (jwks) => KeySet.parse(JSON.stringify(jwks))],
+	["jwk", corpus.jwk, (jwk) => Key.parse(document(jwk))],
+	["sets", corpus.sets, (jwks) => KeySet.parse(document(jwks))],
 	["grants", corpus.grants, (grant) => GrantSchema.parse(grant)],
 ];
 for (const [section, cases, parse] of sections) {

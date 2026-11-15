@@ -945,6 +945,25 @@ test("public - shares no scope with the signer, and parses back", async () => {
 	expect(Key.parse(JSON.stringify(publicKey)).key_ops).toEqual(["verify"]);
 });
 
+test("parse - accepts a canonical padded key field", () => {
+	const k = `${testKey.k}=`;
+	const parsed = Key.parse(JSON.stringify({ ...testKey, k }));
+	expect(parsed.kty === "oct" && parsed.k).toBe(k);
+});
+
+test("parse - refuses a key field moq-auth refuses", () => {
+	const secret = "Fp8kipWUJeUFqeSqWym_tRC_tyI8z-QpqopIGrbrD68";
+	for (const k of [`${secret.slice(0, -1)}9=`, ` ${secret}`, secret.replaceAll("-", "+").replaceAll("_", "/")]) {
+		expect(() => Key.parse(JSON.stringify({ kty: "oct", alg: "HS256", k }))).toThrow();
+	}
+});
+
+test("parse - refuses a repeated member at any depth", () => {
+	const secret = "Fp8kipWUJeUFqeSqWym_tRC_tyI8z-QpqopIGrbrD68";
+	const text = `{"kty":"oct","alg":"HS256","k":"${secret}","scope":{"root":"demo","root":"demo","publish":["**"]}}`;
+	expect(() => Key.parse(text)).toThrow(/duplicate member/);
+});
+
 test("parse - refuses an algorithm another key type owns", async () => {
 	const key = await Key.generate("HS256");
 	expect(() => Key.parse(JSON.stringify({ ...key, alg: "ES256" }))).toThrow(/incompatible with oct/);

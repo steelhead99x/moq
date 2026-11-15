@@ -10,6 +10,7 @@
 import * as jose from "jose";
 import * as z from "zod/mini";
 import type { Claims } from "./claims.ts";
+import { parseJson } from "./json.ts";
 import { Key, KeySchema, type PublicKey } from "./key.ts";
 
 /**
@@ -43,14 +44,9 @@ export interface PublicKeySet {
 	keys: PublicKey[];
 }
 
-/** Parse a JWK Set from JSON. Throws when the JSON or any key in it is invalid. */
+/** Parse a JWK Set from JSON. A repeated member is refused. Throws when the JSON or any key in it is invalid. */
 function parse(jwks: string): KeySet {
-	let data: unknown;
-	try {
-		data = JSON.parse(jwks.trim());
-	} catch {
-		throw new Error("Failed to parse JWKS: invalid JSON format");
-	}
+	const data = parseJson(jwks.trim(), "JWKS", "Failed to parse JWKS: invalid JSON format");
 
 	try {
 		return KeySetSchema.parse(data);
@@ -109,7 +105,7 @@ async function verify(set: KeySet, token: string): Promise<Claims> {
  * The counterpart of the Rust `moq-auth` crate's `KeySet`.
  */
 export const KeySet = {
-	/** Parse a JWK Set from JSON. Throws when the JSON or any key in it is invalid. */
+	/** Parse a JWK Set from JSON. A repeated member is refused. Throws when the JSON or any key in it is invalid. */
 	parse,
 	/** Strip the private material from every key in the set. Throws on a symmetric (oct) key, which has no public half, and on a key that cannot verify. */
 	public: toPublic,
