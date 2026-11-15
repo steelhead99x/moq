@@ -5,6 +5,7 @@
 //! the hot path; they register themselves in [`Shared`] and hand their consumer
 //! straight to the mixer.
 
+use kio::clock::Instant;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 #[cfg(feature = "aec")]
@@ -12,14 +13,14 @@ use std::sync::mpsc::TrySendError;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::Thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 use rand::RngExt;
 
 use super::mixer::{self, Mixer};
 use super::sink::{Registration, Sink};
-use crate::Error;
+use crate::{Error, Layout};
 
 /// Backoff bounds for reopening a device that failed. The first retry is quick because the common
 /// case is a device that came right back (a USB re-enumerate, a sample-rate change); the ceiling
@@ -58,10 +59,6 @@ const COMMAND_QUEUE: usize = 2 * mixer::MAX_SINKS;
 const SYNC_ATTEMPTS: u32 = 8;
 const SYNC_DELAY: Duration = Duration::from_millis(4);
 
-/// Frames the sample-format conversion buffer holds. Comfortably more than any
-/// host's period, so the loop over it almost always runs once.
-const SCRATCH_FRAMES: usize = 2048;
-
 /// State shared between the caller's [`Engine`](super::Engine) handles, their
 /// sinks, and the driver thread.
 ///
@@ -71,6 +68,8 @@ const SCRATCH_FRAMES: usize = 2048;
 #[derive(Default)]
 pub(crate) struct Shared {
 	state: Mutex<State>,
+	/// What every stream on this engine played, read by its observer.
+	pub(super) observe: Arc<super::observe::Shared>,
 }
 
 #[derive(Default)]
@@ -78,6 +77,9 @@ struct State {
 	/// Rate the device is running at, which is what sinks resample to. Zero
 	/// until the first stream opens.
 	rate: u32,
+	/// Layout the device is running in, which is what sinks remix to. Stereo
+	/// stands in until the first stream opens.
+	layout: Layout,
 	/// Registration channel to the live mixer, replaced every time the stream is
 	/// rebuilt. `None` while no stream is running.
 	mixer: Option<SyncSender<mixer::Command>>,
@@ -108,13 +110,14 @@ struct State {
 impl Shared {
 	/// Build a sink, register it, and start mixing it.
 	///
-	/// `build` is handed the sink's id and the rate its channel should target.
+	/// `build` is handed the sink's id and the rate and layout its channel should
+	/// target.
 	/// It runs with no device open too: the registration waits for the next
 	/// restart, so a device that is briefly missing doesn't become an error the
 	/// caller has to retry.
 	pub(super) fn add<F>(&self, build: F) -> Result<Sink, Error>
 	where
-		F: FnOnce(u64, u32) -> Result<(Sink, Registration), Error>,
+		F: FnOnce(u64, u32, Layout) -> Result<(Sink, Registration), Error>,
 	{
 		let mut state = self.state.lock().unwrap();
 
@@ -131,7 +134,7 @@ impl Shared {
 		// 48 kHz stands in until a device opens and the channel is rebuilt at
 		// the real rate.
 		let rate = if state.rate == 0 { 48_000 } else { state.rate };
-		let (sink, mut registration) = build(state.next_id, rate)?;
+		let (sink, mut registration) = build(state.next_id, rate, state.layout)?;
 		state.next_id += 1;
 
 		if let Some(mixer) = &state.mixer {
@@ -174,13 +177,19 @@ impl Shared {
 		}
 	}
 
-	/// Start feeding an echo canceller the mix, replacing any previous one.
+	/// Start feeding an echo canceller the mix.
 	///
 	/// Registers with no device open too: the tap waits for the next restart,
-	/// exactly as a sink does.
+	/// exactly as a sink does. Refuses a second live reference rather than
+	/// silently disconnecting the first microphone.
 	#[cfg(feature = "aec")]
-	pub(crate) fn set_reference(&self, mut reference: crate::aec::Reference) {
+	pub(crate) fn set_reference(&self, mut reference: crate::aec::Reference) -> Result<(), Error> {
 		let mut state = self.state.lock().unwrap();
+		if state.reference.is_some() {
+			return Err(Error::Busy(
+				"playback engine already has an echo-cancellation reference".into(),
+			));
+		}
 		if let Some(mixer) = &state.mixer
 			&& state.rate != 0
 			&& reference.rebuild(state.rate)
@@ -188,21 +197,18 @@ impl Shared {
 			attach_reference(&mut reference, mixer);
 		}
 
-		// A replaced canceller is already detached: the mixer takes whichever
-		// producer arrives last.
 		state.detaching_reference = false;
 		state.reference = Some(reference);
 
 		// Covers the case where the mixer's command queue was momentarily full,
 		// so a canceller is never left silently unattached.
 		Self::wake(&state);
+		Ok(())
 	}
 
 	/// Stop feeding the canceller with this id, called when its last clone drops.
 	///
-	/// A no-op once a newer canceller has taken the slot: the one going away is
-	/// already detached, and taking the tap with it would silently break the one
-	/// that replaced it.
+	/// A no-op when the slot is already empty or belongs to another registration.
 	#[cfg(feature = "aec")]
 	pub(crate) fn clear_reference(&self, id: u64) {
 		let mut state = self.state.lock().unwrap();
@@ -232,6 +238,9 @@ impl Shared {
 	/// restart.
 	pub(super) fn sync(&self) -> bool {
 		let mut state = self.state.lock().unwrap();
+		for sink in &mut state.sinks {
+			sink.complete();
+		}
 		let Some(mixer) = state.mixer.clone() else {
 			// No stream to talk to. Registrations stay pending and `rebind`
 			// picks them up when one opens.
@@ -267,11 +276,11 @@ impl Shared {
 	}
 
 	/// Point every sink at a freshly opened stream: rebuild each channel at
-	/// `rate` and hand the new consumers to `mixer`.
-	fn rebind(&self, rate: u32, mixer: SyncSender<mixer::Command>) {
+	/// `rate` and `layout` and hand the new consumers to `mixer`.
+	fn rebind(&self, rate: u32, layout: Layout, mixer: SyncSender<mixer::Command>) {
 		let mut state = self.state.lock().unwrap();
 		for sink in &mut state.sinks {
-			sink.rebuild(rate);
+			sink.rebuild(rate, layout);
 			sink.attach(&mixer);
 		}
 
@@ -286,6 +295,7 @@ impl Shared {
 		}
 
 		state.rate = rate;
+		state.layout = layout;
 		state.mixer = Some(mixer);
 		// The old mixer is gone, and with it every sink it was told about.
 		state.detaching.clear();
@@ -524,6 +534,11 @@ impl Requests {
 
 	/// Block until there is something to do, or until `deadline` passes.
 	fn wait(&self, deadline: Option<Instant>) -> Work {
+		self.wait_with(deadline, park)
+	}
+
+	/// [`Self::wait`], sleeping through `park`, which may return early.
+	fn wait_with(&self, deadline: Option<Instant>, mut park: impl FnMut(Option<Duration>)) -> Work {
 		loop {
 			if let Some(work) = self.poll(deadline) {
 				return work;
@@ -534,11 +549,16 @@ impl Requests {
 			// below at once, or has yet to signal and will unpark us after it
 			// does. Either way the loop polls again before sleeping, so an
 			// early wake costs a lap rather than a spurious retry.
-			match deadline {
-				Some(at) => std::thread::park_timeout(at.saturating_duration_since(Instant::now())),
-				None => std::thread::park(),
-			}
+			park(deadline.map(|at| at.saturating_duration_since(Instant::now())));
 		}
+	}
+}
+
+/// Park the current thread for up to `timeout`, or until unparked.
+fn park(timeout: Option<Duration>) {
+	match timeout {
+		Some(timeout) => std::thread::park_timeout(timeout),
+		None => std::thread::park(),
 	}
 }
 
@@ -764,7 +784,8 @@ impl Driver {
 		let supported = super::device::negotiate(&device)?;
 
 		let format = supported.sample_format();
-		let config: cpal::StreamConfig = supported.into();
+		let mut config = supported.config();
+		config.buffer_size = super::device::buffer_size(&device, &supported);
 		let rate = config.sample_rate;
 		let channels = config.channels as usize;
 
@@ -784,7 +805,8 @@ impl Driver {
 		// a full retirement channel is the one case where the mixer has to free
 		// on the audio thread after all.
 		let (retired_tx, retired_rx) = sync_channel(COMMAND_QUEUE);
-		let mixer = Mixer::new(rx, retired_tx, rate, channels);
+		let layout = Layout::from_channels(channels as u32)?;
+		let mixer = Mixer::new(rx, retired_tx, rate, layout, self.shared.observe.clone())?;
 
 		let failures = Arc::new(Failures::default());
 		let reporter = FailureReporter {
@@ -796,7 +818,7 @@ impl Driver {
 			.play()
 			.map_err(|err| Error::Playback(format!("cannot start output stream: {err}")))?;
 
-		self.shared.rebind(rate, tx);
+		self.shared.rebind(rate, layout, tx);
 		self.stream = Some(stream);
 		self.failures = Some(failures);
 		// Replaces the previous receiver, dropping anything the old stream
@@ -804,7 +826,7 @@ impl Driver {
 		self.retired = Some(retired_rx);
 		self.retry = RETRY_MIN;
 
-		tracing::info!(rate, channels, ?format, "opened audio output");
+		tracing::info!(rate, ?layout, ?format, "opened audio output");
 		Ok(())
 	}
 
@@ -837,24 +859,25 @@ impl Driver {
 	where
 		T: cpal::SizedSample + cpal::FromSample<f32>,
 	{
-		// The mixer works in `f32`, so anything else needs a staging buffer.
-		// Allocated once and a whole number of frames long, so however big a
-		// buffer the device asks for, the callback loops over this rather than
-		// resizing (allocating on the audio thread is the one thing it must
-		// never do).
-		let mut scratch = vec![0.0f32; SCRATCH_FRAMES * config.channels as usize];
+		let channels = config.channels as usize;
+		let sample_rate = config.sample_rate as f64;
+		let mut epoch = None;
 
 		device
 			.build_output_stream::<T, _, _>(
 				config,
-				move |data, _| {
-					for chunk in data.chunks_mut(scratch.len()) {
-						let scratch = &mut scratch[..chunk.len()];
-						mixer.fill(scratch);
-						for (out, sample) in chunk.iter_mut().zip(scratch.iter()) {
-							*out = T::from_sample(*sample);
-						}
-					}
+				move |data, info| {
+					let timestamp = info.timestamp();
+					let epoch = *epoch.get_or_insert(timestamp.callback);
+					let now = timestamp.callback.saturating_duration_since(epoch);
+					let played_at = timestamp.playback.saturating_duration_since(epoch)
+						+ Duration::from_secs_f64((data.len() / channels) as f64 / sample_rate);
+					mixer.complete(now);
+					// Audio is placed on the clock where it is heard: the buffer's first
+					// frame sounds this long after the callback.
+					let delay = timestamp.playback.checked_duration_since(timestamp.callback);
+					mixer.latency(delay, data.len() / channels);
+					mixer.fill(data, played_at, crate::ring::host() + delay.unwrap_or_default());
 				},
 				move |error| {
 					failures.report(&error);
@@ -899,6 +922,9 @@ impl Driver {
 
 	/// Catch the mixer up after a sink was added or dropped.
 	fn sync(&mut self) {
+		// The audio thread posts a sync once it closes out an observer's measurement.
+		self.shared.observe.wake();
+
 		if let Some(retired) = &self.retired {
 			// Each of these frees a ring buffer, which is exactly why the mixer
 			// handed it over instead of dropping it itself.
@@ -911,6 +937,10 @@ impl Driver {
 			}
 			// The mixer's queue is full, which takes a burst far larger than a
 			// device period. Give it a period to drain and try again.
+			#[expect(
+				clippy::disallowed_methods,
+				reason = "the device thread runs outside any runtime, so it blocks on the host clock"
+			)]
 			std::thread::sleep(SYNC_DELAY);
 		}
 
@@ -922,9 +952,9 @@ impl Driver {
 	/// Jittered so a host running many streams doesn't reopen the device in lockstep after a
 	/// suspend or a driver reload.
 	fn schedule(&mut self) -> Instant {
-		let wait = self.retry.mul_f64(0.5 + rand::rng().random::<f64>() / 2.0);
+		let wait = self.retry.mul_f64(0.5 + kio::clock::rng().random::<f64>() / 2.0);
 		self.retry = (self.retry * 2).min(RETRY_MAX);
-		Instant::now() + wait
+		Instant::now().saturating_add(wait)
 	}
 
 	/// Whether the failures the live stream has reported require a rebuild.
@@ -1002,7 +1032,7 @@ mod tests {
 		let handle = Arc::new(super::super::Handle { commands });
 
 		let (tx, mixer) = sync_channel(depth);
-		shared.rebind(48_000, tx);
+		shared.rebind(48_000, Layout::Stereo, tx);
 
 		Wired {
 			shared,
@@ -1013,7 +1043,26 @@ mod tests {
 	}
 
 	fn add(shared: &Arc<Shared>, handle: &Arc<super::super::Handle>) -> Result<Sink, Error> {
-		shared.add(|id, rate| sink::new(id, rate, Input::default(), shared.clone(), handle.clone()))
+		shared.add(|id, rate, bus| sink::new(id, rate, bus, Input::default(), shared.clone(), handle.clone()))
+	}
+
+	#[test]
+	fn a_completed_drain_survives_the_device_being_detached() {
+		let wired = wired(8);
+		let mut sink = add(&wired.shared, &wired.handle).unwrap();
+		let (retired, _rx) = sync_channel(8);
+		let mut mixer = Mixer::new(wired.mixer, retired, 48_000, Layout::Stereo, Default::default()).unwrap();
+		let mut out = vec![0.0; 4096 * 2];
+		mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+		let samples: Vec<_> = [0.25f32; 123 * 2].iter().flat_map(|s| s.to_le_bytes()).collect();
+		assert_eq!(sink.write(&samples).unwrap().accepted_sample_frames, 123);
+		let mut drain = std::pin::pin!(sink.finish());
+		mixer.fill(&mut out, Duration::from_millis(100), crate::ring::host());
+		mixer.complete(Duration::from_millis(100));
+		wired.shared.unbind();
+		assert!(wired.shared.sync());
+		let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+		assert!(drain.as_mut().poll(&mut cx).is_ready());
 	}
 
 	/// Long enough that only a lost wake, rather than a loaded machine, trips a
@@ -1245,17 +1294,23 @@ mod tests {
 		let (commands, requests) = channel();
 		let (sent, arrived) = std::sync::mpsc::channel();
 
+		let (parking, parked) = std::sync::mpsc::channel();
+
 		let waker = commands.clone();
 		let driver = std::thread::spawn(move || {
 			requests.attach();
 
 			// Deadlines rather than a plain park, so a lost wake fails the test
 			// instead of hanging it.
-			let woken = matches!(requests.wait(Some(Instant::now() + PATIENCE)), Work::Sync);
+			let first = requests.wait_with(Some(Instant::now().saturating_add(PATIENCE)), |timeout| {
+				let _ = parking.send(());
+				park(timeout);
+			});
+			let woken = matches!(first, Work::Sync);
 			sent.send(()).unwrap();
 
 			// Syncs racing in behind the first are fine; only silence is not.
-			let deadline = Instant::now() + PATIENCE;
+			let deadline = Instant::now().saturating_add(PATIENCE);
 			let stopped = loop {
 				match requests.wait(Some(deadline)) {
 					Work::Shutdown => break true,
@@ -1266,9 +1321,9 @@ mod tests {
 			(woken, stopped)
 		});
 
-		// Let the driver reach `park` with an empty mailbox, then race a flood
-		// of notifications against it.
-		std::thread::sleep(Duration::from_millis(10));
+		// Once the driver has found its mailbox empty and is on its way into
+		// `park`, race a flood of notifications against it.
+		parked.recv_timeout(PATIENCE).expect("the driver never parked");
 		std::thread::scope(|s| {
 			for _ in 0..8 {
 				s.spawn(|| waker.sync());
@@ -1292,7 +1347,7 @@ mod tests {
 
 		let driver = std::thread::spawn(move || {
 			requests.attach();
-			requests.wait(Some(Instant::now() + PATIENCE))
+			requests.wait(Some(Instant::now().saturating_add(PATIENCE)))
 		});
 
 		assert!(
@@ -1324,21 +1379,19 @@ mod tests {
 	fn an_early_wake_does_not_fake_a_retry() {
 		let (commands, requests) = channel();
 
-		let waker = commands.clone();
-		let driver = std::thread::spawn(move || {
-			requests.attach();
-			// A deadline far enough out that only the unpark below can end the
-			// park, so a Retry here would mean the deadline was misread.
-			requests.wait(Some(Instant::now() + PATIENCE))
+		// The deadline is never reached: the first park returns with nothing
+		// pending, as a spurious wake does, and the second brings the sync.
+		let mut parks = 0;
+		let work = requests.wait_with(Some(Instant::now().saturating_add(PATIENCE)), |_| {
+			parks += 1;
+			match parks {
+				1 => {}
+				2 => commands.sync(),
+				_ => panic!("the sync did not end the wait"),
+			}
 		});
 
-		std::thread::sleep(Duration::from_millis(10));
-		waker.sync();
-
-		assert!(
-			matches!(driver.join().unwrap(), Work::Sync),
-			"an early wake was reported as a retry"
-		);
+		assert!(matches!(work, Work::Sync), "an early wake was reported as a retry");
 	}
 
 	/// A driver that unwinds takes the mailbox down with it. Without that, a

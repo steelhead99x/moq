@@ -1,6 +1,11 @@
 # moq-bench
 
-A load generator for benchmarking a remote MoQ relay.
+A load generator for benchmarking a remote MoQ relay, plus `moq-bench host`, a
+sampler that records what that load costs on the relay's host.
+
+```bash
+cargo install --git https://github.com/moq-dev/moq moq-bench
+```
 
 `moq-bench` opens many QUIC connections to a server and drives synthetic media
 through them. Every knob is a `[min, max]` range that is rolled once per
@@ -41,33 +46,52 @@ Every `--report` interval, `moq-bench` logs throughput (`send_mbps`/`recv_mbps`
 and `send_fps`/`recv_fps`) plus delivery accounting for the subscribe side:
 
 - `recv_groups`: cumulative groups read end to end across all subscriptions.
-- `lost_groups`: cumulative groups that never arrived, or that the relay gave up
-  on part-way.
+- `history_groups`: the part of `recv_groups` older than its subscription's
+  first group, such as cached history a relay fills in after the subscribe.
+  These are never counted as lost.
+- `lost_groups`: cumulative groups that were skipped at or after a
+  subscription's first group, or that the relay gave up on part-way. It never
+  decreases: a group that lands after being counted lost stays lost.
 - `loss`: `lost_groups` as a percentage.
 - `latency_p50_ms` / `latency_p90_ms` / `latency_p99_ms` / `latency_max_ms`:
   cumulative one-way delivery latency from each group's keyframe timestamp.
+  These cover every sample since the process started, including the
+  `--startup` ramp. `latency_samples` is that cumulative count.
+- `latency_interval_p50_ms` / `latency_interval_p90_ms` /
+  `latency_interval_p99_ms` / `latency_interval_max_ms`: the same figures for
+  samples since the previous report only. `latency_interval_samples` is how
+  many samples that interval contains. Do not read the interval percentiles
+  against the cumulative `latency_samples`.
 
 Subscribers read groups in arrival order (out-of-order included) and track each
 subscription's sequence span. A span wider than the count received means groups
 in between were skipped, so loss reflects dropped groups rather than QUIC packet
 loss (which the transport already repairs). The newest group is the live frontier
 and is excluded from the count: groups just behind it may still be in flight, so a
-gap is only blamed once a higher group confirms it was truly skipped. A group the
+gap is only blamed once a higher group confirms it was truly skipped. The span
+starts at the first group a subscription receives: an older group that arrives
+later is history, counted in `history_groups` rather than widening the span, so
+a join that over-fetches history never reads as loss. A group the
 relay fails part-way (it gives up on a subscriber that fell behind) ends that
 group alone and lands in the same accounting; the subscription stays for the next
-one, so the offered load holds at the configured count. The JSON
-keyframe at the start of each group is parsed back to recover the publisher's
+one, so the offered load holds at the configured count. Subscribers use
+`--max-delay` (default `2s`, the players' automatic budget), so a group still in
+flight when the next one starts is waited on, as a viewer would, rather than
+counted lost. A new subscription also starts up to that far behind the live
+edge, so its first latency samples include the catch-up. `--max-delay 0` keeps
+only the live edge, which with short groups measures skip timing more than
+relay cost. The JSON keyframe at the start of each group is parsed back to recover the publisher's
 shape, so a subscriber works against peers it didn't publish itself.
 
 ## Usage
 
 ```bash
 # Roll the dice with the built-in defaults (1 connection, 1 broadcast, 30fps).
-moq-bench --client-connect https://relay.example.com
+moq-bench --connect https://relay.example.com
 
 # Use a preset, overriding the target and connection count on the CLI.
 moq-bench --file rs/moq-bench/config/hd.toml \
-  --client-connect https://relay.example.com \
+  --connect https://relay.example.com \
   --connections 500
 ```
 
@@ -86,13 +110,14 @@ table (`fps = { min = 24, max = 60 }`).
 | `--frame-size` | E | Bytes per frame |
 | `--group-size` | F | Zeroed frames per group after the keyframe |
 | `--fanout` | | Publish one named broadcast and point every other connection at it |
+| `--max-delay` | | How long a subscriber waits on a late group before skipping it (default `2s`) |
 | `--startup` | | Ramp window for staggering connections/subscriptions |
 | `--duration` | | Stop after this long (runs until interrupted otherwise) |
 | `--report` | | How often to log throughput stats |
 | `--output` | | Also append the stats as JSON lines to this file |
 
-Client TLS/QUIC flags (`--client-tls-disable-verify`, `--client-bind`, ...) come from
-`moq-native` and behave the same as in `moq-cli` and `moq-relay`.
+Client TLS/QUIC flags (`--connect-tls-insecure`, `--connect-bind`, ...) come from
+`moq-tokio` and behave the same as in `moq-cli` and `moq-relay`.
 
 ## Presets
 
@@ -107,22 +132,101 @@ The `config/` directory has a few starting points:
 
 ## Machine-readable output
 
+Every line groups load counts by resource:
+
+```json
+{
+  "connections": { "target": 2, "established": 2 },
+  "broadcasts": { "target": 2, "active": 2, "established": 2 },
+  "subscriptions": { "target": 2, "active": 2, "established": 2 },
+  "ready": true
+}
+```
+
+Targets are fixed sums over all startup rolls, including fan-out roles.
+Established counts are live: connections have connected, broadcasts have connected
+or completed their first group, and subscriptions have read a complete group end
+to end. Broadcast `active` counts producers before establishment; subscription
+`active` includes drains still waiting to subscribe or finish their first group.
+
+`ready` first becomes true on a line whose `established` counts all reach their
+targets at once. Start a measurement window on the first `ready` line. It stays
+true after a later loss; use each resource's `established` count to see
+established work ending.
+
+This changes the previous numeric JSONL fields into objects. Migrate reads of
+`connections` to `connections.established`, `broadcasts` to `broadcasts.active`,
+and `subscriptions` to `subscriptions.active`; those gauges retain their meanings.
+Frame, byte, group and latency fields are unchanged. The human-readable stats log
+also keeps its existing numeric fields.
+
+A mesh publishing run refuses a subscription range larger than the smallest
+possible peer broadcast count: `(max(connections.min, 1) - 1) * broadcasts.min`,
+with inverted range ends normalized first. A publishing run with subscribers,
+including fan-out, refuses an fps range containing zero. Subscribe-only runs may
+use local fps zero and request any subscription count: their external publishers
+determine when the requested target is reached. Targets are never clamped.
+
+Each line includes `interval_start_ms` and `interval_end_ms` (Unix milliseconds),
+and `latency_interval_histogram`: `{ "version": 1, "unit": "ms", "buckets": [[index, count], ...] }`.
+Version 1 is a sparse encoding of 60,001 dense one-millisecond buckets: omitted
+indices have count zero, indices 0 through 59,999 mean that many milliseconds,
+and index 60,000 contains every latency at or above 60 seconds. Pairs are sorted
+by index and contain only nonzero counts. Sparse encoding preserves the existing
+percentile resolution without writing 60,001 zeros per report. The pair counts
+sum to `latency_interval_samples`; an empty interval has `buckets: []` and no
+percentiles. Add counts with the same index across generators and whole intervals,
+then compute nearest-rank percentiles once from that merged distribution. Never
+average percentiles or split samples in an interval that overlaps a window edge.
+
+The first interval starts at the reporter's initial snapshot, so setup samples
+before that snapshot are absent. Cancellation stops reporting without writing a
+partial final interval; the last emitted line covers exactly its recorded bounds.
+Ticker delays can extend or shorten a reported interval, so use its actual bounds
+rather than assuming the configured cadence.
+Latency observations and histogram capture share one lock: the timestamp and bucket
+counts describe the same cut. Percentile calculation and output run after releasing
+the lock. Bounds are rounded to milliseconds; the other cumulative counters remain
+independent atomic samples.
+
 `--output stats.jsonl` mirrors every report interval to a file as one JSON
 line, each stamped with `timestamp_ms`. The frame, byte, and group counters are
 cumulative and monotonic, so a consumer diffs successive lines to compute
-rates, the same convention as `moq-stats` frames. `connections`, `broadcasts`,
-and `subscriptions` are live gauges that fall as work ends; diff only the
-counters.
+rates, the same convention as `moq-stats` frames. Resource `active` and
+`established` counts are live gauges that fall as work ends; diff only the counters.
+
+`groups_lost` is the logged `lost_groups`, so its increase over a window is the
+groups lost inside it. `groups_expected - groups_present` is the gaps still
+outstanding, which a late arrival closes; it is not monotonic, so do not diff
+it to count loss. `groups_history` is the logged `history_groups`: late history
+included in `groups_recv` but outside `groups_expected`.
 
 Latency is measured from wall-clock milliseconds embedded by the publisher.
-Keep separate publisher and subscriber hosts NTP-synchronized. Samples where
+Run each publisher and its subscribers on the same host so a latency sample closes
+on one clock. Several generators on several hosts may then merge whole intervals. Samples where
 the receiver clock is behind the sender are omitted and counted in
 `latency_clock_skew`; values at or above 60 seconds share the last percentile
 bucket while `latency_max_ms` preserves the exact maximum.
 
-## Host-side sampling: moq-bench-host
+Each accepted sample also increments a one-millisecond bucket (0 through
+60,000; the last bucket collects every larger value). A report snapshots
+those counts and subtracts the previous snapshot. The interval percentiles
+and `latency_interval_max_ms` are computed from that delta, and
+`latency_interval_samples` is the sum of the delta. That count is the only
+sample count that belongs with the interval percentiles. `latency_samples`
+stays paired with the cumulative `latency_p50_ms`, `latency_p90_ms`,
+`latency_p99_ms`, and `latency_max_ms`, which still include the startup ramp.
 
-`moq-bench` measures the load it generates; `moq-bench-host` measures what that
+The interval fields describe one `--report` period. The percentile fields are
+omitted when the interval delivered nothing; `latency_interval_samples` is
+then 0. Do not diff or average them across lines: a percentile over a longer
+window is not the combination of these numbers. `latency_interval_max_ms` is
+the highest bucket that gained a sample, so below 60 seconds it is the exact
+millisecond maximum, and 60000 means at least 60 seconds.
+
+## Host-side sampling: moq-bench host
+
+`moq-bench` measures the load it generates; `moq-bench host` measures what that
 load costs. It runs on the host of the process under test, production included:
 it only reads `/proc` (Linux-only), needs no privileges beyond visibility of the
 target process, and never touches the process itself (no ptrace, no perf, no
@@ -130,10 +234,10 @@ signals).
 
 ```bash
 # On the relay host: sample the relay once per second, forever, to stdout.
-moq-bench-host --name moq-relay
+moq-bench host --name moq-relay
 
 # Bounded run to a file, with the per-thread breakdown.
-moq-bench-host --name moq-relay --interval 1s --duration 5m \
+moq-bench host --name moq-relay --interval 1s --duration 5m \
   --threads --output host.jsonl
 ```
 
@@ -145,11 +249,33 @@ process's share of the machine is computable. `--threads` adds a per-thread
 breakdown including the core each thread last ran on, which is how to verify
 pinning once the relay grows a thread-per-core mode.
 
+The `udp_*` fields come from the kernel's own socket accounting (a `sock_diag`
+dump, what `ss -uam` reads) for the process's UDP sockets: how many it holds
+(`udp_sockets`), the smallest receive and send buffer the kernel granted
+(`udp_rcvbuf_min`, `udp_sndbuf_min`, in kernel units, which on Linux are twice
+the honored `SO_RCVBUF` request), the bytes queued for receive right now
+(`udp_rx_queue_bytes`), and `udp_drops`, the datagrams dropped at those sockets
+because a receive queue was full. `udp_drops` is cumulative across every socket
+the sampler saw, closed ones included. One drop is one queued skb, so a
+coalesced GRO train counts once however many datagrams it carried. A drop here
+is local: the process was too slow to read. Loss on the path never reaches the
+socket and needs the transport's own counters. `udp_rcvbuf_errors`,
+`udp_sndbuf_errors` and `udp_in_errors` are the namespace's `/proc/net/snmp`
+counters, IPv4 and IPv6 summed, and count every socket in the namespace. The
+dump sees the sampler's network namespace, so run it in the target's. The
+fields are absent when the host refuses the dump, or for another user's process,
+whose `/proc/<pid>/fd` the sampler may not list; the other fields still sample.
+
 ## Measuring CPU cost
 
 Run the load from one machine and the sampler on the relay's host, then join
 the two JSONL files on `timestamp_ms` over the same steady-state window. Skip
-the `--startup` window while connections ramp. `timestamp_ms` is wall clock from two different hosts,
+the `--startup` window while connections ramp. For latency on the lines inside
+the steady-state window, read `latency_interval_p50_ms`, `latency_interval_p90_ms`,
+`latency_interval_p99_ms`, and `latency_interval_max_ms`. Each is only the
+samples since the previous line, with `latency_interval_samples` as its count.
+The cumulative `latency_p*` fields still include the ramp, and `latency_samples`
+is not that count. `timestamp_ms` is wall clock from two different hosts,
 so keep both NTP-synced; the join only has to agree on the window boundaries,
 since every rate comes from deltas within a single file:
 
@@ -166,3 +292,10 @@ since every rate comes from deltas within a single file:
 Comparisons are only meaningful between runs on the same hardware with the same
 preset. Pin the relay build (`--version` appears in the logs) and record it next
 to the results.
+
+### Observation cost
+
+`just rs bench-tests -p moq-bench --run-ignored only -E 'test(benchmark_observation_contention)'` measures latency recording with 1, 4 and 16 concurrent
+writers and 0, 10 and 100 snapshots per run. It checks final sample conservation
+and prints the cost per sample for each case. The nightly workflow runs the same
+matrix and records it on the benchmark table.

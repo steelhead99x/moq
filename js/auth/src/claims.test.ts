@@ -1,0 +1,156 @@
+import { expect, test } from "bun:test";
+import { authorize, type Claims, ClaimsSchema, type Permissions, ScopeSchema } from "./claims.ts";
+import { encodeGrant, GrantSchema } from "./contract.ts";
+import { encodeGrants } from "./wire.ts";
+
+// These cases mirror the Rust moq-auth crate's claims::tests one-for-one, so both
+// sides stay pinned to the same authorization semantics.
+
+function claims(root: string, subscribe: string[], publish: string[]): Claims {
+	return ClaimsSchema.parse({ root, subscribe, publish });
+}
+
+function texts(permissions: Permissions) {
+	return { subscribe: permissions.subscribe.toJSON(), publish: permissions.publish.toJSON() };
+}
+
+test("claims granting nothing are rejected, matching Rust's useless-token rule", () => {
+	// An empty list grants nothing, so the Rust crate refuses to verify such a token
+	// ("no publish or subscribe allowed; token is useless"). Presence alone is not enough.
+	expect(() => ClaimsSchema.parse({ root: "demo", publish: [] })).toThrow();
+	expect(() => ClaimsSchema.parse({ root: "demo", publish: [], subscribe: [] })).toThrow();
+	expect(() => ClaimsSchema.parse({ root: "demo" })).toThrow();
+
+	// `**` is everything under the root, which is a real grant.
+	expect(ClaimsSchema.parse({ root: "demo", publish: ["**"] }).publish).toEqual(["**"]);
+});
+
+test("claims read legacy put/get prefixes as subtrees", () => {
+	const claims = ClaimsSchema.parse({ root: "demo", put: ["alice", "/a//b/"], get: "" });
+	expect(claims.publish).toEqual(["alice/**", "a/b/**"]);
+	expect(claims.subscribe).toEqual(["**"]);
+	expect(ScopeSchema.parse({ root: "demo", put: ["room"] }).publish).toEqual(["room/**"]);
+});
+
+test("claims refuse mixed encodings and wildcard legacy prefixes", () => {
+	expect(() => ClaimsSchema.parse({ root: "demo", publish: ["alice"], get: [""] })).toThrow();
+	expect(() => ClaimsSchema.parse({ root: "demo", put: [], subscribe: ["alice"] })).toThrow();
+	expect(() => ClaimsSchema.parse({ root: "demo", put: ["a/*"] })).toThrow();
+	expect(() => ScopeSchema.parse({ root: "demo", put: ["room"], publish: ["x"] })).toThrow();
+	// A legacy scope held only lists.
+	expect(() => ScopeSchema.parse({ root: "demo", put: "room" })).toThrow();
+});
+
+test("grants are written the legacy way only when faithful", () => {
+	expect(encodeGrants({ root: "live", publish: ["camera1/**"], subscribe: ["**"] })).toEqual({
+		root: "live",
+		put: ["camera1"],
+		get: [""],
+	});
+	// One grant a prefix can't say moves the whole document to patterns.
+	expect(encodeGrants({ root: "live", publish: ["camera1/**"], subscribe: ["*/chat"] })).toEqual({
+		root: "live",
+		publish: ["camera1/**"],
+		subscribe: ["*/chat"],
+	});
+	expect(encodeGrants({ root: "live", publish: ["camera1"] })).toEqual({ root: "live", publish: ["camera1"] });
+});
+
+test("claims exp and iat are whole seconds", () => {
+	expect(() => ClaimsSchema.parse({ publish: ["**"], exp: 1.5 })).toThrow();
+	expect(() => ClaimsSchema.parse({ publish: ["**"], iat: 1.5 })).toThrow();
+	expect(ClaimsSchema.parse({ publish: ["**"], exp: 4102444800 }).exp).toBe(4102444800);
+});
+
+test("claims refuse a bad pattern", () => {
+	expect(() => ClaimsSchema.parse({ publish: ["a/**/b/**"] })).toThrow();
+	expect(() => ClaimsSchema.parse({ publish: ["/leading"] })).toThrow();
+});
+
+test("authorize - path equals root", () => {
+	const permissions = authorize(claims("room/123", ["**"], ["alice/**"]), "room/123");
+	expect(texts(permissions)).toEqual({ subscribe: ["**"], publish: ["alice/**"] });
+});
+
+test("authorize - path extends root", () => {
+	// Connecting below the root consumes the matching part of each grant.
+	const permissions = authorize(claims("room/123", ["bob/**"], ["alice/**"]), "room/123/alice");
+	expect(texts(permissions)).toEqual({ subscribe: [], publish: ["**"] });
+});
+
+test("authorize - a literal reached exactly is the path itself", () => {
+	const permissions = authorize(claims("room", [], ["alice"]), "room/alice");
+	expect(texts(permissions)).toEqual({ subscribe: [], publish: [""] });
+});
+
+test("authorize - path is parent of root", () => {
+	// Connecting above the root prepends it, keeping the grants anchored.
+	const permissions = authorize(claims("demo", ["**"], ["alice/**"]), "/");
+	expect(texts(permissions)).toEqual({ subscribe: ["demo/**"], publish: ["demo/alice/**"] });
+});
+
+test("authorize - empty root", () => {
+	// A root-scoped token grants everything it lists, wherever it connects.
+	const permissions = authorize(claims("", ["demo/**"], []), "demo/room");
+	expect(texts(permissions)).toEqual({ subscribe: ["**"], publish: [] });
+});
+
+test("authorize - slashes are implicit", () => {
+	const permissions = authorize(claims("/room/123/", ["bob/**"], []), "//room/123//");
+	expect(permissions.subscribe.toJSON()).toEqual(["bob/**"]);
+});
+
+test("authorize - respects segment boundaries", () => {
+	// "foo" must not cover "foobar".
+	expect(() => authorize(claims("foo", ["**"], ["**"]), "foobar")).toThrow(/does not overlap/);
+});
+
+test("authorize - unrelated path", () => {
+	expect(() => authorize(claims("demo", ["**"], ["**"]), "other")).toThrow(/does not overlap/);
+});
+
+test("authorize - no access at path", () => {
+	// The path overlaps the root, but every grant sits outside it.
+	expect(() => authorize(claims("", ["demo/**"], []), "other")).toThrow(/grants no access/);
+});
+
+test("authorize - wildcards rebase as a set", () => {
+	// `**/chat` reached at `chat` is both the path itself and deeper `**/chat`.
+	const permissions = authorize(claims("", ["**/chat"], []), "chat");
+	expect(permissions.subscribe.toJSON()).toEqual(["", "**/chat"]);
+});
+
+test("shared rate vectors parse and re-encode like Rust", async () => {
+	const vectors = await Bun.file(new URL("../../../rs/moq-auth/rate.json", import.meta.url)).json();
+	for (const row of vectors.valid) {
+		expect(encodeGrants(ClaimsSchema.parse(row.input))).toEqual(row.claims);
+		expect(encodeGrant(GrantSchema.parse(row.input))).toEqual(row.grant);
+	}
+	for (const input of vectors.invalid) {
+		expect(ClaimsSchema.safeParse(input).success).toBe(false);
+		expect(GrantSchema.safeParse(input).success).toBe(false);
+	}
+});
+
+test("a capped role decodes beside its patterns and never encodes as a prefix", () => {
+	for (const role of ["publish", "subscribe"] as const) {
+		// Subtrees alone would be written as legacy prefixes, which a cap must not be.
+		const claims = ClaimsSchema.parse({
+			publish: ["alice/**"],
+			subscribe: ["**"],
+			[role]: { path: ["alice/**"], rate: 8000 },
+		});
+		expect(claims[role]).toEqual(["alice/**"]);
+		expect(claims[`${role}_rate`]).toBe(8000);
+		const encoded = encodeGrants(claims);
+		expect(encoded).not.toHaveProperty("put");
+		expect(encoded).not.toHaveProperty("get");
+		expect(encoded[role]).toEqual({ path: ["alice/**"], rate: 8000 });
+	}
+	expect(() => ClaimsSchema.parse({ publish: { path: ["**"], rate: 0 } })).toThrow(/rate must be a positive integer/);
+});
+
+test("a key scope bounds paths, never bitrate", () => {
+	expect(ScopeSchema.safeParse({ publish: { path: ["**"], rate: 8000 } }).success).toBe(false);
+	expect(ScopeSchema.safeParse({ publish: ["**"], subscribe: { path: ["**"], rate: 8000 } }).success).toBe(false);
+});

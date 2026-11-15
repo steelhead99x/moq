@@ -1,86 +1,138 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use crate::coding::*;
 
 use super::Version;
 
-const MAX_PARAMS: u64 = 64;
-
 /// A bag of `id -> raw bytes` parameters, the body shared by SETUP (and any other
 /// parameterized message). Encoded as a varint count followed by `id, length, value`
 /// triples; duplicate ids are rejected on decode.
-#[derive(Default, Debug, Clone)]
-pub struct Parameters(HashMap<u64, Vec<u8>>);
+///
+/// The encoding keeps the order the parameters were set or decoded in.
+#[derive(Default, Clone)]
+pub struct Parameters(Vec<(u64, Vec<u8>)>);
+
+impl std::fmt::Debug for Parameters {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_map()
+			.entries(self.0.iter().map(|(kind, value)| (kind, value.len())))
+			.finish()
+	}
+}
 
 impl Parameters {
 	/// Set a parameter to a raw byte value, replacing any existing entry.
 	pub fn set_bytes(&mut self, id: u64, value: Vec<u8>) {
-		self.0.insert(id, value);
+		match self.0.iter_mut().find(|(k, _)| *k == id) {
+			Some((_, v)) => *v = value,
+			None => self.0.push((id, value)),
+		}
 	}
 
 	/// Borrow a parameter's raw byte value, if present.
 	pub fn get_bytes(&self, id: u64) -> Option<&[u8]> {
-		self.0.get(&id).map(Vec::as_slice)
+		self.0.iter().find(|(k, _)| *k == id).map(|(_, v)| v.as_slice())
 	}
 
-	/// Set a parameter to a varint value, replacing any existing entry.
-	pub fn set_varint(&mut self, id: u64, value: u64) {
+	/// Set a parameter to a varint value in `version`'s encoding, replacing any existing entry.
+	pub fn set_varint(&mut self, id: u64, value: u64, version: Version) -> Result<(), EncodeError> {
 		let mut buf = Vec::new();
-		// Infallible: writing into a Vec never runs short.
-		value.encode(&mut buf, Version::Lite05).expect("varint encode into Vec");
-		self.0.insert(id, buf);
+		Encoder::new(&mut buf, version.into()).varint(value)?;
+		self.set_bytes(id, buf);
+		Ok(())
 	}
 
-	/// Decode a parameter as a single varint, if present. Errors if trailing bytes remain.
-	pub fn get_varint(&self, id: u64) -> Result<Option<u64>, DecodeError> {
-		let Some(mut bytes) = self.0.get(&id).map(Vec::as_slice) else {
+	/// Decode a parameter as a single varint in `version`'s encoding, if present. Errors if
+	/// trailing bytes remain.
+	pub fn get_varint(&self, id: u64, version: Version) -> Result<Option<u64>, DecodeError> {
+		let Some(bytes) = self.get_bytes(id) else {
 			return Ok(None);
 		};
-		let value = u64::decode(&mut bytes, Version::Lite05)?;
-		if !bytes.is_empty() {
+		let mut r = Decoder::new(bytes, version.into());
+		let value = r.varint()?;
+		if !r.is_empty() {
 			return Err(DecodeError::Long);
 		}
 		Ok(Some(value))
 	}
 }
 
-impl Decode<Version> for Parameters {
-	fn decode<R: bytes::Buf>(mut r: &mut R, version: Version) -> Result<Self, DecodeError> {
-		let mut map = HashMap::new();
+impl<'a> Decode<'a, Version> for Parameters {
+	fn decode(r: &mut Decoder<'a>, _: Version) -> Result<Self, DecodeError> {
+		let mut params = Self::default();
 
 		// I hate this encoding so much; let me encode my role and get on with my life.
-		let count = u64::decode(r, version)?;
-		if count > MAX_PARAMS {
-			return Err(DecodeError::TooMany);
-		}
-
+		let count = r.varint()?;
+		// Grow only as entries arrive; the enclosing message bounds the bag.
+		// Linear lookup avoids hashing and another allocation for small SETUPs.
+		// Larger bags need a set so duplicate detection cannot grow quadratically.
+		let mut seen = (count > 64).then(HashSet::new);
 		for _ in 0..count {
-			let kind = u64::decode(r, version)?;
-			if map.contains_key(&kind) {
+			let kind = r.varint()?;
+			let duplicate = match &mut seen {
+				Some(seen) => !seen.insert(kind),
+				None => params.get_bytes(kind).is_some(),
+			};
+			if duplicate {
 				return Err(DecodeError::Duplicate);
 			}
 
-			let data = Vec::<u8>::decode(&mut r, version)?;
-			map.insert(kind, data);
+			params.0.push((kind, r.bytes()?.to_vec()));
 		}
 
-		Ok(Parameters(map))
+		Ok(params)
 	}
 }
 
 impl Encode<Version> for Parameters {
-	fn encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
-		if self.0.len() as u64 > MAX_PARAMS {
-			return Err(EncodeError::TooMany);
-		}
+	fn encode(&self, w: &mut Encoder<'_>, _: Version) -> Result<(), EncodeError> {
+		w.varint(self.0.len() as u64)?;
 
-		self.0.len().encode(w, version)?;
-
-		for (kind, value) in self.0.iter() {
-			kind.encode(w, version)?;
-			value.encode(w, version)?;
+		for (kind, value) in &self.0 {
+			w.varint(*kind)?;
+			w.bytes(value)?;
 		}
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn large_bags_preserve_order_and_reject_duplicates() {
+		let version = Version::Lite07;
+		let mut params = Parameters::default();
+		for kind in 100..1124 {
+			params.set_bytes(kind, Vec::new());
+		}
+		let encoded = params.encode_bytes(version).unwrap();
+		let mut reader = Decoder::new(&encoded, version.into());
+		assert_eq!(Parameters::decode(&mut reader, version).unwrap().0, params.0);
+
+		let mut duplicate = Vec::new();
+		let mut writer = Encoder::new(&mut duplicate, version.into());
+		writer.varint(1025).unwrap();
+		for kind in (100..1124).chain([100]) {
+			writer.varint(kind).unwrap();
+			writer.bytes(&[]).unwrap();
+		}
+		assert!(matches!(
+			Parameters::decode(&mut Decoder::new(&duplicate, version.into()), version),
+			Err(DecodeError::Duplicate)
+		));
+	}
+
+	#[test]
+	fn a_declared_count_does_not_allocate_before_its_entries_arrive() {
+		let version = Version::Lite07;
+		let mut data = Vec::new();
+		Encoder::new(&mut data, version.into()).varint(u64::MAX).unwrap();
+		assert!(matches!(
+			Parameters::decode(&mut Decoder::new(&data, version.into()), version),
+			Err(DecodeError::Short)
+		));
 	}
 }

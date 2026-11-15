@@ -1,19 +1,19 @@
 /**
- * Low Overhead Container (LOC): encode and decode codec bitstreams framed with
+ * Low Overhead Container (LOC): decode codec bitstreams framed with
  * per-frame timestamp and timescale metadata for MoQ.
  *
  * @module
  */
 
+import { Duration } from "@moq/clock";
 import * as Moq from "@moq/net";
-import { Time } from "@moq/net";
 
 /** A decoded LOC frame: the codec bitstream plus its timing metadata. */
 export interface Frame {
 	/** The codec bitstream payload, with the LOC property block stripped. */
 	payload: Uint8Array;
-	/** Presentation timestamp in microseconds. */
-	timestamp: Time.Micro;
+	/** Presentation timestamp, rounded to whole microseconds. */
+	timestamp: Duration;
 	/** True if this frame can be decoded without any preceding frames. */
 	keyframe: boolean;
 }
@@ -38,8 +38,22 @@ const DEFAULT_TIMESCALE = 1_000_000;
  * timescale property are interpreted as microseconds.
  */
 export class Format {
-	/** Decode one moq-net frame into its LOC frames. Throws on malformed input. */
+	/** The kind of content carried by the track. */
+	readonly kind: "audio" | "video" | "data";
+
+	/** Configure endpoint metadata for audio or video; opaque data is the default. */
+	constructor(kind: "audio" | "video" | "data" = "data") {
+		this.kind = kind;
+	}
+
+	/** Return the video-frame or audio-source endpoint for an empty codec payload. */
+	end(frame: Frame): Duration | undefined {
+		return this.kind !== "data" && frame.payload.byteLength === 0 ? frame.timestamp : undefined;
+	}
+
+	/** Decode one moq-net frame into its LOC frames. On a data track an object with no bytes is the discontinuity marker, so it decodes to no frame. Throws on malformed input. */
 	decode(frame: Uint8Array): Frame[] {
+		if (this.kind === "data" && frame.byteLength === 0) return [];
 		const [propsLen, afterLen] = Moq.Varint.decode(frame);
 		if (afterLen.byteLength < propsLen) {
 			throw new Error("loc: properties_length exceeds frame size");
@@ -60,17 +74,18 @@ export class Format {
 			prevType = abs;
 			cursor = afterDelta;
 
-			if (abs % 2 === 0) {
-				const [value, afterValue] = Moq.Varint.decode(cursor);
-				cursor = afterValue;
-				if (abs === PROP_TIMESTAMP || abs === PROP_TIMESTAMP_DRAFT03) {
-					timestamp = value;
-				} else if (abs === PROP_TIMESCALE) {
-					if (value === 0) {
-						throw new Error("loc: timescale property must be non-zero");
-					}
-					timescale = value;
+			if (abs === PROP_TIMESTAMP || abs === PROP_TIMESTAMP_DRAFT03) {
+				[timestamp, cursor] = Moq.Varint.decode(cursor);
+			} else if (abs === PROP_TIMESCALE) {
+				let value: number;
+				[value, cursor] = Moq.Varint.decode(cursor);
+				if (value === 0) {
+					throw new Error("loc: timescale property must be non-zero");
 				}
+				timescale = value;
+			} else if (abs % 2 === 0) {
+				// An unknown varint property may use all 62 bits, which a number can't hold; skip it.
+				cursor = Moq.Varint.decodeBigInt(cursor)[1];
 			} else {
 				const [len, afterLenInner] = Moq.Varint.decode(cursor);
 				if (afterLenInner.byteLength < len) {
@@ -85,82 +100,8 @@ export class Format {
 		}
 
 		const activeTimescale = timescale ?? DEFAULT_TIMESCALE;
-		const micros = Math.round((timestamp * DEFAULT_TIMESCALE) / activeTimescale) as Time.Micro;
+		const micros = Duration.micros(Math.round((timestamp * DEFAULT_TIMESCALE) / activeTimescale));
 
 		return [{ payload, timestamp: micros, keyframe: false }];
-	}
-}
-
-/** A payload that can be copied into a buffer without first materializing a Uint8Array. */
-export interface Source {
-	/** Size in bytes of the payload. */
-	byteLength: number;
-	/** Copy the payload into the provided buffer. */
-	copyTo(buffer: Uint8Array): void;
-}
-
-/**
- * Encoder that packages frames as LOC and writes them to a moq-net track.
- *
- * Each call to {@link encode} produces one moq-net frame containing a
- * property block with the 0x10 timestamp (in microseconds) and the codec
- * bitstream payload.
- */
-export class Producer {
-	#track: Moq.Track.Producer;
-	#group?: Moq.Group.Producer;
-
-	constructor(track: Moq.Track.Producer) {
-		this.#track = track;
-	}
-
-	/** Encode one frame and write it to the track. Keyframes start a new group. */
-	encode(data: Uint8Array | Source, timestamp: Time.Micro, keyframe: boolean) {
-		if (keyframe) {
-			this.#group?.close();
-			this.#group = this.#track.appendGroup();
-		} else if (!this.#group) {
-			throw new Error("must start with a keyframe");
-		}
-
-		this.#group?.writeFrame({
-			payload: this.#encode(data, timestamp),
-			timestamp: Time.Timestamp.fromMicros(timestamp),
-		});
-	}
-
-	#encode(source: Uint8Array | Source, timestamp: Time.Micro): Uint8Array {
-		const propTypeBytes = Moq.Varint.encode(PROP_TIMESTAMP);
-		const propValueBytes = Moq.Varint.encode(timestamp);
-		const propsLen = propTypeBytes.byteLength + propValueBytes.byteLength;
-
-		const propsLenBytes = Moq.Varint.encode(propsLen);
-
-		const payloadSize = source.byteLength;
-		const total = propsLenBytes.byteLength + propsLen + payloadSize;
-		const out = new Uint8Array(total);
-
-		let offset = 0;
-		out.set(propsLenBytes, offset);
-		offset += propsLenBytes.byteLength;
-		out.set(propTypeBytes, offset);
-		offset += propTypeBytes.byteLength;
-		out.set(propValueBytes, offset);
-		offset += propValueBytes.byteLength;
-
-		const payloadView = out.subarray(offset);
-		if (source instanceof Uint8Array) {
-			payloadView.set(source);
-		} else {
-			source.copyTo(payloadView);
-		}
-
-		return out;
-	}
-
-	/** Close the current group and the underlying track, optionally with an error. */
-	close(err?: Error) {
-		this.#group?.close();
-		this.#track.close(err);
 	}
 }

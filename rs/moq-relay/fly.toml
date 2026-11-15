@@ -1,7 +1,7 @@
 app = 'moq'
 primary_region = 'sjc'
 
-# Built with `nix build .#moq-relay-docker`
+# Published from the root Dockerfile by .github/workflows/docker.yml.
 [build]
 image = "moqdev/moq-relay:latest"
 
@@ -16,10 +16,13 @@ port = 443
 # Environment variables
 [env]
 # NOTE: A dedicated IPv4 address is required for UDP.
-MOQ_SERVER_BIND = "fly-global-services:443"
+MOQ_LISTEN = "fly-global-services:443"
 
 # Resource allocation per region
 [[vm]]
 memory = '1gb'
 cpu_kind = 'shared'
 cpus = 1
+# The image runs unprivileged, and Fly does not rewrite UDP ports, so the relay
+# must bind 443 itself. Lower the VM's privileged-port floor to 443.
+kernel_args = "sysctl.net.ipv4.ip_unprivileged_port_start=443"

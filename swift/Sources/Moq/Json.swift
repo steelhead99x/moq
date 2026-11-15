@@ -1,117 +1,294 @@
 import Foundation
 import MoqFFI
 
-/// Write side of a JSON snapshot track (lossy latest-value).
+/// JSON tracks, mirroring the `moq-json` crate.
 ///
-/// Built via `BroadcastProducer.publishJsonSnapshot`. Each `update` supersedes the last, so a
-/// late joiner only sees the newest value. Values cross the FFI boundary as JSON, encoded from
-/// `Value` with `JSONEncoder`, so `Value` must encode to a JSON object or array: `JSONEncoder`
-/// rejects a top-level scalar (a bare number/string/bool) on Foundation before the swift-foundation
-/// rewrite (iOS < 18 / macOS < 15).
-public final class JsonSnapshotProducer<Value: Encodable>: Sendable {
-    let ffi: MoqJsonSnapshotProducer
-
-    init(_ ffi: MoqJsonSnapshotProducer) {
-        self.ffi = ffi
-    }
-
-    /// Publish a new value, encoded as a snapshot or merge-patch delta automatically. A no-op
-    /// if unchanged from the previous update.
-    public func update(_ value: Value) throws {
-        try ffi.update(value: encodeJson(value))
-    }
-
-    /// Finish the track, closing any open group.
-    public func finish() throws {
-        try ffi.finish()
-    }
-}
-
-/// Read side of a JSON snapshot track (lossy latest-value). Iterating yields the latest value,
-/// collapsing the backlog for a reader that has fallen behind: `for try await value in json { ... }`.
-public final class JsonSnapshotConsumer<Value: Decodable & Sendable>: AsyncSequence, Sendable {
-    /// The decoded snapshot value emitted by this sequence.
-    public typealias Element = Value
-
-    let ffi: MoqJsonSnapshotConsumer
-
-    init(_ ffi: MoqJsonSnapshotConsumer) {
-        self.ffi = ffi
-    }
-
-    /// The next value, decoded as `Value`, or `nil` once the track ends or is closed.
-    public func next() async throws -> Value? {
-        guard let json = try await ffi.next() else { return nil }
-        return try decodeJson(json) as Value
-    }
-
-    /// Cancel all current and future reads.
-    public func cancel() {
-        ffi.cancel()
-    }
-
-    /// Create an iterator that cancels native reads when iteration ends.
-    public func makeAsyncIterator() -> AsyncThrowingStream<Value, Swift.Error>.Iterator {
-        moqStream(cancel: { [ffi] in ffi.cancel() }) { [self] in
-            try await next()
-        }.makeAsyncIterator()
-    }
-}
-
-/// Write side of a JSON stream track (lossless append-log).
+/// Each type wraps a track: a producer takes over a `TrackProducer` (the snapshot and stream
+/// producers also advertise it in the broadcast's catalog, which has no window mode), and a
+/// consumer takes over a `TrackConsumer` that has not read a group yet. Values cross the FFI boundary as JSON, encoded with `JSONEncoder` and decoded with
+/// `JSONDecoder`. `JSONEncoder` rejects a top-level scalar (a bare number/string/bool) on
+/// Foundation before the swift-foundation rewrite (iOS < 18 / macOS < 15), so encode an object
+/// or array there.
 ///
-/// Built via `BroadcastProducer.publishJsonStream`. Every `append` is preserved and delivered
-/// in order. Values cross the FFI boundary as JSON, encoded from `Value` with `JSONEncoder`, so
-/// `Value` must encode to a JSON object or array: `JSONEncoder` rejects a top-level scalar (a bare
-/// number/string/bool) on Foundation before the swift-foundation rewrite (iOS < 18 / macOS < 15).
-public final class JsonStreamProducer<Value: Encodable>: Sendable {
-    let ffi: MoqJsonStreamProducer
+/// Compression is the track's: publish JSON with `TrackInfo(compression: .deflate)`, and a consumer reads
+/// it with no option of its own.
+///
+/// Every write (a snapshot update, a stream append, a window push or pop) takes a timestamp on the
+/// broadcast clock, the epoch every track in the broadcast shares: read it with
+/// `Media.CatalogProducer.now()`. The track needs a timescale (`TrackInfo(timescale: 1000)`); one
+/// without is refused.
+public enum Json {}
 
-    init(_ ffi: MoqJsonStreamProducer) {
-        self.ffi = ffi
+extension Json {
+    /// A decoded JSON value and the timestamp of the frame that carried it.
+    public struct Timed<Value> {
+        /// The decoded value.
+        public let value: Value
+        /// The frame's timestamp on the broadcast clock, or `nil` when untimed.
+        public let timestamp: Timestamp?
+
+        /// Pair `value` with its frame timestamp.
+        public init(value: Value, timestamp: Timestamp?) {
+            self.value = value
+            self.timestamp = timestamp
+        }
+
+        init?(_ ffi: MoqJsonValue?) throws where Value: Decodable {
+            guard let ffi else { return nil }
+            self.init(value: try decodeJson(ffi.value), timestamp: ffi.timestamp)
+        }
     }
 
-    /// Append one record to the log.
-    public func append(_ value: Value) throws {
-        try ffi.append(value: encodeJson(value))
+    /// Write side of a JSON snapshot track (lossy latest-value).
+    ///
+    /// Each `update` supersedes the last, so a late joiner only sees the newest value.
+    public final class SnapshotProducer<Value: Encodable>: Sendable {
+        let ffi: MoqJsonSnapshotProducer
+
+        /// Publish `track` as a JSON snapshot track, advertised in `broadcast`'s catalog until it
+        /// finishes. Takes over `track`, whose handle is closed afterward; throws if the catalog
+        /// already carries the track's name or `track` has no timescale.
+        ///
+        /// `deltas` encodes updates as merge-patch deltas; with it off every update is a full
+        /// snapshot in its own group. With deltas on, give the track a `refresh` ratio so a joiner
+        /// past it gets the value restated in a fresh group.
+        public init(
+            broadcast: BroadcastProducer,
+            track: TrackProducer,
+            deltas: Bool = MoqJsonSnapshotConfig().deltas
+        ) throws {
+            ffi = try MoqJsonSnapshotProducer(
+                broadcast: broadcast.ffi,
+                track: track.ffi,
+                config: MoqJsonSnapshotConfig(deltas: deltas)
+            )
+        }
+
+        /// Publish a new value at `timestamp` on the broadcast clock, encoded as a snapshot or
+        /// merge-patch delta automatically. A no-op if unchanged from the previous update.
+        public func update(_ value: Value, timestamp: Timestamp) throws {
+            try ffi.update(value: encodeJson(value), timestamp: timestamp)
+        }
+
+        /// A watch-only handle to whether the track has subscribers.
+        public func demand() throws -> TrackDemand {
+            TrackDemand(try ffi.demand())
+        }
+
+        /// Finish the track, closing any open group.
+        public func finish() throws {
+            try ffi.finish()
+        }
     }
 
-    /// Finish the track, closing the group.
-    public func finish() throws {
-        try ffi.finish()
+    /// Read side of a JSON snapshot track (lossy latest-value). Iterating yields each state in
+    /// order with its timestamp: `for try await state in json { ... }`. Every group a newer one
+    /// supersedes is skipped; `latest()` skips to the newest state instead.
+    public final class SnapshotConsumer<Value: Decodable & Sendable>: AsyncSequence, Sendable {
+        /// The decoded snapshot state emitted by this sequence.
+        public typealias Element = Timed<Value>
+
+        let ffi: MoqJsonSnapshotConsumer
+
+        /// Subscribe to the track `name` on `broadcast` and read it as a JSON snapshot track.
+        /// The consumer owns its subscription, at a zero `delay.max` and `priority` (higher
+        /// first); a read waits for it to resolve and throws if it cannot.
+        public init(broadcast: BroadcastConsumer, name: String, priority: Int8 = 0) throws {
+            ffi = try MoqJsonSnapshotConsumer(broadcast: broadcast.ffi, name: name, priority: priority)
+        }
+
+        /// The next state in order, or `nil` once the track ends or is closed.
+        public func next() async throws -> Timed<Value>? {
+            try Timed(try await ffi.next())
+        }
+
+        /// Skip to the newest state, or wait for one; `nil` once the track ends or is closed.
+        /// Skipped states are gone, and `next()` continues after this one.
+        public func latest() async throws -> Timed<Value>? {
+            try Timed(try await ffi.latest())
+        }
+
+        /// Cancel all current and future reads.
+        public func cancel() {
+            ffi.cancel()
+        }
+
+        /// Create an iterator that cancels native reads when iteration ends.
+        public func makeAsyncIterator() -> AsyncThrowingStream<Timed<Value>, Swift.Error>.Iterator {
+            moqStream(cancel: { [ffi] in ffi.cancel() }) { [self] in
+                try await next()
+            }.makeAsyncIterator()
+        }
+    }
+
+    /// Write side of a JSON stream track (lossless append-log).
+    ///
+    /// Every `append` is preserved and delivered in order.
+    public final class StreamProducer<Value: Encodable>: Sendable {
+        let ffi: MoqJsonStreamProducer
+
+        /// Publish `track` as a JSON stream track, advertised in `broadcast`'s catalog until it
+        /// finishes. Takes over `track`, whose handle is closed afterward; throws if the catalog
+        /// already carries the track's name or `track` has no timescale.
+        public init(broadcast: BroadcastProducer, track: TrackProducer) throws {
+            ffi = try MoqJsonStreamProducer(broadcast: broadcast.ffi, track: track.ffi)
+        }
+
+        /// Append one record to the log at `timestamp` on the broadcast clock.
+        public func append(_ value: Value, timestamp: Timestamp) throws {
+            try ffi.append(value: encodeJson(value), timestamp: timestamp)
+        }
+
+        /// A watch-only handle to whether the track has subscribers.
+        public func demand() throws -> TrackDemand {
+            TrackDemand(try ffi.demand())
+        }
+
+        /// Finish the track, closing the group.
+        public func finish() throws {
+            try ffi.finish()
+        }
+    }
+
+    /// Read side of a JSON stream track (lossless append-log). Iterating yields every record in
+    /// order: `for try await record in json { ... }`.
+    public final class StreamConsumer<Value: Decodable & Sendable>: AsyncSequence, Sendable {
+        /// The decoded stream record emitted by this sequence.
+        public typealias Element = Timed<Value>
+
+        let ffi: MoqJsonStreamConsumer
+
+        /// Read `track` as a JSON stream track. Takes over `track`, whose handle is closed
+        /// afterward; throws if it has already read a group.
+        public init(track: TrackConsumer) throws {
+            ffi = try MoqJsonStreamConsumer(track: track.ffi)
+        }
+
+        /// The next record, or `nil` once the track ends or is closed.
+        public func next() async throws -> Timed<Value>? {
+            try Timed(try await ffi.next())
+        }
+
+        /// Cancel all current and future reads.
+        public func cancel() {
+            ffi.cancel()
+        }
+
+        /// Create an iterator that cancels native reads when iteration ends.
+        public func makeAsyncIterator() -> AsyncThrowingStream<Timed<Value>, Swift.Error>.Iterator {
+            moqStream(cancel: { [ffi] in ffi.cancel() }) { [self] in
+                try await next()
+            }.makeAsyncIterator()
+        }
     }
 }
 
-/// Read side of a JSON stream track (lossless append-log). Iterating yields every record in
-/// order: `for try await record in json { ... }`.
-public final class JsonStreamConsumer<Value: Decodable & Sendable>: AsyncSequence, Sendable {
-    /// The decoded stream record emitted by this sequence.
-    public typealias Element = Value
+extension Json {
+    /// Write side of a JSON window track: records pushed at the back and popped from the front.
+    ///
+    /// The window rolls to new groups that restate the records it retains, so a reader can join at
+    /// any point. Not advertised in the broadcast's catalog; a reader names the track.
+    public final class WindowProducer<Value: Encodable>: Sendable {
+        let ffi: MoqJsonWindowProducer
 
-    let ffi: MoqJsonStreamConsumer
+        /// Publish `track` as a JSON window track. Takes over `track`, whose handle is closed
+        /// afterward; throws if `track` has no timescale.
+        ///
+        /// `checkpointRecords` bounds the records retained and restated for a window that is never
+        /// popped: a reader that keeps up still sees every record, while a later joiner is told the
+        /// older ones were skipped. Give the track a `refresh` ratio so a joiner past it gets the
+        /// window restated in a fresh group.
+        public init(track: TrackProducer, checkpointRecords: UInt64? = nil) throws {
+            ffi = try MoqJsonWindowProducer(
+                track: track.ffi,
+                config: MoqJsonWindowConfig(checkpointRecords: checkpointRecords)
+            )
+        }
 
-    init(_ ffi: MoqJsonStreamConsumer) {
-        self.ffi = ffi
+        /// Append one record to the back of the window at `timestamp` on the broadcast clock.
+        public func push(_ value: Value, timestamp: Timestamp) throws {
+            try ffi.push(value: encodeJson(value), timestamp: timestamp)
+        }
+
+        /// Drop `count` records from the front of the window at `timestamp` on the broadcast
+        /// clock, clamped to what it holds.
+        public func pop(_ count: UInt64, timestamp: Timestamp) throws {
+            try ffi.pop(count: count, timestamp: timestamp)
+        }
+
+        /// Close the open group, so the next edit opens one restating the retained window. A no-op
+        /// when no group is open. Cut at a natural boundary, such as the end of an utterance.
+        public func cut() throws {
+            try ffi.cut()
+        }
+
+        /// A watch-only handle to whether the track has subscribers.
+        public func demand() throws -> TrackDemand {
+            TrackDemand(try ffi.demand())
+        }
+
+        /// Finish the track, closing any open group.
+        public func finish() throws {
+            try ffi.finish()
+        }
     }
 
-    /// The next record, decoded as `Value`, or `nil` once the track ends or is closed.
-    public func next() async throws -> Value? {
-        guard let json = try await ffi.next() else { return nil }
-        return try decodeJson(json) as Value
+    /// One change to a window, as a `WindowConsumer` sees it. Ranges are absolute record indices.
+    public enum WindowEvent<Value> {
+        /// A record joined the window at this index.
+        case push(index: UInt64, value: Value)
+        /// These records left the window.
+        case pop(Range<UInt64>)
+        /// These records will never be delivered: they were pushed and dropped while this reader
+        /// was behind, or fell outside the producer's checkpoint when it joined.
+        case skip(Range<UInt64>)
     }
 
-    /// Cancel all current and future reads.
-    public func cancel() {
-        ffi.cancel()
-    }
+    /// Read side of a JSON window track. Iterating yields each change in order with its
+    /// timestamp: `for try await event in window { ... }`. Group rolls never surface.
+    public final class WindowConsumer<Value: Decodable & Sendable>: AsyncSequence, Sendable {
+        /// The decoded window change emitted by this sequence.
+        public typealias Element = Timed<WindowEvent<Value>>
 
-    /// Create an iterator that cancels native reads when iteration ends.
-    public func makeAsyncIterator() -> AsyncThrowingStream<Value, Swift.Error>.Iterator {
-        moqStream(cancel: { [ffi] in ffi.cancel() }) { [self] in
-            try await next()
-        }.makeAsyncIterator()
+        let ffi: MoqJsonWindowConsumer
+
+        /// Read `track` as a JSON window track. Takes over `track`, whose handle is closed
+        /// afterward; throws if it has already read a group.
+        public init(track: TrackConsumer) throws {
+            ffi = try MoqJsonWindowConsumer(track: track.ffi)
+        }
+
+        /// The next change, or `nil` once the track ends or is closed. A record first learned of
+        /// from a restatement carries that frame's timestamp, not its original push time.
+        public func next() async throws -> Element? {
+            guard let timed = try await ffi.next() else { return nil }
+            let event: WindowEvent<Value>
+            switch timed.event {
+            case .push(let index, let value): event = .push(index: index, value: try decodeJson(value))
+            case .pop(let start, let end): event = .pop(start..<end)
+            case .skip(let start, let end): event = .skip(start..<end)
+            }
+            return Timed(value: event, timestamp: timed.timestamp)
+        }
+
+        /// Cancel all current and future reads.
+        public func cancel() {
+            ffi.cancel()
+        }
+
+        /// Create an iterator that cancels native reads when iteration ends.
+        public func makeAsyncIterator() -> AsyncThrowingStream<Element, Swift.Error>.Iterator {
+            moqStream(cancel: { [ffi] in ffi.cancel() }) { [self] in
+                try await next()
+            }.makeAsyncIterator()
+        }
     }
 }
+
+extension Json.WindowEvent: Sendable where Value: Sendable {}
+extension Json.WindowEvent: Equatable where Value: Equatable {}
+extension Json.Timed: Sendable where Value: Sendable {}
+extension Json.Timed: Equatable where Value: Equatable {}
 
 private func encodeJson(_ value: some Encodable) throws -> String {
     String(decoding: try JSONEncoder().encode(value), as: UTF8.self)

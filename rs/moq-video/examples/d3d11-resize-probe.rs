@@ -59,6 +59,11 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
+#[expect(
+	clippy::disallowed_methods,
+	clippy::disallowed_types,
+	reason = "the probe times real Direct3D calls on the host clock"
+)]
 mod probe {
 	use std::ffi::c_void;
 	use std::mem::{ManuallyDrop, size_of};
@@ -68,10 +73,11 @@ mod probe {
 	use std::time::{Duration, Instant};
 
 	use anyhow::{Context, Result, anyhow, bail};
-	use moq_video::windows::Win32::Foundation::{HMODULE, RECT};
-	use moq_video::windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-	use moq_video::windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
-	use moq_video::windows::Win32::Graphics::Direct3D11::{
+	use moq_video::{Frame, I420, Size, Surface};
+	use windows::Win32::Foundation::{HMODULE, RECT};
+	use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+	use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
+	use windows::Win32::Graphics::Direct3D11::{
 		D3D11_BIND_DECODER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_VIDEO_ENCODER, D3D11_BOX,
 		D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_DEBUG,
 		D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MESSAGE, D3D11_SDK_VERSION,
@@ -85,8 +91,8 @@ mod probe {
 		ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
 		ID3D11VideoProcessorOutputView,
 	};
-	use moq_video::windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
-	use moq_video::windows::Win32::Media::MediaFoundation::{
+	use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
+	use windows::Win32::Media::MediaFoundation::{
 		IMFActivate, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFSample, IMFTransform, MF_E_NO_MORE_TYPES,
 		MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY,
 		MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION, MFCreateDXGIDeviceManager, MFCreateMediaType,
@@ -95,9 +101,8 @@ mod probe {
 		MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
 		MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
 	};
-	use moq_video::windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
-	use moq_video::windows::core::Interface;
-	use moq_video::{Frame, I420, Size, Surface};
+	use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
+	use windows::core::Interface;
 
 	/// The source stream the probe decodes, and the size it scales down to.
 	const SOURCE: Size = Size {
@@ -549,7 +554,7 @@ mod probe {
 		let pitch = mapped.RowPitch as usize;
 		let base = mapped.pData as *const u8;
 
-		let mut data = vec![0u8; I420::len(size.width, size.height)];
+		let mut data = vec![0u8; I420::len(size)?];
 		let (luma, chroma) = data.split_at_mut(w * h);
 		let (u_plane, v_plane) = chroma.split_at_mut(cw * ch);
 		for row in 0..h {
@@ -566,7 +571,7 @@ mod probe {
 			}
 		}
 
-		I420::new(size.width, size.height, data).context("I420::new")
+		I420::new(size, data).context("I420::new")
 	}
 
 	struct UnmapGuard<'a> {
@@ -833,22 +838,28 @@ mod probe {
 	/// `FRAMES` access units of a gradient, encoded by openh264 (Annex-B with
 	/// inline parameter sets, which is what the MFT wants).
 	fn stream() -> Result<Vec<Vec<u8>>> {
-		let mut config = moq_video::encode::Config::new(SOURCE.width, SOURCE.height, 30);
+		let mut config =
+			moq_video::encode::Config::new(SOURCE.width, SOURCE.height, moq_video::FrameRate::new(30, 1).unwrap());
 		config.kind = moq_video::encode::Kind::Software;
 		let mut encoder = moq_video::encode::Encoder::new(&config).context("openh264 encoder")?;
 
 		let mut out = Vec::new();
 		for index in 0..FRAMES {
 			if index == 0 {
-				encoder.keyframe();
+				encoder.cut().unwrap();
 			}
 			let frame = Frame::new(
 				Surface::I420(gradient(index)),
 				moq_net::Timestamp::from_micros(index * 33_333).unwrap(),
 			);
-			for encoded in encoder.encode(&frame).context("encode")? {
+			encoder.encode(&frame).context("encode")?;
+			while let Some(encoded) = encoder.receive().context("encode")? {
 				out.push(encoded.payload.to_vec());
 			}
+		}
+		encoder.flush().context("flush")?;
+		while let Some(encoded) = encoder.receive().context("flush")? {
+			out.push(encoded.payload.to_vec());
 		}
 		Ok(out)
 	}
@@ -857,13 +868,13 @@ mod probe {
 	/// and two frames are never identical.
 	fn gradient(index: u64) -> I420 {
 		let (w, h) = (SOURCE.width as usize, SOURCE.height as usize);
-		let mut data = vec![128u8; I420::len(SOURCE.width, SOURCE.height)];
+		let mut data = vec![128u8; I420::len(SOURCE).expect("source size")];
 		for y in 0..h {
 			for x in 0..w {
 				data[y * w + x] = ((x * 255 / w + y * 255 / h) / 2 + index as usize * 4) as u8;
 			}
 		}
-		I420::new(SOURCE.width, SOURCE.height, data).expect("gradient")
+		I420::new(SOURCE, data).expect("gradient")
 	}
 
 	/// Mean absolute error between two planes, the same check the CUDA and
@@ -877,7 +888,7 @@ mod probe {
 	fn report(device: &ID3D11Device, scaled: &ID3D11Texture2D, source: &I420) -> Result<()> {
 		let got = download_i420(device, scaled, TARGET)?;
 		let expected = Frame::new(Surface::I420(source.clone()), moq_net::Timestamp::ZERO)
-			.resize(TARGET)
+			.resize(TARGET, &moq_video::resize::Config::default())
 			.context("cpu resize")?
 			.surface
 			.into_i420()
@@ -888,9 +899,7 @@ mod probe {
 			SOURCE.height,
 			TARGET.width,
 			TARGET.height,
-			// `into_i420` hands back one packed buffer, so its luma is the leading
-			// `width * height` bytes rather than a plane accessor.
-			mae(got.y(), &expected[..TARGET.pixels() as usize])
+			mae(got.y(), expected.y())
 		);
 		Ok(())
 	}
@@ -1049,7 +1058,10 @@ mod probe {
 		let mut frames = Vec::new();
 		for (index, unit) in stream()?.into_iter().enumerate() {
 			let timestamp = moq_net::Timestamp::from_micros(index as u64 * 33_333).unwrap();
-			frames.extend(decoder.decode(&unit.into(), timestamp, index == 0).context("decode")?);
+			decoder.decode(&unit.into(), timestamp, index == 0).context("decode")?;
+			while let Some(frame) = decoder.receive().context("decode")? {
+				frames.push(frame);
+			}
 		}
 		let Some(Surface::Texture(texture)) = frames.first().map(|f| &f.surface) else {
 			bail!("the crate's decoder did not produce a GPU texture on this machine");
@@ -1111,11 +1123,12 @@ mod probe {
 		let mut frames = Vec::new();
 		for (index, unit) in units.iter().enumerate() {
 			let timestamp = moq_net::Timestamp::from_micros(index as u64 * 33_333).unwrap();
-			frames.extend(
-				decoder
-					.decode(&unit.clone().into(), timestamp, index == 0)
-					.context("decode")?,
-			);
+			decoder
+				.decode(&unit.clone().into(), timestamp, index == 0)
+				.context("decode")?;
+			while let Some(frame) = decoder.receive().context("decode")? {
+				frames.push(frame);
+			}
 		}
 		let Some(first) = frames.into_iter().next() else {
 			bail!("the decoder did not produce a frame on this machine");
@@ -1138,7 +1151,11 @@ mod probe {
 			for (rung, target) in SIZES.into_iter().enumerate() {
 				workers.push(scope.spawn(move || -> Result<()> {
 					let _com = ComGuard::new().with_context(|| format!("ladder rung {rung} COM"))?;
-					let mut config = moq_video::encode::Config::new(target.width, target.height, 30);
+					let mut config = moq_video::encode::Config::new(
+						target.width,
+						target.height,
+						moq_video::FrameRate::new(30, 1).unwrap(),
+					);
 					config.kind = moq_video::encode::Kind::Named("mediafoundation".into());
 					let mut encoder = moq_video::encode::Encoder::new(&config)
 						.with_context(|| format!("ladder rung {rung} hardware encoder"))?;
@@ -1148,7 +1165,7 @@ mod probe {
 								return Ok(());
 							}
 							let resized = frame
-								.resize(target)
+								.resize(target, &moq_video::resize::Config::default())
 								.with_context(|| format!("ladder rung {rung} resize"))?;
 							if !matches!(&resized.surface, Surface::Texture(_)) {
 								bail!("ladder rung {rung} resize left the GPU");
@@ -1156,6 +1173,11 @@ mod probe {
 							encoder
 								.encode(&resized)
 								.with_context(|| format!("ladder rung {rung} encode"))?;
+							while encoder
+								.receive()
+								.with_context(|| format!("ladder rung {rung} encode"))?
+								.is_some()
+							{}
 						}
 					}
 					Ok(())
@@ -1194,6 +1216,7 @@ mod probe {
 						decoder
 							.decode(&unit.clone().into(), timestamp, index == 0)
 							.context("live ladder decode")?;
+						while decoder.receive().context("live ladder decode")?.is_some() {}
 						timestamp_index += 1;
 					}
 				}

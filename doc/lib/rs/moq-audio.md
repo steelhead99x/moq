@@ -9,37 +9,65 @@ description: Native audio capture, codecs, playback, and echo cancellation
 [![docs.rs](https://docs.rs/moq-audio/badge.svg)](https://docs.rs/moq-audio)
 
 The audio half of a native call: microphone in, hang track out, speaker at
-the far end. Everything is Rust, so there is no C toolchain, CMake step, or
-codec to install.
+the far end. `moq import capture` and `moq play` use it. There is no C
+toolchain or codec package to install, apart from ALSA headers on Linux when
+capture or playback is enabled.
 
 | Module | Does |
 | --- | --- |
 | `capture` | Microphones via CoreAudio, WASAPI, ALSA (and PipeWire/PulseAudio hosts), plus macOS system audio |
-| `encode` | PCM to Opus (with DTX and voice-activity signaling) or raw PCM for the lowest latency |
-| `decode` | Opus, PCM, and AAC-LC back to PCM, resampled to the rate you want |
-| `playback` | One output device mixing every track in a call, with click-free volume ramps |
-| `aec` | Acoustic echo cancellation (a port of WebRTC's), so a laptop with no headset doesn't feed itself back |
+| `encode` | PCM to Opus (mono or stereo, with DTX and voice activity) or raw PCM |
+| `decode` | Opus (up to 7.1), PCM, and AAC-LC (mono or stereo) back to PCM, resampled to the rate you want |
+| `playback` | One output device mixing every track in a call, with click-free volume ramps, each track's received audio stretched onto the caller's clock (`Sink::due`) |
+| `aec` | Acoustic echo cancellation (a port of WebRTC's) for caller-supplied PCM or the built-in devices |
+| `bus` | Routes sources into several mixes, each with its own meter and mix-minus, advanced on the caller's clock |
 
-Highlights:
+Open one `capture::Producer`, give a consumer to each bus channel or encoder,
+and run the producer alongside them. They share samples and capture timestamps;
+a slow reader loses only its own expired audio. Dropping the producer releases
+the device, and a device failure ends every reader with the same error.
 
-- **`encode::Publication`** advertises the track and opens the microphone only while someone listens. Stop, swap devices, and restart without changing the track subscribers know; read a level meter for the UI.
-- **A/V sync signal.** `Sink::buffered()` reports how far ahead the speaker is, which is what a video clock steers by.
-- **Activity per packet**, read off the Opus stream, so a call UI shows who is talking without a second voice detector.
-- **One Linux build dependency**: ALSA headers, and only when `capture` or `playback` is enabled.
+The bus owns no clock: whoever owns the audio clock, such as a program
+clock on `kio::clock` or a device callback, advances its one driver by the
+frames that clock moved, so tests step it on virtual time. Each mix sums only
+the sources routed into it, and its readers get blocks stamped with their
+position on that clock, so a reader that falls behind skips its own audio
+without stalling the mix. A positioned channel takes audio already scheduled
+on that clock, such as decoded media timed against its video; given a stretch
+bound, it glides onto positions that move with a playout target, as playback
+glides onto its clock, instead of writing silence or failing at each step.
 
-```rust
-let mut audio = moq_audio::decode::Consumer::new(&broadcast, &rendition, "audio", Default::default()).await?;
-let engine = moq_audio::playback::Engine::open(Default::default()).await?;
-let mut sink = engine.sink(moq_audio::playback::Input { sample_rate: audio.sample_rate(), channels: audio.channels(), ..Default::default() })?;
-while let Some(frame) = audio.read().await? {
-    sink.write(&frame.data)?;
-}
-```
+Without a subscriber the encoder keeps raw PCM
+up to the track's `max_age`, then encodes the part of that history within the
+subscribers' max delay before continuing live when someone subscribes. With an unlimited `max_age` it keeps at most 30 seconds
+(about 11.5 MB for 48 kHz stereo f32). Set `encode::Capture::retain` to false
+to encode continuously instead. Dropping an encoder leaves the shared capture running. A device
+failure keeps the retained history on the track until it is subscribed or expires, then the
+encoder returns the error. Opus packs 20 ms per packet by default,
+or 10 ms with a shorter `frame_duration`. Groups carry at least 20 ms by default,
+so 10 ms packets pair up. `encode::Options::join`
+changes that minimum; a join shorter than a packet puts every packet in its own
+group, and zero is refused. Longer groups
+mean fewer streams per relay but coarser loss. There is no AAC encoder, so an
+AAC encode request is refused; AAC decode is for broadcasts from the ingest gateways.
+
+Playback writes never block: samples that do not fit are dropped and
+reported, and retrying them would only add latency. Voice activity is read off the Opus
+stream, so a call UI needs no second detector. Echo cancellation pairs one
+playback engine with one live microphone, or processes playback and microphone
+PCM supplied by another audio stack. A microphone buffer is stamped at
+the capture instant of its first sample, so it lines up with video acquired
+then: up to 10 ms later with echo cancellation on, and at the producer's read time on a host with no usable capture timestamp.
 
 ```bash
-cargo add moq-audio                                    # aac, capture, playback, aec on by default
-cargo add moq-audio --no-default-features --features aac   # a service that only relays or decodes
+cargo add moq-audio --features playback
+cargo add moq-audio --features aec    # Built-in devices; Linux: cpal links libasound
+cargo add moq-audio                   # PCM echo processing needs no device feature
+cargo add moq-audio --features capture,pipewire
 ```
 
+`pipewire` and `pulseaudio` only take effect alongside `capture` or `playback`, and only on Linux and the BSDs; elsewhere they compile to nothing, so a dependent can enable them on every platform.
+
 API: [docs.rs/moq-audio](https://docs.rs/moq-audio). Pair with
-[`moq-video`](/lib/rs/moq-video).
+[`moq-video`](/lib/rs/moq-video). The playout target `moq play` and
+`<moq-watch>` share is [audio jitter](/concept/audio-jitter).

@@ -1,3 +1,12 @@
+#![warn(missing_docs)]
+#![cfg_attr(
+	not(feature = "async"),
+	allow(
+		rustdoc::broken_intra_doc_links,
+		reason = "the docs link the async-only functions, which a poll-only build leaves out"
+	)
+)]
+
 //! Media muxers and demuxers for MoQ.
 //!
 //! Sits between [`moq_net`] (pub/sub transport) and [`hang`] (media
@@ -19,27 +28,44 @@
 //! - [`Pacer`] maps each exported frame's media timestamp to the wall-clock
 //!   instant it should be delivered at, for byte streams whose spacing is
 //!   part of the format (MPEG-TS).
-//! - [`timeline`](mod@timeline) publishes the broadcast's group index: one
-//!   record per media group mapping it to its start timestamp, so consumers
-//!   can seek or build playlists without downloading media.
+//! - [`sync`] holds a broadcast's tracks on one playout clock without letting a slow one stall the rest.
+//! - [`rate`] turns bandwidth grants into stable media bitrate targets shared
+//!   by audio, video, and transcode senders.
+//! - [`follow`] follows a broadcast across the publisher instances that
+//!   serve it, for a reader that restarts on each one.
+//! - [`Linger`] keeps a cleanly ended broadcast up for a fixed time, so a
+//!   subscriber that arrives after the end still gets its tail.
+//! - [`Ingest`] is how a protocol gateway publishes what it ingests: max age,
+//!   allocator, and linger.
+//!
+//! The `poll_*` methods are always available. Enable the `async` feature for their generated
+//! async wrappers and the async constructors with no poll of their own; it is off by default.
 
+#[cfg(any(test, feature = "fuzz"))]
+mod allocation;
 pub mod catalog;
 mod clock;
 pub mod codec;
 pub mod container;
 mod error;
+pub mod follow;
+#[cfg(any(test, feature = "fuzz"))]
+pub mod fuzz;
 pub mod import;
+mod ingest;
+mod jitter;
+pub mod json;
+mod linger;
 mod pace;
+pub mod rate;
 pub mod select;
 mod source;
-pub mod timeline;
+mod stats;
+pub mod sync;
 
 pub use clock::Clock;
 pub use error::*;
+pub use ingest::Ingest;
+pub use linger::Linger;
 pub use pace::Pacer;
-pub use source::Source;
-
-/// Re-export of the [`mp4_atom`] crate, whose types appear in the public CMAF
-/// surface ([`container::fmp4`]). A major version bump of `mp4_atom` is a
-/// breaking change for moq-mux.
-pub use mp4_atom;
+pub use source::{Binding, Source};

@@ -18,9 +18,14 @@ pub use export::*;
 pub use import::*;
 pub use split::*;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
+use h264_reader::nal::sps::{FrameMbsFlags, SeqParameterSet};
+use h264_reader::rbsp::{BitRead, BitReaderError};
+
+use crate::codec::annexb::{InBandCodec, ParameterSets};
 
 // H.264 NAL unit types (ISO/IEC 14496-10 §7.4.1).
+const NAL_TYPE_SEI: u8 = 6;
 const NAL_TYPE_SPS: u8 = 7;
 const NAL_TYPE_PPS: u8 = 8;
 
@@ -58,71 +63,105 @@ fn avc1_is_keyframe(data: &[u8], length_size: usize) -> bool {
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+	/// The SPS NAL is shorter than its required header.
 	#[error("SPS NAL too short")]
 	SpsTooShort,
 
+	/// The SPS NAL could not be parsed.
 	#[error("failed to parse SPS")]
 	SpsParse,
 
+	/// The AVCDecoderConfigurationRecord is shorter than its required header.
 	#[error("AVCDecoderConfigurationRecord too short")]
 	AvccTooShort,
 
+	/// The AVCDecoderConfigurationRecord ends before its declared parameter sets.
 	#[error("AVCDecoderConfigurationRecord truncated")]
 	AvccTruncated,
 
-	#[error("avc1 description for rendition {name:?} is missing SPS or PPS (sps={sps}, pps={pps})")]
-	MissingParamSets { name: String, sps: usize, pps: usize },
+	/// The AVCDecoderConfigurationRecord declares a configurationVersion other than 1.
+	#[error("unsupported AVCDecoderConfigurationRecord version {0}")]
+	AvccVersion(u8),
 
+	/// The named avc1 rendition lacks an SPS or PPS in its description.
+	#[error("avc1 description for rendition {name:?} is missing SPS or PPS (sps={sps}, pps={pps})")]
+	MissingParamSets {
+		/// The rendition name.
+		name: String,
+		/// The number of SPS NAL units in the description.
+		sps: usize,
+		/// The number of PPS NAL units in the description.
+		pps: usize,
+	},
+
+	/// The SPS length does not fit the avcC length field.
 	#[error("SPS too large for avcC length field ({0} > {max})", max = u16::MAX)]
 	SpsTooLarge(usize),
 
+	/// The PPS length does not fit the avcC length field.
 	#[error("PPS too large for avcC length field ({0} > {max})", max = u16::MAX)]
 	PpsTooLarge(usize),
 
+	/// No SPS is available to configure the stream.
 	#[error("avcC requires at least one SPS")]
 	MissingSps,
 
+	/// The number of SPS NAL units exceeds the avcC limit of 31.
 	#[error("too many SPS for avcC ({0} > 31)")]
 	TooManySps(usize),
 
+	/// The number of PPS NAL units exceeds the avcC limit of 255.
 	#[error("too many PPS for avcC ({0} > 255)")]
 	TooManyPps(usize),
 
+	/// The NAL payload length does not fit a four-byte prefix.
 	#[error("NAL too large for 4-byte length prefix")]
 	NalTooLarge,
 
+	/// The NAL unit ends before its required header or slice fields.
 	#[error("NAL unit is too short")]
 	NalTooShort,
 
+	/// The NAL header sets the forbidden_zero_bit.
 	#[error("forbidden zero bit is not zero")]
 	ForbiddenZeroBit,
 
+	/// The stream has not supplied its decoder configuration.
 	#[error("not initialized")]
 	NotInitialized,
 
+	/// The avc3 track has not been created.
 	#[error("avc3 track not created")]
 	Avc3TrackNotCreated,
 
+	/// The access unit has no timestamp.
 	#[error("missing timestamp")]
 	MissingTimestamp,
 
+	/// Parsing or transforming the Annex B stream failed.
 	#[error("annexb: {0}")]
 	Annexb(#[from] crate::codec::annexb::Error),
 }
 
+/// A result using this module's error type.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Parsed H.264 SPS (Sequence Parameter Set) NAL.
 ///
-/// Wraps [`h264_parser::Sps`] with the codec-config fields that the hang
+/// Reads the SPS with [`h264_reader`] and keeps the codec-config fields that the hang
 /// catalog records: profile_idc, level_idc, and the packed constraint_set
 /// flags. The first byte of `nal` must be the NAL header.
 #[derive(Debug, Clone)]
 pub struct Sps {
+	/// The SPS profile_idc.
 	pub profile: u8,
+	/// The packed SPS constraint_set flags.
 	pub constraints: u8,
+	/// The SPS level_idc.
 	pub level: u8,
+	/// The coded picture width in pixels.
 	pub coded_width: u32,
+	/// The coded picture height in pixels.
 	pub coded_height: u32,
 }
 
@@ -132,16 +171,208 @@ impl Sps {
 		if nal.len() < 4 {
 			return Err(Error::SpsTooShort);
 		}
-		let rbsp = h264_parser::nal::ebsp_to_rbsp(&nal[1..]);
-		let sps = h264_parser::Sps::parse(&rbsp).map_err(|_| Error::SpsParse)?;
+		let sps = read_sps(nal).ok_or(Error::SpsParse)?;
+		let (coded_width, coded_height) = sps.pixel_dimensions().map_err(|_| Error::SpsParse)?;
 		Ok(Self {
-			profile: sps.profile_idc,
-			constraints: pack_constraint_flags(&sps),
+			profile: sps.profile_idc.into(),
+			// constraint_set0..5_flag; the two reserved bits after them stay clear.
+			constraints: u8::from(sps.constraint_flags) & 0xfc,
 			level: sps.level_idc,
-			coded_width: sps.width,
-			coded_height: sps.height,
+			coded_width,
+			coded_height,
 		})
 	}
+}
+
+/// Parse an SPS NAL unit (header included), `None` when it is malformed.
+///
+/// h264-reader refuses the whole SPS when its VUI is cut short or breaks a constraint, but the
+/// codec string and coded size only need the fields before it. So a refused SPS is read again
+/// without its VUI, as though `vui_parameters_present_flag` were 0, and declares nothing the VUI
+/// would have.
+fn read_sps(nal: &[u8]) -> Option<SeqParameterSet> {
+	use crate::codec::annexb::rbsp;
+
+	SeqParameterSet::from_bits(rbsp(nal, 1)).ok().or_else(|| {
+		let sps = SeqParameterSet::from_bits(WithoutVui(rbsp(nal, 1))).ok()?;
+		tracing::debug!("H.264 SPS VUI refused by h264-reader; using the SPS without it");
+		Some(sps)
+	})
+}
+
+/// A reader that reports `vui_parameters_present_flag` as 0 and leaves the rest of the RBSP
+/// unread, so h264-reader parses an SPS up to its VUI.
+struct WithoutVui<R>(R);
+
+impl<R: BitRead> BitRead for WithoutVui<R> {
+	fn read_ue(&mut self, name: &'static str) -> std::result::Result<u32, BitReaderError> {
+		self.0.read_ue(name)
+	}
+
+	fn read_se(&mut self, name: &'static str) -> std::result::Result<i32, BitReaderError> {
+		self.0.read_se(name)
+	}
+
+	fn read_bit(&mut self, name: &'static str) -> std::result::Result<bool, BitReaderError> {
+		match name {
+			"vui_parameters_present_flag" => Ok(false),
+			_ => self.0.read_bit(name),
+		}
+	}
+
+	fn read<const BITS: u32, I: h264_reader::rbsp::Integer>(
+		&mut self,
+		name: &'static str,
+	) -> std::result::Result<I, BitReaderError> {
+		self.0.read::<BITS, I>(name)
+	}
+
+	fn read_var<I: h264_reader::rbsp::Integer>(
+		&mut self,
+		bit_count: u32,
+		name: &'static str,
+	) -> std::result::Result<I, BitReaderError> {
+		self.0.read_var(bit_count, name)
+	}
+
+	fn read_to<V: h264_reader::rbsp::Primitive>(
+		&mut self,
+		name: &'static str,
+	) -> std::result::Result<V, BitReaderError> {
+		self.0.read_to(name)
+	}
+
+	fn skip(&mut self, bit_count: u32, name: &'static str) -> std::result::Result<(), BitReaderError> {
+		self.0.skip(bit_count, name)
+	}
+
+	fn byte_aligned(&self) -> bool {
+		self.0.byte_aligned()
+	}
+
+	fn has_more_rbsp_data(&mut self, name: &'static str) -> std::result::Result<bool, BitReaderError> {
+		self.0.has_more_rbsp_data(name)
+	}
+
+	/// The VUI and the trailing bits after it go unread.
+	fn finish_rbsp(self) -> std::result::Result<(), BitReaderError> {
+		Ok(())
+	}
+
+	fn finish_sei_payload(self) -> std::result::Result<(), BitReaderError> {
+		self.0.finish_sei_payload()
+	}
+}
+
+/// The reordering an SPS NAL unit declares in its VUI: `max_num_reorder_frames` from the
+/// bitstream restriction, and the frame period when `fixed_frame_rate_flag` is set.
+///
+/// `None` when the SPS carries no VUI or no bitstream restriction, or fails to parse.
+pub(crate) fn sps_reorder(nal: &[u8]) -> Option<crate::codec::video::Reorder> {
+	let vui = sps_vui(nal)?;
+	Some(crate::codec::video::Reorder {
+		depth: vui.depth?,
+		period: vui.period,
+	})
+}
+
+/// The NAL HRD an SPS NAL unit's VUI declares, when it carries one.
+pub(crate) fn sps_hrd(nal: &[u8]) -> Option<crate::codec::video::Hrd> {
+	sps_vui(nal)?.hrd
+}
+
+/// Whether an SPS NAL unit codes field pictures or field macroblock pairs (`frame_mbs_only_flag` 0).
+pub(crate) fn sps_interlaced(nal: &[u8]) -> Option<bool> {
+	let sps = read_sps(nal)?;
+	Some(!matches!(sps.frame_mbs_flags, FrameMbsFlags::Frames))
+}
+
+/// What an SPS VUI declares about picture timing, sample shape, and colour.
+struct Vui {
+	/// The sample aspect, when the VUI specifies one.
+	sample_aspect: Option<(u32, u32)>,
+	/// The video signal type's range and colour description, unspecified fields absent.
+	color: Option<hang::catalog::Color>,
+	/// `frame_mbs_only_flag`: every picture is a frame, so two ticks are one frame.
+	frame_only: bool,
+	/// One frame's duration as `(units, scale)` when `fixed_frame_rate_flag` is set.
+	period: Option<(u64, u64)>,
+	/// `max_num_reorder_frames`, when the bitstream restriction is present.
+	depth: Option<u32>,
+	/// The NAL HRD, when present.
+	hrd: Option<crate::codec::video::Hrd>,
+}
+
+impl Vui {
+	/// Read the VUI of a parsed SPS (ITU-T H.264 E.1.1), `None` when it carries none.
+	fn new(sps: &SeqParameterSet) -> Option<Self> {
+		let vui = sps.vui_parameters.as_ref()?;
+		let sample_aspect = vui
+			.aspect_ratio_info
+			.as_ref()
+			.and_then(|info| info.get())
+			.map(|(width, height)| (u32::from(width), u32::from(height)));
+		let color = vui.video_signal_type.as_ref().and_then(|signal| {
+			let (primaries, transfer, matrix) = match &signal.colour_description {
+				Some(c) => (c.colour_primaries, c.transfer_characteristics, c.matrix_coefficients),
+				None => (2, 2, 2),
+			};
+			crate::codec::color::cicp(primaries, transfer, matrix, Some(signal.video_full_range_flag))
+		});
+		// With a fixed rate, a frame lasts two ticks (E.2.1).
+		let period = vui
+			.timing_info
+			.as_ref()
+			.filter(|t| t.fixed_frame_rate_flag && t.num_units_in_tick > 0 && t.time_scale > 0)
+			.map(|t| (2 * u64::from(t.num_units_in_tick), u64::from(t.time_scale)));
+		// The last schedule is the one a decoder conforms to (E.2.2).
+		let hrd = vui.nal_hrd_parameters.as_ref().and_then(|hrd| {
+			let spec = hrd.cpb_specs.last()?;
+			Some(crate::codec::video::Hrd {
+				bit_rate: (u64::from(spec.bit_rate_value_minus1) + 1) << (6 + hrd.bit_rate_scale),
+				cpb_size: (u64::from(spec.cpb_size_value_minus1) + 1) << (4 + hrd.cpb_size_scale),
+			})
+		});
+		Some(Self {
+			sample_aspect,
+			color,
+			frame_only: matches!(sps.frame_mbs_flags, FrameMbsFlags::Frames),
+			period,
+			depth: vui.bitstream_restrictions.as_ref().map(|b| b.max_num_reorder_frames),
+			hrd,
+		})
+	}
+
+	/// Only a fixed frame rate on a frame-only SPS fixes the picture period; field pictures
+	/// need their slice header's `pic_struct` (ITU-T H.264 E.2.1, Table E-6).
+	fn framerate(&self) -> Option<f64> {
+		if !self.frame_only {
+			return None;
+		}
+		let (units, scale) = self.period?;
+		Some(scale as f64 / units as f64)
+	}
+
+	fn apply(&self, config: &mut hang::catalog::VideoConfig) {
+		config.framerate = self.framerate();
+		let display_aspect = match (config.coded_width, config.coded_height, self.sample_aspect) {
+			(Some(width), Some(height), Some(sample)) => crate::codec::video::display_aspect(width, height, sample),
+			_ => None,
+		};
+		config.display_aspect_width = display_aspect.map(|(width, _)| width);
+		config.display_aspect_height = display_aspect.map(|(_, height)| height);
+		config.color = self.color.clone();
+		// A field picture counts as half a frame, so only a frame-only SPS declares in frames.
+		config.reorder = self
+			.depth
+			.filter(|depth| self.frame_only && *depth <= crate::codec::video::max_reorder(config))
+			.and_then(|depth| u8::try_from(depth).ok());
+	}
+}
+
+/// `None` when the SPS carries no VUI or fails to parse.
+fn sps_vui(nal: &[u8]) -> Option<Vui> {
+	Vui::new(&read_sps(nal)?)
 }
 
 /// Parsed AVCDecoderConfigurationRecord (ISO/IEC 14496-15 §5.3.3.1.2).
@@ -164,10 +395,16 @@ pub struct Avcc {
 	pub sps: Vec<Bytes>,
 	/// PPS NAL units carried out-of-band in the record.
 	pub pps: Vec<Bytes>,
-	/// Resolution from the embedded SPS, if one was present and parseable.
+	/// Picture width in pixels from the embedded SPS, if available.
 	pub coded_width: Option<u32>,
+	/// Picture height in pixels from the embedded SPS, if available.
 	pub coded_height: Option<u32>,
 }
+
+/// The largest AVCDecoderConfigurationRecord its count fields allow (ISO/IEC 14496-15 §5.3.3.1.2):
+/// 6 fixed bytes, up to 31 SPS, a count byte, up to 255 PPS, then the High-profile extension's 4
+/// bytes and up to 255 SPS extensions, each parameter set a `u16` length and up to 64 KiB.
+pub(crate) const AVCC_MAX_LEN: usize = 6 + 1 + 4 + (31 + 255 + 255) * (2 + u16::MAX as usize);
 
 impl Avcc {
 	/// Parse an AVCDecoderConfigurationRecord buffer.
@@ -176,21 +413,9 @@ impl Avcc {
 			return Err(Error::AvccTooShort);
 		}
 
-		let profile = avcc[1];
-		let constraints = avcc[2];
-		let level = avcc[3];
-		let length_size = (avcc[4] & 0x03) as usize + 1;
-		let num_sps = (avcc[5] & 0x1f) as usize;
-
-		let mut pos = 6;
-		let sps = read_param_sets(avcc, &mut pos, num_sps)?;
-
-		if avcc.len() <= pos {
-			return Err(Error::AvccTruncated);
-		}
-		let num_pps = avcc[pos] as usize;
-		pos += 1;
-		let pps = read_param_sets(avcc, &mut pos, num_pps)?;
+		let record = decode_avcc(avcc)?;
+		let sps: Vec<Bytes> = record.sequence_parameter_sets.into_iter().map(Bytes::from).collect();
+		let pps = record.picture_parameter_sets.into_iter().map(Bytes::from).collect();
 
 		// Resolution from the first parseable SPS.
 		let (mut coded_width, mut coded_height) = (None, None);
@@ -203,10 +428,10 @@ impl Avcc {
 		}
 
 		Ok(Self {
-			profile,
-			constraints,
-			level,
-			length_size,
+			profile: record.avc_profile_indication,
+			constraints: record.profile_compatibility,
+			level: record.avc_level_indication,
+			length_size: record.length_size.into(),
 			sps,
 			pps,
 			coded_width,
@@ -215,13 +440,26 @@ impl Avcc {
 	}
 }
 
-fn pack_constraint_flags(sps: &h264_parser::Sps) -> u8 {
-	((sps.constraint_set0_flag as u8) << 7)
-		| ((sps.constraint_set1_flag as u8) << 6)
-		| ((sps.constraint_set2_flag as u8) << 5)
-		| ((sps.constraint_set3_flag as u8) << 4)
-		| ((sps.constraint_set4_flag as u8) << 3)
-		| ((sps.constraint_set5_flag as u8) << 2)
+/// Decode an AVCDecoderConfigurationRecord body with mp4-atom.
+///
+/// Stricter than a bare scan of the parameter-set arrays: the record must be version 1,
+/// and any bytes after the PPS array must form a whole High-profile extension.
+fn decode_avcc(avcc: &[u8]) -> Result<mp4_atom::Avcc> {
+	use mp4_atom::Atom;
+	mp4_atom::Avcc::decode_body(&mut &avcc[..]).map_err(|err| match err {
+		mp4_atom::Error::UnknownVersion(version) => Error::AvccVersion(version),
+		_ => Error::AvccTruncated,
+	})
+}
+
+/// Encode a record whose fields the caller has already bounded.
+fn encode_avcc(record: &mp4_atom::Avcc) -> Bytes {
+	use mp4_atom::Atom;
+	let mut out = BytesMut::new();
+	record
+		.encode_body(&mut out)
+		.expect("a length size of 4 and an 8-bit 4:2:0 extension encode");
+	out.freeze()
 }
 
 /// Build an AVCDecoderConfigurationRecord (ISO/IEC 14496-15 §5.3.3.1.2) from the
@@ -234,7 +472,8 @@ pub(crate) fn build_avcc(sps_nals: &[Bytes], pps_nals: &[Bytes]) -> Result<Bytes
 	if first_sps.len() < 4 {
 		return Err(Error::SpsTooShort);
 	}
-	// numOfSequenceParameterSets is a 5-bit field, numOfPictureParameterSets a byte.
+	// numOfSequenceParameterSets is a 5-bit field, numOfPictureParameterSets a byte;
+	// mp4-atom truncates the counts and lengths rather than refusing them.
 	if sps_nals.len() > 0x1f {
 		return Err(Error::TooManySps(sps_nals.len()));
 	}
@@ -252,82 +491,61 @@ pub(crate) fn build_avcc(sps_nals: &[Bytes], pps_nals: &[Bytes]) -> Result<Bytes
 		}
 	}
 
-	let profile_idc = first_sps[1];
-	let constraints = first_sps[2];
-	let level_idc = first_sps[3];
-
-	let payload: usize = sps_nals.iter().chain(pps_nals).map(|n| 2 + n.len()).sum();
-	let mut out = BytesMut::with_capacity(7 + payload);
-	out.put_u8(1); // configurationVersion
-	out.put_u8(profile_idc);
-	out.put_u8(constraints);
-	out.put_u8(level_idc);
-	out.put_u8(0xff); // reserved (6 bits) | lengthSizeMinusOne (2 bits = 3)
-	out.put_u8(0xe0 | sps_nals.len() as u8); // reserved (3 bits) | numOfSequenceParameterSets
-	for sps in sps_nals {
-		out.put_u16(sps.len() as u16);
-		out.put_slice(sps);
-	}
-	out.put_u8(pps_nals.len() as u8); // numOfPictureParameterSets
-	for pps in pps_nals {
-		out.put_u16(pps.len() as u16);
-		out.put_slice(pps);
-	}
-	Ok(out.freeze())
+	Ok(encode_avcc(&mp4_atom::Avcc {
+		configuration_version: 1,
+		avc_profile_indication: first_sps[1],
+		profile_compatibility: first_sps[2],
+		avc_level_indication: first_sps[3],
+		length_size: 4,
+		sequence_parameter_sets: sps_nals.iter().map(|nal| nal.to_vec()).collect(),
+		picture_parameter_sets: pps_nals.iter().map(|nal| nal.to_vec()).collect(),
+		ext: None,
+	}))
 }
 
-/// Read `count` length-prefixed (u16) NAL units from `buf` starting at `*pos`,
-/// advancing `*pos` past the last one. All arithmetic is checked so malformed
-/// configs surface as errors rather than panics.
-fn read_param_sets(buf: &[u8], pos: &mut usize, count: usize) -> Result<Vec<Bytes>> {
-	let mut out = Vec::with_capacity(count);
-	for _ in 0..count {
-		let after_len = pos.checked_add(2).ok_or(Error::AvccTruncated)?;
-		if buf.len() < after_len {
-			return Err(Error::AvccTruncated);
-		}
-		let len = u16::from_be_bytes([buf[*pos], buf[*pos + 1]]) as usize;
-		let after_nal = after_len.checked_add(len).ok_or(Error::AvccTruncated)?;
-		if buf.len() < after_nal {
-			return Err(Error::AvccTruncated);
-		}
-		out.push(Bytes::copy_from_slice(&buf[after_len..after_nal]));
-		*pos = after_nal;
+/// An avcC whose parameter sets will arrive in the samples, from a catalog codec
+/// string that already fixes the record.
+///
+/// Baseline, Main, and Extended carry no avcC extension. High is 8-bit and declared
+/// 4:2:0, which the extension must state when the SPS is absent; a monochrome High
+/// stream is rare enough to accept that mismatch, and its in-band SPS still governs
+/// decoding. Every other profile leaves chroma format or bit depth to the SPS, so the
+/// record has to wait for one.
+pub(crate) fn catalog_avcc(h264: &hang::catalog::H264) -> Option<Bytes> {
+	if !h264.inline {
+		return None;
 	}
-	Ok(out)
+	let ext = match h264.profile {
+		66 | 77 | 88 => None,
+		// The default extension is 8-bit 4:2:0 with no SPS extensions.
+		100 => Some(mp4_atom::AvccExt::default()),
+		_ => return None,
+	};
+
+	Some(encode_avcc(&mp4_atom::Avcc {
+		configuration_version: 1,
+		avc_profile_indication: h264.profile,
+		profile_compatibility: h264.constraints,
+		avc_level_indication: h264.level,
+		length_size: 4,
+		sequence_parameter_sets: Vec::new(),
+		picture_parameter_sets: Vec::new(),
+		ext,
+	}))
 }
 
 /// Extract the parameter-set NALs (SPS then PPS) and the NALU length size from
 /// an AVCDecoderConfigurationRecord. The inverse of [`build_avcc`]; used to
 /// re-emit out-of-band avc1 parameter sets as inline Annex-B (e.g. for MPEG-TS).
-pub(crate) fn avcc_params(avcc: &[u8]) -> anyhow::Result<(usize, Vec<Bytes>)> {
-	anyhow::ensure!(avcc.len() >= 6, "AVCDecoderConfigurationRecord too short");
-	let length_size = (avcc[4] & 0x03) as usize + 1;
-
-	let mut params = Vec::new();
-	let num_sps = avcc[5] & 0x1f;
-	let mut pos = read_param_set_array(avcc, 6, num_sps as usize, &mut params)?;
-
-	anyhow::ensure!(avcc.len() > pos, "avcC missing PPS count");
-	let num_pps = avcc[pos];
-	pos += 1;
-	read_param_set_array(avcc, pos, num_pps as usize, &mut params)?;
-
-	Ok((length_size, params))
-}
-
-/// Read `count` u16-length-prefixed NALs starting at `pos`, appending each to
-/// `params`. Returns the offset just past the last NAL read.
-fn read_param_set_array(buf: &[u8], mut pos: usize, count: usize, params: &mut Vec<Bytes>) -> anyhow::Result<usize> {
-	for _ in 0..count {
-		anyhow::ensure!(buf.len() >= pos + 2, "truncated parameter-set length");
-		let len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
-		pos += 2;
-		anyhow::ensure!(buf.len() >= pos + len, "parameter-set NAL exceeds buffer");
-		params.push(Bytes::copy_from_slice(&buf[pos..pos + len]));
-		pos += len;
-	}
-	Ok(pos)
+pub(crate) fn avcc_params(avcc: &[u8]) -> Result<(usize, Vec<Bytes>)> {
+	let record = decode_avcc(avcc)?;
+	let params = record
+		.sequence_parameter_sets
+		.into_iter()
+		.chain(record.picture_parameter_sets)
+		.map(Bytes::from)
+		.collect();
+	Ok((record.length_size.into(), params))
 }
 
 /// Transform H.264 frames from Annex-B (inline SPS/PPS, "avc3") to
@@ -385,8 +603,8 @@ impl Avc1 {
 		let mut nal_iter = crate::codec::annexb::NalIterator::new(&mut buf);
 
 		let mut out = BytesMut::with_capacity(payload.remaining());
-		let mut frame_sps: Vec<Bytes> = Vec::new();
-		let mut frame_pps: Vec<Bytes> = Vec::new();
+		let mut frame_sps = ParameterSets::new();
+		let mut frame_pps = ParameterSets::new();
 		let mut emitted_any_slice = false;
 
 		loop {
@@ -411,10 +629,12 @@ impl Avc1 {
 		// rather than lingering in the avcC. Per type, so a frame that updates only
 		// one of SPS/PPS keeps the other.
 		let mut changed = false;
+		let frame_sps: Vec<Bytes> = frame_sps.into_values().collect();
 		if !frame_sps.is_empty() && frame_sps != self.sps {
 			self.sps = frame_sps;
 			changed = true;
 		}
+		let frame_pps: Vec<Bytes> = frame_pps.into_values().collect();
 		if !frame_pps.is_empty() && frame_pps != self.pps {
 			self.pps = frame_pps;
 			changed = true;
@@ -439,25 +659,25 @@ impl Avc1 {
 	}
 }
 
-/// Process one NAL: SPS/PPS are collected (distinctly) into this frame's sets,
+/// Process one NAL: SPS/PPS are collected by id into this frame's sets,
 /// everything else is length-prefixed and appended to `out`. Returns true if the
 /// NAL was a slice (i.e. produced sample bytes).
 fn process_nal(
 	nal: &Bytes,
 	out: &mut BytesMut,
-	frame_sps: &mut Vec<Bytes>,
-	frame_pps: &mut Vec<Bytes>,
+	frame_sps: &mut ParameterSets,
+	frame_pps: &mut ParameterSets,
 ) -> Result<bool> {
 	if nal.is_empty() {
 		return Ok(false);
 	}
 	match nal[0] & 0x1f {
 		NAL_TYPE_SPS => {
-			crate::codec::annexb::push_distinct(frame_sps, nal);
+			InBandCodec::H264.insert_parameter_set(frame_sps, nal)?;
 			Ok(false)
 		}
 		NAL_TYPE_PPS => {
-			crate::codec::annexb::push_distinct(frame_pps, nal);
+			InBandCodec::H264.insert_parameter_set(frame_pps, nal)?;
 			Ok(false)
 		}
 		_ => {
@@ -469,11 +689,187 @@ fn process_nal(
 	}
 }
 
+/// Real SPS NAL units from 64x64, 25 fps x264 encodes (High profile, 50 Hz VUI tick), for
+/// tests that need a VUI with a bitstream restriction.
+#[cfg(test)]
+pub(crate) mod fixtures {
+	/// A 1440x1080 x264 encode with `setsar=4/3` and `force-cfr=1`, shown 16:9.
+	pub(crate) const SPS_ANAMORPHIC: &[u8] = &[
+		0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x5a, 0x02, 0x27, 0xe5, 0xc3, 0x84, 0x00, 0x00, 0x03, 0x00, 0x04,
+		0x00, 0x00, 0x03, 0x00, 0xca, 0x3c, 0x60, 0xc6, 0x58,
+	];
+	/// A 64x48 x264 encode with extended 7:5 SAR, shown 28:15.
+	pub(crate) const SPS_EXTENDED_SAR: &[u8] = &[
+		0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x44, 0x7b, 0xff, 0x00, 0x07, 0x00, 0x05, 0x10, 0x00, 0x00, 0x03, 0x00,
+		0x10, 0x00, 0x00, 0x03, 0x03, 0x28, 0xf1, 0x22, 0x59, 0x60,
+	];
+	/// `bframes=1:force-cfr=1`: one B-frame per reference (`max_num_reorder_frames` 1) with
+	/// `fixed_frame_rate_flag` set.
+	pub(crate) const SPS_IPB: &[u8] = &[
+		0x67, 0x64, 0x00, 0x0a, 0xac, 0xe4, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
+		0x03, 0x28, 0xf1, 0x22, 0x51, 0x20,
+	];
+	/// `bframes=3:b-pyramid=2:force-cfr=1`: a B-pyramid (`max_num_reorder_frames` 2) with
+	/// `fixed_frame_rate_flag` set.
+	pub(crate) const SPS_PYRAMID: &[u8] = &[
+		0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x44, 0x26, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03,
+		0x00, 0xca, 0x3c, 0x48, 0x96, 0x58,
+	];
+	/// `bframes=1` at x264's default: `max_num_reorder_frames` 1 without `fixed_frame_rate_flag`.
+	pub(crate) const SPS_IPB_VARIABLE: &[u8] = &[
+		0x67, 0x64, 0x00, 0x0a, 0xac, 0xe4, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
+		0x03, 0x20, 0xf1, 0x22, 0x51, 0x20,
+	];
+	/// `interlaced=1:tff=1:bframes=0` at 320x240, with `fixed_frame_rate_flag` forced on: the same
+	/// 50 Hz tick, but `frame_mbs_only_flag` 0 leaves `pic_struct` to the slice header.
+	pub(crate) const SPS_FIELD: &[u8] = &[
+		0x67, 0xf4, 0x00, 0x15, 0x91, 0x9d, 0x02, 0x82, 0x1f, 0x89, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00,
+		0x00, 0x03, 0x00, 0xca, 0x7c, 0x50, 0xaa, 0x80,
+	];
+	/// `bframes=1:force-cfr=1:nal-hrd=cbr:bitrate=9000:vbv-maxrate=9000:vbv-bufsize=9000`: a
+	/// contribution encoder's 9 Mbit CBR NAL HRD at 9 Mb/s, one second of buffer delay.
+	pub(crate) const SPS_HRD: &[u8] = &[
+		0x67, 0x64, 0x00, 0x1e, 0xac, 0xe4, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
+		0x03, 0x2e, 0x04, 0x00, 0x00, 0x89, 0x54, 0x40, 0x00, 0x11, 0x2a, 0x8e, 0x4c, 0x30, 0x07, 0x8b, 0x16, 0x89,
+	];
+	pub(crate) const PPS: &[u8] = &[0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0];
+	/// `colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv` on a Baseline encode: an SDR
+	/// video signal type with a full colour description.
+	pub(crate) const SPS_BT709: &[u8] = &[
+		0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9b, 0x01, 0x6a, 0x02, 0x02, 0x02, 0x80, 0x00, 0x00, 0x03, 0x00, 0x80,
+		0x00, 0x00, 0x19, 0x07, 0x89, 0x13, 0x50,
+	];
+	/// The same encode signalling BT.2020 primaries, PQ, and the BT.2020 non-constant matrix.
+	pub(crate) const SPS_HDR10: &[u8] = &[
+		0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9b, 0x01, 0x6a, 0x12, 0x20, 0x12, 0x80, 0x00, 0x00, 0x03, 0x00, 0x80,
+		0x00, 0x00, 0x19, 0x07, 0x89, 0x13, 0x50,
+	];
+	/// x264's `mastering-display` SEI for a 1000-nit BT.2020 display with a D65 white point; its
+	/// minimum luminance needs emulation prevention.
+	pub(crate) const SEI_MASTERING: &[u8] = &[
+		0x06, 0x89, 0x18, 0x21, 0x34, 0x9b, 0xaa, 0x19, 0x96, 0x08, 0xfc, 0x8a, 0x48, 0x39, 0x08, 0x3d, 0x13, 0x40,
+		0x42, 0x00, 0x98, 0x96, 0x80, 0x00, 0x00, 0x03, 0x00, 0x32, 0x80,
+	];
+	/// x264's `cll=1000,400` SEI.
+	pub(crate) const SEI_CONTENT_LIGHT: &[u8] = &[0x06, 0x90, 0x04, 0x03, 0xe8, 0x01, 0x90, 0x80];
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
+	/// Only a VUI with a video signal type adds colour, and its colour description is read whole.
+	#[test]
+	fn sps_color_reads_the_video_signal_type() {
+		let sps_color = |nal: &[u8]| sps_vui(nal)?.color;
+		let sdr = sps_color(fixtures::SPS_BT709).unwrap();
+		assert_eq!(
+			(sdr.primaries, sdr.transfer, sdr.matrix, sdr.range),
+			(Some(1), Some(1), Some(1), Some(hang::catalog::ColorRange::Limited))
+		);
+		let hdr = sps_color(fixtures::SPS_HDR10).unwrap();
+		assert_eq!(
+			(hdr.primaries, hdr.transfer, hdr.matrix, hdr.range),
+			(Some(9), Some(16), Some(9), Some(hang::catalog::ColorRange::Limited))
+		);
+		assert_eq!(sps_color(fixtures::SPS_IPB), None, "a VUI without a video signal type");
+	}
+
+	/// An SPS whose VUI ends early still yields its codec string and size, and declares no VUI.
+	#[test]
+	fn sps_with_a_short_vui_keeps_the_fields_before_it() {
+		let sps: &[u8] = &[
+			0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe9, 0xb8, 0x08, 0x08, 0x0a, 0x00, 0x00, 0x07, 0xd0, 0x00,
+			0x01, 0xd4, 0xc0, 0x80,
+		];
+		assert!(SeqParameterSet::from_bits(crate::codec::annexb::rbsp(sps, 1)).is_err());
+		let parsed = Sps::parse(sps).unwrap();
+		assert_eq!((parsed.profile, parsed.constraints, parsed.level), (0x42, 0xc0, 0x1f));
+		assert_eq!((parsed.coded_width, parsed.coded_height), (1280, 720));
+		assert!(sps_vui(sps).is_none());
+		assert_eq!(sps_interlaced(sps), Some(false));
+	}
+
+	/// Annex B's `trailing_zero_8bits` left on an SPS is not an emulated start code.
+	#[test]
+	fn sps_ignores_trailing_zero_bytes() {
+		let mut padded = fixtures::SPS_IPB.to_vec();
+		padded.extend_from_slice(&[0, 0, 0, 0]);
+		assert_eq!(sps_reorder(&padded), sps_reorder(fixtures::SPS_IPB));
+		assert!(sps_reorder(&padded).is_some());
+	}
+
 	const SC4: &[u8] = &[0, 0, 0, 1];
+
+	#[test]
+	fn sps_reorder_reads_the_vui() {
+		use crate::codec::video::Reorder;
+
+		let fixed = Some((2, 50));
+		assert_eq!(
+			sps_reorder(fixtures::SPS_IPB),
+			Some(Reorder {
+				depth: 1,
+				period: fixed
+			})
+		);
+		assert_eq!(
+			sps_reorder(fixtures::SPS_PYRAMID),
+			Some(Reorder {
+				depth: 2,
+				period: fixed
+			})
+		);
+		assert_eq!(
+			sps_reorder(fixtures::SPS_IPB_VARIABLE),
+			Some(Reorder { depth: 1, period: None })
+		);
+		// The field-capable SPS still declares its depth and tick; only the frame rate needs
+		// `pic_struct` to read it.
+		assert_eq!(
+			sps_reorder(fixtures::SPS_FIELD),
+			Some(Reorder {
+				depth: 0,
+				period: Some((2, 50))
+			})
+		);
+		// Baseline with no VUI declares nothing.
+		assert_eq!(sps_reorder(&[0x67, 0x42, 0xc0, 0x1f, 0xde]), None);
+		// A VUI cut short is no declaration rather than a wrong one.
+		assert_eq!(sps_reorder(&fixtures::SPS_IPB[..fixtures::SPS_IPB.len() - 3]), None);
+	}
+
+	#[test]
+	fn sps_framerate_needs_a_fixed_rate() {
+		assert_eq!(sps_vui(fixtures::SPS_IPB).unwrap().framerate(), Some(25.0));
+		// The same 50 Hz tick without `fixed_frame_rate_flag` is only a ceiling.
+		assert_eq!(sps_vui(fixtures::SPS_IPB_VARIABLE).unwrap().framerate(), None);
+		// A field-capable SPS makes the tick a field or a frame depending on `pic_struct`.
+		assert_eq!(sps_vui(fixtures::SPS_FIELD).unwrap().framerate(), None);
+		assert!(sps_vui(&[0x67, 0x42, 0xc0, 0x1f, 0xde]).is_none());
+	}
+
+	#[test]
+	fn sps_hrd_reads_the_nal_hrd() {
+		use crate::codec::video::{Hrd, Reorder};
+
+		assert_eq!(
+			sps_hrd(fixtures::SPS_HRD),
+			Some(Hrd {
+				bit_rate: 9_000_000,
+				cpb_size: 9_000_000
+			})
+		);
+		// The bitstream restriction follows the HRD in the VUI, so it still reads past it.
+		assert_eq!(
+			sps_reorder(fixtures::SPS_HRD),
+			Some(Reorder {
+				depth: 1,
+				period: Some((2, 50))
+			})
+		);
+		assert_eq!(sps_hrd(fixtures::SPS_IPB), None);
+	}
 
 	fn annexb_frame(nals: &[&[u8]]) -> Bytes {
 		let mut buf = BytesMut::new();
@@ -548,12 +944,71 @@ mod tests {
 	}
 
 	#[test]
+	fn build_avcc_layout_is_unchanged() {
+		let sps = Bytes::from_static(&[0x67, 0x42, 0xc0, 0x1f, 0xde]);
+		let pps = Bytes::from_static(&[0x68, 0xce, 0x3c, 0x80]);
+
+		let avcc = build_avcc(std::slice::from_ref(&sps), std::slice::from_ref(&pps)).unwrap();
+		assert_eq!(
+			avcc.as_ref(),
+			&[
+				0x01, 0x42, 0xc0, 0x1f, 0xff, 0xe1, 0x00, 0x05, 0x67, 0x42, 0xc0, 0x1f, 0xde, 0x01, 0x00, 0x04, 0x68,
+				0xce, 0x3c, 0x80,
+			]
+		);
+	}
+
+	#[test]
+	fn avcc_parse_reads_past_the_high_extension() {
+		let sps = fixtures::SPS_ANAMORPHIC;
+		let avcc = encode_avcc(&mp4_atom::Avcc {
+			configuration_version: 1,
+			avc_profile_indication: sps[1],
+			profile_compatibility: sps[2],
+			avc_level_indication: sps[3],
+			length_size: 4,
+			sequence_parameter_sets: vec![sps.to_vec()],
+			picture_parameter_sets: vec![fixtures::PPS.to_vec()],
+			ext: Some(mp4_atom::AvccExt::default()),
+		});
+
+		let parsed = Avcc::parse(&avcc).unwrap();
+		assert_eq!(parsed.profile, 100);
+		assert_eq!(parsed.length_size, 4);
+		assert_eq!(parsed.sps, vec![Bytes::from_static(sps)]);
+		assert_eq!(parsed.pps, vec![Bytes::from_static(fixtures::PPS)]);
+		assert_eq!((parsed.coded_width, parsed.coded_height), (Some(1440), Some(1080)));
+	}
+
+	#[test]
+	fn avcc_parse_refuses_other_versions_and_partial_extensions() {
+		let sps = Bytes::from_static(&[0x67, 0x42, 0xc0, 0x1f, 0xde]);
+		let pps = Bytes::from_static(&[0x68, 0xce, 0x3c, 0x80]);
+		let avcc = build_avcc(std::slice::from_ref(&sps), std::slice::from_ref(&pps)).unwrap();
+
+		let mut version = avcc.to_vec();
+		version[0] = 0;
+		assert!(matches!(Avcc::parse(&version), Err(Error::AvccVersion(0))));
+
+		// One trailing byte cannot be the 4-byte High-profile extension.
+		let mut partial = avcc.to_vec();
+		partial.push(0xfd);
+		assert!(matches!(Avcc::parse(&partial), Err(Error::AvccTruncated)));
+
+		assert!(matches!(
+			Avcc::parse(&avcc[..avcc.len() - 1]),
+			Err(Error::AvccTruncated)
+		));
+		assert!(matches!(Avcc::parse(&avcc[..6]), Err(Error::AvccTooShort)));
+	}
+
+	#[test]
 	fn build_avcc_carries_multiple_pps() {
 		// A source with one SPS and two PPS (ids 0 and 1): the avcC must keep both,
 		// in order, so slices referencing either id stay decodable.
 		let sps = Bytes::from_static(&[0x67, 0x42, 0xc0, 0x1f, 0xde]);
 		let pps0 = Bytes::from_static(&[0x68, 0xce, 0x3c, 0x80]);
-		let pps1 = Bytes::from_static(&[0x68, 0xce, 0x3c, 0x81]);
+		let pps1 = Bytes::from_static(&[0x68, 0x4e, 0x3c, 0x80]);
 
 		let avcc = build_avcc(std::slice::from_ref(&sps), &[pps0.clone(), pps1.clone()]).unwrap();
 		// numOfSequenceParameterSets is the low 5 bits of byte 5.
@@ -568,7 +1023,7 @@ mod tests {
 		// One keyframe carrying both PPS: the synthesized avcC keeps both, in order.
 		let sps = &[0x67, 0x42, 0xc0, 0x1f, 0xde][..];
 		let pps0 = &[0x68, 0xce, 0x3c, 0x80][..];
-		let pps1 = &[0x68, 0xce, 0x3c, 0x81][..];
+		let pps1 = &[0x68, 0x4e, 0x3c, 0x80][..];
 		let idr = &[0x65, 0x88][..];
 
 		let mut tx = Avc1::new();
@@ -588,7 +1043,7 @@ mod tests {
 		// and drops the old one rather than accumulating both forever.
 		let sps = &[0x67, 0x42, 0xc0, 0x1f, 0xde][..];
 		let pps0 = &[0x68, 0xce, 0x3c, 0x80][..];
-		let pps1 = &[0x68, 0xce, 0x3c, 0x81][..];
+		let pps1 = &[0x68, 0x4e, 0x3c, 0x80][..];
 		let idr = &[0x65, 0x88][..];
 
 		let mut tx = Avc1::new();
@@ -602,6 +1057,21 @@ mod tests {
 			vec![sps, pps1],
 			"reinit must drop the superseded PPS"
 		);
+	}
+
+	#[test]
+	fn avc3_repeated_pps_id_keeps_the_last() {
+		// Two PPS defining id 0 in one keyframe: the later replaces the earlier, as in a decoder.
+		let sps = &[0x67, 0x42, 0xc0, 0x1f, 0xde][..];
+		let pps_a = &[0x68, 0xce, 0x3c, 0x80][..];
+		let pps_b = &[0x68, 0xce, 0x38, 0x80][..];
+		let idr = &[0x65, 0x88][..];
+
+		let mut tx = Avc1::new();
+		tx.transform(annexb_frame(&[sps, pps_a, pps_b, idr])).unwrap();
+
+		let (_, params) = avcc_params(tx.avcc().expect("avcC available")).unwrap();
+		assert_eq!(params.iter().map(|p| p.as_ref()).collect::<Vec<_>>(), vec![sps, pps_b]);
 	}
 
 	#[test]
@@ -634,26 +1104,68 @@ mod tests {
 		assert_eq!(out.as_ref(), expected.as_ref());
 	}
 
+	fn decode_avcc(bytes: &Bytes) -> mp4_atom::Avcc {
+		use mp4_atom::Atom;
+		mp4_atom::Avcc::decode_body(&mut std::io::Cursor::new(bytes.as_ref())).unwrap()
+	}
+
 	#[test]
-	fn avc3_export_e2e_payload_shape() {
-		// Mirror the byte shapes used by the export integration test so any
-		// divergence surfaces here in isolation.
-		let sps = &[0x67u8, 0x42, 0xc0, 0x1f, 0xde, 0xad, 0xbe, 0xef][..];
-		let pps = &[0x68u8, 0xce, 0x3c, 0x80][..];
-		let idr = &[0x65u8, 0x88, 0x84, 0x21, 0x00, 0x11, 0x22, 0x33][..];
-		let pslice = &[0x61u8, 0xe0, 0x12, 0x34][..];
+	fn catalog_avcc_baseline_has_no_extension() {
+		let h264 = hang::catalog::H264 {
+			profile: 0x42,
+			constraints: 0xc0,
+			level: 0x1f,
+			inline: true,
+		};
+		let avcc = decode_avcc(&catalog_avcc(&h264).unwrap());
+		assert_eq!(avcc.avc_profile_indication, 0x42);
+		assert_eq!(avcc.profile_compatibility, 0xc0);
+		assert_eq!(avcc.avc_level_indication, 0x1f);
+		assert_eq!(avcc.length_size, 4);
+		assert!(avcc.sequence_parameter_sets.is_empty());
+		assert!(avcc.picture_parameter_sets.is_empty());
+		assert!(avcc.ext.is_none());
+	}
 
-		let mut tx = Avc1::new();
-		let key = annexb_frame(&[sps, pps, idr]);
-		let key_out = tx.transform(key).expect("transform key").expect("output");
-		assert!(tx.avcc().is_some());
+	#[test]
+	fn catalog_avcc_high_states_420_8bit() {
+		let h264 = hang::catalog::H264 {
+			profile: 100,
+			constraints: 0,
+			level: 0x28,
+			inline: true,
+		};
+		let avcc = decode_avcc(&catalog_avcc(&h264).unwrap());
+		assert_eq!(avcc.avc_profile_indication, 100);
+		assert!(avcc.sequence_parameter_sets.is_empty());
+		assert_eq!(
+			avcc.ext,
+			Some(mp4_atom::AvccExt {
+				chroma_format: 1,
+				bit_depth_luma: 8,
+				bit_depth_chroma: 8,
+				sequence_parameter_sets_ext: Vec::new(),
+			})
+		);
+	}
 
-		assert_eq!(key_out.len(), 4 + idr.len());
-		assert_eq!(&key_out[4..], idr);
-
-		let p = annexb_frame(&[pslice]);
-		let p_out = tx.transform(p).expect("transform p").expect("output");
-		assert_eq!(p_out.len(), 4 + pslice.len());
-		assert_eq!(&p_out[4..], pslice);
+	#[test]
+	fn catalog_avcc_refuses_profiles_the_string_cannot_describe() {
+		for profile in [110, 122, 244, 44, 144] {
+			let h264 = hang::catalog::H264 {
+				profile,
+				constraints: 0,
+				level: 0x1f,
+				inline: true,
+			};
+			assert!(catalog_avcc(&h264).is_none(), "profile {profile}");
+		}
+		let out_of_band = hang::catalog::H264 {
+			profile: 0x42,
+			constraints: 0xc0,
+			level: 0x1f,
+			inline: false,
+		};
+		assert!(catalog_avcc(&out_of_band).is_none());
 	}
 }

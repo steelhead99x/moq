@@ -2,7 +2,7 @@
 //! DXVA.
 //!
 //! The inverse of the encode Media Foundation backend, and the Windows
-//! counterpart to the macOS VideoToolbox decode backend. Unlike encoders, the
+//! counterpart to the VideoToolbox decode backend. Unlike encoders, the
 //! GPU vendors (NVIDIA especially) don't ship standalone async hardware decoder
 //! MFTs; the portable hardware path is the Microsoft decoder MFT driven
 //! synchronously with a Direct3D11 device manager bound to it, which routes the
@@ -25,8 +25,8 @@
 //! does the MFT offer an output type carrying the real frame size, so we set the
 //! NV12 output type (and read the size off it) right after that first input.
 //!
-//! Used only from the one decode task (the consumer's `read` loop), so the COM
-//! handles are wrapped in a thread-confined `Send` type.
+//! The backend is `!Send`: the COM handles must stay on the thread that created
+//! them, either the `Sink` worker thread or the thread owning a direct `Decoder`.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -41,14 +41,14 @@ use windows::Win32::Media::MediaFoundation::{
 	MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_FRAME_SIZE,
 	MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE, MFCreateMediaType, MFCreateMemoryBuffer,
 	MFCreateSample, MFMediaType_Video, MFOffset, MFSampleExtension_Discontinuity, MFT_CATEGORY_VIDEO_DECODER,
-	MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-	MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-	MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoArea, MFVideoFormat_H264,
-	MFVideoFormat_HEVC, MFVideoFormat_NV12,
+	MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH,
+	MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER,
+	MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoArea,
+	MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
 };
 use windows::core::{GUID, Interface};
 
-use super::{Backend, Codec, Config};
+use super::{Backend, Codec, Config, Stream};
 use crate::frame::d3d11::Texture;
 use crate::frame::{I420, Surface};
 use crate::mf::{ComGuard, create_d3d_device, mf_err, unpack_2x32};
@@ -93,26 +93,26 @@ pub(crate) struct MediaFoundation {
 	last_timestamp: Option<Timestamp>,
 	/// Mark the first accepted sample after a drain as a new stream epoch.
 	discontinuity: bool,
+	/// Pictures the MFT handed back, waiting for `receive`.
+	ready: VecDeque<Frame>,
 	/// Kept alive for the MFT's lifetime; the MFT holds its own ref but we own the
 	/// pairing. Drops before `_com`.
 	_manager: IMFDXGIDeviceManager,
 	_com: ComGuard,
 }
 
-// The MFT and its COM handles are only ever touched from the one decode task (the
-// consumer's single-threaded `read` loop).
-unsafe impl Send for MediaFoundation {}
-
 impl MediaFoundation {
 	/// `config` is accepted for signature parity; the decoder MFT emits frames
 	/// at the stream's native size (callers scale the frames themselves).
-	pub(crate) fn open(codec: Codec, _config: &Config) -> Result<Box<dyn Backend>, Error> {
+	pub(crate) fn open(stream: &Stream, _config: &Config) -> Result<Box<dyn Backend>, Error> {
+		let codec = stream.codec;
 		let (input_subtype, label) = match codec {
 			Codec::H264 => (MFVideoFormat_H264, "H.264"),
 			Codec::H265 => (MFVideoFormat_HEVC, "H.265"),
-			Codec::Av1 => {
-				return Err(Error::Codec(anyhow::anyhow!(
-					"Media Foundation AV1 decode is not wired"
+			Codec::Av1 | Codec::Vp8 | Codec::Vp9 => {
+				return Err(Error::codec(anyhow::anyhow!(
+					"Media Foundation {} decode is not wired",
+					codec.label()
 				)));
 			}
 		};
@@ -148,6 +148,7 @@ impl MediaFoundation {
 			pending: VecDeque::new(),
 			last_timestamp: None,
 			discontinuity: false,
+			ready: VecDeque::new(),
 			_manager: manager,
 			_com: com,
 		};
@@ -194,7 +195,7 @@ impl MediaFoundation {
 			let media = match unsafe { self.transform.GetOutputAvailableType(0, index) } {
 				Ok(media) => media,
 				Err(e) if e.code() == MF_E_NO_MORE_TYPES => {
-					return Err(Error::Codec(anyhow::anyhow!("decoder offers no NV12 output type")));
+					return Err(Error::codec(anyhow::anyhow!("decoder offers no NV12 output type")));
 				}
 				Err(e) => return Err(mf_err("GetOutputAvailableType", e)),
 			};
@@ -241,7 +242,7 @@ impl MediaFoundation {
 
 		// I420 chroma is 2x2 subsampled, so the download needs even dimensions.
 		if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
-			return Err(Error::Codec(anyhow::anyhow!(
+			return Err(Error::codec(anyhow::anyhow!(
 				"decoder reported unusable frame size {width}x{height}"
 			)));
 		}
@@ -310,12 +311,12 @@ impl MediaFoundation {
 	/// Reports whether the decoder got anywhere, which is not the same as whether
 	/// it handed back a picture: renegotiating the output type is progress too, and
 	/// it produces no frame.
-	fn drain_output(&mut self, out: &mut Vec<Frame>) -> Result<bool, Error> {
+	fn drain_output(&mut self) -> Result<bool, Error> {
 		if !self.output_configured {
 			return Ok(false);
 		}
 		let mut progressed = false;
-		while self.process_output(out)? {
+		while self.process_output()? {
 			progressed = true;
 		}
 		Ok(progressed)
@@ -324,7 +325,7 @@ impl MediaFoundation {
 	/// One `ProcessOutput`. Returns `true` if it produced a frame or handled a
 	/// stream change (so the caller keeps draining), `false` on
 	/// `MF_E_TRANSFORM_NEED_MORE_INPUT` (the decoder wants the next access unit).
-	fn process_output(&mut self, out: &mut Vec<Frame>) -> Result<bool, Error> {
+	fn process_output(&mut self) -> Result<bool, Error> {
 		// In DXVA mode the MFT provides its own texture-backed sample, so we pass a
 		// null slot; otherwise we hand it a system-memory buffer to fill.
 		let provided = if self.provides_samples {
@@ -353,7 +354,8 @@ impl MediaFoundation {
 				if let Some(sample) = sample {
 					let sample_time = unsafe { sample.GetSampleTime() }.ok();
 					let surface = self.sample_to_surface(&sample)?;
-					out.push(Frame::new(surface, self.take_timestamp(sample_time)));
+					let timestamp = self.take_timestamp(sample_time);
+					self.ready.push_back(Frame::new(surface, timestamp));
 				}
 				Ok(true)
 			}
@@ -419,14 +421,15 @@ impl MediaFoundation {
 				.ContiguousCopyTo(&mut nv12)
 				.map_err(|e| mf_err("contiguous copy", e))?;
 		}
-		Ok(Surface::I420(I420::from_nv12(&nv12, self.width, self.height)?))
+		Ok(Surface::I420(I420::from_nv12(
+			&nv12,
+			crate::Size::new(self.width, self.height),
+		)?))
 	}
 }
 
 impl Backend for MediaFoundation {
-	fn decode(&mut self, access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<Vec<Frame>, Error> {
-		let mut out = Vec::new();
-
+	fn decode(&mut self, access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<(), Error> {
 		let sample = self.build_sample(&access_unit)?;
 		if self.discontinuity {
 			unsafe { sample.SetUINT32(&MFSampleExtension_Discontinuity, 1) }
@@ -446,8 +449,8 @@ impl Backend for MediaFoundation {
 					// renegotiates the output type here and produces no picture doing
 					// it, and that is exactly the case where feeding the same access
 					// unit again is the right move.
-					if !self.drain_output(&mut out)? {
-						return Err(Error::Codec(anyhow::anyhow!(
+					if !self.drain_output()? {
+						return Err(Error::codec(anyhow::anyhow!(
 							"decoder rejected the access unit with no output to drain"
 						)));
 					}
@@ -456,7 +459,11 @@ impl Backend for MediaFoundation {
 			}
 		}
 		self.discontinuity = false;
-		remember_timestamp(&mut self.pending, self.sample_time(), timestamp);
+		// Read the stamp before the call: arguments evaluate left to right, so
+		// `&mut self.pending` would still hold the borrow when `sample_time`
+		// wants `&self`.
+		let sample_time = self.sample_time();
+		remember_timestamp(&mut self.pending, sample_time, timestamp);
 		self.sample_index += 1;
 
 		// The decoder only reports the picture size once it has parsed the first
@@ -466,29 +473,42 @@ impl Backend for MediaFoundation {
 			self.configure_output()?;
 		}
 
-		self.drain_output(&mut out)?;
-		Ok(out)
+		self.drain_output()?;
+		Ok(())
 	}
 
-	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
-		let mut out = Vec::new();
-		if self.output_configured {
-			unsafe {
-				self.transform
-					.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)
-					.map_err(|e| mf_err("drain", e))?;
-			}
-			self.drain_output(&mut out)?;
-			// A synchronous MFT may accept input immediately after NEED_MORE_INPUT.
-			// START_OF_STREAM is still useful to implementations that track the
-			// notification, but it is optional for this MFT category.
-			unsafe {
-				let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-			}
-		}
-		self.pending.clear();
+	fn receive(&mut self) -> Result<Option<Frame>, Error> {
+		Ok(self.ready.pop_front())
+	}
+
+	fn flush(&mut self) -> Result<(), Error> {
+		// Whatever the drain does, the next access unit opens a new stream.
 		self.discontinuity = true;
-		Ok(out)
+		if !self.output_configured {
+			self.pending.clear();
+			return Ok(());
+		}
+
+		let drained = unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) }
+			.map_err(|e| mf_err("drain", e))
+			.and_then(|()| self.drain_output());
+		// Only after the drain, which pairs the delayed pictures with these.
+		self.pending.clear();
+		if let Err(err) = drained {
+			// A drain cut short leaves the MFT refusing input until it has handed
+			// back everything it holds. Flushing discards that instead, and is what
+			// a failure here leaves the decoder ready for the next keyframe with.
+			unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0) }
+				.map_err(|e| Error::CodecGone(format!("flush after a failed drain: {e}")))?;
+			return Err(err);
+		}
+		// A synchronous MFT may accept input immediately after NEED_MORE_INPUT.
+		// START_OF_STREAM is still useful to implementations that track the
+		// notification, but it is optional for this MFT category.
+		unsafe {
+			let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+		}
+		Ok(())
 	}
 
 	fn name(&self) -> &str {
@@ -558,7 +578,7 @@ fn enumerate_decoder(subtype: GUID) -> Result<IMFTransform, Error> {
 		.map_err(|e| mf_err("MFTEnumEx", e))?;
 	}
 	if count == 0 {
-		return Err(Error::Codec(anyhow::anyhow!("no decoder MFT found")));
+		return Err(Error::codec(anyhow::anyhow!("no decoder MFT found")));
 	}
 
 	let entries = unsafe { std::slice::from_raw_parts_mut(activates, count as usize) };
@@ -575,7 +595,7 @@ fn enumerate_decoder(subtype: GUID) -> Result<IMFTransform, Error> {
 		windows::Win32::System::Com::CoTaskMemFree(Some(activates as *const c_void));
 	}
 
-	transform.ok_or_else(|| Error::Codec(anyhow::anyhow!("failed to activate decoder MFT")))
+	transform.ok_or_else(|| Error::codec(anyhow::anyhow!("failed to activate decoder MFT")))
 }
 
 #[cfg(test)]

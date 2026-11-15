@@ -12,8 +12,9 @@ use crate::{Error, Result};
 
 /// Frames (header included) in one group before a new group is forced, matching
 /// [`snapshot`](crate::snapshot)'s cap. Kept well below moq-net's per-group frame cap so a late
-/// joiner can always read the header at frame 0.
-pub(super) const MAX_GROUP_FRAMES: usize = 256;
+/// joiner can always read the header at frame 0, and so a roll always precedes
+/// [`moq_net::Error::GroupTooLarge`].
+pub(super) const MAX_GROUP_FRAMES: usize = 1024;
 
 /// Largest index represented exactly by both Rust and JavaScript implementations.
 pub(super) const MAX_INDEX: u64 = (1 << 53) - 1;
@@ -25,47 +26,45 @@ pub(super) const MAX_INDEX: u64 = (1 << 53) - 1;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ProducerConfig {
-	/// How much the ops in a group may cost before a fresh group is emitted.
+	/// Whether edits ride as push and pop ops in the open group.
 	///
-	/// A new group opens once the pushes and pops *already written* exceed `op_ratio` times the
-	/// size of the group's header frame. The pending op is excluded from that check, so the one that
-	/// tips the group over budget still lands: a group overshoots by at most one op before rolling.
-	/// `0` disables ops entirely, so every edit is its own single-frame group.
+	/// `false` makes every edit its own single-frame group restating the window. The window's
+	/// counterpart to [`snapshot::Config::deltas`](crate::snapshot::Config::deltas). How long a
+	/// group of ops runs is not an option: it grows until a joiner wants a fresh one, judged by the
+	/// track's [`refresh`](moq_net::track::Info::refresh) ratio, or until it reaches the frame or
+	/// byte cap.
 	///
-	/// This is the window's counterpart to
-	/// [`snapshot::ProducerConfig::delta_ratio`](crate::snapshot::ProducerConfig::delta_ratio), and
-	/// the same trade: a bigger ratio spends less on headers and makes a late joiner read more ops.
-	///
-	/// Defaults to `8`.
-	pub op_ratio: u32,
+	/// Defaults to `true`.
+	pub ops: bool,
 
-	/// Compress each group as one sync-flushed DEFLATE stream, so every op reuses the header and the
-	/// ops before it as context.
+	/// Maximum records retained and repeated in a group checkpoint.
 	///
-	/// `false` (the default) emits plaintext JSON frames. A [`Decoder`](super::Decoder) reading them
-	/// must set [`ConsumerConfig::compression`](super::ConsumerConfig::compression) to match.
-	pub compression: bool,
+	/// `None` (the default) repeats the complete window. A bound keeps checkpoints finite for an
+	/// unbounded window: readers following every group retain earlier records, while one joining a
+	/// later group receives [`Event::Skip`](super::Event::Skip) for the omitted prefix.
+	pub checkpoint_records: Option<usize>,
 }
 
 impl Default for ProducerConfig {
 	fn default() -> Self {
 		Self {
-			op_ratio: 8,
-			compression: false,
+			ops: true,
+			checkpoint_records: None,
 		}
 	}
 }
 
 impl ProducerConfig {
-	/// Set [`op_ratio`](Self::op_ratio) (a builder, since the struct is `#[non_exhaustive]`).
-	pub fn with_op_ratio(mut self, op_ratio: u32) -> Self {
-		self.op_ratio = op_ratio;
+	/// Set [`ops`](Self::ops) (a builder, since the struct is `#[non_exhaustive]`).
+	pub fn with_ops(mut self, ops: bool) -> Self {
+		self.ops = ops;
 		self
 	}
 
-	/// Set [`compression`](Self::compression) (a builder, since the struct is `#[non_exhaustive]`).
-	pub fn with_compression(mut self, compression: bool) -> Self {
-		self.compression = compression;
+	/// Set [`checkpoint_records`](Self::checkpoint_records). Must be at least one.
+	pub fn with_checkpoint_records(mut self, checkpoint_records: usize) -> Self {
+		assert!(checkpoint_records > 0, "checkpoint_records must be positive");
+		self.checkpoint_records = Some(checkpoint_records);
 		self
 	}
 }
@@ -74,13 +73,14 @@ impl ProducerConfig {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Encoded {
-	/// The frame payload, DEFLATE-compressed when [`ProducerConfig::compression`] is set.
+	/// The frame payload: a group header or an op.
 	pub payload: Bytes,
 
 	/// Whether this frame is a group header, which must open a new group.
 	///
-	/// The encoder decides this, never the caller: the op budget and the frame cap force a new group
-	/// independently of which edit was requested.
+	/// The encoder decides this for an edit: the group's frame and byte caps force a new group
+	/// independently of which edit was requested. A caller asks for one with
+	/// [`snapshot`](Encoder::snapshot).
 	pub keyframe: bool,
 }
 
@@ -99,6 +99,8 @@ pub struct Pending<'a, T> {
 enum Edit {
 	Push(Value),
 	Pop(u64),
+	/// A header restating the window as it is, which changes nothing.
+	Restate,
 }
 
 impl<T> std::ops::Deref for Pending<'_, T> {
@@ -122,7 +124,7 @@ impl<T> Pending<'_, T> {
 impl<T> Drop for Pending<'_, T> {
 	fn drop(&mut self) {
 		if self.edit.is_some() {
-			self.encoder.resync();
+			self.encoder.reset();
 		}
 	}
 }
@@ -134,29 +136,31 @@ impl<T> Drop for Pending<'_, T> {
 /// an append-only log cannot do.
 ///
 /// Frames must reach the wire in the order they were encoded, and a frame with
-/// [`keyframe`](Encoded::keyframe) set must open a new group: both the positional indices and the
-/// group-scoped DEFLATE window depend on it.
+/// [`keyframe`](Encoded::keyframe) set must open a new group: the positional indices depend on it.
+/// When a joiner wants a fresh group (see
+/// [`Demand::wanted`](moq_net::track::Demand::wanted)), [`snapshot`](Self::snapshot) restates the
+/// window in one.
 pub struct Encoder<T> {
 	config: ProducerConfig,
 
-	/// The retained window. Records are stored decoded so a header can restate them, and so a record
-	/// serializes identically whether it reaches a reader as a push or in a later header.
+	/// The decodable checkpoint suffix. With no checkpoint bound this is the complete window.
 	window: VecDeque<Value>,
 
-	/// Absolute index of `window.front()`. Only a group header puts this on the wire.
+	/// Absolute index of the oldest logically retained record.
 	offset: u64,
 
-	/// The current group's DEFLATE encoder (one window per group), `Some` while compressing.
-	flate: Option<moq_flate::Encoder>,
+	/// Absolute index of `window.front()`, which may follow `offset` in checkpoint mode.
+	start: u64,
 
-	/// Bytes of pushes and pops emitted into the current group, excluding its header frame.
-	op_bytes: u64,
-
-	/// Reference size the op budget is measured against: the current group's header frame.
-	header_len: u64,
+	/// Bytes charged to the current group, header included.
+	group_bytes: u64,
 
 	/// Frames emitted into the current group, header included.
 	group_frames: usize,
+
+	/// The most bytes a group may hold, the cap both a header and the ops after it meet. A field
+	/// rather than the constant so a test can shrink it to a size it can reach.
+	max_group_bytes: u64,
 
 	/// Whether the next frame must be a header because a frame was lost. Kept separate from the
 	/// window, which a resync must never discard.
@@ -168,126 +172,138 @@ pub struct Encoder<T> {
 impl<T> Encoder<T> {
 	/// Create an encoder with an empty window, so the first edit opens a group.
 	pub fn new(config: ProducerConfig) -> Self {
+		assert!(
+			config.checkpoint_records != Some(0),
+			"checkpoint_records must be positive"
+		);
 		Self {
 			config,
 			window: VecDeque::new(),
 			offset: 0,
-			flate: None,
-			op_bytes: 0,
-			header_len: 0,
+			start: 0,
+			group_bytes: 0,
 			group_frames: 0,
+			max_group_bytes: crate::MAX_GROUP_BYTES,
 			resync: true,
 			_marker: PhantomData,
 		}
 	}
 
-	/// The retained window, oldest first.
+	/// The retained checkpoint suffix, oldest first.
 	///
-	/// The encoder holds this to restate it on a roll, so a caller needs no parallel copy.
+	/// This is the complete window unless [`ProducerConfig::checkpoint_records`] is set.
 	pub fn window(&self) -> Vec<Value> {
 		self.window.iter().cloned().collect()
 	}
 
 	/// Absolute index of the oldest retained record, and of the next one to be pushed.
 	pub fn range(&self) -> std::ops::Range<u64> {
-		self.offset..self.offset + self.window.len() as u64
+		self.offset..self.start + self.window.len() as u64
 	}
 
-	/// Discard group-local state after an encoded frame did not reach the wire.
-	fn resync(&mut self) {
-		self.flate = None;
-		self.op_bytes = 0;
-		self.header_len = 0;
+	/// Discard group-local state, so the next edit opens a new group with a header.
+	///
+	/// Call this whenever the caller closes the current group behind the encoder's back. It is also
+	/// how the encoder recovers after an encoded frame did not reach the wire.
+	pub fn reset(&mut self) {
+		self.group_bytes = 0;
 		self.group_frames = 0;
 		self.resync = true;
+	}
+
+	/// Restate the retained window in a header, which must open a new group.
+	///
+	/// For a caller that opens groups itself: call it when a joiner wants a fresh group, such as when
+	/// [`Demand::wanted`](moq_net::track::Demand::wanted) passes the largest group written, so the
+	/// joiner reads the window without the ops before it. The frame is a [`Pending`] like any other.
+	pub fn snapshot(&mut self) -> Result<Pending<'_, T>> {
+		let bytes = Self::header(
+			&self.config,
+			self.offset,
+			self.start,
+			self.window.len(),
+			self.window.iter(),
+		)?;
+		let encoded = self.emit_header(bytes)?;
+		Ok(self.pending(encoded, Edit::Restate))
 	}
 
 	/// Apply an edit after its encoded frame reached the wire.
 	fn commit(&mut self, edit: Edit) {
 		match edit {
-			Edit::Push(record) => self.window.push_back(record),
-			Edit::Pop(count) => {
-				self.window.drain(..count as usize);
-				self.offset += count;
+			Edit::Push(record) => {
+				self.window.push_back(record);
+				if let Some(limit) = self.config.checkpoint_records {
+					while self.window.len() > limit {
+						self.window.pop_front();
+						self.start += 1;
+					}
+				}
 			}
+			Edit::Pop(count) => {
+				let offset = self.offset + count;
+				let stored = offset.saturating_sub(self.start).min(self.window.len() as u64);
+				self.window.drain(..stored as usize);
+				self.start += stored;
+				self.offset = offset;
+			}
+			Edit::Restate => {}
 		}
 	}
 
-	/// Whether the pending edit may ride as an op in the open group.
+	/// Whether the pending edit may ride as an op in the open group: ops are on and the group is
+	/// under its frame cap. The byte cap is checked once the op is encoded.
 	fn op_allowed(&self) -> bool {
-		let ratio = u64::from(self.config.op_ratio);
-		ratio != 0
-			&& self.group_frames > 0
-			&& self.group_frames < MAX_GROUP_FRAMES
-			&& self.op_bytes <= ratio * self.header_len
-	}
-
-	/// Reject plaintext that the paired DEFLATE decoder could not produce.
-	fn validate_plaintext(len: usize, kind: &str) -> Result<()> {
-		if u64::try_from(len).unwrap_or(u64::MAX) > moq_flate::DEFAULT_MAX_FRAME_SIZE {
-			return Err(Error::Json(format!(
-				"window {kind} exceeds the decoder's decompressed size limit"
-			)));
-		}
-		Ok(())
-	}
-
-	/// Compress an already-serialized op into the open group, charging it to the budget.
-	fn frame(&mut self, bytes: Vec<u8>) -> Result<Encoded> {
-		Self::validate_plaintext(bytes.len(), "frame")?;
-		let payload = match self.flate.as_mut() {
-			Some(flate) => flate.frame(&bytes),
-			None => Bytes::from(bytes),
-		};
-
-		self.op_bytes += payload.len() as u64;
-		self.group_frames += 1;
-
-		Ok(Encoded {
-			payload,
-			keyframe: false,
-		})
+		self.config.ops && self.group_frames > 0 && self.group_frames < MAX_GROUP_FRAMES
 	}
 
 	/// Emit an op when the header will remain cached, otherwise restate the window in a new group.
 	fn emit_op(&mut self, bytes: Vec<u8>) -> Result<Option<Encoded>> {
-		let encoded = self.frame(bytes)?;
-		let group_bytes = self.header_len.saturating_add(self.op_bytes);
-		if group_bytes > moq_net::group::MAX_CACHE_BYTES {
-			self.resync();
-			Ok(None)
-		} else {
-			Ok(Some(encoded))
+		let payload = Bytes::from(bytes);
+		self.group_frames += 1;
+		self.group_bytes = self.group_bytes.saturating_add(payload.len() as u64);
+		if self.group_bytes > self.max_group_bytes {
+			self.reset();
+			return Ok(None);
 		}
+		Ok(Some(Encoded {
+			payload,
+			keyframe: false,
+		}))
 	}
 
-	/// Serialize a header before mutably borrowing the compression state.
-	fn header(offset: u64, records: Vec<&Value>) -> Result<Vec<u8>> {
-		Ok(serde_json::to_vec(&Header { offset, records })?)
+	/// Serialize a bounded suffix of the window as a group header.
+	fn header<'a>(
+		config: &ProducerConfig,
+		offset: u64,
+		start: u64,
+		len: usize,
+		records: impl Iterator<Item = &'a Value>,
+	) -> Result<Vec<u8>> {
+		let skip = config
+			.checkpoint_records
+			.map(|limit| len.saturating_sub(limit))
+			.unwrap_or_default();
+		let start = start
+			.checked_add(skip as u64)
+			.ok_or_else(|| Error::Json("window checkpoint exceeds u64".into()))?;
+		let header = Header {
+			offset,
+			start: (start != offset).then_some(start),
+			records: records.skip(skip).collect(),
+		};
+		Ok(serde_json::to_vec(&header)?)
 	}
 
 	/// Encode the header restating the whole window and opening a new group.
 	fn emit_header(&mut self, bytes: Vec<u8>) -> Result<Encoded> {
-		Self::validate_plaintext(bytes.len(), "header")?;
-
-		// Open a fresh per-group encoder (cold window) and compress the header as frame 0, recording
-		// its wire size as the op budget's anchor.
-		let (payload, flate) = match self.config.compression {
-			true => {
-				let mut flate = moq_flate::Encoder::new();
-				let payload = flate.frame(&bytes);
-				(payload, Some(flate))
-			}
-			false => (Bytes::from(bytes), None),
-		};
-		if payload.len() as u64 > moq_net::group::MAX_CACHE_BYTES {
+		let payload = Bytes::from(bytes);
+		if payload.len() as u64 > self.max_group_bytes {
 			return Err(Error::Json("window header exceeds the group cache limit".into()));
 		}
 
-		self.header_len = payload.len() as u64;
-		self.op_bytes = 0;
+		self.group_bytes = payload.len() as u64;
 		self.group_frames = 1;
-		self.flate = flate;
 		self.resync = false;
 
 		Ok(Encoded {
@@ -301,15 +317,23 @@ impl<T> Encoder<T> {
 	/// Returns `None` when there is nothing to drop, so a caller can trim unconditionally. Emits a
 	/// pop into the open group, or a header restating what is left in a new group.
 	pub fn pop(&mut self, count: u64) -> Result<Option<Pending<'_, T>>> {
-		let count = count.min(self.window.len() as u64);
+		let count = count.min(self.range().end - self.offset);
 		if count == 0 {
 			return Ok(None);
 		}
 
 		let offset = self.offset + count;
+		let stored = offset.saturating_sub(self.start).min(self.window.len() as u64) as usize;
+		let start = self.start + stored as u64;
 		let encoded = match self.resync || !self.op_allowed() {
 			true => {
-				let bytes = Self::header(offset, self.window.iter().skip(count as usize).collect())?;
+				let bytes = Self::header(
+					&self.config,
+					offset,
+					start,
+					self.window.len() - stored,
+					self.window.iter().skip(stored),
+				)?;
 				self.emit_header(bytes)?
 			}
 			false => {
@@ -317,7 +341,13 @@ impl<T> Encoder<T> {
 				match self.emit_op(bytes)? {
 					Some(encoded) => encoded,
 					None => {
-						let bytes = Self::header(offset, self.window.iter().skip(count as usize).collect())?;
+						let bytes = Self::header(
+							&self.config,
+							offset,
+							start,
+							self.window.len() - stored,
+							self.window.iter().skip(stored),
+						)?;
 						self.emit_header(bytes)?
 					}
 				}
@@ -341,7 +371,7 @@ impl<T: Serialize> Encoder<T> {
 	/// Append one record to the back of the window.
 	///
 	/// Emits a push into the open group, or a header restating the window (the new record included)
-	/// when the op budget is spent or a frame was lost.
+	/// when the group is full or a frame was lost.
 	pub fn push(&mut self, value: &T) -> Result<Pending<'_, T>> {
 		// Serialize before touching the window, so a value that can't be encoded leaves the encoder
 		// exactly as it was. Reading the record back out of its own bytes keeps the stored copy
@@ -355,8 +385,11 @@ impl<T: Serialize> Encoder<T> {
 		let encoded = match self.resync || !self.op_allowed() {
 			true => {
 				let bytes = Self::header(
+					&self.config,
 					self.offset,
-					self.window.iter().chain(std::iter::once(&record)).collect(),
+					self.start,
+					self.window.len() + 1,
+					self.window.iter().chain(std::iter::once(&record)),
 				)?;
 				self.emit_header(bytes)?
 			}
@@ -366,8 +399,11 @@ impl<T: Serialize> Encoder<T> {
 					Some(encoded) => encoded,
 					None => {
 						let bytes = Self::header(
+							&self.config,
 							self.offset,
-							self.window.iter().chain(std::iter::once(&record)).collect(),
+							self.start,
+							self.window.len() + 1,
+							self.window.iter().chain(std::iter::once(&record)),
 						)?;
 						self.emit_header(bytes)?
 					}
@@ -383,11 +419,15 @@ impl<T: Serialize> Encoder<T> {
 mod test {
 	use super::*;
 
+	/// A group budget small enough to fill cheaply, standing in for moq-net's 32 MiB cache.
+	const BUDGET: u64 = 32 * 1024;
+
 	#[test]
 	fn an_op_that_would_evict_the_header_rolls_first() {
-		let mut encoder = Encoder::<String>::new(ProducerConfig::default().with_op_ratio(u32::MAX));
-		let first = "a".repeat(16 * 1024 * 1024);
-		let next = "b".repeat(15 * 1024 * 1024);
+		let mut encoder = Encoder::<String>::new(ProducerConfig::default().with_ops(true));
+		encoder.max_group_bytes = BUDGET;
+		let first = "a".repeat(16 * 1024);
+		let next = "b".repeat(15 * 1024);
 
 		let frame = encoder.push(&first).unwrap();
 		assert!(frame.keyframe);
@@ -403,7 +443,7 @@ mod test {
 
 		let frame = encoder.push(&next).unwrap();
 		assert!(frame.keyframe);
-		assert!(frame.payload.len() < moq_net::group::MAX_CACHE_BYTES as usize);
+		assert!(frame.payload.len() < BUDGET as usize);
 		frame.commit();
 	}
 
@@ -426,7 +466,8 @@ mod test {
 	#[test]
 	fn a_header_larger_than_the_group_cache_is_rejected() {
 		let mut encoder = Encoder::<String>::new(ProducerConfig::default());
-		let record = "x".repeat(moq_net::group::MAX_CACHE_BYTES as usize);
+		encoder.max_group_bytes = BUDGET;
+		let record = "x".repeat(BUDGET as usize);
 
 		let err = encoder.push(&record).err().expect("oversized header should fail");
 		assert!(err.to_string().contains("group cache limit"));
@@ -434,11 +475,5 @@ mod test {
 
 		let frame = encoder.push(&"ok".to_string()).unwrap();
 		assert!(frame.keyframe);
-	}
-
-	#[test]
-	fn plaintext_is_bounded_by_the_decoder_limit() {
-		let len = usize::try_from(moq_flate::DEFAULT_MAX_FRAME_SIZE + 1).unwrap();
-		assert!(Encoder::<()>::validate_plaintext(len, "frame").is_err());
 	}
 }

@@ -1,0 +1,704 @@
+//! The handle a session holds for the grant that admitted it.
+//!
+//! Whoever runs the accept loop decides how a session is authorized, builds a
+//! [`Producer`], and hands the [`Consumer`] to the session. The session reads the
+//! current [`Grant`], waits for it to change, and learns when it is revoked. The
+//! producer side is driven by [`Client`](crate::Client) when an auth server answers, or
+//! by any in-process logic when the embedder decides itself. No trait, no callbacks.
+
+use std::sync::Arc;
+use std::task::Poll;
+#[cfg(feature = "client")]
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{Bytes, Grant};
+
+/// Why a lease ended, from whichever side ended it.
+///
+/// On the wire an `end` event carries it as one string: the fixed spellings below,
+/// or the session's own classification verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Reason {
+	/// A handle was dropped without saying why.
+	Dropped,
+	/// The grant reached its `expires`.
+	Expired,
+	/// The auth server refused the session on a re-check.
+	Refused,
+	/// The auth server answered a grant the relay cannot honor.
+	Invalid,
+	/// The grant no longer covers the session's original scope.
+	Narrowed,
+	/// The relay is shutting down.
+	Shutdown,
+	/// The session ended for its own reason, named by whoever closed it.
+	Session(String),
+}
+
+impl Reason {
+	/// The wire spelling.
+	pub fn as_str(&self) -> &str {
+		match self {
+			Self::Dropped => "dropped",
+			Self::Expired => "expired",
+			Self::Refused => "refused",
+			Self::Invalid => "invalid",
+			Self::Narrowed => "narrowed",
+			Self::Shutdown => "shutdown",
+			Self::Session(reason) => reason,
+		}
+	}
+}
+
+impl std::fmt::Display for Reason {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.as_str())
+	}
+}
+
+impl From<&str> for Reason {
+	fn from(reason: &str) -> Self {
+		match reason {
+			"dropped" => Self::Dropped,
+			"expired" => Self::Expired,
+			"refused" => Self::Refused,
+			"invalid" => Self::Invalid,
+			"narrowed" => Self::Narrowed,
+			"shutdown" => Self::Shutdown,
+			other => Self::Session(other.to_string()),
+		}
+	}
+}
+
+impl From<String> for Reason {
+	fn from(reason: String) -> Self {
+		Self::from(reason.as_str())
+	}
+}
+
+impl Serialize for Reason {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.serialize_str(self.as_str())
+	}
+}
+
+impl<'de> Deserialize<'de> for Reason {
+	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		Ok(String::deserialize(deserializer)?.into())
+	}
+}
+
+#[derive(Debug)]
+struct State {
+	grant: Grant,
+	/// Bumped on every update, so a consumer can tell a change from a spurious wake.
+	epoch: u64,
+	/// Set once by whichever side ends the lease first; the other side reads it.
+	closed: Option<(Reason, Bytes)>,
+	/// Bumped on each re-check ask; the producer observes and clears, so a burst
+	/// coalesces into one wake.
+	revalidate: u64,
+}
+
+/// What the grant's clock requires next.
+#[cfg(feature = "client")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Due {
+	/// Ask the decider for a fresh grant.
+	Revalidate,
+	/// The grant expired before it could be renewed.
+	Expired,
+}
+
+#[cfg(feature = "client")]
+#[derive(Debug)]
+struct Clock {
+	next: Option<kio::clock::Instant>,
+	expires: Option<kio::clock::Instant>,
+	cadence: Option<Duration>,
+	failures: u32,
+}
+
+/// The timers a [`Producer::poll_due`] waits on, kept by its caller between polls.
+#[cfg(feature = "client")]
+#[derive(Default)]
+pub(crate) struct DueTimers {
+	revalidate: Option<kio::clock::Sleep>,
+	expire: Option<kio::clock::Sleep>,
+}
+
+#[cfg(feature = "client")]
+impl DueTimers {
+	/// Ready once the clock reaches `at`; never for no instant. Re-arms when `at` moves.
+	fn poll_at(
+		timer: &mut Option<kio::clock::Sleep>,
+		waiter: &kio::Waiter,
+		at: Option<kio::clock::Instant>,
+	) -> Poll<()> {
+		let Some(at) = at else {
+			*timer = None;
+			return Poll::Pending;
+		};
+		let sleep = match timer {
+			Some(sleep) => {
+				if sleep.deadline() != at {
+					sleep.reset(at);
+				}
+				sleep
+			}
+			None => timer.insert(kio::clock::sleep_until(at)),
+		};
+		waiter.poll_future(std::pin::Pin::new(sleep))
+	}
+}
+
+#[cfg(feature = "client")]
+impl Clock {
+	fn new(grant: &Grant) -> Self {
+		Self {
+			// A cadence too far out to schedule is no scheduled re-check; `expires` still bounds the grant.
+			next: grant
+				.revalidate
+				.and_then(|cadence| kio::clock::now().checked_add(cadence)),
+			expires: grant.deadline(),
+			cadence: grant.revalidate,
+			failures: 0,
+		}
+	}
+}
+
+/// The authorizing side of a lease: applies new grants and revokes.
+///
+/// Dropping it revokes with [`Reason::Dropped`] unless the lease already ended.
+#[derive(Debug)]
+pub struct Producer {
+	state: kio::Shared<State>,
+	// Its changes wake a parked `poll_due`, which re-arms on the new deadlines.
+	#[cfg(feature = "client")]
+	clock: kio::Shared<Clock>,
+}
+
+impl Producer {
+	/// Start a lease on `grant`, returning both handles.
+	pub fn new(grant: Grant) -> (Self, Consumer) {
+		#[cfg(feature = "client")]
+		let clock = kio::Shared::new(Clock::new(&grant));
+		let state = kio::Shared::new(State {
+			grant,
+			epoch: 0,
+			closed: None,
+			revalidate: 0,
+		});
+		(
+			Self {
+				state: state.clone(),
+				#[cfg(feature = "client")]
+				clock,
+			},
+			Consumer::new(state),
+		)
+	}
+
+	/// Replace the grant, waking the consumer. A no-op once the lease ended.
+	pub fn update(&self, grant: Grant) {
+		let mut state = self.state.lock();
+		if state.closed.is_some() {
+			return;
+		}
+		#[cfg(feature = "client")]
+		{
+			*self.clock.lock() = Clock::new(&grant);
+		}
+		state.grant = grant;
+		state.epoch += 1;
+	}
+
+	/// What the grant's clock requires next: a re-check, or its expiry. A session may
+	/// request an earlier re-check through [`Consumer::revalidate`].
+	#[cfg(feature = "client")]
+	#[cfg_attr(test, kio::wrapper)]
+	pub(crate) fn poll_due(&self, waiter: &kio::Waiter, timers: &mut DueTimers) -> Poll<Due> {
+		// Judged under the clock's lock, so a change after it parks this poll on the new deadlines.
+		let mut due = None;
+		let clock = self.clock.poll(waiter, |clock| {
+			if DueTimers::poll_at(&mut timers.expire, waiter, clock.expires).is_ready() {
+				due = Some(Due::Expired);
+			} else if DueTimers::poll_at(&mut timers.revalidate, waiter, clock.next).is_ready() {
+				due = Some(Due::Revalidate);
+			}
+			if due.is_some() { Poll::Ready(()) } else { Poll::Pending }
+		});
+		if let Poll::Ready(mut clock) = clock {
+			let due = due.expect("ready with a due");
+			if due == Due::Revalidate {
+				clock.next = None;
+			}
+			return Poll::Ready(due);
+		}
+		std::task::ready!(self.poll_revalidate_requested(waiter));
+		self.clock.lock().next = None;
+		Poll::Ready(Due::Revalidate)
+	}
+
+	/// Keep the current grant after a failed re-check and schedule a jittered retry.
+	#[cfg(feature = "client")]
+	pub(crate) fn failed(&self) -> Duration {
+		use rand::RngExt;
+		const BACKOFF_MAX: Duration = Duration::from_secs(60);
+		let mut clock = self.clock.lock();
+		clock.failures = clock.failures.saturating_add(1);
+		let base = Duration::from_secs(1) * 2u32.saturating_pow(clock.failures.saturating_sub(1).min(16));
+		let base = base.min(clock.cadence.unwrap_or(BACKOFF_MAX)).min(BACKOFF_MAX);
+		let delay = base.mul_f64(kio::clock::rng().random_range(0.75..=1.25));
+		clock.next = Some(kio::clock::now().saturating_add(delay));
+		delay
+	}
+
+	/// Consume an already-asked re-check after an in-flight response.
+	#[cfg(feature = "client")]
+	pub(crate) fn immediate(&self) {
+		self.clock.lock().next = None;
+	}
+
+	/// End the lease with `reason`, consuming the handle, and return the reason
+	/// the lease ended with: `reason`, or the consumer's if it closed first.
+	pub fn revoke(self, reason: Reason) -> Reason {
+		self.finish(reason, Bytes::default()).0
+	}
+
+	/// The lease's end, from either side: why it ended, and the totals the session reported.
+	/// A producer-side revoke, or a drop, reports zero bytes.
+	#[cfg_attr(feature = "async", kio::wrapper)]
+	pub fn poll_closed(&self, waiter: &kio::Waiter) -> Poll<(Reason, Bytes)> {
+		let state = std::task::ready!(self.state.poll(waiter, |state| ready_if(state.closed.is_some())));
+		Poll::Ready(state.closed.clone().expect("waited for a close"))
+	}
+
+	/// Resolves once at least one re-check has been asked since the last observation.
+	/// A burst of asks resolves once.
+	#[cfg_attr(feature = "async", kio::wrapper)]
+	pub fn poll_revalidate_requested(&self, waiter: &kio::Waiter) -> Poll<()> {
+		let mut state = std::task::ready!(self.state.poll(waiter, |state| ready_if(state.revalidate > 0)));
+		state.revalidate = 0;
+		Poll::Ready(())
+	}
+
+	pub(crate) fn finish(&self, reason: Reason, bytes: Bytes) -> (Reason, Bytes) {
+		self.state.lock().closed.get_or_insert((reason, bytes)).clone()
+	}
+}
+
+impl Drop for Producer {
+	fn drop(&mut self) {
+		self.finish(Reason::Dropped, Bytes::default());
+	}
+}
+
+/// The session's side of a lease: reads the grant and learns when it changes or ends.
+///
+/// Dropping the last clone ends the lease with [`Reason::Dropped`]; [`close`](Self::close) ends every clone.
+#[derive(Debug, Clone)]
+pub struct Consumer {
+	hold: Arc<Held>,
+	seen: u64,
+}
+
+#[derive(Debug)]
+struct Held {
+	state: kio::Shared<State>,
+	#[cfg(feature = "client")]
+	context: Option<crate::client::Context>,
+}
+
+impl Consumer {
+	fn new(state: kio::Shared<State>) -> Self {
+		Self {
+			hold: Arc::new(Held {
+				state,
+				#[cfg(feature = "client")]
+				context: None,
+			}),
+			seen: 0,
+		}
+	}
+
+	#[cfg(feature = "client")]
+	pub(crate) fn context(&self) -> Option<&crate::client::Context> {
+		self.hold.context.as_ref()
+	}
+
+	#[cfg(feature = "client")]
+	pub(crate) fn set_context(&mut self, context: crate::client::Context) {
+		Arc::get_mut(&mut self.hold).expect("new lease has one holder").context = Some(context);
+	}
+
+	/// A lease on a grant nobody drives: it never changes and is never revoked,
+	/// so only the holder ends it. What a static or public grant admits under.
+	pub fn fixed(grant: Grant) -> Self {
+		let state = kio::Shared::new(State {
+			grant,
+			epoch: 0,
+			closed: None,
+			revalidate: 0,
+		});
+		Self::new(state)
+	}
+
+	/// The grant as it stands now.
+	pub fn grant(&self) -> Grant {
+		self.hold.state.read().grant.clone()
+	}
+
+	/// The next update: the new grant, or the reason the lease ended.
+	#[cfg_attr(feature = "async", kio::wrapper)]
+	pub fn poll_changed(&mut self, waiter: &kio::Waiter) -> Poll<Result<Grant, Reason>> {
+		let seen = self.seen;
+		let state = std::task::ready!(
+			self.hold
+				.state
+				.poll(waiter, |state| ready_if(state.epoch > seen || state.closed.is_some()))
+		);
+		if let Some((reason, _)) = &state.closed {
+			return Poll::Ready(Err(reason.clone()));
+		}
+		self.seen = state.epoch;
+		Poll::Ready(Ok(state.grant.clone()))
+	}
+
+	/// The reason the lease ended, once it does.
+	#[cfg_attr(feature = "async", kio::wrapper)]
+	pub fn poll_closed(&self, waiter: &kio::Waiter) -> Poll<Reason> {
+		let state = std::task::ready!(self.hold.state.poll(waiter, |state| ready_if(state.closed.is_some())));
+		Poll::Ready(state.closed.as_ref().expect("waited for a close").0.clone())
+	}
+
+	/// Ask the producer to re-check now. A no-op on a [`fixed`](Self::fixed)
+	/// lease, which has nobody to ask.
+	pub fn revalidate(&self) {
+		self.hold.state.lock().revalidate += 1;
+	}
+
+	/// Resolve once the lease has ended and the decider heard: after an auth server's
+	/// `end` POST returns or fails, so its request timeout bounds the wait, and as soon
+	/// as the lease ends when nobody needs telling. Take it before [`close`](Self::close)
+	/// to learn when that close was reported.
+	#[cfg(feature = "async")]
+	pub fn reported(&self) -> impl Future<Output = ()> + Send + 'static {
+		// Holds the state, not the lease, so dropping every consumer still ends it.
+		let reported = Reported {
+			state: self.hold.state.clone(),
+			#[cfg(feature = "client")]
+			context: self.hold.context.clone(),
+		};
+		kio::wait(move |waiter| reported.poll(waiter))
+	}
+
+	/// End the lease with the session's own close classification and the totals it
+	/// moved, and return the reason the lease ended with:
+	/// `reason`, or the producer's if it revoked first. [`Drop`] reports zero bytes.
+	pub fn close(self, reason: impl Into<Reason>, bytes: Bytes) -> Reason {
+		let reason = reason.into();
+		#[cfg(feature = "client")]
+		if let Some(context) = &self.hold.context {
+			context.close(reason.clone(), bytes);
+		}
+		self.hold.state.lock().closed.get_or_insert((reason, bytes)).0.clone()
+	}
+}
+
+impl Drop for Held {
+	fn drop(&mut self) {
+		#[cfg(feature = "client")]
+		if let Some(context) = &self.context {
+			context.close(Reason::Dropped, Bytes::default());
+		}
+		self.state
+			.lock()
+			.closed
+			.get_or_insert((Reason::Dropped, Bytes::default()));
+	}
+}
+
+/// What [`Consumer::reported`] waits on.
+#[cfg(feature = "async")]
+struct Reported {
+	state: kio::Shared<State>,
+	#[cfg(feature = "client")]
+	context: Option<crate::client::Context>,
+}
+
+#[cfg(feature = "async")]
+impl Reported {
+	fn poll(&self, waiter: &kio::Waiter) -> Poll<()> {
+		drop(std::task::ready!(
+			self.state.poll(waiter, |state| ready_if(state.closed.is_some()))
+		));
+		#[cfg(feature = "client")]
+		if let Some(context) = &self.context {
+			std::task::ready!(context.poll_reported(waiter));
+		}
+		Poll::Ready(())
+	}
+}
+
+fn ready_if(condition: bool) -> Poll<()> {
+	if condition { Poll::Ready(()) } else { Poll::Pending }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::future::Future;
+	use std::pin::pin;
+	use std::task::{Context, Waker};
+
+	fn grant(publish: &str) -> Grant {
+		Grant::new(
+			publish.parse::<moq_pattern::Pattern>().unwrap(),
+			moq_pattern::Patterns::new(),
+		)
+	}
+
+	fn poll<F: Future>(future: F) -> Poll<F::Output> {
+		pin!(future).poll(&mut Context::from_waker(Waker::noop()))
+	}
+
+	#[test]
+	fn update_wakes_the_consumer_once_per_change() {
+		let (producer, mut consumer) = Producer::new(grant("a/**"));
+		assert_eq!(consumer.grant(), grant("a/**"));
+		assert!(poll(consumer.changed()).is_pending());
+
+		producer.update(grant("b/**"));
+		assert_eq!(poll(consumer.changed()), Poll::Ready(Ok(grant("b/**"))));
+		assert_eq!(consumer.grant(), grant("b/**"));
+		assert!(poll(consumer.changed()).is_pending());
+	}
+
+	#[test]
+	fn revoke_reaches_the_consumer() {
+		let (producer, mut consumer) = Producer::new(grant("a/**"));
+		assert!(poll(consumer.closed()).is_pending());
+
+		producer.revoke(Reason::Refused);
+		assert_eq!(poll(consumer.closed()), Poll::Ready(Reason::Refused));
+		assert_eq!(poll(consumer.changed()), Poll::Ready(Err(Reason::Refused)));
+	}
+
+	#[test]
+	fn the_session_close_hands_over_byte_totals() {
+		let (producer, consumer) = Producer::new(grant("a/**"));
+		consumer.close("done", Bytes { sent: 3, received: 5 });
+		assert_eq!(
+			poll(producer.closed()),
+			Poll::Ready((Reason::Session("done".into()), Bytes { sent: 3, received: 5 }))
+		);
+	}
+
+	#[test]
+	fn consumer_clones_hold_the_lease_until_the_last_drop() {
+		let (producer, consumer) = Producer::new(grant("a/**"));
+		let retained = consumer.clone();
+		drop(consumer);
+		assert!(poll(producer.closed()).is_pending());
+		drop(retained);
+		assert_eq!(
+			poll(producer.closed()),
+			Poll::Ready((Reason::Dropped, Bytes::default()))
+		);
+	}
+
+	#[test]
+	fn closing_one_consumer_ends_every_clone() {
+		let (producer, consumer) = Producer::new(grant("a/**"));
+		let retained = consumer.clone();
+		consumer.close(Reason::Shutdown, Bytes { sent: 3, received: 5 });
+		assert_eq!(poll(retained.closed()), Poll::Ready(Reason::Shutdown));
+		assert_eq!(
+			poll(producer.closed()),
+			Poll::Ready((Reason::Shutdown, Bytes { sent: 3, received: 5 }))
+		);
+	}
+
+	#[test]
+	fn dropping_the_producer_revokes() {
+		let (producer, consumer) = Producer::new(grant("a/**"));
+		drop(producer);
+		assert_eq!(poll(consumer.closed()), Poll::Ready(Reason::Dropped));
+	}
+
+	#[test]
+	fn dropping_the_consumer_reports_zero_bytes() {
+		let (producer, consumer) = Producer::new(grant("a/**"));
+		drop(consumer);
+		assert_eq!(
+			poll(producer.closed()),
+			Poll::Ready((Reason::Dropped, Bytes::default()))
+		);
+	}
+
+	#[test]
+	fn the_session_close_reaches_the_producer_and_the_first_reason_wins() {
+		let (producer, consumer) = Producer::new(grant("a/**"));
+		assert!(poll(producer.closed()).is_pending());
+
+		let recorded = consumer.close("disconnected", Bytes { sent: 1, received: 2 });
+		assert_eq!(recorded, Reason::Session("disconnected".into()));
+		assert_eq!(
+			poll(producer.closed()),
+			Poll::Ready((Reason::Session("disconnected".into()), Bytes { sent: 1, received: 2 }))
+		);
+
+		// A later revocation changes nothing, and says so.
+		assert_eq!(producer.revoke(Reason::Expired), Reason::Session("disconnected".into()));
+	}
+
+	#[test]
+	fn a_fixed_lease_only_ends_by_the_holder() {
+		let mut consumer = Consumer::fixed(grant("a/**"));
+		assert_eq!(consumer.grant(), grant("a/**"));
+		assert!(poll(consumer.changed()).is_pending());
+		assert!(poll(consumer.closed()).is_pending());
+		consumer.revalidate();
+		assert_eq!(consumer.grant(), grant("a/**"));
+		assert!(poll(consumer.changed()).is_pending());
+		assert!(poll(consumer.closed()).is_pending());
+		assert_eq!(consumer.close("done", Bytes::default()), Reason::Session("done".into()));
+	}
+
+	#[test]
+	fn n_nudges_wake_the_producer_once() {
+		let (producer, consumer) = Producer::new(grant("a/**"));
+		assert!(poll(producer.revalidate_requested()).is_pending());
+
+		for _ in 0..8 {
+			consumer.revalidate();
+		}
+		assert_eq!(poll(producer.revalidate_requested()), Poll::Ready(()));
+		assert!(poll(producer.revalidate_requested()).is_pending());
+
+		consumer.revalidate();
+		assert_eq!(poll(producer.revalidate_requested()), Poll::Ready(()));
+	}
+
+	#[cfg(feature = "client")]
+	#[tokio::test]
+	async fn due_follows_cadence_nudges_and_backoff() {
+		tokio::time::pause();
+		let mut grant = grant("a/**");
+		grant.revalidate = Some(Duration::from_secs(10));
+		grant.expires = Some(kio::clock::wall() + Duration::from_secs(60));
+		let (producer, consumer) = Producer::new(grant.clone());
+		assert!(
+			kio::clock::timeout(Duration::ZERO, producer.due(&mut DueTimers::default()))
+				.await
+				.is_err()
+		);
+		tokio::time::advance(Duration::from_secs(10)).await;
+		assert_eq!(producer.due(&mut DueTimers::default()).await, Due::Revalidate);
+		assert!(
+			kio::clock::timeout(Duration::ZERO, producer.due(&mut DueTimers::default()))
+				.await
+				.is_err()
+		);
+
+		let delay = producer.failed();
+		assert!(delay >= Duration::from_millis(750) && delay <= Duration::from_millis(1250));
+		tokio::time::advance(Duration::from_secs(2)).await;
+		assert_eq!(producer.due(&mut DueTimers::default()).await, Due::Revalidate);
+
+		grant.revalidate = Some(Duration::from_secs(5));
+		producer.update(grant);
+		consumer.revalidate();
+		assert_eq!(producer.due(&mut DueTimers::default()).await, Due::Revalidate);
+		assert!(
+			kio::clock::timeout(Duration::ZERO, producer.due(&mut DueTimers::default()))
+				.await
+				.is_err()
+		);
+	}
+
+	#[cfg(feature = "client")]
+	#[tokio::test]
+	async fn due_reschedules_an_outstanding_wait_after_update() {
+		tokio::time::pause();
+		let mut grant = grant("a/**");
+		grant.revalidate = Some(Duration::from_secs(30));
+		grant.expires = Some(kio::clock::wall() + Duration::from_secs(3600));
+		let (producer, _consumer) = Producer::new(grant.clone());
+		let producer = std::sync::Arc::new(producer);
+		let waiter = tokio::spawn({
+			let producer = producer.clone();
+			async move { producer.due(&mut DueTimers::default()).await }
+		});
+		tokio::task::yield_now().await;
+		grant.revalidate = Some(Duration::from_secs(5));
+		producer.update(grant);
+		tokio::time::advance(Duration::from_secs(5)).await;
+		assert_eq!(waiter.await.unwrap(), Due::Revalidate);
+	}
+
+	#[cfg(feature = "client")]
+	#[tokio::test]
+	async fn backoff_grows_and_stays_bounded() {
+		tokio::time::pause();
+		let mut grant = grant("a/**");
+		grant.revalidate = Some(Duration::from_secs(30));
+		grant.expires = Some(kio::clock::wall() + Duration::from_secs(3600));
+		let (producer, _consumer) = Producer::new(grant);
+		let first = producer.failed();
+		assert!(first >= Duration::from_millis(750) && first <= Duration::from_millis(1250));
+		let mut later = first;
+		for _ in 0..40 {
+			later = producer.failed();
+		}
+		assert!(later <= Duration::from_secs(30).mul_f64(1.25));
+	}
+
+	#[cfg(feature = "client")]
+	#[tokio::test]
+	async fn an_unschedulable_cadence_never_rechecks() {
+		tokio::time::pause();
+		let mut grant = grant("a/**");
+		grant.revalidate = Some(Duration::MAX);
+		let (producer, _consumer) = Producer::new(grant);
+		tokio::time::advance(Duration::from_secs(3600)).await;
+		assert!(
+			kio::clock::timeout(Duration::ZERO, producer.due(&mut DueTimers::default()))
+				.await
+				.is_err()
+		);
+	}
+
+	#[cfg(feature = "client")]
+	#[tokio::test]
+	async fn due_expires_even_without_a_recheck() {
+		tokio::time::pause();
+		let mut grant = grant("a/**");
+		grant.expires = Some(kio::clock::wall() - Duration::from_secs(4));
+		let (producer, _consumer) = Producer::new(grant);
+		let task = tokio::spawn(async move { producer.due(&mut DueTimers::default()).await });
+		tokio::task::yield_now().await;
+		tokio::time::advance(Duration::from_secs(2)).await;
+		assert_eq!(task.await.unwrap(), Due::Expired);
+	}
+
+	#[test]
+	fn reason_round_trips_as_one_string() {
+		for (reason, text) in [
+			(Reason::Dropped, "\"dropped\""),
+			(Reason::Expired, "\"expired\""),
+			(Reason::Refused, "\"refused\""),
+			(Reason::Invalid, "\"invalid\""),
+			(Reason::Narrowed, "\"narrowed\""),
+			(Reason::Shutdown, "\"shutdown\""),
+			(Reason::Session("protocol error".into()), "\"protocol error\""),
+		] {
+			assert_eq!(serde_json::to_string(&reason).unwrap(), text);
+			assert_eq!(serde_json::from_str::<Reason>(text).unwrap(), reason);
+		}
+	}
+}

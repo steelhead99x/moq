@@ -1,12 +1,11 @@
+import { Duration } from "@moq/clock";
 import type * as Catalog from "@moq/hang/catalog";
-import type * as Moq from "@moq/net";
-import { Time } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
+import { SupportProbe } from "../support-probe";
+import { supported as decoderSupported } from "./supported";
 
-// AudioWorklet always renders in 128-sample quanta.
-const WORKLET_QUANTUM = 128;
-
+/** What the viewer wants from the audio rendition. */
 export type Target = {
 	// Optional manual override for the selected rendition name.
 	name?: string;
@@ -19,6 +18,7 @@ export type Target = {
  */
 export type Supported = (config: Catalog.AudioConfig) => Promise<boolean>;
 
+/** Signals the source reads. */
 export type SourceInput = {
 	broadcast: Getter<Broadcast | undefined>;
 
@@ -26,18 +26,28 @@ export type SourceInput = {
 	target: Getter<Target | undefined>;
 
 	// A function that checks if an audio configuration can be played. Renditions that fail the
-	// probe are filtered out. Nothing is selected until one is provided.
+	// probe are filtered out. Defaults to `Decoder.supported`, the WebCodecs probe.
 	supported: Getter<Supported | undefined>;
 };
 
-type SourceOutput = {
+/** Signals the source derives. */
+export type SourceOutput = {
 	catalog: Signal<Catalog.Audio | undefined>;
 	available: Signal<Record<string, Catalog.AudioConfig>>;
+
+	// Why no rendition can be chosen, or undefined while healthy or still probing. A
+	// `NotSupportedError` means the browser can decode none of the catalog's renditions.
+	error: Signal<Error | undefined>;
+
 	track: Signal<string | undefined>;
 	config: Signal<Catalog.AudioConfig | undefined>;
 
-	// The per-rendition jitter (ms) to add to the sync buffer. Wired into Sync by the parent.
-	jitter: Signal<Moq.Time.Milli | undefined>;
+	/**
+	 * The jitter the selected rendition advertises: a floor on the decoder's playout target.
+	 *
+	 * @internal Feeds the decoder.
+	 */
+	jitter: Signal<Duration | undefined>;
 };
 
 /**
@@ -45,16 +55,23 @@ type SourceOutput = {
  * for audio playback. The Decoder consumes whichever rendition it picks.
  */
 export class Source {
+	/** The wired inputs, read-only. */
 	readonly in: Readonlys<SourceInput>;
+
+	#probe = new SupportProbe<Catalog.AudioConfig>("audio");
 
 	readonly #out: SourceOutput = {
 		catalog: new Signal<Catalog.Audio | undefined>(undefined),
 		available: new Signal<Record<string, Catalog.AudioConfig>>({}),
+		error: this.#probe.error,
 		track: new Signal<string | undefined>(undefined),
 		config: new Signal<Catalog.AudioConfig | undefined>(undefined),
-		jitter: new Signal<Moq.Time.Milli | undefined>(undefined),
+		jitter: new Signal<Duration | undefined>(undefined),
 	};
+	/** The derived outputs, read-only. */
 	readonly out = readonlys(this.#out);
+	/** Whether rendition support is still being resolved. @internal */
+	readonly pending: Getter<boolean> = this.#probe.pending;
 
 	#signals = new Effect();
 
@@ -81,116 +98,44 @@ export class Source {
 	}
 
 	#runSupported(effect: Effect): void {
-		const renditions = effect.get(this.#out.catalog)?.renditions ?? {};
-		const supported = effect.get(this.in.supported);
-		if (!supported) return;
-
-		effect.spawn(async () => {
-			const available: Record<string, Catalog.AudioConfig> = {};
-
-			// `supported` comes from the consumer, so we cannot assume it ever settles. A rerun
-			// waits for the tasks it spawned, so an unraced probe would hold the next run shut
-			// for good. Captured here so it stays this run's promise once we start awaiting.
-			const cancelled = effect.cancel.then(() => undefined);
-
-			for (const [name, config] of Object.entries(renditions)) {
-				const isSupported = await Promise.race([supported(config), cancelled]);
-
-				// Torn down: stop probing and publish nothing, since the rerun redoes this.
-				if (effect.abort.aborted) return;
-
-				if (isSupported) available[name] = config;
-			}
-
-			if (Object.keys(available).length === 0 && Object.keys(renditions).length > 0) {
-				console.warn("no supported audio renditions found:", renditions);
-			}
-
-			this.#out.available.set(available);
-		});
+		const supported = effect.get(this.in.supported) ?? decoderSupported;
+		// Read the catalog from the broadcast itself, so the probe result is tagged with the right one.
+		const broadcast = effect.get(this.in.broadcast);
+		const renditions = (broadcast && effect.get(broadcast.out.catalog)?.audio?.renditions) ?? {};
+		this.#probe.run(effect, supported, renditions, (available) => this.#out.available.set(available));
 	}
 
 	#runSelected(effect: Effect): void {
-		const available = effect.get(this.#out.available);
-		if (Object.keys(available).length === 0) return;
-
 		const target = effect.get(this.in.target);
 
-		let selected: { track: string; config: Catalog.AudioConfig } | undefined;
+		// A disabled rendition has no frames coming, so it is never selected, even by name.
+		const available = Object.fromEntries(
+			Object.entries(effect.get(this.#out.available)).filter(([, config]) => config.enabled !== false),
+		);
 
-		// Manual selection by name
-		if (target?.name && target.name in available) {
-			selected = { track: target.name, config: available[target.name] };
-		} else {
-			// Automatic selection
-			selected = this.#select(available);
-			if (!selected) return;
-		}
+		const track = target?.name && target.name in available ? target.name : this.#select(available);
+		if (!track) return;
 
-		effect.set(this.#out.track, selected.track);
-		effect.set(this.#out.config, selected.config);
-
-		// Use catalog jitter if available, otherwise estimate from codec frame duration.
-		// Add the worklet render quantum so the ring buffer has margin between frame arrivals.
-		const codecJitter = selected.config.jitter ?? defaultAudioJitter(selected.config) ?? 0;
-		const overhead = Math.ceil((WORKLET_QUANTUM / selected.config.sampleRate) * 1000);
-		const jitter = codecJitter + overhead;
-		effect.set(this.#out.jitter, Time.Milli(jitter));
+		const config = available[track];
+		effect.set(this.#out.track, track);
+		effect.set(this.#out.config, config);
+		effect.set(this.#out.jitter, config.jitter !== undefined ? Duration.millis(config.jitter) : undefined);
 	}
 
 	/**
 	 * Select rendition based on the configured strategy.
 	 */
-	#select(
-		renditions: Record<string, Catalog.AudioConfig>,
-	): { track: string; config: Catalog.AudioConfig } | undefined {
+	#select(renditions: Record<string, Catalog.AudioConfig>): string | undefined {
 		const entries = Object.entries(renditions);
-		if (entries.length === 0) return undefined;
-
-		for (const [track, config] of entries) {
-			if (config.container.kind === "legacy") {
-				return { track, config };
-			}
+		for (const kind of ["legacy", "loc", "cmaf"]) {
+			const found = entries.find(([, config]) => config.container.kind === kind);
+			if (found) return found[0];
 		}
-
-		for (const [track, config] of entries) {
-			if (config.container.kind === "loc") {
-				return { track, config };
-			}
-		}
-
-		for (const [track, config] of entries) {
-			if (config.container.kind === "cmaf") {
-				return { track, config };
-			}
-		}
-
 		return undefined;
 	}
 
+	/** Stop and release everything this holds. */
 	close(): void {
 		this.#signals.close();
 	}
-}
-
-// Estimate the minimum jitter (frame duration) based on the audio codec.
-// TODO these are defaults; the actual frame duration depends on encoder config.
-function defaultAudioJitter(config: Catalog.AudioConfig): number | undefined {
-	if (config.codec.startsWith("opus")) {
-		// Opus supports 2.5–60ms but 20ms is the real-time default.
-		return 20;
-	}
-
-	if (config.codec.startsWith("mp4a")) {
-		// 1024 samples for LC-AAC; HE-AAC/AAC-LD use different sizes.
-		return Math.ceil((1024 / config.sampleRate) * 1000);
-	}
-
-	if (config.codec === "mp3") {
-		// 1152 samples per frame for MPEG-1 Layer III; MPEG-2/2.5 use 576.
-		const samples = config.sampleRate >= 32000 ? 1152 : 576;
-		return Math.ceil((samples / config.sampleRate) * 1000);
-	}
-
-	return undefined;
 }

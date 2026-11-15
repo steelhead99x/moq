@@ -1,7 +1,15 @@
 import type * as Moq from "@moq/net";
-import { Time } from "@moq/net";
+import { Error as NetError, type Timed } from "@moq/net";
 
-import { Encoder, type ProducerConfig } from "./encoder.ts";
+import { type Config as CodecConfig, Encoder, type Pending } from "./encoder.ts";
+
+/**
+ * A log its producer finished: it takes no more records. {@link Producer.finish} returns it,
+ * mirroring the Rust `stream::Finished`; the producer itself still refuses an append after the
+ * finish.
+ */
+// biome-ignore lint/suspicious/noEmptyInterface: nothing is left to call once the track is released.
+export interface Finished {}
 
 /**
  * Publishes an ordered log of JSON records to a track, one record per frame in a single group.
@@ -17,38 +25,77 @@ export class Producer<T> {
 	#group?: Moq.Group.Producer;
 
 	/** Wrap a track to publish a record log into it. */
-	constructor(track: Moq.Track.Producer, config: ProducerConfig = {}) {
-		this.#track = track;
+	constructor(config: Producer.Config<T>) {
+		this.#track = config.track;
 		this.#encoder = new Encoder(config);
 	}
 
-	/** Append one record to the log. */
-	append(value: T): void {
+	/**
+	 * Append one record to the log.
+	 *
+	 * A record beyond the whole-frame limit throws `FrameTooLarge` before it is written.
+	 *
+	 * A record that cannot be written ends the track: a log missing a record is not the
+	 * lossless log this mode promises, so the failure is surfaced rather than papered over with a
+	 * second group. The track is aborted rather than closed cleanly, so a consumer sees the failure
+	 * instead of a log that merely looks complete.
+	 *
+	 * `at` is when the value was captured, written as its frame timestamp. Omit it only on an
+	 * untimed track: it is never filled in.
+	 */
+	append({ value, at }: Timed<T>): void {
 		// Encode first, so a value that can't be serialized doesn't publish an empty group that
 		// subscribers would advance into and wait on. Opening the group afterwards is safe because
 		// the record stays uncommitted until the write lands.
-		const record = this.#encoder.encode(value);
-
+		let record: Pending;
 		try {
-			this.#group ??= this.#track.appendGroup();
-			this.#group.writeFrame({ payload: record.payload, timestamp: Time.Timestamp.now() });
+			record = this.#encoder.encode(value);
 		} catch (err) {
-			// The group is already visible on the track, so leaving it open would strand a subscriber
-			// that advanced into it. Closing it is also the group roll that recovery needs, so reset the
-			// encoder to finish it: the record never landed, and without the reset a compressed encoder
-			// refuses every later one even though the fresh group could carry it.
-			this.#group?.close();
-			this.#group = undefined;
-			this.#encoder.reset();
+			if (err instanceof NetError.FrameTooLarge) throw err;
+			// A record that can't be encoded is as lost as one the group rejects: the log is missing it
+			// either way. Nothing was published, so this only has to end the track.
+			this.#abort(err);
 			throw err;
 		}
+
+		this.#group ??= this.#track.appendGroup();
+
+		try {
+			this.#group.writeFrame({ payload: record.payload, timestamp: at });
+		} catch (err) {
+			// The group is live, so the record is a hole in the log and a second group would hand
+			// consumers that gap dressed up as a complete log.
+			this.#abort(err);
+			throw err;
+		}
+
 		record.commit();
 	}
 
-	/** Finish the track, closing the group. */
-	finish(): void {
-		this.#group?.close();
+	// End the track with an error, so a consumer sees the failure rather than a clean end.
+	#abort(err: unknown): void {
+		const abort = err instanceof Error ? err : new Error(String(err));
+
+		// Close the group with the same error first. A consumer that already pulled it holds its own
+		// handle, which the track's close no longer reaches, so dropping ours would leave a reader
+		// sitting in the group with a generic error instead of the failure that ended the log.
+		this.#group?.abort(abort);
 		this.#group = undefined;
-		this.#track.close();
+		this.#track.abort(abort);
 	}
+
+	/** Finish the track, closing the group, and return it as {@link Finished}. */
+	finish(): Finished {
+		this.#group?.finish();
+		this.#group = undefined;
+		this.#track.finish();
+		this.#track.close();
+		return this;
+	}
+}
+
+/** Types for {@link Producer}. */
+export namespace Producer {
+	/** Stream producer options, including the destination track. */
+	export type Config<T> = CodecConfig<T> & { track: Moq.Track.Producer };
 }

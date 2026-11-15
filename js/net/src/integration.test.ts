@@ -1,33 +1,107 @@
-import { expect, test } from "bun:test";
-import type { Getter } from "@moq/signals";
-import { Producer as BroadcastProducer } from "./broadcast.ts";
-import { accept, connect } from "./connection/index.ts";
-import { RemoteError } from "./error.ts";
+import { afterEach, expect, mock, onTestFinished, spyOn, test } from "bun:test";
+import { Duration, now, yieldNow } from "@moq/clock";
+import { Manual } from "@moq/clock/test";
+import { Session as Qmux } from "@moq/qmux";
+import type * as Announce from "./announced.ts";
+import { type Consumer as BroadcastConsumer, Producer as BroadcastProducer } from "./broadcast.ts";
+import {
+	type AcceptProps,
+	accept as acceptSession,
+	Connection,
+	type ConnectProps,
+	connect as connectSession,
+	type Session,
+} from "./connection/index.ts";
+import { SessionCode, SessionError, StreamCode, StreamError, TimestampMismatch, TooFarBehind } from "./error.ts";
 import * as Ietf from "./ietf/index.ts";
+import { Publisher as IetfPublisher } from "./ietf/publisher.ts";
+import { RequestError } from "./ietf/request.ts";
+import { refuse as refuseRequest } from "./ietf/request_stream.ts";
+import * as Instance from "./instance.ts";
+import { hooks } from "./internal.ts";
 import * as Lite from "./lite/index.ts";
-import { createMockTransportPair } from "./mock.ts";
+import { Publisher as LitePublisher } from "./lite/publisher.ts";
+import { createMockTransportPair, manual, settlesWithin, textFrame, waitFor } from "./mock.ts";
+import type { Consumer as OriginConsumer } from "./origin.ts";
+import { Producer as OriginProducer } from "./origin.ts";
 import * as Path from "./path.ts";
+import { Stream } from "./stream.ts";
 import { Timescale, Timestamp } from "./time.ts";
-import type { Producer as TrackProducer } from "./track.ts";
+import type { Position, Producer as TrackProducer } from "./track.ts";
+import { unwanted } from "./util/demand.ts";
 import { withTimeout } from "./util/timeout.ts";
+import { wireOf } from "./wire.ts";
+
+function publish(origin: OriginProducer, path: Path.Valid) {
+	const broadcastRoute = origin.route(path);
+	const broadcast = broadcastRoute.broadcast;
+	return broadcast;
+}
 
 const url = new URL("https://localhost:4443/test");
 
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+function connect(url: URL, props: Omit<ConnectProps, "url"> = {}): Promise<Session> {
+	return connectSession({ url, ...props });
+}
+
+function accept(
+	transport: WebTransport,
+	url: URL,
+	props: Omit<AcceptProps, "transport" | "url"> = {},
+): Promise<Session> {
+	return acceptSession({ transport, url, ...props });
+}
+
+/**
+ * Have every peer refuse announce requests for the rest of the test, the way a relay without
+ * discovery does. Returns how many it has refused so far.
+ */
+function withoutDiscovery(): () => number {
+	let refused = 0;
+	const refuse = async () => {
+		refused++;
+		throw new Error("discovery unsupported");
+	};
+	spyOn(LitePublisher.prototype, "runAnnounce").mockImplementation(refuse);
+	// Every draft answers on the request's own stream; the refusal codes match across them.
+	spyOn(IetfPublisher.prototype, "runSubscribeNamespace").mockImplementation((_msg, stream) => {
+		refused++;
+		return refuseRequest(stream, Ietf.Version.DRAFT_18, "subscribe_namespace", {
+			condition: "not_supported",
+			reasonPhrase: "discovery unsupported",
+		});
+	});
+	return () => refused;
+}
+
+afterEach(() => mock.restore());
+
+/**
+ * The table's route for `path` as a handle of the caller's own.
+ *
+ * A request is the only way to consume by path, and it resolves against the table
+ * synchronously, so a routed path needs no waiting. Cloned because a request only borrows.
+ */
+async function routed(origin: OriginConsumer, path: Path.Valid): Promise<BroadcastConsumer | undefined> {
+	const request = origin.request(path);
+	await yieldNow();
+	// The handle is the request's logical front, which ends with the request, so the request
+	// stays open for the test.
+	return request.active.peek()?.clone();
+}
 
 async function runPublishSubscribeFlow(protocol: string, version?: number) {
 	const pair = createMockTransportPair(protocol);
+	const origin = new OriginProducer();
 
 	const [client, server] = await Promise.all([
 		connect(url, { transport: pair.client }),
-		accept(pair.server, url, version !== undefined ? { version } : undefined),
+		accept(pair.server, url, { version, publish: origin.consume() }),
 	]);
 
 	// Server publishes a broadcast
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-	const prefixedBroadcast = new BroadcastProducer();
-	server.publish(Path.from("root/child"), prefixedBroadcast);
+	const broadcast = publish(origin, Path.from("test"));
+	const prefixedBroadcast = publish(origin, Path.from("root/child"));
 
 	// Serve every requested "video" track. On lite-05+ a subscribe is preceded by
 	// a TRACK info lookup, which the publisher answers by requesting the track too,
@@ -35,34 +109,34 @@ async function runPublishSubscribeFlow(protocol: string, version?: number) {
 	let served = 0;
 	const serving = (async () => {
 		for (;;) {
-			const req = await broadcast.requested();
+			const req = await wireOf(broadcast).requested();
 			if (!req) break;
 			if (req.name !== "video") {
 				req.reject(new Error(`unexpected track: ${req.name}`));
 				continue;
 			}
 			served++;
-			req.accept().writeString("hello");
+			req.accept({ timescale: Timescale.MILLI }).writeFrame(textFrame("hello"));
 		}
 	})();
 
 	// Client discovers announced broadcast
-	const announced = client.announced();
+	const announced = client.routes();
 	const entry = await announced.next();
 	if (!entry) throw new Error("expected entry");
-	expect(entry.path).toBe("test" as Path.Valid);
-	expect(entry.active).toBe(true);
+	expect(entry.prefix).toBe("test" as Path.Valid);
+	expect(entry.kind).toBe("start");
 
-	// Prefix-scoped discovery returns paths relative to the requested prefix.
-	const prefixed = client.announced(Path.from("root"));
+	// Scoped discovery only echoes the suffix on the wire, but presents the whole path.
+	const prefixed = client.routes(Path.Pattern.subtree(Path.from("root")));
 	const prefixedEntry = await prefixed.next();
 	if (!prefixedEntry) throw new Error("expected prefixed entry");
-	expect(prefixedEntry.path).toBe("child" as Path.Valid);
-	expect(prefixedEntry.active).toBe(true);
+	expect(prefixedEntry.prefix).toBe("root/child" as Path.Valid);
+	expect(prefixedEntry.kind).toBe("start");
 
 	// Client consumes the broadcast and subscribes to a track
-	const remote = client.consume(Path.from("test"));
-	const track = remote.track("video").subscribe();
+	const remote = wireOf(client).consume(Path.from("test"));
+	const track = remote.track("video").subscribe().ordered();
 
 	// Client reads data
 	const data = await track.readString();
@@ -76,8 +150,8 @@ async function runPublishSubscribeFlow(protocol: string, version?: number) {
 	announced.close();
 	prefixed.close();
 	remote.close();
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
 }
 
 test("integration: lite draft-01", async () => {
@@ -100,10 +174,13 @@ test("integration: lite draft-05", async () => {
 
 test("integration: lite subscription options and updates reach the publisher", async () => {
 	const pair = createMockTransportPair(Lite.ALPN_05);
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
+	const broadcast = publish(origin, Path.from("test"));
 
 	let resolveProducer: ((producer: TrackProducer) => void) | undefined;
 	const accepted = new Promise<TrackProducer>((resolve) => {
@@ -111,307 +188,618 @@ test("integration: lite subscription options and updates reach the publisher", a
 	});
 	const serving = (async () => {
 		for (;;) {
-			const request = await broadcast.requested();
+			const request = await wireOf(broadcast).requested();
 			if (!request) return;
-			const producer = request.accept();
-			if (request.subscription.startGroup === 0) resolveProducer?.(producer);
+			const producer = request.accept({ timescale: Timescale.MILLI });
+			// The TRACK lookup opens the request and the SUBSCRIBE joins it, so its options land after.
+			const check = (subscription = producer.subscription.peek()) => {
+				if (subscription?.ranges?.[0]?.start?.absolute === 1n) resolveProducer?.(producer);
+			};
+			check();
+			producer.subscription.subscribe(check);
 		}
 	})();
 
-	const remote = client.consume(Path.from("test"));
+	const remote = wireOf(client).consume(Path.from("test"));
+	// A floor of group 1, a concrete group on every draft.
 	const subscriber = remote.track("video").subscribe({
 		priority: 3,
-		ordered: true,
-		latencyMax: 250,
-		startGroup: 0,
-		endGroup: 9,
+		delay: { max: Duration.millis(250) },
+		ranges: [{ start: { absolute: 1n }, end: { absolute: 9n } }],
 	});
 	const producer = await accepted;
 	expect(producer.subscription.peek()).toEqual({
 		priority: 3,
-		ordered: true,
-		latencyMax: 250,
-		startGroup: 0,
-		endGroup: 9,
+		// The negotiated lite-06 cannot state a minimum.
+		delay: { min: null, max: Duration.millis(250) },
+		order: "descending",
+		ranges: [{ start: { absolute: 1n }, end: { absolute: 9n } }],
 	});
 
 	const updated = producer.subscription.changed();
-	subscriber.update({ priority: 8, ordered: false, latencyMax: 500, startGroup: 2, endGroup: 12 });
+	subscriber.update({
+		priority: 8,
+		delay: { max: Duration.millis(500) },
+		ranges: [{ start: { absolute: 2n }, end: { absolute: 12n } }],
+	});
 	expect(await updated).toEqual({
 		priority: 8,
-		ordered: false,
-		latencyMax: 500,
-		startGroup: 2,
-		endGroup: 12,
+		delay: { min: null, max: Duration.millis(500) },
+		order: "descending",
+		ranges: [{ start: { absolute: 2n }, end: { absolute: 12n } }],
 	});
 
 	subscriber.close();
 	remote.close();
 	broadcast.close();
 	await serving;
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
+});
+
+// Both handshake paths: a SETUP-negotiated draft (16) and ALPN-selected ones (17+).
+test.each([Ietf.ALPN.DRAFT_22])("integration: %s carries the subscriber max age to the publisher", async (alpn) => {
+	const pair = createMockTransportPair(alpn);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const accepted = (async () => {
+		const request = await wireOf(broadcast).requested();
+		if (!request) throw new Error("no request");
+		return request.accept({ timescale: Timescale.MILLI });
+	})();
+
+	const remote = wireOf(client).consume(Path.from("test"));
+	const subscriber = remote.track("video").subscribe({ delay: { max: Duration.millis(250) } });
+	const producer = await accepted;
+	// Without the negotiated parameter the publisher keeps its whole backlog instead.
+	expect(producer.subscription.peek()?.delay?.max).toEqual(Duration.millis(250));
+
+	const updated = producer.subscription.changed();
+	subscriber.update({ delay: { max: Duration.millis(500) } });
+	expect((await updated)?.delay?.max).toEqual(Duration.millis(500));
+
+	subscriber.close();
+	remote.close();
+	broadcast.close();
+	origin.close();
+	client.abort();
+	server.abort();
+});
+
+test("integration: lite carries a fractional delay as a whole millisecond", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_05);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+
+	let resolveProducer: ((producer: TrackProducer) => void) | undefined;
+	const accepted = new Promise<TrackProducer>((resolve) => {
+		resolveProducer = resolve;
+	});
+	const serving = (async () => {
+		for (;;) {
+			const request = await wireOf(broadcast).requested();
+			if (!request) return;
+			const producer = request.accept({ timescale: Timescale.MILLI });
+			// The TRACK lookup opens the request and the SUBSCRIBE joins it, so its options land after.
+			const check = (subscription = producer.subscription.peek()) => {
+				if (subscription?.ranges?.[0]?.start?.absolute === 1n) resolveProducer?.(producer);
+			};
+			check();
+			producer.subscription.subscribe(check);
+		}
+	})();
+
+	const remote = wireOf(client).consume(Path.from("test"));
+	// A varint cannot encode 38.75, so an unrounded value fails the SUBSCRIBE outright and
+	// nothing resubscribes. The publisher must see the budget rounded up instead.
+	const subscriber = remote
+		.track("video")
+		.subscribe({ delay: { max: Duration.millis(38.75) }, ranges: [{ start: { absolute: 1n } }] });
+
+	// A failed subscribe never reaches the publisher, so race its closure to report the
+	// encode error rather than block until the suite times out.
+	const failed = Promise.resolve(subscriber.closed).then<never>((err) => {
+		throw err ?? new Error("subscription closed before the publisher saw it");
+	});
+
+	const producer = await Promise.race([accepted, failed]);
+	expect(producer.subscription.peek()?.delay?.max).toEqual(Duration.millis(39));
+
+	const updated = producer.subscription.changed();
+	subscriber.update({ delay: { max: Duration.millis(500.25) }, ranges: [{ start: { absolute: 1n } }] });
+	expect((await Promise.race([updated, failed]))?.delay?.max).toEqual(Duration.millis(501));
+
+	subscriber.close();
+	remote.close();
+	broadcast.close();
+	await serving;
+	origin.close();
+	client.abort();
+	server.abort();
 });
 
 test("integration: lite applies initial and updated group bounds", async () => {
-	const GROUP_COUNT = 6;
-	const INITIAL_START_GROUP = 1;
-	const INITIAL_END_GROUP = 2;
-	const UPDATED_GROUP = 4;
+	using clock = manual();
+	const GROUP_COUNT = 6n;
+	const INITIAL_START_GROUP = 1n;
+	const INITIAL_END_GROUP = 3n; // exclusive: groups 1 and 2
+	const UPDATED_GROUP = 4n;
+	const UPDATED_END_GROUP = 5n; // exclusive: group 4
+	const REPLAY_LATENCY_MS = 5000;
 	const PENDING_ASSERT_MS = 20;
 	const UPDATE_TIMEOUT_MS = 1000;
 
 	const pair = createMockTransportPair(Lite.ALPN_05);
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
-	const broadcast = new BroadcastProducer();
-	const producer = broadcast.createTrack("video");
-	for (let sequence = 0; sequence < GROUP_COUNT; sequence++) producer.appendGroup().close();
-	server.publish(Path.from("test"), broadcast);
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI, maxAge: null });
+	for (let sequence = 0n; sequence < GROUP_COUNT; sequence++) producer.appendGroup().finish();
 
-	const remote = client.consume(Path.from("test"));
+	const remote = wireOf(client).consume(Path.from("test"));
 	const subscriber = remote
 		.track("video")
-		.subscribe({ startGroup: INITIAL_START_GROUP, endGroup: INITIAL_END_GROUP });
+		.subscribe({
+			delay: { max: Duration.millis(REPLAY_LATENCY_MS) },
+			ranges: [{ start: { absolute: INITIAL_START_GROUP }, end: { absolute: INITIAL_END_GROUP } }],
+		})
+		.ordered();
 	try {
 		expect((await subscriber.nextGroup())?.sequence).toBe(INITIAL_START_GROUP);
-		expect((await subscriber.nextGroup())?.sequence).toBe(INITIAL_END_GROUP);
+		expect((await subscriber.nextGroup())?.sequence).toBe(INITIAL_END_GROUP - 1n);
 
-		const pending = subscriber.nextGroup();
-		expect(await Promise.race([pending, sleep(PENDING_ASSERT_MS).then(() => "pending")])).toBe("pending");
+		// A bounded read ends once its window is read, as in Rust.
+		expect(await subscriber.nextGroup()).toBeUndefined();
 
-		subscriber.update({ startGroup: UPDATED_GROUP, endGroup: UPDATED_GROUP });
-		expect((await withTimeout(pending, UPDATE_TIMEOUT_MS, "updated group bound timed out"))?.sequence).toBe(
+		// Replacing the ranges reads on from the same reader, the update going upstream.
+		subscriber.update({
+			delay: { max: Duration.millis(REPLAY_LATENCY_MS) },
+			ranges: [{ start: { absolute: UPDATED_GROUP }, end: { absolute: UPDATED_END_GROUP } }],
+		});
+		const updated = (pending: Promise<unknown>) =>
+			withTimeout(pending, Duration.millis(UPDATE_TIMEOUT_MS), "updated group bound timed out");
+		expect(((await updated(subscriber.nextGroup())) as { sequence: bigint } | undefined)?.sequence).toBe(
 			UPDATED_GROUP,
 		);
+		expect(await updated(subscriber.nextGroup())).toBeUndefined();
 
-		const capped = subscriber.nextGroup();
-		expect(await Promise.race([capped, sleep(PENDING_ASSERT_MS).then(() => "pending")])).toBe("pending");
+		// An open range parks at the live edge instead.
+		subscriber.update({
+			delay: { max: Duration.millis(REPLAY_LATENCY_MS) },
+			ranges: [{ start: { absolute: GROUP_COUNT } }],
+		});
+		expect(await settlesWithin(subscriber.nextGroup(), clock, Duration.millis(PENDING_ASSERT_MS))).toBe(false);
 	} finally {
 		subscriber.close();
 		remote.close();
 		broadcast.close();
-		client.close();
-		server.close();
+		client.abort();
+		server.abort();
+	}
+});
+
+test("integration: lite refuses an empty requested range on open and on update", async () => {
+	const GROUP_COUNT = 4;
+	const REPLAY_LATENCY_MS = 5000;
+	const TIMEOUT_MS = 1000;
+
+	const pair = createMockTransportPair(Lite.ALPN_05);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
+	for (let sequence = 0; sequence < GROUP_COUNT; sequence++) producer.appendGroup().finish();
+
+	const remote = wireOf(client).consume(Path.from("test"));
+	const video = remote.track("video");
+	try {
+		// Bounds that meet cannot go on the wire: the nearest encoding inverts the range. The read
+		// of an empty window ends at once, and the copy is refused.
+		const empty = video.subscribe({
+			delay: { max: Duration.millis(REPLAY_LATENCY_MS) },
+			ranges: [{ start: { absolute: 2n }, end: { absolute: 2n } }],
+		});
+		expect(await empty.recvGroup()).toBeUndefined();
+		expect(
+			await withTimeout(Promise.resolve(empty.closed), Duration.millis(TIMEOUT_MS), "empty open never settled"),
+		).toHaveProperty("message", "empty subscription range cannot be encoded");
+		empty.close();
+
+		// A live subscription whose demand later collapses to nothing fails the same way.
+		const live = video
+			.subscribe({
+				delay: { max: Duration.millis(REPLAY_LATENCY_MS) },
+				ranges: [{ start: { absolute: 1n }, end: { absolute: 2n } }],
+			})
+			.ordered();
+		expect((await live.nextGroup())?.sequence).toBe(1n);
+		live.update({
+			delay: { max: Duration.millis(REPLAY_LATENCY_MS) },
+			ranges: [{ start: { absolute: 3n }, end: { absolute: 3n } }],
+		});
+		expect(await live.nextGroup()).toBeUndefined();
+		expect(
+			await withTimeout(Promise.resolve(live.closed), Duration.millis(TIMEOUT_MS), "empty update never settled"),
+		).toHaveProperty("message", "empty subscription range cannot be encoded");
+		live.close();
+	} finally {
+		remote.close();
+		broadcast.close();
+		client.abort();
+		server.abort();
+	}
+});
+
+// Lite-07 carries every range, so a sparse request counting back from the latest group delivers
+// just its groups, and the publisher ends it once they are accounted for.
+test("integration: lite-07 serves sparse and relative ranges", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_07_WIP);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI, maxAge: null });
+	for (let sequence = 0; sequence < 10; sequence++) producer.appendGroup().finish();
+
+	const remote = wireOf(client).consume(Path.from("test"));
+	try {
+		const reader = remote
+			.track("video")
+			.subscribe({
+				delay: { max: null },
+				order: "ascending",
+				ranges: [
+					{ start: { absolute: 1n }, end: { absolute: 3n } },
+					{ start: { relative: 2n }, end: { absolute: 9n } },
+				],
+			})
+			.ordered();
+		// Covering the ranges ends the subscription upstream, and the read with its window.
+		const got: bigint[] = [];
+		for (let i = 0; i < 4; i++) got.push((await reader.nextGroup())?.sequence ?? -1n);
+		expect(got).toEqual([1n, 2n, 7n, 8n]);
+		expect(await reader.nextGroup()).toBeUndefined();
+		reader.close();
+	} finally {
+		remote.close();
+		broadcast.close();
+		client.abort();
+		server.abort();
+	}
+});
+
+// A publisher counts a relative start back from its newest group, which may hold no frame yet and
+// so counts neither in the largest it reports nor where the copy resolves the start. The copy reports
+// the publisher's start, where a reader waiting on each group in sequence starts. Mirrors the Rust
+// `a_relative_start_reports_the_publishers_start_over_a_frameless_newest_group`.
+// The newest group lands before the reader asks, as it can under load: a sibling reads it, so the
+// reader's own window has yet to settle on it when it asks where it starts.
+test("integration: lite-07 reports a relative start over a frameless newest group", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_07_WIP);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { maxAge: null });
+	for (let sequence = 0; sequence < 5; sequence++) {
+		const group = producer.appendGroup();
+		group.writeFrame({ payload: new Uint8Array([sequence]) });
+		group.finish();
+	}
+	const newest = producer.appendGroup();
+
+	const remote = wireOf(client).consume(Path.from("test"));
+	const subscription = { delay: { max: null }, ranges: [{ start: { relative: 0n } }] };
+	const reader = remote.track("video").subscribe(subscription);
+	const sibling = remote.track("video").subscribe(subscription);
+	try {
+		// Accepting the track subscribes it upstream, whose answer resolves the start.
+		await reader.info();
+		expect((await sibling.recvGroup())?.sequence).toBe(5n);
+		expect(await reader.start()).toBe(5n);
+		newest.writeFrame({ payload: new Uint8Array([5]) });
+		newest.finish();
+		expect((await reader.recvGroup())?.sequence).toBe(5n);
+	} finally {
+		sibling.close();
+		reader.close();
+		remote.close();
+		broadcast.close();
+		client.abort();
+		server.abort();
+	}
+});
+
+// A lite-07 publisher keeps a covered bounded subscription open for an update: the read ends
+// with its window, the same range reads again from the cache, and a wider one reaches upstream
+// for the rest, past a group that never existed. The demand goes with the readers. Mirrors the
+// Rust `a_covered_bounded_subscription_stays_open`.
+test("integration: lite-07 keeps a covered bounded subscription open", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_07_WIP);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI, maxAge: null });
+	for (const sequence of [0n, 1n, 2n, 4n, 5n]) producer.createGroup(sequence).finish();
+
+	const remote = wireOf(client).consume(Path.from("test"));
+	const bounded = (end: bigint) =>
+		remote.track("video").subscribe({
+			delay: { max: Duration.millis(60_000) },
+			order: "ascending",
+			ranges: [{ start: { absolute: 1n }, end: { absolute: end } }],
+		});
+	// Arrival reads, as the Rust test's: an ordered one would wait out the missing group 3.
+	const read = async (reader: ReturnType<typeof bounded>, count: number) => {
+		const got: bigint[] = [];
+		for (let i = 0; i < count; i++) got.push((await reader.recvGroup())?.sequence ?? -1n);
+		return got;
+	};
+	try {
+		const reader = bounded(3n);
+		expect(await read(reader, 2)).toEqual([1n, 2n]);
+		// The read ends with its window, while the covered subscription stays open.
+		expect(await reader.recvGroup()).toBeUndefined();
+		expect(producer.subscription.peek()).toBeDefined();
+
+		const again = bounded(3n);
+		expect(await read(again, 2)).toEqual([1n, 2n]);
+
+		const wider = bounded(6n);
+		expect(await read(wider, 4)).toEqual([1n, 2n, 4n, 5n]);
+		reader.close();
+		again.close();
+		wider.close();
+		// The demand goes with the readers.
+		while (producer.subscription.peek() !== undefined) await producer.subscription.changed();
+	} finally {
+		remote.close();
+		broadcast.close();
+		client.abort();
+		server.abort();
+	}
+});
+
+// A time range goes upstream in the track's timescale, the publisher resolves its start from
+// where its groups start, and the copy's reader resolves the end from the groups it receives.
+test("integration: lite-07 serves a time range", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_07_WIP);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MICRO, maxAge: null });
+	for (let sequence = 0; sequence < 10; sequence++) {
+		const group = producer.appendGroup();
+		group.writeFrame(textFrame(`${sequence}`, Timestamp.fromMillis(sequence * 1000)));
+		group.finish();
+	}
+
+	const remote = wireOf(client).consume(Path.from("test"));
+	try {
+		const reader = remote
+			.track("video")
+			.subscribe({
+				delay: { max: null },
+				order: "ascending",
+				ranges: [{ start: { time: Timestamp.fromMillis(2500) }, end: { time: Timestamp.fromMillis(5000) } }],
+			})
+			.ordered();
+		const got: bigint[] = [];
+		for (let i = 0; i < 4; i++) got.push((await reader.nextGroup())?.sequence ?? -1n);
+		expect(got).toEqual([2n, 3n, 4n, 5n]);
+		reader.close();
+
+		// An untimed track refuses it.
+		broadcast.createTrack("untimed", {});
+		const untimed = remote.track("untimed").subscribe({ ranges: [{ start: { time: Timestamp.fromMillis(0) } }] });
+		await expect(untimed.recvGroup()).rejects.toThrow(TimestampMismatch);
+	} finally {
+		remote.close();
+		broadcast.close();
+		client.abort();
+		server.abort();
 	}
 });
 
 test("integration: lite draft-06", async () => {
 	// Exercises announce ids: every active assigns an ordinal on the wire.
-	await runPublishSubscribeFlow(Lite.ALPN_06_WIP);
+	await runPublishSubscribeFlow(Lite.ALPN_06);
 });
 
+// A subscriber learns a track's properties over a TRACK stream before it subscribes. The
+// publisher holds the track for that stream until the subscriber closes it, which it does once
+// its SUBSCRIBE is answered, so a publisher starting the track on demand sees one request and one
+// demand edge per viewer rather than one for each stream with a gap in between.
+test.each([Lite.ALPN_05, Lite.ALPN_06, Lite.ALPN_07_WIP])(
+	"integration: %s demand holds across a subscription's TRACK and SUBSCRIBE",
+	async (protocol) => {
+		using clock = manual();
+		const pair = createMockTransportPair(protocol);
+		const origin = new OriginProducer();
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client }),
+			accept(pair.server, url, { publish: origin.consume() }),
+		]);
+
+		const broadcast = publish(origin, Path.from("test"));
+		// Whether anyone subscribes to the served track, recorded on each change.
+		const edges: boolean[] = [];
+		let producer: TrackProducer | undefined;
+		let dispose = () => {};
+		let requests = 0;
+		const serving = (async () => {
+			for (;;) {
+				const request = await wireOf(broadcast).requested();
+				if (!request) return;
+				requests++;
+				producer = request.accept({ timescale: Timescale.MILLI });
+				const wanted = producer.demand().wanted;
+				const edge = () => {
+					const now = wanted.peek() !== undefined;
+					if (edges.at(-1) !== now) edges.push(now);
+				};
+				edge();
+				dispose = wanted.subscribe(edge);
+				producer.writeFrame(textFrame("hello"));
+			}
+		})();
+
+		const remote = wireOf(client).consume(Path.from("test"));
+		const track = remote.track("video").subscribe().ordered();
+		expect(await track.readString()).toBe("hello");
+		await clock.advance(Duration.millis(50));
+		// One request, wanted from its subscription on and never let go in between.
+		if (!producer) throw new Error("the track was never answered");
+		const served = producer;
+		expect(requests).toBe(1);
+		expect(edges.filter((edge) => edge)).toEqual([true]);
+		expect(edges.at(-1)).toBe(true);
+
+		track.close();
+		await withTimeout(unwanted(served.demand()), Duration.millis(1000), "demand outlived the reader");
+		expect(edges.at(-1)).toBe(false);
+		expect(edges.filter((edge) => edge)).toEqual([true]);
+
+		dispose();
+		remote.close();
+		broadcast.close();
+		await serving;
+		client.abort();
+		server.abort();
+	},
+);
+
 test("integration: lite draft-06 announce lifecycle", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
 	// Announced before the client asks, so it can ride the initial set.
-	const first = new BroadcastProducer();
-	server.publish(Path.from("first"), first);
+	const first = publish(origin, Path.from("first"));
 
-	const announced = client.announced();
+	const announced = client.routes();
 	let entry = await announced.next();
 	if (!entry) throw new Error("expected announce");
-	expect(entry.path).toBe("first" as Path.Valid);
-	expect(entry.active).toBe(true);
+	expect(entry.prefix).toBe("first" as Path.Valid);
+	expect(entry.kind).toBe("start");
 
 	// A live announce.
-	const second = new BroadcastProducer();
-	server.publish(Path.from("second"), second);
+	const second = publish(origin, Path.from("second"));
 	entry = await announced.next();
 	if (!entry) throw new Error("expected announce");
-	expect(entry.path).toBe("second" as Path.Valid);
-	expect(entry.active).toBe(true);
+	expect(entry.prefix).toBe("second" as Path.Valid);
+	expect(entry.kind).toBe("start");
 
 	// Unannounce: retracted by announce id on the wire.
 	second.close();
 	entry = await announced.next();
 	if (!entry) throw new Error("expected unannounce");
-	expect(entry.path).toBe("second" as Path.Valid);
-	expect(entry.active).toBe(false);
+	expect(entry.prefix).toBe("second" as Path.Valid);
+	expect(entry.kind).toBe("end");
 
 	// Re-announce the same path: a fresh announce assigning a fresh id.
-	const secondAgain = new BroadcastProducer();
-	server.publish(Path.from("second"), secondAgain);
+	const secondAgain = publish(origin, Path.from("second"));
 	entry = await announced.next();
 	if (!entry) throw new Error("expected re-announce");
-	expect(entry.path).toBe("second" as Path.Valid);
-	expect(entry.active).toBe(true);
+	expect(entry.prefix).toBe("second" as Path.Valid);
+	expect(entry.kind).toBe("start");
 
 	// Cleanup
 	first.close();
 	secondAgain.close();
 	announced.close();
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
 });
 
-test("integration: lite draft-05 datagram delivery", async () => {
-	const enc = new TextEncoder();
-	const dec = new TextDecoder();
-	const pair = createMockTransportPair(Lite.ALPN_05);
+/** Collect announced prefixes until `until` arrives. */
+async function announcedUntil(announced: Announce.Routes, until: string) {
+	const seen: string[] = [];
+	while (!seen.includes(until)) {
+		const entry = await withTimeout(announced.next(), Duration.millis(1000), `waiting for ${until}`);
+		if (!entry) throw new Error("announcements ended");
+		seen.push(entry.prefix);
+	}
+	return seen;
+}
 
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+// A `.`-named broadcast is left out of discovery unless the request opts in or names the
+// dot segment. lite-06 cannot carry the opt-in, so its peer never lists the hidden path.
+for (const [protocol, carriesOptIn] of [
+	[Lite.ALPN_07_WIP, true],
+	[Lite.ALPN_06, false],
+	[Ietf.ALPN.DRAFT_18, true],
+] as const) {
+	test(`integration: ${protocol} hides dot paths from discovery`, async () => {
+		const pair = createMockTransportPair(protocol);
+		const origin = new OriginProducer();
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client }),
+			accept(pair.server, url, { publish: origin.consume() }),
+		]);
 
-	// A static track fans datagrams out to whoever subscribes.
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
+		// Published first, so a reader that may see it lists it before `visible`.
+		const hidden = publish(origin, Path.from(".x/y"));
+		const visible = publish(origin, Path.from("visible"));
 
-	const remote = client.consume(Path.from("test"));
-	const track = remote.track("video").subscribe();
+		const plain = client.routes();
+		expect(await announcedUntil(plain, "visible")).toEqual(["visible"]);
 
-	// Datagrams aren't cached, so the first few may race the subscription setup. Pump until
-	// the subscriber receives one, then stop.
-	const received = track.recvDatagram();
-	let stop = false;
-	const pump = (async () => {
-		for (let i = 0; !stop; i++) {
-			producer.appendDatagram(Timestamp.fromMillis(i), enc.encode("dgram"));
-			await sleep(2);
+		// An IETF reader shares the session's table, so `visible` may land before the
+		// opted-in request's own answer; wait on the hidden path itself where it is due.
+		const opted = client.routes(undefined, { hidden: true });
+		if (carriesOptIn) await announcedUntil(opted, ".x/y");
+		else expect(await announcedUntil(opted, "visible")).toEqual(["visible"]);
+
+		if (carriesOptIn) {
+			const named = client.routes(Path.Pattern.parse(".x/**"));
+			expect(await announcedUntil(named, ".x/y")).toEqual([".x/y"]);
+			named.close();
 		}
-	})();
 
-	const got = await received;
-	stop = true;
-	await pump;
-
-	expect(got).toBeDefined();
-	expect(dec.decode(got?.payload)).toBe("dgram");
-
-	broadcast.close();
-	remote.close();
-	client.close();
-	server.close();
-});
-
-test("integration: lite draft-05 datagrams not sent on a non-datagram transport", async () => {
-	const enc = new TextEncoder();
-	// maxDatagramSize 0 simulates a qmux/WebSocket session: the publisher must fall back to
-	// not sending datagrams (there is no group fallback), while groups still flow.
-	const pair = createMockTransportPair(Lite.ALPN_05, { datagrams: false });
-
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
-
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
-
-	const remote = client.consume(Path.from("test"));
-	const track = remote.track("video").subscribe();
-
-	// Keep pushing a group (to prove the connection is live) and a datagram (which must be dropped).
-	let stop = false;
-	const pump = (async () => {
-		for (let i = 0; !stop; i++) {
-			producer.appendDatagram(Timestamp.fromMillis(i), enc.encode("dgram"));
-			producer.writeString("group");
-			await sleep(2);
-		}
-	})();
-
-	// A group arrives, confirming the subscription works over this transport.
-	const grp = await track.readString();
-	expect(grp).toBe("group");
-
-	// No datagram is ever delivered: recvDatagram stays pending until the timeout wins.
-	const datagram = track.recvDatagram();
-	datagram.catch(() => {}); // The track close below settles it; swallow to avoid a stray rejection.
-	const outcome = await Promise.race([datagram, sleep(50).then(() => "timeout" as const)]);
-	expect(outcome).toBe("timeout");
-
-	stop = true;
-	await pump;
-
-	broadcast.close();
-	remote.close();
-	client.close();
-	server.close();
-});
-
-test("integration: lite draft-05 datagrams sent with standards-track createWritable", async () => {
-	const enc = new TextEncoder();
-	const dec = new TextDecoder();
-	const pair = createMockTransportPair(Lite.ALPN_05, { datagramWritable: "createWritable" });
-
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
-
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
-
-	const remote = client.consume(Path.from("test"));
-	const track = remote.track("video").subscribe();
-
-	const received = track.recvDatagram();
-	let stop = false;
-	const pump = (async () => {
-		for (let i = 0; !stop; i++) {
-			producer.appendDatagram(Timestamp.fromMillis(i), enc.encode("dgram"));
-			await sleep(2);
-		}
-	})();
-
-	const got = await received;
-	stop = true;
-	await pump;
-
-	expect(got).toBeDefined();
-	expect(dec.decode(got?.payload)).toBe("dgram");
-
-	broadcast.close();
-	remote.close();
-	client.close();
-	server.close();
-});
-
-test("integration: lite draft-05 missing datagram writer does not close streams", async () => {
-	const enc = new TextEncoder();
-	const pair = createMockTransportPair(Lite.ALPN_05, { datagramWritable: "none" });
-
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
-
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
-
-	const remote = client.consume(Path.from("test"));
-	const track = remote.track("video").subscribe();
-
-	producer.appendDatagram(Timestamp.fromMillis(0), enc.encode("dgram"));
-	producer.writeString("group");
-
-	expect(await track.readString()).toBe("group");
-
-	broadcast.close();
-	remote.close();
-	client.close();
-	server.close();
-});
-
-test("integration: lite draft-05 missing datagram reader does not close streams", async () => {
-	const enc = new TextEncoder();
-	const pair = createMockTransportPair(Lite.ALPN_05, { datagramReadable: false });
-
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
-
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
-
-	const remote = client.consume(Path.from("test"));
-	const track = remote.track("video").subscribe();
-
-	producer.appendDatagram(Timestamp.fromMillis(0), enc.encode("dgram"));
-	producer.writeString("group");
-
-	expect(await track.readString()).toBe("group");
-
-	broadcast.close();
-	remote.close();
-	client.close();
-	server.close();
-});
+		plain.close();
+		opted.close();
+		hidden.close();
+		visible.close();
+		client.abort();
+		server.abort();
+	});
+}
 
 /** A stream reset as a transport delivers one: the peer's code, and nothing else useful. */
 class Reset extends Error {
@@ -425,26 +813,29 @@ class Reset extends Error {
 }
 
 test("integration: a group reset carries the peer's code to the subscriber", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
 
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
-	const broadcast = new BroadcastProducer();
+	const broadcast = publish(origin, Path.from("test"));
 	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
-	server.publish(Path.from("test"), broadcast);
 
-	const remote = client.consume(Path.from("test"));
-	const track = remote.track("video").subscribe();
+	const remote = wireOf(client).consume(Path.from("test"));
+	const track = remote.track("video").subscribe().ordered();
 
 	const group = producer.appendGroup();
-	group.writeString("frame");
+	group.writeFrame(textFrame("frame"));
 
 	const consumer = await track.nextGroup();
 	if (!consumer) throw new Error("expected a group");
 	expect(await consumer.readString()).toBe("frame");
 
 	// Reset the group stream the way a peer that dropped the group does.
-	group.close(new Reset(2));
+	group.abort(new Reset(2));
 
 	// The subscriber reads the code back off a typed error rather than whichever shape the
 	// transport produced, so nothing has to feature-detect a browser global.
@@ -452,77 +843,274 @@ test("integration: a group reset carries the peer's code to the subscriber", asy
 		() => undefined,
 		(e: unknown) => e,
 	);
-	expect(err).toBeInstanceOf(RemoteError);
-	expect((err as RemoteError).code).toBe(2);
+	expect(err).toBeInstanceOf(StreamError);
+	expect((err as StreamError).code).toBe(StreamCode.DeliveryTimeout);
 
 	broadcast.close();
 	remote.close();
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
 });
 
-test("integration: lite draft-05 fetches a cached group", async () => {
+test("integration: a locally raised group error reaches the peer as its own code", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
+
+	const remote = wireOf(client).consume(Path.from("test"));
+	const track = remote.track("video").subscribe().ordered();
+
+	const group = producer.appendGroup();
+	group.writeFrame(textFrame("frame"));
+
+	const consumer = await track.nextGroup();
+	if (!consumer) throw new Error("expected a group");
+	expect(await consumer.readString()).toBe("frame");
+
+	// The publisher's own cache dropped the rest of the group. Nothing hand-builds a transport
+	// error here, which is the point: the condition is raised the way the library raises it.
+	group.abort(new TooFarBehind());
+
+	const err = await consumer.readFrame().then(
+		() => undefined,
+		(e: unknown) => e,
+	);
+	// Without the mapping this arrives as StreamCode.Internal (0), which reads as a crash on the
+	// publisher's side rather than a reader that fell behind.
+	expect(err).toBeInstanceOf(StreamError);
+	expect((err as StreamError).code).toBe(StreamCode.TooFarBehind);
+	// And the reverse direction agrees, so a gap is one class whichever side it happened on.
+	expect(err).toBeInstanceOf(TooFarBehind);
+
+	broadcast.close();
+	remote.close();
+	client.abort();
+	server.abort();
+});
+
+test("integration: subscribing to an unserved broadcast is refused as NotFound", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	// Announced, so the subscribe is attempted, but the publisher drops it before the subscribe
+	// arrives and answers with a reset instead of a track.
+	const broadcast = publish(origin, Path.from("test"));
+	const remote = wireOf(client).consume(Path.from("test"));
+	broadcast.close();
+
+	const track = remote.track("video").subscribe();
+	const err = await withTimeout(Promise.resolve(track.closed), Duration.millis(1000), "track never closed");
+	expect(err).toBeInstanceOf(StreamError);
+	expect((err as StreamError).code).toBe(StreamCode.NotFound);
+
+	remote.close();
+	client.abort();
+	server.abort();
+});
+
+test("integration: a peer is served the cheaper route it was offered, not the local broadcast", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const path = Path.from("test");
+	// One publisher instance, so the two compete on cost alone.
+	const instance = Instance.random();
+	const localRoute = origin.route(path, { instance: { id: instance, epoch: 0n }, cost: 5n });
+	const local = localRoute.broadcast;
+	const dynamic = origin.claim(path, { instance: { id: instance, epoch: 0n }, cost: 1n });
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const remote = wireOf(client).consume(path);
+	const track = remote.track("video").subscribe();
+	const { value: request } = await withTimeout(
+		dynamic.requested().next(),
+		Duration.millis(1000),
+		"the cheaper route was never asked",
+	);
+	expect(request?.path).toBe(path);
+
+	track.close();
+	remote.close();
+	client.abort();
+	server.abort();
+	dynamic.close();
+	local.close();
+	origin.close();
+});
+
+test("integration: lite draft-07 fetches a cached group", async () => {
 	const enc = new TextEncoder();
 	const dec = new TextDecoder();
-	const pair = createMockTransportPair(Lite.ALPN_05);
+	const pair = createMockTransportPair(Lite.ALPN_07_WIP);
+	const origin = new OriginProducer();
 
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
-	const broadcast = new BroadcastProducer();
-	const producer = broadcast.createTrack("video");
-	server.publish(Path.from("test"), broadcast);
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI, maxAge: null });
 
 	const group0 = producer.appendGroup();
 	group0.writeFrame({ payload: enc.encode("alpha"), timestamp: Timestamp.fromMillis(10) });
 	group0.writeFrame({ payload: enc.encode("beta"), timestamp: Timestamp.fromMillis(15) });
-	group0.close();
+	group0.finish();
 
 	const group1 = producer.appendGroup();
 	group1.writeFrame({ payload: enc.encode("newer"), timestamp: Timestamp.fromMillis(20) });
-	group1.close();
+	group1.finish();
 
 	// Fetch group 0 without holding a live subscription; the timestamps round-trip.
-	const remote = client.consume(Path.from("test"));
-	const fetched = await remote.track("video").fetchGroup(0);
+	const remote = wireOf(client).consume(Path.from("test"));
+	const fetched = await remote.track("video").fetchGroup(0n);
 
 	const first = await fetched.readFrame();
 	expect(dec.decode(first?.payload)).toBe("alpha");
-	expect(first?.timestamp.asMillis()).toBe(10);
+	expect(first?.timestamp?.asMillis()).toBe(10);
 
 	const second = await fetched.readFrame();
 	expect(dec.decode(second?.payload)).toBe("beta");
-	expect(second?.timestamp.asMillis()).toBe(15);
+	expect(second?.timestamp?.asMillis()).toBe(15);
 
 	expect(await fetched.readFrame()).toBeUndefined();
 
 	broadcast.close();
 	remote.close();
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
+});
+
+test.each(["gap", "end"])("integration: lite fetch rejects coalesced misses at %s with NotFound", async (missing) => {
+	const pair = createMockTransportPair(Lite.ALPN_05);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+	const broadcast = publish(origin, Path.from("test"));
+	let serving: Promise<void> | undefined;
+	if (missing === "gap") {
+		const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
+		const group = producer.createGroup(1n);
+		group.finish();
+	} else {
+		serving = (async () => {
+			for (;;) {
+				const request = await wireOf(broadcast).requested();
+				if (!request) return;
+				const accepted = request.accept({ timescale: Timescale.MILLI });
+				accepted.finish();
+				accepted.close();
+			}
+		})();
+	}
+	const remote = wireOf(client).consume(Path.from("test"));
+	try {
+		const track = remote.track("video");
+		const results = await Promise.allSettled([track.fetchGroup(0n), track.fetchGroup(0n)]);
+		for (const result of results) {
+			expect(result.status).toBe("rejected");
+			if (result.status !== "rejected") throw new Error("missing group was accepted");
+			expect(result.reason).toBeInstanceOf(StreamError);
+			expect(result.reason.code).toBe(StreamCode.NotFound);
+		}
+		if (results[0].status === "rejected" && results[1].status === "rejected") {
+			expect(results[0].reason).toBe(results[1].reason);
+		}
+	} finally {
+		broadcast.close();
+		await serving;
+		remote.close();
+		client.abort();
+		server.abort();
+		origin.close();
+	}
+});
+
+test.each(["frame", "FIN"])("integration: lite fetch waits for the publisher's first %s", async (answer) => {
+	const pair = createMockTransportPair(Lite.ALPN_05);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
+	const group = producer.appendGroup();
+	const remote = wireOf(client).consume(Path.from("test"));
+	try {
+		let settled = 0;
+		const fetch = () =>
+			remote
+				.track("video")
+				.fetchGroup(0n)
+				.then((consumer) => {
+					settled++;
+					return consumer;
+				});
+		const a = fetch();
+		const b = fetch();
+		// Let the in-memory peer process the request with no response available yet.
+		await yieldNow();
+		expect(settled).toBe(0);
+		if (answer === "frame") group.writeFrame(textFrame("accepted"));
+		else group.finish();
+		const consumers = await Promise.all([a, b]);
+		for (const consumer of consumers) {
+			expect(await consumer.readString()).toBe(answer === "frame" ? "accepted" : undefined);
+			consumer.close();
+		}
+	} finally {
+		group.finish();
+		broadcast.close();
+		remote.close();
+		client.abort();
+		server.abort();
+		origin.close();
+	}
 });
 
 test("integration: lite draft-05 coalesces concurrent fetches of one group", async () => {
 	const enc = new TextEncoder();
 	const dec = new TextDecoder();
 	const pair = createMockTransportPair(Lite.ALPN_05);
+	const origin = new OriginProducer();
 
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
-	const broadcast = new BroadcastProducer();
-	const producer = broadcast.createTrack("video");
-	server.publish(Path.from("test"), broadcast);
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
 
 	const group0 = producer.appendGroup();
 	group0.writeFrame({ payload: enc.encode("alpha"), timestamp: Timestamp.fromMillis(10) });
 	group0.writeFrame({ payload: enc.encode("beta"), timestamp: Timestamp.fromMillis(15) });
-	group0.close();
+	group0.finish();
 
-	const remote = client.consume(Path.from("test"));
+	const remote = wireOf(client).consume(Path.from("test"));
 	const trackConsumer = remote.track("video");
 
 	// Two concurrent fetches of the same group coalesce onto one FETCH stream; each reads an
 	// independent mirror that still sees the full group.
-	const [a, b] = await Promise.all([trackConsumer.fetchGroup(0), trackConsumer.fetchGroup(0)]);
+	const [a, b] = await Promise.all([trackConsumer.fetchGroup(0n), trackConsumer.fetchGroup(0n)]);
 
 	for (const fetched of [a, b]) {
 		expect(dec.decode((await fetched.readFrame())?.payload)).toBe("alpha");
@@ -531,34 +1119,37 @@ test("integration: lite draft-05 coalesces concurrent fetches of one group", asy
 	}
 
 	// After the coalesced fetch completes and its cache entry evicts, the same group re-fetches.
-	const again = await trackConsumer.fetchGroup(0);
+	const again = await trackConsumer.fetchGroup(0n);
 	expect(dec.decode((await again.readFrame())?.payload)).toBe("alpha");
 	expect(dec.decode((await again.readFrame())?.payload)).toBe("beta");
 	expect(await again.readFrame()).toBeUndefined();
 
 	broadcast.close();
 	remote.close();
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
 });
 
-test("integration: lite draft-05 fetches an in-progress group", async () => {
+test("integration: lite draft-07 fetches an in-progress group", async () => {
 	const enc = new TextEncoder();
 	const dec = new TextDecoder();
-	const pair = createMockTransportPair(Lite.ALPN_05);
+	const pair = createMockTransportPair(Lite.ALPN_07_WIP);
+	const origin = new OriginProducer();
 
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
-	const broadcast = new BroadcastProducer();
-	const producer = broadcast.createTrack("video");
-	server.publish(Path.from("test"), broadcast);
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
 
 	// Open the group and write one frame, but leave it open (in-progress).
 	const group0 = producer.appendGroup();
 	group0.writeFrame({ payload: enc.encode("alpha"), timestamp: Timestamp.fromMillis(10) });
 
-	const remote = client.consume(Path.from("test"));
-	const fetched = await remote.track("video").fetchGroup(0);
+	const remote = wireOf(client).consume(Path.from("test"));
+	const fetched = await remote.track("video").fetchGroup(0n);
 
 	const first = await fetched.readFrame();
 	expect(dec.decode(first?.payload)).toBe("alpha");
@@ -567,66 +1158,211 @@ test("integration: lite draft-05 fetches an in-progress group", async () => {
 	group0.writeFrame({ payload: enc.encode("beta"), timestamp: Timestamp.fromMillis(15) });
 	const second = await fetched.readFrame();
 	expect(dec.decode(second?.payload)).toBe("beta");
-	expect(second?.timestamp.asMillis()).toBe(15);
+	expect(second?.timestamp?.asMillis()).toBe(15);
 
-	group0.close();
+	group0.finish();
 	expect(await fetched.readFrame()).toBeUndefined();
 
 	broadcast.close();
 	remote.close();
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
 });
 
-test("integration: ietf fetch group is unsupported", async () => {
-	const pair = createMockTransportPair(Ietf.ALPN.DRAFT_18);
+// The publisher caches TRACK_INFO so it only asks the application once per track. The cache
+// has to expire with the broadcast that answered it: a republish puts a different producer
+// on the path, and its immutable properties are its own.
+test("integration: lite draft-07 track info follows a republished broadcast", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_07_WIP);
+	const origin = new OriginProducer();
 
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
-	const remote = client.consume(Path.from("test"));
-	await expect(remote.track("video").fetchGroup(0)).rejects.toThrow("fetch group is not supported for moq-transport");
+	const path = Path.from("test");
+	const first = publish(origin, path);
+	first.createTrack("video", { priority: 1, timescale: Timescale.MILLI, maxAge: Duration.millis(1000) });
 
+	const remote = wireOf(client).consume(path);
+	const before = await remote.track("video").info();
+	expect(before.priority).toBe(1);
+	expect(before.timescale).toBe(Timescale.MILLI);
+	expect(before.maxAge).toEqual(Duration.millis(1000));
+
+	// Replace the broadcast on the same path with one whose track declares different
+	// immutable properties.
+	const second = publish(origin, path);
+	second.createTrack("video", { priority: 7, timescale: Timescale.MICRO, maxAge: Duration.millis(5000) });
+
+	const after = await remote.track("video").info();
+	expect(after.priority).toBe(7);
+	expect(after.timescale).toBe(Timescale.MICRO);
+	expect(after.maxAge).toEqual(Duration.millis(5000));
+
+	first.close();
+	second.close();
 	remote.close();
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
 });
 
-test("integration: ietf draft-14", async () => {
-	await runPublishSubscribeFlow("", Ietf.Version.DRAFT_14);
+// An authored track omitting maxAge advertises the zero default, an explicit null advertises no
+// limit, which a consumer decodes as absence, and a number goes out as itself. Before lite-05
+// nothing is carried, nor over moq-transport, whose MAX_CACHE_DURATION would expire the newest
+// group too. A received track without one has no publisher limit.
+test.each([Lite.ALPN_03, Lite.ALPN_05, Lite.ALPN_07_WIP, Ietf.ALPN.DRAFT_22])(
+	"integration: %s carries the authored max age default, null, and a value",
+	async (alpn) => {
+		const pair = createMockTransportPair(alpn);
+		const origin = new OriginProducer();
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client }),
+			accept(pair.server, url, { publish: origin.consume() }),
+		]);
+
+		const path = Path.from("test");
+		const broadcast = publish(origin, path);
+		const tracks = {
+			omitted: broadcast.createTrack("omitted", { timescale: Timescale.MILLI }),
+			unlimited: broadcast.createTrack("unlimited", { timescale: Timescale.MILLI, maxAge: null }),
+			explicit: broadcast.createTrack("explicit", { timescale: Timescale.MILLI, maxAge: Duration.millis(5000) }),
+		};
+		expect((await tracks.omitted.info()).maxAge).toEqual(Duration.ZERO);
+		expect((await tracks.unlimited.info()).maxAge).toBeNull();
+
+		const remote = wireOf(client).consume(path);
+		const info = async (name: string) => {
+			// moq-transport answers info through a subscription, so hold one open.
+			const sub = remote.track(name).subscribe();
+			try {
+				return await withTimeout(sub.info(), Duration.millis(5_000), `${name} info`);
+			} finally {
+				sub.close();
+			}
+		};
+		const carried = alpn !== Lite.ALPN_03 && alpn !== Ietf.ALPN.DRAFT_22;
+		expect((await info("omitted")).maxAge).toEqual(carried ? Duration.ZERO : null);
+		expect((await info("unlimited")).maxAge).toBeNull();
+		expect((await info("explicit")).maxAge).toEqual(carried ? Duration.millis(5000) : null);
+
+		broadcast.close();
+		remote.close();
+		client.abort();
+		server.abort();
+	},
+);
+
+// FETCH reads the same cache to decide the timescale it serves frames in, so a stale entry
+// quantizes the successor's timestamps to the predecessor's resolution.
+test("integration: lite draft-07 fetch uses the republished track's timescale", async () => {
+	const enc = new TextEncoder();
+	const pair = createMockTransportPair(Lite.ALPN_07_WIP);
+	const origin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const path = Path.from("test");
+	const first = publish(origin, path);
+	const firstTrack = first.createTrack("video", { timescale: Timescale.MILLI });
+	const firstGroup = firstTrack.appendGroup();
+	firstGroup.writeFrame({ payload: enc.encode("alpha"), timestamp: Timestamp.fromMillis(10) });
+	firstGroup.finish();
+
+	// Prime the publisher's TRACK_INFO cache against the predecessor.
+	const remote = wireOf(client).consume(path);
+	expect((await remote.track("video").info()).timescale).toBe(Timescale.MILLI);
+
+	const second = publish(origin, path);
+	const secondTrack = second.createTrack("video", { timescale: Timescale.MICRO });
+	const secondGroup = secondTrack.appendGroup();
+	secondGroup.writeFrame({ payload: enc.encode("beta"), timestamp: Timestamp.fromMicros(1234) });
+	secondGroup.finish();
+
+	// A millisecond timescale would round this to 1000us.
+	const fetched = await remote.track("video").fetchGroup(0n);
+	const frame = await fetched.readFrame();
+	expect(frame?.timestamp?.asMicros()).toBe(1234);
+
+	first.close();
+	second.close();
+	remote.close();
+	client.abort();
+	server.abort();
 });
 
-test("integration: ietf draft-15", async () => {
-	await runPublishSubscribeFlow(Ietf.ALPN.DRAFT_15);
-});
+// We list no tracks by PUBLISH, so a SUBSCRIBE_TRACKS is refused NOT_SUPPORTED on its own stream, and
+// the subscription already on the session keeps going.
+test("integration: ietf SUBSCRIBE_TRACKS is refused per request", async () => {
+	for (const [protocol, version] of [
+		[Ietf.ALPN.DRAFT_18, Ietf.Version.DRAFT_18],
+		[Ietf.ALPN.DRAFT_20, Ietf.Version.DRAFT_20],
+		[Ietf.ALPN.DRAFT_22, Ietf.Version.DRAFT_22],
+	] as const) {
+		const pair = createMockTransportPair(protocol);
+		const origin = new OriginProducer();
 
-test("integration: ietf draft-16", async () => {
-	await runPublishSubscribeFlow(Ietf.ALPN.DRAFT_16);
-});
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client }),
+			accept(pair.server, url, { publish: origin.consume() }),
+		]);
 
-test("integration: ietf draft-17", async () => {
-	await runPublishSubscribeFlow(Ietf.ALPN.DRAFT_17);
+		const broadcast = publish(origin, Path.from("test"));
+		const served: TrackProducer[] = [];
+		const serving = (async () => {
+			for (;;) {
+				const req = await wireOf(broadcast).requested();
+				if (!req) break;
+				const track = req.accept({ timescale: Timescale.MILLI });
+				track.writeFrame(textFrame("before"));
+				served.push(track);
+			}
+		})();
+
+		const remote = wireOf(client).consume(Path.from("test"));
+		const track = remote.track("video").subscribe().ordered();
+		expect(await track.readString()).toBe("before");
+
+		const bidi = await pair.client.createBidirectionalStream();
+		const listing = new Stream({ ...bidi, version });
+		// SUBSCRIBE_TRACKS (0x51): Request ID 62, the prefix "room", and no parameters.
+		await listing.writer.u53(0x51);
+		await listing.writer.write(Uint8Array.from([0, 8, 62, 1, 4, ...new TextEncoder().encode("room"), 0]));
+		expect(await listing.reader.u53()).toBe(RequestError.id);
+		expect((await RequestError.decode(listing.reader, version)).errorCode).toBe(0x3);
+
+		for (const producer of served) producer.writeFrame(textFrame("after"));
+		expect(await track.readString()).toBe("after");
+
+		broadcast.close();
+		await serving;
+		remote.close();
+		client.close();
+		server.close();
+	}
 });
 
 test("integration: ietf draft-18", async () => {
 	await runPublishSubscribeFlow(Ietf.ALPN.DRAFT_18);
 });
 
-test("integration: ietf draft-19", async () => {
-	await runPublishSubscribeFlow(Ietf.ALPN.DRAFT_19);
-});
-
 // consume(path) dedupes per path: repeat calls for a still-live path share one reference-counted
 // broadcast, so it stays live until every handle closes and a closed path re-consumes fresh.
 async function runConsumeDedup(protocol: string, version?: number) {
 	const pair = createMockTransportPair(protocol);
+	const origin = new OriginProducer();
 	const [client, server] = await Promise.all([
 		connect(url, { transport: pair.client }),
-		accept(pair.server, url, version !== undefined ? { version } : undefined),
+		accept(pair.server, url, { version, publish: origin.consume() }),
 	]);
 
 	// Two handles to the same path share one broadcast: closing the first leaves it live...
-	const first = client.consume(Path.from("shared"));
-	const second = client.consume(Path.from("shared"));
+	const first = wireOf(client).consume(Path.from("shared"));
+	const second = wireOf(client).consume(Path.from("shared"));
 	first.close();
 	expect(first.closed.peek()).toBeUndefined();
 	expect(second.closed.peek()).toBeUndefined();
@@ -637,140 +1373,91 @@ async function runConsumeDedup(protocol: string, version?: number) {
 	expect(second.closed.peek()).toBeDefined();
 
 	// A different path is independent: a lone handle closes the broadcast immediately.
-	const other = client.consume(Path.from("other"));
+	const other = wireOf(client).consume(Path.from("other"));
 	other.close();
 	expect(other.closed.peek()).toBeDefined();
 
 	// Once closed, the path re-consumes fresh (a new live handle).
-	const third = client.consume(Path.from("shared"));
+	const third = wireOf(client).consume(Path.from("shared"));
 	expect(third.closed.peek()).toBeUndefined();
 	third.close();
 
-	client.close();
-	server.close();
-}
-
-async function waitUntil(predicate: () => boolean): Promise<void> {
-	for (let i = 0; i < 200; i++) {
-		if (predicate()) return;
-		await sleep(5);
-	}
-	throw new Error("condition not met within timeout");
+	client.abort();
+	server.abort();
 }
 
 // Closing the last subscriber to a track tears the wire subscription down, so the publisher stops
 // serving it (the muted-watch-tile case in #2355) instead of sending groups to a reader that left.
 async function runSubscriberTeardown(protocol: string, version?: number) {
 	const pair = createMockTransportPair(protocol);
+	const origin = new OriginProducer();
 	const [client, server] = await Promise.all([
 		connect(url, { transport: pair.client }),
-		accept(pair.server, url, version !== undefined ? { version } : undefined),
+		accept(pair.server, url, { version, publish: origin.consume() }),
 	]);
 
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-	const video = broadcast.createTrack("video");
-	video.writeString("hello");
+	const broadcast = publish(origin, Path.from("test"));
+	const video = broadcast.createTrack("video", { timescale: Timescale.MILLI });
+	video.writeFrame(textFrame("hello"));
 
-	const remote = client.consume(Path.from("test"));
-	const sub = remote.track("video").subscribe();
+	const remote = wireOf(client).consume(Path.from("test"));
+	const sub = remote.track("video").subscribe().ordered();
 	expect(await sub.readString()).toBe("hello");
 
 	// The publisher now has a live downstream reader for the track.
-	await waitUntil(() => video.used.peek());
+	await waitFor(video.demand().wanted, (wanted) => wanted !== undefined);
 
 	// Closing the only subscriber must tear the wire subscription down, so demand drops on the
 	// publisher rather than the relay serving groups to nobody.
 	sub.close();
-	await waitUntil(() => !video.used.peek());
+	await waitFor(video.demand().wanted, (wanted) => wanted === undefined);
 
 	broadcast.close();
 	remote.close();
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
 }
 
 test("integration: lite subscriber teardown on last unsubscribe", async () => {
-	await runSubscriberTeardown(Lite.ALPN_06_WIP);
+	await runSubscriberTeardown(Lite.ALPN_06);
 });
 
 test("integration: ietf subscriber teardown on last unsubscribe", async () => {
-	await runSubscriberTeardown(Ietf.ALPN.DRAFT_17);
-});
-
-// Draft-14 sends an explicit Unsubscribe after the demand loop breaks; exercise that path too.
-// Uses a dynamic serve (draft-14 doesn't complete SUBSCRIBE_OK for a statically inserted track).
-test("integration: ietf draft-14 subscriber teardown on last unsubscribe", async () => {
-	const pair = createMockTransportPair("");
-	const [client, server] = await Promise.all([
-		connect(url, { transport: pair.client }),
-		accept(pair.server, url, { version: Ietf.Version.DRAFT_14 }),
-	]);
-
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-
-	// Serve dynamically, keeping the served producer so we can watch its demand.
-	let served: TrackProducer | undefined;
-	const serving = (async () => {
-		for (;;) {
-			const req = await broadcast.requested();
-			if (!req) break;
-			served = req.accept();
-			served.writeString("hello");
-		}
-	})();
-
-	// Draft-14 only completes SUBSCRIBE_OK once the session is warmed by an announce round-trip.
-	const announced = client.announced();
-	await announced.next();
-
-	const remote = client.consume(Path.from("test"));
-	const sub = remote.track("video").subscribe();
-	expect(await sub.readString()).toBe("hello");
-	await waitUntil(() => served?.used.peek() === true);
-
-	// Closing the subscriber sends Unsubscribe and tears the subscription down, so demand drops.
-	sub.close();
-	await waitUntil(() => served?.used.peek() === false);
-
-	broadcast.close();
-	await serving;
-	announced.close();
-	remote.close();
-	client.close();
-	server.close();
+	await runSubscriberTeardown(Ietf.ALPN.DRAFT_18);
 });
 
 // A fetched group can stay open indefinitely (a catalog track, a JSON stream), so abandoning the
 // fetch must cancel the FETCH stream rather than wait for a stream end that never comes.
 test("integration: lite fetch teardown when the reader abandons an open group", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-	const video = broadcast.createTrack("video");
+	const broadcast = publish(origin, Path.from("test"));
+	const video = broadcast.createTrack("video", { timescale: Timescale.MILLI });
 	const group = video.appendGroup(); // deliberately left open: an indefinite group.
-	group.writeString("hello");
+	group.writeFrame(textFrame("hello"));
 
-	const remote = client.consume(Path.from("test"));
+	const remote = wireOf(client).consume(Path.from("test"));
 	const fetched = await remote.track("video").fetchGroup(group.sequence);
 	expect(await fetched.readString()).toBe("hello");
 
 	// The publisher is now serving the still-open group.
-	await waitUntil(() => group.used.peek());
+	await waitFor(group.demand().wanted, (wanted) => wanted);
 
 	// Abandoning the fetch cancels the FETCH stream, so the publisher stops serving instead of
 	// pumping an open group to a reader that left.
 	fetched.close();
-	await waitUntil(() => !group.used.peek());
+	await waitFor(group.demand().wanted, (wanted) => !wanted);
 
-	group.close();
+	group.finish();
 	broadcast.close();
 	remote.close();
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
 });
 
 // Older drafts have no TRACK stream or SUBSCRIBE_UPDATE, so the demand loop must still tear the
@@ -782,116 +1469,171 @@ test("integration: lite draft-01 subscriber teardown on last unsubscribe", async
 // Two subscribers to one track dedupe onto a single wire subscription: closing one keeps it alive
 // for the other, and only the last close tears it down.
 test("integration: lite fan-out keeps the upstream until the last subscriber leaves", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-	const video = broadcast.createTrack("video");
-	video.writeString("hello");
+	const broadcast = publish(origin, Path.from("test"));
+	const video = broadcast.createTrack("video", { timescale: Timescale.MILLI });
+	video.writeFrame(textFrame("hello"));
 
-	const remote = client.consume(Path.from("test"));
-	const a = remote.track("video").subscribe();
-	const b = remote.track("video").subscribe();
+	const remote = wireOf(client).consume(Path.from("test"));
+	const a = remote.track("video").subscribe().ordered();
+	const b = remote.track("video").subscribe().ordered();
 	expect(await a.readString()).toBe("hello");
 	expect(await b.readString()).toBe("hello");
-	await waitUntil(() => video.used.peek());
+	await waitFor(video.demand().wanted, (wanted) => wanted !== undefined);
 
 	// Closing one leaves the shared upstream serving the other.
 	a.close();
-	video.writeString("more");
+	video.writeFrame(textFrame("more"));
 	expect(await b.readString()).toBe("more");
-	expect(video.used.peek()).toBe(true);
+	expect(video.demand().wanted.peek()).toBeDefined();
 
 	// The last close tears it down.
 	b.close();
-	await waitUntil(() => !video.used.peek());
+	await waitFor(video.demand().wanted, (wanted) => wanted === undefined);
 
 	broadcast.close();
 	remote.close();
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
 });
 
 // Repeated subscribe/unsubscribe cycles must each tear down and re-open cleanly (the 40-toggle
 // scenario in the issue), never wedging the shared cache or leaking a subscription.
 test("integration: lite re-subscribe re-opens the upstream after each teardown", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-	const video = broadcast.createTrack("video");
+	const broadcast = publish(origin, Path.from("test"));
+	const video = broadcast.createTrack("video", { timescale: Timescale.MILLI });
 
-	const remote = client.consume(Path.from("test"));
+	const remote = wireOf(client).consume(Path.from("test"));
 
 	for (let i = 0; i < 8; i++) {
-		video.writeString(`hello-${i}`);
-		const sub = remote.track("video").subscribe();
+		video.writeFrame(textFrame(`hello-${i}`));
+		const sub = remote.track("video").subscribe().ordered();
 		expect(await sub.readString()).toBe(`hello-${i}`);
-		await waitUntil(() => video.used.peek());
+		await waitFor(video.demand().wanted, (wanted) => wanted !== undefined);
 
 		sub.close();
-		await waitUntil(() => !video.used.peek());
+		await waitFor(video.demand().wanted, (wanted) => wanted === undefined);
 	}
 
 	broadcast.close();
 	remote.close();
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
 });
 
 // Coalesced fetches of one open group share a single FETCH stream: closing one keeps it flowing
 // for the other, and only the last abandon cancels it.
 test("integration: lite coalesced fetch stays until every reader abandons the open group", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-	const video = broadcast.createTrack("video");
+	const broadcast = publish(origin, Path.from("test"));
+	const video = broadcast.createTrack("video", { timescale: Timescale.MILLI });
 	const group = video.appendGroup(); // open
-	group.writeString("hello");
+	group.writeFrame(textFrame("hello"));
 
-	const remote = client.consume(Path.from("test"));
+	const remote = wireOf(client).consume(Path.from("test"));
 	const f1 = await remote.track("video").fetchGroup(group.sequence);
 	const f2 = await remote.track("video").fetchGroup(group.sequence);
 	expect(await f1.readString()).toBe("hello");
 	expect(await f2.readString()).toBe("hello");
-	await waitUntil(() => group.used.peek());
+	await waitFor(group.demand().wanted, (wanted) => wanted);
 
 	// Closing one coalesced reader keeps the shared FETCH flowing for the other.
 	f1.close();
-	group.writeString("more");
+	group.writeFrame(textFrame("more"));
 	expect(await f2.readString()).toBe("more");
-	expect(group.used.peek()).toBe(true);
+	expect(group.demand().wanted.peek()).toBe(true);
 
 	// The last abandon cancels the FETCH.
 	f2.close();
-	await waitUntil(() => !group.used.peek());
+	await waitFor(group.demand().wanted, (wanted) => !wanted);
 
-	group.close();
+	group.finish();
 	broadcast.close();
 	remote.close();
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
+});
+
+// A fetch that coalesces after the last reader left, but before the FETCH is cancelled, re-arms
+// the demand watch. The frame read in flight across that re-arm must still reach the group. The
+// window is a few microtasks wide, so the late reader arrives after every delay across it.
+test("integration: lite fetch re-armed by a late reader keeps every frame", async () => {
+	using clock = manual();
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const video = broadcast.createTrack("video", { timescale: Timescale.MILLI });
+	const remote = wireOf(client).consume(Path.from("test"));
+
+	for (let delay = 0; delay <= 12; delay++) {
+		const group = video.appendGroup(); // open
+		group.writeFrame(textFrame("hello"));
+
+		const f1 = await remote.track("video").fetchGroup(group.sequence);
+		expect(await f1.readString()).toBe("hello");
+
+		f1.close();
+		for (let i = 0; i < delay; i++) await Promise.resolve();
+		const f2 = await remote.track("video").fetchGroup(group.sequence);
+		expect(await f2.readString()).toBe("hello");
+
+		group.writeFrame(textFrame("more"));
+		const more = f2.readString();
+		expect(`${delay}: ${await settlesWithin(more, clock, Duration.millis(500))}`).toBe(`${delay}: true`);
+		expect(await more).toBe("more");
+
+		f2.close();
+		group.finish();
+	}
+
+	broadcast.close();
+	remote.close();
+	client.abort();
+	server.abort();
 });
 
 // A finite group must still deliver every frame and end cleanly (the demand watch must not disturb
 // normal completion), exercising the per-frame loop many times.
 test("integration: lite fetch delivers every frame of a finite multi-frame group", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-	const video = broadcast.createTrack("video");
+	const broadcast = publish(origin, Path.from("test"));
+	const video = broadcast.createTrack("video", { timescale: Timescale.MILLI });
 	const group = video.appendGroup();
 	const count = 50;
-	for (let i = 0; i < count; i++) group.writeString(`f${i}`);
-	group.close(); // finite
+	for (let i = 0; i < count; i++) group.writeFrame(textFrame(`f${i}`));
+	group.finish(); // finite
 
-	const remote = client.consume(Path.from("test"));
+	const remote = wireOf(client).consume(Path.from("test"));
 	const fetched = await remote.track("video").fetchGroup(group.sequence);
 	for (let i = 0; i < count; i++) {
 		expect(await fetched.readString()).toBe(`f${i}`);
@@ -901,8 +1643,8 @@ test("integration: lite fetch delivers every frame of a finite multi-frame group
 
 	broadcast.close();
 	remote.close();
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
 });
 
 test("integration: lite consume dedup", async () => {
@@ -910,65 +1652,21 @@ test("integration: lite consume dedup", async () => {
 });
 
 test("integration: ietf consume dedup", async () => {
-	await runConsumeDedup(Ietf.ALPN.DRAFT_17);
-});
-
-// Drafts 14-16 multiplex both directions over one control stream. A subscribe must resolve when it
-// races an inbound announce, without warming the session by reading that announce first.
-async function runSubscribeWithoutWarmup(version: number) {
-	const pair = createMockTransportPair("");
-	const [client, server] = await Promise.all([
-		connect(url, { transport: pair.client }),
-		accept(pair.server, url, { version }),
-	]);
-
-	const broadcast = new BroadcastProducer();
-	server.publish(Path.from("test"), broadcast);
-	const serving = (async () => {
-		const req = await broadcast.requested();
-		if (req) req.accept().writeString("hello");
-	})();
-
-	const remote = client.consume(Path.from("test"));
-	const track = remote.track("video").subscribe();
-	const data = await Promise.race([
-		track.readString(),
-		new Promise<never>((_, reject) =>
-			setTimeout(() => reject(new Error("timed out waiting for SUBSCRIBE_OK")), 2000),
-		),
-	]);
-	expect(data).toBe("hello");
-
-	broadcast.close();
-	await serving;
-	remote.close();
-	client.close();
-	server.close();
-}
-
-test("integration: ietf draft-14 subscribe without announce warmup", async () => {
-	await runSubscribeWithoutWarmup(Ietf.Version.DRAFT_14);
-});
-
-test("integration: ietf draft-15 subscribe without announce warmup", async () => {
-	await runSubscribeWithoutWarmup(Ietf.Version.DRAFT_15);
-});
-
-test("integration: ietf draft-16 subscribe without announce warmup", async () => {
-	await runSubscribeWithoutWarmup(Ietf.Version.DRAFT_16);
+	await runConsumeDedup(Ietf.ALPN.DRAFT_18);
 });
 
 test("integration: subscribe to non-existent broadcast", async () => {
-	const pair = createMockTransportPair("");
+	const pair = createMockTransportPair(Ietf.ALPN.DRAFT_18);
+	const origin = new OriginProducer();
 
 	const [client, server] = await Promise.all([
 		connect(url, { transport: pair.client }),
-		accept(pair.server, url, { version: Ietf.Version.DRAFT_14 }),
+		accept(pair.server, url, { publish: origin.consume() }),
 	]);
 
 	// Client tries to consume a broadcast that nobody is publishing
-	const remote = client.consume(Path.from("nonexistent"));
-	const track = remote.subscribe("video");
+	const remote = wireOf(client).consume(Path.from("nonexistent"));
+	const track = remote.track("video").subscribe().ordered();
 
 	// Reading should eventually error since the broadcast doesn't exist
 	await expect(
@@ -977,239 +1675,1395 @@ test("integration: subscribe to non-existent broadcast", async () => {
 		})(),
 	).rejects.toThrow();
 
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
 });
 
 // Resolves once `signal` satisfies `pred`, returning the matching value.
-async function waitFor<T>(signal: Getter<T>, pred: (value: T) => boolean): Promise<T> {
-	for (;;) {
-		const value = signal.peek();
-		if (pred(value)) return value;
-		await signal.changed();
-	}
-}
-
-test("integration: announcedBroadcast waits for a late publisher", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+test("integration: a follower waits for a late publisher", async () => {
+	using clock = manual();
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const clientOrigin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client, consume: clientOrigin }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
 	// Serves every requested track with `payload`, until the broadcast closes.
 	const serve = async (broadcast: BroadcastProducer, payload: string) => {
 		for (;;) {
-			const req = await broadcast.requested();
+			const req = await wireOf(broadcast).requested();
 			if (!req) break;
-			req.accept().writeString(payload);
+			req.accept({ timescale: Timescale.MILLI }).writeFrame(textFrame(payload));
 		}
 	};
 
 	// Nobody publishes this path yet. A blind consume would be reset (see the
 	// "subscribe to non-existent broadcast" test); the handle just stays offline.
-	const watched = client.announcedBroadcast(Path.from("late"));
-	await sleep(50);
+	const watched = clientOrigin.follow(Path.from("late"));
+	await clock.advance(Duration.millis(50));
 	expect(watched.active.peek()).toBeUndefined();
 
 	// The publisher arrives afterwards.
-	const first = new BroadcastProducer();
+	const first = publish(origin, Path.from("late"));
 	const servingFirst = serve(first, "hello");
-	server.publish(Path.from("late"), first);
 
 	const active = await waitFor(watched.active, (b) => b !== undefined);
 	if (!active) throw new Error("expected an active broadcast");
-	expect(await active.subscribe("video").readString()).toBe("hello");
+	expect(await active.track("video").subscribe().ordered().readString()).toBe("hello");
 
-	// It goes away.
+	// It goes away; the request stays open for the next publisher instance.
 	first.close();
 	await servingFirst;
 	await waitFor(watched.active, (b) => b === undefined);
+	expect(watched.closed.peek()).toBeUndefined();
 
-	// And comes back under the same name: a fresh consumer, not the dead one.
-	const second = new BroadcastProducer();
+	// It comes back under the same name with a fresh consumer on the same request.
+	const second = publish(origin, Path.from("late"));
 	const servingSecond = serve(second, "world");
-	server.publish(Path.from("late"), second);
 
-	const republished = await waitFor(watched.active, (b) => b !== undefined);
+	const again = watched;
+	const republished = await waitFor(again.active, (b) => b !== undefined);
 	if (!republished) throw new Error("expected a republished broadcast");
 	expect(republished).not.toBe(active);
-	expect(await republished.subscribe("video").readString()).toBe("world");
+	expect(await republished.track("video").subscribe().ordered().readString()).toBe("world");
 
 	// Closing the handle releases the broadcast it held.
-	watched.close();
-	expect(watched.active.peek()).toBeUndefined();
-	expect(republished.closed.peek()).not.toBeUndefined();
+	again.close();
+	expect(again.active.peek()).toBeUndefined();
 
 	second.close();
 	await servingSecond;
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
+	clientOrigin.close();
 });
 
-test("integration: announcedBroadcast consumes blind without discovery", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+test("integration: only a request consumes blind without discovery", async () => {
+	withoutDiscovery();
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const clientOrigin = new OriginProducer();
 	const [client, server] = await Promise.all([
-		connect(url, { transport: pair.client, discovery: false }),
-		accept(pair.server, url),
+		connect(url, { transport: pair.client, consume: clientOrigin }),
+		accept(pair.server, url, { publish: origin.consume() }),
 	]);
 
-	const broadcast = new BroadcastProducer();
+	const broadcast = publish(origin, Path.from("test"));
 	const serving = (async () => {
 		for (;;) {
-			const req = await broadcast.requested();
+			const req = await wireOf(broadcast).requested();
 			if (!req) break;
-			req.accept().writeString("blind");
+			req.accept({ timescale: Timescale.MILLI }).writeFrame(textFrame("blind"));
 		}
 	})();
-	server.publish(Path.from("test"), broadcast);
 
-	// No announcement ever arrives, so waiting for one would hang. Subscribe anyway.
-	const watched = client.announcedBroadcast(Path.from("test"));
+	const followed = clientOrigin.follow(Path.from("test"));
+	await until(() => clientOrigin.discovery.peek() === false);
+	expect(followed.active.peek()).toBeUndefined();
+	const watched = clientOrigin.request(Path.from("test"));
 	const active = await waitFor(watched.active, (b) => b !== undefined);
 	if (!active) throw new Error("expected an active broadcast");
-	expect(await active.subscribe("video").readString()).toBe("blind");
+	expect(await active.track("video").subscribe().ordered().readString()).toBe("blind");
 
 	watched.close();
+	followed.close();
 	broadcast.close();
 	await serving;
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
+	clientOrigin.close();
 });
 
 test("integration: a republish is not served from the previous generation's cache", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
-	const [client, server] = await Promise.all([connect(url, { transport: pair.client }), accept(pair.server, url)]);
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const clientOrigin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client, consume: clientOrigin }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
 
 	const serve = async (broadcast: BroadcastProducer, payload: string) => {
 		for (;;) {
-			const req = await broadcast.requested();
+			const req = await wireOf(broadcast).requested();
 			if (!req) break;
-			req.accept().writeString(payload);
+			req.accept({ timescale: Timescale.MILLI }).writeFrame(textFrame(payload));
 		}
 	};
 
-	const first = new BroadcastProducer();
+	const first = publish(origin, Path.from("shared"));
 	const servingFirst = serve(first, "old");
-	server.publish(Path.from("shared"), first);
 
-	const watched = client.announcedBroadcast(Path.from("shared"));
+	const watched = clientOrigin.follow(Path.from("shared"));
 	const active = await waitFor(watched.active, (b) => b !== undefined);
 	if (!active) throw new Error("expected an active broadcast");
-	expect(await active.subscribe("video").readString()).toBe("old");
+	expect(await active.track("video").subscribe().ordered().readString()).toBe("old");
 
 	// A second holder of the same path, which is what makes the cache reachable: consumed
 	// broadcasts are reference-counted, so the handle closing its own copy below does not
 	// release the shared one.
-	const bystander = client.consume(Path.from("shared"));
+	const bystander = wireOf(client).consume(Path.from("shared"));
 
 	first.close();
 	await servingFirst;
 	await waitFor(watched.active, (b) => b === undefined);
+	watched.close();
 
 	// The republish must subscribe fresh. Cloning the cached entry would resolve the previous
 	// generation's tracks, which the wire has already reset.
-	const second = new BroadcastProducer();
+	const second = publish(origin, Path.from("shared"));
 	const servingSecond = serve(second, "new");
-	server.publish(Path.from("shared"), second);
 
-	const republished = await waitFor(watched.active, (b) => b !== undefined);
+	const again = clientOrigin.follow(Path.from("shared"));
+	const republished = await waitFor(again.active, (b) => b !== undefined);
 	if (!republished) throw new Error("expected a republished broadcast");
-	expect(await republished.subscribe("video").readString()).toBe("new");
+	expect(await republished.track("video").subscribe().ordered().readString()).toBe("new");
 
 	bystander.close();
-	watched.close();
+	again.close();
 	second.close();
 	await servingSecond;
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
+	clientOrigin.close();
 });
 
-test("integration: a blind handle picks up a publisher that arrives late", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+// #3363: an `invisible muted` <moq-publish> unpublishes and republishes the same path on one
+// session every time it is toggled. Each generation is a new producer under the old name, and the
+// gap between them can be a single microtask, so the announce loop has to key the path on which
+// producer holds it rather than on the path alone.
+async function runRepublishCycle(protocol: string) {
+	const pair = createMockTransportPair(protocol);
+	const origin = new OriginProducer();
+	const clientOrigin = new OriginProducer();
 	const [client, server] = await Promise.all([
-		connect(url, { transport: pair.client, discovery: false }),
-		accept(pair.server, url),
+		connect(url, { transport: pair.client, consume: clientOrigin }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const serve = async (broadcast: BroadcastProducer, payload: string) => {
+		for (;;) {
+			const req = await wireOf(broadcast).requested();
+			if (!req) break;
+			req.accept({ timescale: Timescale.MILLI }).writeFrame(textFrame(payload));
+		}
+	};
+
+	const watched = clientOrigin.follow(Path.from("toggle"));
+	let previous: BroadcastConsumer | undefined;
+	for (let generation = 0; generation < 3; generation++) {
+		const payload = `gen${generation}`;
+		const producer = publish(origin, Path.from("toggle"));
+		const serving = serve(producer, payload);
+
+		// A dead consumer left in place would still satisfy `!== undefined`, so wait for the swap.
+		const active = await withTimeout(
+			waitFor(watched.active, (b) => b !== undefined && b !== previous),
+			Duration.millis(1000),
+			`generation ${generation} never came online`,
+		);
+		if (!active) throw new Error("expected an active broadcast");
+		const frame = withTimeout(
+			active.track("audio").subscribe().ordered().readString(),
+			Duration.millis(1000),
+			`generation ${generation} never served a frame`,
+		);
+		expect(await frame).toBe(payload);
+		previous = active;
+
+		// Unpublish, as the element does when it runs out of media, and go straight back around
+		// once the viewer has heard it: the request waits for the next publisher.
+		producer.close();
+		await serving;
+		await withTimeout(
+			waitFor(watched.active, (b) => b === undefined),
+			Duration.millis(1000),
+			`generation ${generation} never ended`,
+		);
+		expect(watched.closed.peek()).toBeUndefined();
+	}
+
+	watched.close();
+	origin.close();
+	clientOrigin.close();
+	client.abort();
+	server.abort();
+}
+
+test("integration: lite republish on one session swaps the handle every generation", async () => {
+	await runRepublishCycle(Lite.ALPN_06);
+});
+
+// moq-transport withdraws by reset, which the replacement request does not wait behind.
+test.each([Ietf.ALPN.DRAFT_18, Ietf.ALPN.DRAFT_22])(
+	"integration: %s republish withdrawn by reset swaps the handle",
+	async (protocol) => {
+		await runRepublishCycle(protocol);
+	},
+);
+
+test("integration: a blind handle picks up a publisher that arrives late", async () => {
+	withoutDiscovery();
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const clientOrigin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client, consume: clientOrigin }),
+		accept(pair.server, url, { publish: origin.consume() }),
 	]);
 
 	// Without discovery there is no announcement to wait for, so the handle consumes blind.
-	const watched = client.announcedBroadcast(Path.from("later"));
+	const watched = clientOrigin.request(Path.from("later"));
 	const blind = await waitFor(watched.active, (b) => b !== undefined);
 	if (!blind) throw new Error("expected a blind consumer");
 
 	// Nobody publishes the path yet, so a subscribe is how the caller finds out. That kills the
 	// track, not the handle: a consumed broadcast is scoped to the path, not to one publisher.
-	await expect(blind.subscribe("video").readString()).rejects.toThrow();
+	await expect(blind.track("video").subscribe().ordered().readString()).rejects.toMatchObject({
+		code: StreamCode.NotFound,
+	});
 	expect(watched.active.peek()).toBe(blind);
 
 	// So a subscribe made after the publisher finally shows up still works, on the same handle.
-	const producer = new BroadcastProducer();
+	const producer = publish(origin, Path.from("later"));
 	const serving = (async () => {
 		for (;;) {
-			const req = await producer.requested();
+			const req = await wireOf(producer).requested();
 			if (!req) break;
-			req.accept().writeString("late");
+			req.accept({ timescale: Timescale.MILLI }).writeFrame(textFrame("late"));
 		}
 	})();
-	server.publish(Path.from("later"), producer);
 
-	expect(await blind.subscribe("video").readString()).toBe("late");
+	expect(await blind.track("video").subscribe().ordered().readString()).toBe("late");
 
 	watched.close();
 	producer.close();
 	await serving;
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
+	clientOrigin.close();
 });
 
 test("integration: a blind handle goes offline when the session dies", async () => {
-	const pair = createMockTransportPair(Lite.ALPN_06_WIP);
+	withoutDiscovery();
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+	const clientOrigin = new OriginProducer();
 	const [client, server] = await Promise.all([
-		connect(url, { transport: pair.client, discovery: false }),
-		accept(pair.server, url),
+		connect(url, { transport: pair.client, consume: clientOrigin }),
+		accept(pair.server, url, { publish: origin.consume() }),
 	]);
 
-	const watched = client.announcedBroadcast(Path.from("whatever"));
+	const watched = clientOrigin.request(Path.from("whatever"));
 	await waitFor(watched.active, (b) => b !== undefined);
 
 	// The gated path goes offline when the announcement stream ends with the session. There is
 	// no stream here, so the session itself is what has to clear it.
-	server.close();
-	client.close();
+	server.abort();
+	client.abort();
 	await waitFor(watched.active, (b) => b === undefined);
 
 	watched.close();
+	clientOrigin.close();
 });
 
 // The handle and the consume-cache eviction are protocol-agnostic, but their implementations
 // are not: each subscriber resolves announcements its own way. These mirror the lite cases.
 test("integration: ietf blind handle picks up a publisher that arrives late", async () => {
-	const pair = createMockTransportPair("");
+	withoutDiscovery();
+	const pair = createMockTransportPair(Ietf.ALPN.DRAFT_18);
+	const origin = new OriginProducer();
+	const clientOrigin = new OriginProducer();
 	const [client, server] = await Promise.all([
-		connect(url, { transport: pair.client, discovery: false }),
-		accept(pair.server, url, { version: Ietf.Version.DRAFT_14 }),
+		connect(url, { transport: pair.client, consume: clientOrigin }),
+		accept(pair.server, url, { publish: origin.consume() }),
 	]);
 
-	const watched = client.announcedBroadcast(Path.from("later"));
+	const watched = clientOrigin.request(Path.from("later"));
 	const blind = await waitFor(watched.active, (b) => b !== undefined);
 	if (!blind) throw new Error("expected a blind consumer");
 
 	// Rejects with 404 rather than resetting the whole handle.
-	await expect(blind.subscribe("video").readString()).rejects.toThrow();
+	await expect(blind.track("video").subscribe().ordered().readString()).rejects.toThrow("does_not_exist");
 	expect(watched.active.peek()).toBe(blind);
 
-	const producer = new BroadcastProducer();
+	const producer = publish(origin, Path.from("later"));
 	const serving = (async () => {
 		for (;;) {
-			const req = await producer.requested();
+			const req = await wireOf(producer).requested();
 			if (!req) break;
-			req.accept().writeString("ietf-late");
+			req.accept({ timescale: Timescale.MILLI }).writeFrame(textFrame("ietf-late"));
 		}
 	})();
-	server.publish(Path.from("later"), producer);
 
-	expect(await blind.subscribe("video").readString()).toBe("ietf-late");
+	expect(await blind.track("video").subscribe().ordered().readString()).toBe("ietf-late");
 
 	watched.close();
 	producer.close();
 	await serving;
-	client.close();
-	server.close();
+	client.abort();
+	server.abort();
+	clientOrigin.close();
 });
+
+// ---------------------------------------------------------------------------
+// Origin-fed sessions: the `consume` option end to end.
+// ---------------------------------------------------------------------------
+
+/** Poll until `pred` holds, so a regression fails the test instead of hanging it. */
+// Yields rather than sleeps, so it also polls under a Manual clock, where only the suite timeout bounds it.
+async function until(pred: () => boolean): Promise<void> {
+	const deadline = now().saturatingAdd(Duration.millis(1000));
+	while (!pred()) {
+		if (now().gt(deadline)) throw new Error("timed out waiting for condition");
+		await yieldNow();
+	}
+}
+
+async function runOriginFlow(protocol: string, version?: number) {
+	const pair = createMockTransportPair(protocol);
+	const serverOrigin = new OriginProducer();
+	const clientOrigin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client, consume: clientOrigin }),
+		accept(pair.server, url, { version, publish: serverOrigin.consume() }),
+	]);
+
+	// The server publishes into its origin; the wire announces it.
+	const broadcast = publish(serverOrigin, Path.from("test"));
+	const serving = (async () => {
+		for (;;) {
+			const req = await wireOf(broadcast).requested();
+			if (!req) break;
+			if (req.name !== "video") {
+				req.reject(new Error(`unexpected track: ${req.name}`));
+				continue;
+			}
+			req.accept({ timescale: Timescale.MILLI }).writeFrame(textFrame("hello"));
+		}
+	})();
+
+	// The announcement lands in the client's origin.
+	const reader = clientOrigin.consume();
+	const announced = reader.routes();
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("test"), kind: "start" });
+
+	// Consuming through the origin reaches the wire.
+	const remote = await routed(reader, Path.from("test"));
+	if (!remote) throw new Error("expected the origin to route the broadcast");
+	const track = remote.track("video").subscribe().ordered();
+	expect(await track.readString()).toBe("hello");
+
+	// Unpublishing retracts the entry over the wire and out of the origin.
+	broadcast.close();
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("test"), kind: "end" });
+	await until(() => !wireOf(reader).routes(Path.from("test")));
+
+	await serving;
+	track.close();
+	remote.close();
+	announced.close();
+	client.abort();
+	server.abort();
+	serverOrigin.close();
+	clientOrigin.close();
+}
+
+test("origin: discovers, consumes, and retracts over lite", async () => {
+	await runOriginFlow(Lite.ALPN_05);
+});
+
+test("origin: remote entries retract when the session dies, local ones survive", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_05);
+	const serverOrigin = new OriginProducer();
+	const clientOrigin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client, consume: clientOrigin }),
+		accept(pair.server, url, { publish: serverOrigin.consume() }),
+	]);
+
+	publish(serverOrigin, Path.from("remote"));
+	const mine = publish(clientOrigin, Path.from("mine"));
+
+	const reader = clientOrigin.consume();
+	// Watching is what has the session discover the peer's routes.
+	const watching = reader.routes();
+	await until(() => wireOf(reader).routes(Path.from("remote")));
+
+	client.abort();
+	server.abort();
+
+	// The session that fed the entry is gone, so the entry goes with it.
+	await until(() => !wireOf(reader).routes(Path.from("remote")));
+
+	// The local publish is not the session's to take.
+	const local = await routed(reader, Path.from("mine"));
+	expect(local).toBeDefined();
+	local?.close();
+
+	watching.close();
+	mine.close();
+	serverOrigin.close();
+	clientOrigin.close();
+});
+
+test("origin: one origin on both directions consumes locally and never echoes", async () => {
+	using clock = manual();
+	const pair = createMockTransportPair(Lite.ALPN_05);
+
+	// The client routes both directions through one origin, the FFI default shape.
+	const shared = new OriginProducer();
+	// The server feeds what the client announces into its own origin, so an echo would land here.
+	const serverSees = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client, publish: shared.consume(), consume: shared }),
+		accept(pair.server, url, { publish: serverSees.consume(), consume: serverSees }),
+	]);
+
+	// Both sides watch everything, so each session asks the other for announcements.
+	const watchingShared = shared.routes();
+	const watchingServer = serverSees.routes();
+
+	// The server announces a broadcast; it lands in the shared origin as a remote entry.
+	{
+		const remote = publish(serverSees, Path.from("from-server"));
+		const reader = shared.consume();
+		await until(() => wireOf(reader).routes(Path.from("from-server")));
+		remote.close();
+	}
+
+	// The client publishes; consuming its own path through the shared origin is local, no wire.
+	const mine = publish(shared, Path.from("from-client"));
+	mine.createTrack("chat", { timescale: Timescale.MILLI });
+	const reader = shared.consume();
+	const loopback = await routed(reader, Path.from("from-client"));
+	if (!loopback) throw new Error("expected a local route");
+	const track = loopback.track("chat").subscribe();
+	expect(track).toBeDefined();
+	track.close();
+	loopback.close();
+
+	// The server sees the client's broadcast once, as its own remote entry.
+	const serverReader = serverSees.consume();
+	await until(() => wireOf(serverReader).routes(Path.from("from-client")));
+
+	// The critical part: the client must NOT re-announce "from-server" back. If it did, the
+	// server's forwarder would insert it as a remote entry in serverSees. Give the wire a
+	// moment, then check the only remote entry the server has is the client's own broadcast.
+	await clock.advance(Duration.millis(50));
+	expect(wireOf(serverReader).routes(Path.from("from-server"))).toBe(false);
+
+	watchingShared.close();
+	watchingServer.close();
+	mine.close();
+	client.abort();
+	server.abort();
+	shared.close();
+	serverSees.close();
+});
+
+test("origin: a request discovers the peer cannot announce before resolving blind", async () => {
+	const refused = withoutDiscovery();
+	const pair = createMockTransportPair(Lite.ALPN_05);
+	const serverOrigin = new OriginProducer();
+	const clientOrigin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client, consume: clientOrigin }),
+		accept(pair.server, url, { publish: serverOrigin.consume() }),
+	]);
+
+	const broadcast = publish(serverOrigin, Path.from("blind"));
+	const serving = (async () => {
+		for (;;) {
+			const req = await wireOf(broadcast).requested();
+			if (!req) break;
+			req.accept({ timescale: Timescale.MILLI }).writeFrame(textFrame("found you"));
+		}
+	})();
+
+	const reader = clientOrigin.consume();
+	// A request owns discovery, so it learns that this peer needs a blind request.
+	expect(wireOf(reader).routes(Path.from("blind"))).toBe(false);
+
+	const request = reader.request(Path.from("blind"));
+	await until(() => request.active.peek() !== undefined);
+
+	const front = request.active.peek();
+	const track = front?.track("chat").subscribe().ordered();
+	if (!track) throw new Error("expected a track");
+	expect(await track.readString()).toBe("found you");
+	expect(refused()).toBe(1);
+	expect(reader.discovery.peek()).toBe(false);
+
+	track.close();
+	request.close();
+	broadcast.close();
+	await serving;
+	client.abort();
+	server.abort();
+	serverOrigin.close();
+	clientOrigin.close();
+});
+
+test.each([Lite.ALPN_03, Lite.ALPN_05, Lite.ALPN_06, Lite.ALPN_07_WIP])(
+	"%s: closing an announce consumer ends the peer's announce stream",
+	async (alpn) => {
+		// Wrap the peer's handler so the test sees when its side of the stream ends.
+		const run = LitePublisher.prototype.runAnnounce;
+		let ended = 0;
+		spyOn(LitePublisher.prototype, "runAnnounce").mockImplementation(function (this: LitePublisher, msg, stream) {
+			return run.call(this, msg, stream).finally(() => ended++);
+		});
+		const pair = createMockTransportPair(alpn);
+		const serverOrigin = new OriginProducer();
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client }),
+			accept(pair.server, url, { publish: serverOrigin.consume() }),
+		]);
+		const broadcast = publish(serverOrigin, Path.from("room/cam"));
+
+		// Repeated watch cycles must each give their stream back, not pile up on the peer.
+		for (let i = 1; i <= 3; i++) {
+			const announced = client.routes(Path.Pattern.subtree(Path.from("room")));
+			expect((await announced.next())?.kind).toBe("start");
+			announced.close();
+			await until(() => ended === i);
+		}
+
+		broadcast.close();
+		client.abort();
+		server.abort();
+		serverOrigin.close();
+	},
+);
+
+test.each([Lite.ALPN_05, Lite.ALPN_06, Lite.ALPN_07_WIP])(
+	"%s: closing an announce consumer before ANNOUNCE_OK ends the peer's stream",
+	async (alpn) => {
+		// The peer never answers, and returns only once the request stream closes.
+		let started = 0;
+		let ended = 0;
+		spyOn(LitePublisher.prototype, "runAnnounce").mockImplementation(async (_msg, stream) => {
+			started++;
+			await stream.reader.closed.catch(() => {});
+			ended++;
+		});
+		const pair = createMockTransportPair(alpn);
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client }),
+			accept(pair.server, url, { publish: new OriginProducer().consume() }),
+		]);
+
+		const announced = client.routes(Path.Pattern.subtree(Path.from("room")));
+		await until(() => started === 1);
+		announced.close();
+		await until(() => ended === 1);
+
+		client.abort();
+		server.abort();
+	},
+);
+
+for (const alpn of [Lite.ALPN_06, Lite.ALPN_07_WIP]) {
+	for (const method of ["request", "follow"] as const) {
+		test(`${alpn}: a ${method} outlives the listing it resolved through`, async () => {
+			const clock = new Manual();
+			const installed = clock.install();
+			onTestFinished(() => installed.close());
+			const run = LitePublisher.prototype.runAnnounce;
+			let started = 0;
+			let ended = 0;
+			spyOn(LitePublisher.prototype, "runAnnounce").mockImplementation(function (
+				this: LitePublisher,
+				msg,
+				stream,
+			) {
+				started++;
+				return run.call(this, msg, stream).finally(() => ended++);
+			});
+			const pair = createMockTransportPair(alpn);
+			const serverOrigin = new OriginProducer();
+			const clientOrigin = new OriginProducer();
+			const [client, server] = await Promise.all([
+				connect(url, { transport: pair.client, consume: clientOrigin }),
+				accept(pair.server, url, { publish: serverOrigin.consume() }),
+			]);
+
+			const broadcast = publish(serverOrigin, Path.from("room/cam"));
+			const serving = (async () => {
+				for (;;) {
+					const req = await wireOf(broadcast).requested();
+					if (!req) break;
+					req.accept({ timescale: Timescale.MILLI }).writeFrame(textFrame(req.name));
+				}
+			})();
+
+			// Browse, then play what the listing found.
+			const reader = clientOrigin.consume();
+			const listing = reader.routes(Path.Pattern.subtree(Path.from("room")));
+			expect((await listing.next())?.kind).toBe("start");
+			const request = reader[method](Path.from("room/cam"));
+			await until(() => request.active.peek() !== undefined);
+			const front = request.active.peek();
+
+			// The listing leaves. Its announce request stays open for the request beneath it rather
+			// than handing the route to a narrower one, so the instance never changes.
+			listing.close();
+			await clock.advance(Duration.millis(2000));
+			expect([started, ended]).toEqual([1, 0]);
+			expect(request.closed.peek()).toBeUndefined();
+			expect(request.active.peek()).toBe(front);
+			const track = front?.track("after").subscribe().ordered();
+			expect(await track?.readString()).toBe("after");
+			track?.close();
+
+			// Once the request goes too, the announce request lingers out.
+			request.close();
+			await clock.advance(Duration.millis(2000));
+			expect(ended).toBe(1);
+
+			broadcast.close();
+			await serving;
+			client.abort();
+			server.abort();
+			serverOrigin.close();
+			clientOrigin.close();
+		});
+	}
+}
+
+// As Rust's lazy discovery tests: a request owns its discovery, so nothing watches first.
+test.each([Lite.ALPN_05, Lite.ALPN_06, Lite.ALPN_07_WIP])(
+	"%s: a request on an unwatched path resolves it, or fails Unroutable once the peer syncs",
+	async (alpn) => {
+		const pair = createMockTransportPair(alpn);
+		const serverOrigin = new OriginProducer();
+		const clientOrigin = new OriginProducer();
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client, consume: clientOrigin }),
+			accept(pair.server, url, { publish: serverOrigin.consume() }),
+		]);
+		const broadcast = publish(serverOrigin, Path.from("room/cam"));
+
+		const reader = clientOrigin.consume();
+		const found = reader.request(Path.from("room/cam"));
+		const missing = reader.request(Path.from("room/missing"));
+		await until(() => found.active.peek() !== undefined && missing.closed.peek() !== undefined);
+		expect(found.closed.peek()).toBeUndefined();
+		const err = missing.closed.peek();
+		expect(err).toBeInstanceOf(StreamError);
+		expect((err as StreamError).code).toBe(StreamCode.Unroutable);
+
+		found.close();
+		missing.close();
+		broadcast.close();
+		client.abort();
+		server.abort();
+		serverOrigin.close();
+		clientOrigin.close();
+	},
+);
+
+test.each([Ietf.ALPN.DRAFT_18])(
+	"%s: closing an announce consumer before the namespace answer ends the peer's stream",
+	async (alpn) => {
+		// The peer never answers, and returns only once the request stream closes.
+		let started = 0;
+		let ended = 0;
+		spyOn(IetfPublisher.prototype, "runSubscribeNamespace").mockImplementation(async (_msg, stream) => {
+			started++;
+			await stream.reader.closed.catch(() => {});
+			ended++;
+		});
+		const pair = createMockTransportPair(alpn);
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client }),
+			accept(pair.server, url, { publish: new OriginProducer().consume() }),
+		]);
+
+		const announced = client.routes(Path.Pattern.subtree(Path.from("room")));
+		await until(() => started === 1);
+		announced.close();
+		await until(() => ended === 1);
+
+		client.abort();
+		server.abort();
+	},
+);
+
+test("origin: a blind request ends with its session, and the next session answers a fresh one", async () => {
+	using clock = manual();
+	withoutDiscovery();
+	const original = globalThis.WebTransport;
+	const reconnectUrl = new URL("https://example.com/re-request");
+
+	const servers: { session: { close: () => void }; origin: OriginProducer }[] = [];
+	const stub = function StubWebTransport() {
+		const pair = createMockTransportPair(Lite.ALPN_05);
+		const serverOrigin = new OriginProducer();
+		void accept(pair.server, reconnectUrl, { publish: serverOrigin.consume() }).then((session) => {
+			servers.push({ session, origin: serverOrigin });
+		});
+		return pair.client;
+	};
+	globalThis.WebTransport = stub as unknown as typeof WebTransport;
+
+	const clientOrigin = new OriginProducer();
+	const reload = new Connection({
+		enabled: true,
+		url: reconnectUrl,
+		websocket: { enabled: false },
+		delay: { initial: Duration.millis(10), multiplier: 1, max: Duration.millis(10) },
+		consume: clientOrigin,
+		share: false,
+	});
+
+	const request = clientOrigin.request(Path.from("standing"));
+
+	try {
+		const first = await waitFor(request.active, (b) => b !== undefined);
+
+		// The answering session dies, and the request it answered ends with it: the next session
+		// is another publisher instance as far as anything here can tell.
+		servers[0]?.session.close();
+		await Promise.resolve(request.closed);
+		expect(request.active.peek()).toBeUndefined();
+
+		// The next session answers a fresh request, once the reconnect delay passes.
+		const fresh = clientOrigin.request(Path.from("standing"));
+		await clock.drive(waitFor(fresh.active, (b) => b !== undefined));
+		expect(fresh.active.peek()).not.toBe(first);
+		fresh.close();
+	} finally {
+		request.close();
+		reload.close();
+		clientOrigin.close();
+		globalThis.WebTransport = original;
+	}
+});
+
+test("origin: a reactive handle follows announcements across a republish", async () => {
+	using clock = manual();
+	const pair = createMockTransportPair(Lite.ALPN_05);
+	const serverOrigin = new OriginProducer();
+	const clientOrigin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client, consume: clientOrigin }),
+		accept(pair.server, url, { publish: serverOrigin.consume() }),
+	]);
+
+	const watch = clientOrigin.follow(Path.from("show"));
+
+	// Nothing published yet: the handle waits instead of subscribing blind.
+	await clock.advance(Duration.millis(5));
+	expect(watch.active.peek()).toBeUndefined();
+
+	// The publish resolves it through the wire.
+	const first = publish(serverOrigin, Path.from("show"));
+	await until(() => watch.active.peek() !== undefined);
+	const held = watch.active.peek();
+
+	// A republish swaps the active consumer without closing the request.
+	const second = publish(serverOrigin, Path.from("show"));
+	await waitFor(watch.active, (b) => b !== undefined && b !== held);
+	expect(watch.closed.peek()).toBeUndefined();
+
+	second.close();
+	first.close();
+	await waitFor(watch.active, (b) => b === undefined);
+	expect(watch.closed.peek()).toBeUndefined();
+
+	watch.close();
+	client.abort();
+	server.abort();
+	serverOrigin.close();
+	clientOrigin.close();
+});
+
+test("origin: overlapping sessions carrying one path fail over", async () => {
+	using clock = manual();
+	// Two live relays announce the same broadcast into one origin, the redundant-relay
+	// shape (and the GOAWAY drain shape, where old and new sessions briefly overlap).
+	const clientOrigin = new OriginProducer();
+
+	const setup = async () => {
+		const pair = createMockTransportPair(Lite.ALPN_05);
+		const serverOrigin = new OriginProducer();
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client, consume: clientOrigin }),
+			accept(pair.server, url, { publish: serverOrigin.consume() }),
+		]);
+		const broadcast = publish(serverOrigin, Path.from("redundant"));
+		const serving = (async () => {
+			for (;;) {
+				const req = await wireOf(broadcast).requested();
+				if (!req) break;
+				req.accept({ timescale: Timescale.MILLI }).writeFrame(textFrame("still here"));
+			}
+		})();
+		return { client, server, serverOrigin, broadcast, serving };
+	};
+
+	const watching = clientOrigin.routes();
+	const first = await setup();
+	const second = await setup();
+
+	const reader = clientOrigin.consume();
+	await until(() => wireOf(reader).routes(Path.from("redundant")));
+
+	// The newer session dies; the older one still carries the path and must keep serving.
+	second.client.abort();
+	second.server.abort();
+	await clock.advance(Duration.millis(50));
+
+	const remote = await routed(reader, Path.from("redundant"));
+	if (!remote) throw new Error("route black-holed despite a live session");
+	const track = remote.track("chat").subscribe().ordered();
+	expect(await track.readString()).toBe("still here");
+
+	track.close();
+	remote.close();
+	watching.close();
+	first.broadcast.close();
+	await first.serving;
+	first.client.abort();
+	first.server.abort();
+	first.serverOrigin.close();
+	second.serverOrigin.close();
+	second.broadcast.close();
+	clientOrigin.close();
+});
+
+test("origin: a standby session answers a fresh request when the answerer dies", async () => {
+	const clientOrigin = new OriginProducer();
+
+	const setup = async (payload: string) => {
+		const pair = createMockTransportPair(Lite.ALPN_05);
+		const serverOrigin = new OriginProducer();
+		const [client, server] = await Promise.all([
+			// Nothing watches, so no announce request opens: requests are the only way through.
+			connect(url, { transport: pair.client, consume: clientOrigin }),
+			accept(pair.server, url, { publish: serverOrigin.consume() }),
+		]);
+		const broadcast = publish(serverOrigin, Path.from("blind"));
+		const serving = (async () => {
+			for (;;) {
+				const req = await wireOf(broadcast).requested();
+				if (!req) break;
+				req.accept({ timescale: Timescale.MILLI }).writeFrame(textFrame(payload));
+			}
+		})();
+		return { client, server, serverOrigin, broadcast, serving };
+	};
+
+	// The first session answers the standing request; the second attaches as a standby.
+	const request = clientOrigin.request(Path.from("blind"));
+	const answerer = await setup("from answerer");
+	await until(() => request.active.peek() !== undefined);
+	const standby = await setup("from standby");
+
+	// The answering session dies while the standby stays connected: the request it answered
+	// ends with it, and the standby answers a fresh one without waiting for a new session.
+	answerer.client.abort();
+	answerer.server.abort();
+	await until(() => request.closed.peek() !== undefined);
+	const fresh = clientOrigin.request(Path.from("blind"));
+	await until(() => fresh.active.peek() !== undefined);
+
+	const front = fresh.active.peek();
+	const track = front?.track("chat").subscribe().ordered();
+	if (!track) throw new Error("expected a track from the standby");
+	expect(await track.readString()).toBe("from standby");
+
+	track.close();
+	fresh.close();
+	request.close();
+	standby.broadcast.close();
+	await standby.serving;
+	standby.client.abort();
+	standby.server.abort();
+	standby.serverOrigin.close();
+	answerer.serverOrigin.close();
+	answerer.broadcast.close();
+	clientOrigin.close();
+});
+
+test("create then announce is discoverable on the wire", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_06);
+	const origin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const announced = client.routes();
+	const broadcastRoute = origin.route(Path.from("later"), { hidden: true });
+	const broadcast = broadcastRoute.broadcast;
+	broadcast.createTrack("chat", { timescale: Timescale.MILLI });
+
+	const pending = announced.next();
+	broadcastRoute.announce();
+	const entry = await pending;
+	expect(entry?.prefix).toBe("later" as Path.Valid);
+	expect(entry?.kind).toBe("start");
+
+	announced.close();
+	broadcast.close();
+	client.abort();
+	server.abort();
+	origin.close();
+});
+
+test.each([Lite.ALPN_06, Lite.ALPN_07_WIP, Ietf.ALPN.DRAFT_18, Ietf.ALPN.DRAFT_22])(
+	"a held answer's first subscribe succeeds on %s without an exact route",
+	async (protocol) => {
+		const pair = createMockTransportPair(protocol);
+		const origin = new OriginProducer();
+		const consumer = new OriginProducer();
+		const handle = origin.claim(Path.empty());
+		const held = new BroadcastProducer();
+		held.createTrack("chat", { timescale: Timescale.MILLI }).writeFrame(textFrame("hello"));
+		const serving = (async () => {
+			for await (const request of handle.requested()) request.serve(held.consume());
+		})();
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client, consume: consumer }),
+			accept(pair.server, url, { publish: origin.consume() }),
+		]);
+		const requested = consumer.request(Path.from("live/cam"));
+		const remote = await waitFor(requested.active, (broadcast) => broadcast !== undefined);
+		if (!remote) throw new Error("request did not resolve");
+		const track = remote.track("chat").subscribe().ordered();
+		expect(await track.readString()).toBe("hello");
+		expect(wireOf(origin.consume()).advertised.peek()?.has(Path.from("live/cam"))).toBe(false);
+		track.close();
+		requested.close();
+		handle.close();
+		await serving;
+		held.close();
+		client.abort();
+		server.abort();
+		origin.close();
+		consumer.close();
+	},
+);
+
+// Without an instance on the wire nothing says the job's route continues the claim's stream.
+test.each([Lite.ALPN_06, Ietf.ALPN.DRAFT_18, Ietf.ALPN.DRAFT_22])(
+	"publishing a job still resets its first subscribe on %s",
+	async (protocol) => {
+		const pair = createMockTransportPair(protocol);
+		const origin = new OriginProducer();
+		const consumer = new OriginProducer();
+		const handle = origin.claim(Path.empty());
+		const serving = (async () => {
+			const requests = handle.requested();
+			const request = (await requests.next()).value;
+			if (!request) throw new Error("missing job request");
+			const job = request.route({ hidden: true });
+			job.broadcast.createTrack("chat", { timescale: Timescale.MILLI }).writeFrame(textFrame("job"));
+			job.announce();
+			return job;
+		})();
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client, consume: consumer }),
+			accept(pair.server, url, { publish: origin.consume() }),
+		]);
+		const requested = consumer.request(Path.from("live/cam"));
+		const remote = await waitFor(requested.active, (broadcast) => broadcast !== undefined);
+		if (!remote) throw new Error("request did not resolve");
+		const track = remote.track("chat").subscribe().ordered();
+		await expect(track.readString()).rejects.toBeInstanceOf(Error);
+		const job = await serving;
+		track.close();
+		requested.close();
+		handle.close();
+		job.close();
+		client.abort();
+		server.abort();
+		origin.close();
+		consumer.close();
+	},
+);
+
+// On lite-07 a job's exact route continues its claim's minted instance, so a reader resolved
+// through the claim keeps its broadcast and its subscription once that route lands.
+test.each(["request", "follow"] as const)(
+	"a job's route continues a reader resolved through its claim (%s)",
+	async (method) => {
+		const pair = createMockTransportPair(Lite.ALPN_07_WIP);
+		const origin = new OriginProducer();
+		const consumer = new OriginProducer();
+		const path = Path.from("live/cam");
+		const handle = origin.claim(Path.empty());
+		const serving = (async () => {
+			const requests = handle.requested();
+			const request = (await requests.next()).value;
+			if (!request) throw new Error("missing job request");
+			const job = request.route({ hidden: true });
+			const chat = job.broadcast.createTrack("chat", { timescale: Timescale.MILLI });
+			chat.writeFrame(textFrame("job"));
+			job.announce();
+			return { job, chat };
+		})();
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client, consume: consumer }),
+			accept(pair.server, url, { publish: origin.consume() }),
+		]);
+		const listing = consumer.announced(Path.Pattern.literal(path));
+		const requested = method === "request" ? consumer.request(path) : consumer.follow(path);
+		const remote = await waitFor(requested.active, (broadcast) => broadcast !== undefined);
+		if (!remote) throw new Error("request did not resolve");
+		const track = remote.track("chat").subscribe().ordered();
+		expect(await track.readString()).toBe("job");
+
+		// Written once the job's route is listed at the reader: the same subscription carries it.
+		const { job, chat } = await serving;
+		expect(job.instance).toBe(handle.instance);
+		expect(await listing.next()).toMatchObject({ kind: "present", prefix: path });
+		chat.writeFrame(textFrame("later"));
+		expect(await track.readString()).toBe("later");
+		expect(requested.active.peek()).toBe(remote);
+		expect(requested.closed.peek()).toBeUndefined();
+
+		track.close();
+		listing.close();
+		requested.close();
+		handle.close();
+		job.close();
+		client.abort();
+		server.abort();
+		origin.close();
+		consumer.close();
+	},
+);
+
+// The peer's close code a killed session carries.
+const DEATH = SessionCode(71);
+
+/**
+ * Serve one track with a group left open, kill the publisher's session once the subscriber has
+ * read into it, and return how the subscriber's track ended.
+ */
+async function runSessionDeath(
+	protocol: string,
+	version?: number,
+	kill: "death" | "remote" | "local" = "death",
+): Promise<[Error | null, Error | null, Position | undefined]> {
+	using clock = manual();
+	const pair = createMockTransportPair(protocol);
+	const origin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { version, publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const serving = (async () => {
+		for (;;) {
+			const req = await wireOf(broadcast).requested();
+			if (!req) break;
+			req.accept({ timescale: Timescale.MILLI }).appendGroup().writeFrame(textFrame("head"));
+		}
+	})();
+
+	const remote = wireOf(client).consume(Path.from("test"));
+	const track = remote.track("video").subscribe();
+	const group = await track.recvGroup();
+	if (!group) throw new Error("missing group");
+	expect(await group.readString()).toBe("head");
+
+	if (kill === "local") client.close();
+	// The track is live, so the drain runs to its deadline and closes anyway.
+	else if (kill === "remote") void server.close().catch(() => {});
+	else pair.server.close({ closeCode: DEATH, reason: "killed" });
+	const groupEnd = Promise.resolve(group.closed);
+	const closed = await clock.drive(
+		withTimeout(Promise.resolve(track.closed), Duration.millis(2000), "the track never ended"),
+	);
+
+	broadcast.close();
+	await serving;
+	remote.close();
+	client.abort();
+	server.abort();
+	origin.close();
+	return [
+		closed,
+		await clock.drive(withTimeout(groupEnd, Duration.millis(2000), "the group never ended")),
+		hooks.subscriberEnd(track),
+	];
+}
+
+for (const [name, protocol, version] of [
+	["lite draft-03", Lite.ALPN_03, undefined],
+	["lite draft-05", Lite.ALPN_05, undefined],
+	["ietf draft-18", Ietf.ALPN.DRAFT_18, undefined],
+] as const) {
+	test(`integration: ${name} ends a track with its session's error`, async () => {
+		const [closed, groupEnd] = await runSessionDeath(protocol, version);
+		expect(closed).toBeInstanceOf(SessionError);
+		expect((closed as SessionError).code).toBe(DEATH);
+		expect(groupEnd).toBeInstanceOf(SessionError);
+		expect((groupEnd as SessionError).code).toBe(DEATH);
+	});
+	// A clean close cuts off the track and its open group, and a local close reads exactly as
+	// the remote one does. It declares no end, so a resumed reader's replacement route
+	// continues past it.
+	for (const kill of ["remote", "local"] as const) {
+		test(`integration: ${name} cancels the track on a ${kill} session close`, async () => {
+			const [closed, groupEnd, end] = await runSessionDeath(protocol, version, kill);
+			expect(closed).toBeInstanceOf(SessionError);
+			expect((closed as SessionError).code).toBe(SessionCode.Cancel);
+			expect(groupEnd).toBeInstanceOf(SessionError);
+			expect((groupEnd as SessionError).code).toBe(SessionCode.Cancel);
+			expect(end).toBeUndefined();
+		});
+	}
+}
+
+// On lite-05+ the subscribe stream carries responses until its FIN, so a reset of it is how the
+// publisher ends a subscription with an error, and the track ends with that error.
+test("integration: lite draft-05 ends a track with the publisher's reset", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_05);
+	const origin = new OriginProducer();
+
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const served: TrackProducer[] = [];
+	const serving = (async () => {
+		for (;;) {
+			const req = await wireOf(broadcast).requested();
+			if (!req) break;
+			const producer = req.accept({ timescale: Timescale.MILLI });
+			producer.appendGroup().writeFrame(textFrame("head"));
+			served.push(producer);
+		}
+	})();
+
+	const remote = wireOf(client).consume(Path.from("test"));
+	const track = remote.track("video").subscribe();
+	const group = await track.recvGroup();
+	expect(await group?.readString()).toBe("head");
+
+	const reset = StreamCode(70);
+	for (const producer of served) producer.abort(new StreamError(reset));
+	const closed = await withTimeout(Promise.resolve(track.closed), Duration.millis(2000), "the track never ended");
+	expect(closed).toBeInstanceOf(StreamError);
+	expect((closed as StreamError).code).toBe(reset);
+
+	broadcast.close();
+	await serving;
+	remote.close();
+	client.abort();
+	server.abort();
+	origin.close();
+});
+
+test.each([Lite.ALPN_06, Lite.ALPN_07_WIP, Ietf.ALPN.DRAFT_22])(
+	"integration: %s streams a frame larger than any whole-frame limit",
+	async (protocol) => {
+		const MiB = 1024 * 1024;
+		const size = 80 * MiB + 7;
+		const byte = (offset: number) => (offset * 7 + 3) % 251;
+		const pair = createMockTransportPair(protocol);
+		const origin = new OriginProducer();
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client }),
+			accept(pair.server, url, { publish: origin.consume() }),
+		]);
+
+		const broadcast = publish(origin, Path.from("test"));
+		const serving = (async () => {
+			const request = await wireOf(broadcast).requested();
+			if (!request) return;
+			const group = request.accept({ timescale: Timescale.MILLI }).appendGroup();
+			const frame = group.createFrame({ size, timestamp: Timestamp.fromMillis(5) });
+			for (let written = 0; written < size; ) {
+				const chunk = new Uint8Array(Math.min(size - written, MiB + 13));
+				for (let i = 0; i < chunk.byteLength; i++) chunk[i] = byte(written + i);
+				frame.write(chunk);
+				written += chunk.byteLength;
+				await yieldNow();
+			}
+			frame.finish();
+			group.writeFrame(textFrame("after"));
+			group.finish();
+		})();
+
+		const remote = wireOf(client).consume(Path.from("test"));
+		const subscriber = remote.track("video").subscribe();
+		const group = await subscriber.recvGroup();
+		const frame = await group?.nextFrame();
+		expect(frame?.size).toBe(size);
+		let read = 0;
+		for (let chunk = await frame?.readChunk(); chunk; chunk = await frame?.readChunk()) {
+			expect(chunk[0]).toBe(byte(read));
+			expect(chunk[chunk.byteLength - 1]).toBe(byte(read + chunk.byteLength - 1));
+			read += chunk.byteLength;
+		}
+		expect(read).toBe(size);
+		expect(new TextDecoder().decode((await group?.readFrame())?.payload)).toBe("after");
+
+		await serving;
+		subscriber.close();
+		remote.close();
+		broadcast.close();
+		client.abort();
+		server.abort();
+	},
+	30_000,
+);
+
+// A qmux session pair negotiating `protocol` over an in-memory socket, each side granting the other
+// `maxStreamsUni` unidirectional streams.
+function qmuxPair(protocol: string, maxStreamsUni: bigint): { client: Qmux; server: Qmux } {
+	const socket = (readable: ReadableStream<Uint8Array>, writable: WritableStream<Uint8Array>) => {
+		const closed = Promise.withResolvers<{ closeCode: number; reason: string }>();
+		return {
+			url: "",
+			opened: Promise.resolve({ readable, writable, extensions: "", protocol: `qmux-01.${protocol}` }),
+			closed: closed.promise,
+			close: () => closed.resolve({ closeCode: 1000, reason: "" }),
+		};
+	};
+	// Copied, since a sender may reuse its buffer once a write resolves.
+	const pipe = () =>
+		new TransformStream<Uint8Array, Uint8Array>({ transform: (chunk, c) => c.enqueue(chunk.slice()) });
+	const up = pipe();
+	const down = pipe();
+	const config = { idleTimeout: null, maxStreamsUni };
+	const client = new Qmux(socket(down.readable, up.writable), { config });
+	const server = Qmux.accept(socket(up.readable, down.writable), { config });
+	return { client, server };
+}
+
+// On lite-07 a group whose stream a newer one reset to make room only pauses: once credit returns,
+// a new stream continues it, and its reader receives every frame without an error. Mirrors the Rust
+// `a_reset_group_resumes_without_loss`.
+test("integration: lite-07 resumes a group reset to make room without loss", async () => {
+	using clock = manual();
+	// Advance the clock until `work` settles: a waiting open makes room once it has waited about a
+	// round trip.
+	const settled = async <T>(work: Promise<T>, what: string): Promise<T> => {
+		for (let i = 0; i < 100; i++) if (await settlesWithin(work, clock, Duration.millis(10))) return work;
+		throw new Error(`${what} never settled`);
+	};
+	// One unidirectional stream of credit, so a newer group's open must reset the older one.
+	const pair = qmuxPair(Lite.ALPN_07_WIP, 1n);
+	// The server learns the negotiated protocol once its socket opens.
+	await Promise.all([pair.client.ready, pair.server.ready]);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+	const broadcast = publish(origin, Path.from("live"));
+	// Kept, so the older group is never too old for the subscription.
+	const producer = broadcast.createTrack("0", { timescale: Timescale.MILLI, maxAge: null });
+	const remote = wireOf(client).consume(Path.from("live"));
+	const subscriber = remote.track("0").subscribe({ order: "descending", delay: { max: Duration.millis(30_000) } });
+	try {
+		// Unfinished, so its stream holds the only credit until the newer group resets it.
+		const older = producer.appendGroup();
+		older.writeFrame(textFrame("a"));
+		const paused = await settled(subscriber.recvGroup(), "the older group");
+		if (!paused) throw new Error("no older group");
+		expect(paused.sequence).toBe(0n);
+		expect(await settled(paused.readString(), "its first frame")).toBe("a");
+
+		const newer = producer.appendGroup();
+		newer.writeFrame(textFrame("new"));
+		newer.finish();
+		const group = await settled(subscriber.recvGroup(), "the newer group taking the older one's credit");
+		expect(group?.sequence).toBe(1n);
+
+		// Written after the reset: a continuation carries them, behind the frame already held.
+		older.writeFrame(textFrame("b"));
+		older.writeFrame(textFrame("c"));
+		older.finish();
+		const rest: string[] = [];
+		for (;;) {
+			const frame = await settled(paused.readString(), "the paused group's continuation");
+			if (frame === undefined) break;
+			rest.push(frame);
+		}
+		expect(rest).toEqual(["b", "c"]);
+		expect(await paused.closed).toBeNull();
+	} finally {
+		subscriber.close();
+		remote.close();
+		broadcast.close();
+		client.abort();
+		server.abort();
+	}
+});
+
+// Out of credit, a late group that ranks below the stream holding it waits for credit without
+// holding back a newer group that outranks that stream. Mirrors the Rust
+// `a_waiting_late_group_lets_a_newer_group_through`.
+for (const alpn of [Lite.ALPN_06, Lite.ALPN_07_WIP]) {
+	test(`integration: ${alpn} lets a newer group past a late one waiting for credit`, async () => {
+		using clock = manual();
+		const settled = async <T>(work: Promise<T>, what: string): Promise<T> => {
+			for (let i = 0; i < 100; i++) if (await settlesWithin(work, clock, Duration.millis(10))) return work;
+			throw new Error(`${what} never settled`);
+		};
+		const pair = qmuxPair(alpn, 1n);
+		await Promise.all([pair.client.ready, pair.server.ready]);
+		const origin = new OriginProducer();
+		const [client, server] = await Promise.all([
+			connect(url, { transport: pair.client }),
+			accept(pair.server, url, { publish: origin.consume() }),
+		]);
+		const broadcast = publish(origin, Path.from("live"));
+		const producer = broadcast.createTrack("0", { timescale: Timescale.MILLI, maxAge: null });
+		const remote = wireOf(client).consume(Path.from("live"));
+		const subscriber = remote
+			.track("0")
+			.subscribe({ order: "descending", delay: { max: Duration.millis(30_000) } });
+		try {
+			// Unfinished, so its stream holds the only credit.
+			// Each group stamped in sequence order, since the track checks a late group's start.
+			const at = (sequence: bigint) => Timestamp.fromMillis(1_000 + Number(sequence));
+			const held = producer.createGroup(2n);
+			held.writeFrame(textFrame("held", at(2n)));
+			expect((await settled(subscriber.recvGroup(), "the held group"))?.sequence).toBe(2n);
+
+			// Late and below the held stream: it waits for credit it cannot make room for.
+			const late = producer.createGroup(0n);
+			late.writeFrame(textFrame("late", at(0n)));
+			late.finish();
+
+			const newer = producer.createGroup(3n);
+			newer.writeFrame(textFrame("new", at(3n)));
+			newer.finish();
+			// lite-07 may fill the late group by a fetch first; only group 3 must not wait behind it.
+			for (;;) {
+				const group = await settled(subscriber.recvGroup(), "the newer group past the late one");
+				if (!group) throw new Error("the subscription ended");
+				if (group.sequence === 3n) break;
+				expect(group.sequence).toBe(0n);
+			}
+		} finally {
+			subscriber.close();
+			remote.close();
+			broadcast.close();
+			client.abort();
+			server.abort();
+		}
+	});
+}

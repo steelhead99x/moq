@@ -1,36 +1,21 @@
-import { Decoder as Flate } from "@moq/flate";
-
-/** Options shared by a {@link Decoder} and the {@link Consumer} that wraps one. */
-export interface ConsumerConfig {
-	/** Whether the frames are `deflate-raw` compressed. Must match the encoder. Defaults to `false`. */
-	compression?: boolean;
-}
+import { parse } from "../parse.ts";
+import type { Config } from "./encoder.ts";
 
 /**
- * Decodes JSON records from frame payloads, sharing one DEFLATE window across the log.
+ * Decodes JSON records from frame payloads.
  *
- * The track-free core of {@link Consumer}, and the mirror of {@link Encoder}. Payloads must be fed
- * in the order they were encoded, since each one builds on the window the earlier ones left behind.
- * Call {@link reset} at a group boundary, matching the encoder.
+ * The track-free core of {@link Consumer}, and the mirror of {@link Encoder}.
  */
 export class Decoder<T> {
-	#decompress: boolean;
-	// The DEFLATE window for the whole log, present while decompressing.
-	#flate?: Flate;
+	#schema?: Config<T>["schema"];
 
-	constructor(config: ConsumerConfig = {}) {
-		this.#decompress = config.compression ?? false;
-		this.#flate = this.#decompress ? new Flate() : undefined;
-	}
-
-	/** Start a cold DEFLATE window, for a caller that has just moved to a new group. */
-	reset(): void {
-		this.#flate = this.#decompress ? new Flate() : undefined;
+	constructor(config: Config<T> = {}) {
+		this.#schema = config.schema;
 	}
 
 	/** Decode the next frame payload back into a record. */
 	decode(payload: Uint8Array): T {
-		const plain = this.#flate ? this.#flate.frame(payload) : payload;
-		return JSON.parse(new TextDecoder().decode(plain));
+		const value = parse(payload);
+		return this.#schema ? this.#schema.parse(value) : (value as T);
 	}
 }

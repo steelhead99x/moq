@@ -130,7 +130,7 @@ async fn ensure_screen_access() -> Result<(), Error> {
 
 	let granted = tokio::task::spawn_blocking(|| objc2_core_graphics::CGRequestScreenCaptureAccess())
 		.await
-		.map_err(|error| Error::Codec(anyhow::anyhow!("screen permission request failed: {error}")))?;
+		.map_err(|error| Error::codec(anyhow::anyhow!("screen permission request failed: {error}")))?;
 	if granted {
 		Ok(())
 	} else {
@@ -144,7 +144,11 @@ async fn ensure_screen_access() -> Result<(), Error> {
 /// Start a stream for `filter`. `size` is the source's native pixel size, used
 /// unless the caller overrode width/height.
 async fn open(config: &Config, filter: &SCContentFilter, size: (u32, u32)) -> Result<Stream, Error> {
-	let fps = config.framerate.map(|f| f as i32).unwrap_or(DEFAULT_FRAMERATE).max(1);
+	let fps = config
+		.framerate
+		.map(|rate| rate.rounded() as i32)
+		.unwrap_or(DEFAULT_FRAMERATE)
+		.max(1);
 	let configuration = unsafe { SCStreamConfiguration::new() };
 	// `size` is already even; an override might not be.
 	let width = config.width.map(|w| even(w as f64)).unwrap_or(size.0);
@@ -172,7 +176,7 @@ async fn open(config: &Config, filter: &SCContentFilter, size: (u32, u32)) -> Re
 		let proto = ProtocolObject::from_ref(&*delegate);
 		stream
 			.addStreamOutput_type_sampleHandlerQueue_error(proto, SCStreamOutputType::Screen, Some(&dispatch))
-			.map_err(|e| Error::Codec(anyhow::anyhow!("add screen output: {e:?}")))?;
+			.map_err(|e| Error::codec(anyhow::anyhow!("add screen output: {e:?}")))?;
 	}
 
 	start_capture(&stream).await?;
@@ -187,16 +191,16 @@ async fn open(config: &Config, filter: &SCContentFilter, size: (u32, u32)) -> Re
 	};
 
 	let label = config.source.label();
-	let first = match tokio::time::timeout(FIRST_FRAME_TIMEOUT, chan.recv()).await {
+	let first = match kio::clock::timeout(FIRST_FRAME_TIMEOUT, chan.recv()).await {
 		Ok(Ok(Some(frame))) => frame,
 		Ok(Err(error)) => return Err(error),
 		Ok(Ok(None)) | Err(_) => {
-			return Err(Error::Codec(anyhow::anyhow!(
+			return Err(Error::codec(anyhow::anyhow!(
 				"no frames from {label} within {FIRST_FRAME_TIMEOUT:?} (screen recording permission?)"
 			)));
 		}
 	};
-	let (width, height) = (first.width(), first.height());
+	let crate::Size { width, height } = first.size();
 
 	tracing::info!(source = %label, width, height, "opened screen capture (ScreenCaptureKit)");
 
@@ -291,7 +295,7 @@ fn find_display(content: &SCShareableContent, device: Option<&str>) -> Result<Re
 			.strip_prefix("display:")
 			.unwrap_or(spec)
 			.parse::<usize>()
-			.map_err(|_| Error::Codec(anyhow::anyhow!("invalid display selector {spec:?}")))?,
+			.map_err(|_| Error::codec(anyhow::anyhow!("invalid display selector {spec:?}")))?,
 	};
 	if index >= displays.count() {
 		return Err(Error::SourceUnavailable(format!("no display at index {index}")));
@@ -303,7 +307,7 @@ fn find_display(content: &SCShareableContent, device: Option<&str>) -> Result<Re
 fn find_window(content: &SCShareableContent, id: &str) -> Result<Retained<SCWindow>, Error> {
 	let wanted: u32 = id
 		.parse()
-		.map_err(|_| Error::Codec(anyhow::anyhow!("invalid window id {id:?}")))?;
+		.map_err(|_| Error::codec(anyhow::anyhow!("invalid window id {id:?}")))?;
 
 	let windows = unsafe { content.windows() };
 	(0..windows.count())
@@ -372,11 +376,11 @@ async fn shareable_content() -> Result<Retained<SCShareableContent>, Error> {
 	});
 	unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
 
-	match tokio::time::timeout(ASYNC_TIMEOUT, rx).await {
+	match kio::clock::timeout(ASYNC_TIMEOUT, rx).await {
 		Ok(Ok(Ok(content))) => Ok(content.0),
-		Ok(Ok(Err(msg))) => Err(Error::Codec(anyhow::anyhow!("shareable content: {msg}"))),
-		Ok(Err(_)) => Err(Error::Codec(anyhow::anyhow!("shareable content handler dropped"))),
-		Err(_) => Err(Error::Codec(anyhow::anyhow!(
+		Ok(Ok(Err(msg))) => Err(Error::codec(anyhow::anyhow!("shareable content: {msg}"))),
+		Ok(Err(_)) => Err(Error::codec(anyhow::anyhow!("shareable content handler dropped"))),
+		Err(_) => Err(Error::codec(anyhow::anyhow!(
 			"timed out listing shareable content (screen recording permission?)"
 		))),
 	}
@@ -394,11 +398,11 @@ async fn start_capture(stream: &SCStream) -> Result<(), Error> {
 	});
 	unsafe { stream.startCaptureWithCompletionHandler(Some(&handler)) };
 
-	match tokio::time::timeout(ASYNC_TIMEOUT, rx).await {
+	match kio::clock::timeout(ASYNC_TIMEOUT, rx).await {
 		Ok(Ok(None)) => Ok(()),
-		Ok(Ok(Some(msg))) => Err(Error::Codec(anyhow::anyhow!("start capture: {msg}"))),
-		Ok(Err(_)) => Err(Error::Codec(anyhow::anyhow!("start-capture handler dropped"))),
-		Err(_) => Err(Error::Codec(anyhow::anyhow!("timed out starting screen capture"))),
+		Ok(Ok(Some(msg))) => Err(Error::codec(anyhow::anyhow!("start capture: {msg}"))),
+		Ok(Err(_)) => Err(Error::codec(anyhow::anyhow!("start-capture handler dropped"))),
+		Err(_) => Err(Error::codec(anyhow::anyhow!("timed out starting screen capture"))),
 	}
 }
 

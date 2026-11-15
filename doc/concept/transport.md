@@ -1,6 +1,6 @@
 ---
 title: Transport
-description: QUIC, WebTransport, the WebSocket fallback, raw QUIC, stream listeners, and iroh
+description: QUIC, WebTransport, the WebSocket fallback, raw QUIC, and stream listeners
 ---
 
 # Transport
@@ -33,7 +33,10 @@ support it. The TypeScript client is pickier than the browsers: it uses
 WebTransport on Firefox only from 153 (earlier releases allow too few incoming
 streams) and keeps Safari on the WebSocket fallback, since WebKit bugs stall
 long sessions even though Safari 26.4 ships the API. Native
-clients can use WebTransport too, but usually skip it.
+clients can use WebTransport too, but usually skip it. Both Rust runtime
+crates expose `quic::web` as a WebTransport library usable without MoQ;
+see [moq-tokio](https://docs.rs/moq-tokio/latest/moq_tokio/quic/web/) and
+[moq-uring](https://docs.rs/moq-uring/latest/moq_uring/quic/web/).
 
 ## WebSocket fallback
 
@@ -42,15 +45,39 @@ connection (`wss://`) and keep whichever wins. A small multiplexer,
 [qmux](/draft/qmux-websocket), carries MoQ streams over the socket. It works
 everywhere but cannot escape TCP head-of-line blocking, so priority and resets
 only help once bytes leave the TCP queue. The fallback is automatic in every
-client; the relay enables it with `[web.https]`.
+client; the relay serves it on its `[web.http]` or `[web.https]` listener. A
+reconnecting connection that lands on WebSocket probes QUIC in the background,
+5 to 10 seconds in and then on a doubling backoff capped at one probe every 5
+minutes. Once a probe gets through, it moves back the way it follows a GOAWAY:
+the WebSocket session tells the relay it is leaving and keeps serving until the
+QUIC session replaces it.
+
+A `moq-tokio` client with a client certificate refuses to dial `http://`,
+`ws://`, `tcp://`, or `unix://`: none can present the certificate to a server
+it has authenticated, and `http://` trusts a fingerprint fetched over
+plaintext. Dial `https://`, `wss://`, `moqt://`, `moql://`, or `tls://` instead.
+
+Each side lets the other hold 10,000 streams open in each direction, as over
+QUIC, since MoQ holds one per subscription and per live group. Set it with
+`websocket.maxStreams` in `@moq/net` and `quic.max_streams` in `moq-tokio`.
+
+QUIC gets a head start in the race: 500 ms in `@moq/net` and 200 ms in
+`moq-tokio`. Once WebSocket wins against a server, identified by the host and
+port the fallback dials, later connects to that server race both transports at
+once. The path and query, including a rotating `?jwt=` token, don't matter. A
+QUIC win or probe against that server restores the head start, and so does the
+end of the WebSocket session that won, so a redial after an outage prefers QUIC.
 
 ## Raw QUIC (native)
 
 Native clients dial the relay directly with the MoQ ALPN, skipping the HTTP/3
-handshake. The URL path and `?jwt=` token travel in the MoQ `SETUP` message
+handshake. The URL path and any `?jwt=` token travel in the MoQ `SETUP` message
 instead of a `CONNECT` request, so the server sees the same thing either way.
-`moq-native` picks this automatically for `https://` URLs; use `moql://` or
-`moqt://` to force it.
+On every transport, a SETUP token (moq-lite-07-wip and moq-transport) can carry
+the credential in place of the query.
+`moq-tokio` dials WebTransport for `https://` URLs; use `moql://` or `moqt://`
+for raw QUIC. A browser cannot dial raw QUIC, so `@moq/net` reaches a `moqt://`
+or `moql://` URL over WebTransport at the same host, port, and path.
 
 ## TCP and Unix sockets (local workers)
 
@@ -61,25 +88,8 @@ authenticate through the same JWT and public-access rules as QUIC, and the Unix
 socket can additionally allowlist the connecting process by uid, gid, or pid.
 See [stream listeners](/bin/relay/auth#stream-listeners).
 
-## iroh (peer-to-peer, experimental)
+## Custom Rust transports
 
-[iroh](https://www.iroh.computer/) swaps "dial a hostname" for "dial a public
-key". Two native MoQ endpoints on the same network can exchange media with no
-relay, no DNS, and no certificate authority: the endpoint's key is its address
-and its TLS identity.
-
-```bash
-moq --iroh-enabled --iroh-disable-relay \
-    --client-connect "iroh://<endpoint-id>/anon" --broadcast cam.hang play
-```
-
-Keep it on the local network. Across the internet iroh falls back to an n0
-relay that forwards opaque packets, which is a TURN-shaped hop that cannot
-cache or fan out; a [MoQ relay](/bin/relay/) is the right tool there.
-`--iroh-disable-relay` pins traffic to direct addresses but also removes hole
-punching. Discovery still publishes the endpoint's addresses to n0's DNS
-whichever way it is configured. Browsers can't use iroh at all: WebTransport
-gives a page a connection, not an endpoint.
-
-The relay opts in with `[iroh] enabled = true` and a persisted `secret` so the
-endpoint id survives restarts. See the [config reference](/bin/relay/config#iroh).
+`moq-net` runs over its own poll traits, so a custom transport implements
+those directly. `moq-tokio` and `moq-uring` are the built-in
+adapters. See the [moq-net API](/lib/rs/moq-net).

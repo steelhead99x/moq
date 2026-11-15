@@ -1,0 +1,40 @@
+name: Video
+
+# Runs the @moq/video renderer in headless Chromium, which `just check` cannot:
+# the WebGPU path, a lost device, and the Canvas2D fallback only exist in a real
+# browser. SwiftShader stands in for the GPU, so no GPU runner is needed.
+#
+# Narrow trigger: the renderer, the harness, and what the harness
+# drives: the two files that wire the renderer into `<moq-publish>`, and the
+# `@moq/watch` playback path, fed from an in-memory origin so no relay is needed.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_call:
+
+concurrency:
+  group: video-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  video:
+    name: Video
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/nix
+
+      - name: Video
+        run: nix develop --command just test video
+        shell: bash -leo pipefail {0}

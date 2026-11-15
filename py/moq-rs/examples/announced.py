@@ -1,4 +1,4 @@
-"""List broadcasts announced on a relay under a given prefix.
+"""List routes announced on a relay under a given prefix.
 
 python py/moq-rs/examples/announced.py --url https://relay.example.com
 python py/moq-rs/examples/announced.py --url https://relay.example.com --prefix live/
@@ -10,11 +10,14 @@ import asyncio
 import moq
 
 
-async def run(url: str, prefix: str, tls_verify: bool) -> None:
-    async with moq.Client(url, tls_verify=tls_verify) as client:
-        print(f"watching announcements under {prefix!r} at {url}")
-        async for announcement in client.announced(prefix):
-            print(f"  + {announcement.path}")
+async def run(url: str, prefix: str, insecure: bool) -> None:
+    async with moq.Client(url, tls=moq.ClientTls(insecure=insecure)) as client:
+        print(f"watching route announcements under {prefix!r} at {url}")
+        async for event in client.announced(prefix):
+            if isinstance(event, moq.AnnounceEventPresent):
+                print(f"  + {event.announce.prefix}")
+            elif isinstance(event, (moq.AnnounceEventAbsent, moq.AnnounceEventOffline)):
+                print(f"  - {event.announce.prefix}")
 
 
 def main() -> None:
@@ -25,7 +28,7 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        asyncio.run(run(args.url, args.prefix, tls_verify=not args.no_tls_verify))
+        asyncio.run(run(args.url, args.prefix, insecure=args.no_tls_verify))
     except KeyboardInterrupt:
         pass
 

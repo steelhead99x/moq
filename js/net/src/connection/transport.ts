@@ -1,14 +1,13 @@
-import Session from "@moq/qmux";
-
 /** The wire transport a session runs over. */
-export type Transport = "webtransport" | "websocket";
+export type Transport = "webtransport" | "websocket" | "webrtc";
 
 /**
- * The transport a live session is actually running over. qmux implements the `WebTransport`
- * interface on top of a WebSocket, so the two are indistinguishable by shape.
+ * The transport a live session is actually running over. WebSocket and WebRTC adapters
+ * share the WebTransport shape and carry their label, so `@moq/qmux` stays a lazy chunk.
  *
  * @internal Not re-exported from the package entrypoint.
  */
 export function transportOf(quic: WebTransport): Transport {
-	return quic instanceof Session ? "websocket" : "webtransport";
+	const label = "transport" in quic ? quic.transport : undefined;
+	return label === "webrtc" || label === "websocket" ? label : "webtransport";
 }

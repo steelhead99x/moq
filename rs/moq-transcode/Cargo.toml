@@ -5,7 +5,7 @@ authors = ["Luke Curley <kixelated@gmail.com>"]
 repository = "https://github.com/moq-dev/moq"
 license = "MIT OR Apache-2.0"
 
-version = "0.0.16"
+version = "0.1.10"
 edition = "2024"
 rust-version.workspace = true
 
@@ -13,28 +13,29 @@ keywords = ["quic", "http3", "webtransport", "media", "video"]
 categories = ["multimedia", "multimedia::video", "multimedia::encoding"]
 
 [features]
-# The hardware codecs are on by default, mirroring moq-video: NVDEC -> NVENC is
-# the whole point of a GPU transcode fleet, and it is the zero-copy GPU pipeline
-# (NVDEC decodes and scales in hardware, NVENC encodes the CUDA frame in place).
-# Both dlopen their driver at runtime, so disabling them only slims the compile.
-default = ["nvidia", "vaapi", "v4l2"]
+# NVIDIA and VAAPI are on by default, mirroring moq-video: each is a zero-copy
+# GPU pipeline (NVDEC -> NVENC, or VA decode -> VPP -> VA encode), and each
+# dlopens its driver, so neither needs anything on the build host. OpenH264, the
+# software H.264 fallback, is vendored C++ and opt-in like moq-video's: release
+# builds enable it. `v4l2` mirrors moq-video's opt-in too, though it costs the
+# build nothing.
+default = ["nvidia", "vaapi"]
 # NVENC + NVDEC (Linux, dlopen'd at runtime; a no-op elsewhere).
 nvidia = ["moq-video/nvidia"]
-# Compatibility aliases for the pre-consolidation names, kept so a manifest that
-# already asks for the old split still resolves. Undocumented on purpose: the
-# feature tables name only `nvidia`.
-nvenc = ["nvidia"]
-nvdec = ["nvidia"]
-# Intel/AMD VAAPI hardware encoder (Linux; libva dlopen'd at runtime).
+# Software H.264 encode/decode through moq-video's vendored OpenH264 backend.
+# Off by default; enable it in release builds.
+openh264 = ["moq-video/openh264"]
+# Intel/AMD VAAPI hardware codecs (Linux; libva dlopen'd at runtime, and
+# moq-vaapi checks its bindings in, so nothing is needed on the build host).
 vaapi = ["moq-video/vaapi"]
-# The V4L2 M2M codecs of an ARM SoC (Linux; the `v4l` crate's bindgen needs
-# libclang at build time).
+# The V4L2 M2M codecs of an ARM SoC (Linux; moq-v4l checks its bindings in, so
+# nothing is needed on the build host).
 v4l2 = ["moq-video/v4l2"]
 
 [dependencies]
 bytes = { workspace = true }
 hang = { workspace = true }
-kio = { workspace = true }
+kio = { workspace = true, features = ["async"] }
 moq-mux = { workspace = true }
 moq-net = { workspace = true }
 moq-video = { workspace = true }
@@ -44,9 +45,27 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
-clap = { workspace = true }
-# Default features on (unlike the workspace entry) so the example gets a QUIC backend.
-moq-native = { path = "../moq-native" }
+criterion = { package = "bench-harness", path = "../bench-harness" }
+# `join_all`, so the ladder bench feeds every rung at once like the rung tasks do.
+futures = { workspace = true }
+kio = { workspace = true, features = ["manual", "runtime", "sim"] }
+moq-tokio = { path = "../moq-tokio", default-features = false, features = ["quic", "websocket"] }
+# The tests encode with OpenH264, the one encoder a GPU-less host has, so they
+# turn it on without making it a default of the library.
+moq-video = { path = "../moq-video", features = ["openh264"] }
 # test-util unlocks tokio::time::pause for the deterministic live-feed tests.
 tokio = { workspace = true, features = ["full", "test-util"] }
 url = { workspace = true }
+usage-rs = { workspace = true }
+workspace-hack = { path = "../workspace-hack" }
+
+# The ladder bench reads the driving thread's CPU clock.
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+
+[[bench]]
+name = "ladder"
+harness = false
+
+[lints]
+workspace = true

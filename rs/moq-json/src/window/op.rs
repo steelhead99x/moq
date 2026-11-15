@@ -2,13 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The first frame in every group, naming the complete retained window.
+/// The first frame in every group, naming the retained window and a decodable suffix.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Header<T> {
-	/// Absolute index of `records[0]`, so a reader knows which records it missed.
+	/// Absolute index of the oldest retained record.
 	pub offset: u64,
-	/// The retained records, oldest first.
+	/// Absolute index of `records[0]`; omitted when it equals `offset`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub start: Option<u64>,
+	/// A suffix of the retained records, oldest first.
 	pub records: Vec<T>,
 }
 
@@ -36,12 +39,13 @@ mod test {
 		name: String,
 		first: bool,
 		frame: String,
+		events: Vec<Value>,
 	}
 
-	/// The exact frame bytes for each op, shared with the TypeScript suite.
+	/// The exact frame bytes and decoded events, shared with the TypeScript suite.
 	///
-	/// This file is the wire contract between the two implementations. A change here is a format
-	/// change, so both suites have to move together.
+	/// Frame strings are the wire contract between the two implementations. Changes to those
+	/// strings are format changes, while expected events pin decoder semantics.
 	#[test]
 	fn vectors_round_trip() {
 		let vectors: Vec<Vector> = serde_json::from_str(include_str!("../../tests/window-vectors.json")).unwrap();
@@ -60,6 +64,27 @@ mod test {
 				}
 			};
 			assert_eq!(encoded, vector.frame, "{}", vector.name);
+
+			let mut decoder = super::super::Decoder::<Value>::new(Default::default());
+			let mut group = decoder.group();
+			if !vector.first {
+				group
+					.decode(br#"{"offset":0,"records":[{"n":0},{"n":1},{"n":2}]}"#)
+					.unwrap();
+				while group.next_event().is_some() {}
+			}
+			group.decode(vector.frame.as_bytes()).unwrap();
+			let events: Vec<_> = std::iter::from_fn(|| group.next_event())
+				.map(|event| {
+					use super::super::Event;
+					match event {
+						Event::Push { index, value } => json!({"push": {"index": index, "value": value}}),
+						Event::Pop(range) => json!({"pop": {"start": range.start, "end": range.end}}),
+						Event::Skip(range) => json!({"skip": {"start": range.start, "end": range.end}}),
+					}
+				})
+				.collect();
+			assert_eq!(events, vector.events, "{}", vector.name);
 		}
 	}
 
@@ -69,11 +94,21 @@ mod test {
 		// rather than a silently different wire.
 		let header = Header {
 			offset: 4,
+			start: None,
 			records: vec![json!({ "a": 1 })],
 		};
 		assert_eq!(
 			serde_json::to_value(&header).unwrap(),
 			json!({ "offset": 4, "records": [{ "a": 1 }] })
+		);
+		let checkpoint = Header {
+			offset: 4,
+			start: Some(6),
+			records: vec![json!({ "a": 3 })],
+		};
+		assert_eq!(
+			serde_json::to_value(&checkpoint).unwrap(),
+			json!({ "offset": 4, "start": 6, "records": [{ "a": 3 }] })
 		);
 		assert_eq!(
 			serde_json::to_value(Op::Push(json!({ "a": 1 }))).unwrap(),

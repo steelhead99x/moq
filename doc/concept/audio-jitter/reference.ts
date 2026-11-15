@@ -1,0 +1,284 @@
+// A reference implementation of the estimator described in /concept/audio-jitter,
+// used only to generate the conformance corpus beside it.
+//
+// It is not normative and is not shipped in any package. The document is normative:
+// when the two disagree the document wins, this file is corrected, and the corpus is
+// regenerated. Nothing outside this directory may import it, because an
+// implementation that calls the reference proves nothing about the document.
+
+/** Milliseconds of media time the reference search looks back over. */
+export const WINDOW = 2000;
+
+/** Milliseconds of delay per histogram bucket. */
+export const BUCKET = 20;
+
+/** Histogram buckets, so the measured term saturates at BUCKET * BUCKETS. */
+export const BUCKETS = 100;
+
+/** The quantile of the delay distribution the target is read at. */
+export const QUANTILE = 0.95;
+
+/** Weight retained per folded observation. */
+export const FORGET = 0.983;
+
+/** Milliseconds of arrival time per resampled observation. */
+export const RESAMPLE = 500;
+
+/** The most weight one observation takes, which only the prior's weight can lift it toward. */
+export const FRESH_MAX = 0.1;
+
+/** Idle intervals folded at once, purely to bound the work. */
+export const IDLE_MAX = 1024;
+
+/** The cold-start distribution, which is also what an idle receiver relaxes back to. */
+export function prior(): Float64Array {
+	const out = new Float64Array(BUCKETS);
+	for (let i = 0; i < BUCKETS; i++) {
+		out[i] = 0.5 ** (i + 1);
+	}
+	return out;
+}
+
+const PRIOR = prior();
+
+/** One frame as the receiver saw it, in milliseconds. */
+export interface Arrival {
+	/** The receiver's monotonic clock when the frame came off the transport. */
+	arrival: number;
+	/** The frame's container timestamp, converted to milliseconds. */
+	media: number;
+}
+
+/** What the receiver knows about the track before any frame arrives. */
+export interface Config {
+	/** The codec's frame duration, never learned from observed timestamps. */
+	frame: number;
+	/** The publisher's advertised flush span, a floor on the measured term. */
+	advertised?: number;
+}
+
+/** Estimates the audio playout target from arrival timing alone. */
+export class Estimator {
+	readonly #frame: number;
+	readonly #advertised: number;
+
+	/** Arrivals still inside the reference window, in media order. */
+	#history: Arrival[] = [];
+	/** The largest media timestamp observed, so a reordered frame is recognized. */
+	#newest = Number.NEGATIVE_INFINITY;
+
+	/** The arrival that resample intervals are counted from. */
+	#origin?: number;
+	/** The interval currently accumulating, counted from #origin. */
+	#interval = 0;
+	/** The largest delay seen in that interval. */
+	#peak = 0;
+	/** The oldest media timestamp measured in that interval. */
+	#oldest = 0;
+	/** The first arrival, when the subscription began. */
+	#start?: number;
+	/** The latest a frame produced before the subscription arrived, starting at `#start`. */
+	#joined = 0;
+	/** A declared end precedes the next measured observation, so the silence before it is not idle. */
+	#ended = false;
+	/** The earliest a frame stalled in this interval was due. */
+	#due = Number.POSITIVE_INFINITY;
+	/** The latest a frame stalled in this interval arrived. */
+	#late = Number.NEGATIVE_INFINITY;
+
+	/** The bucket of the open stall's largest delay, folded once the stall ends. */
+	#stall?: number;
+	/** When the open stall's latest stalled frame arrived. */
+	#stallLate = 0;
+	/** The earliest the open stall's frames were due. */
+	#stallDue = 0;
+	/** Intervals the open stall spanned besides the one it folds as. */
+	#span = 0;
+	/** Empty intervals before this one, held until it shows whether they belong to a stall. */
+	#pending = 0;
+
+	#histogram = prior();
+	/** How much of the histogram is still the prior's rather than evidence. */
+	#prior = 1;
+
+	constructor(config: Config) {
+		this.#frame = config.frame;
+		this.#advertised = config.advertised ?? 0;
+	}
+
+	/** Fold one frame's arrival into the estimate. */
+	observe({ arrival, media }: Arrival): void {
+		// A reordered arrival is measured but never joins the window: it arrived after a
+		// newer frame, so it is never the fastest, and nothing later is measured against it.
+		if (media > this.#newest) {
+			this.#newest = media;
+
+			// Pruning by media time rather than by arrival is what makes a timestamp jump
+			// self-correcting: everything before it leaves the window at once.
+			while (this.#history.length > 0 && this.#history[0].media < media - WINDOW) {
+				this.#history.shift();
+			}
+			this.#history.push({ arrival, media });
+		}
+
+		// A frame due before the first arrival by the window's fastest path was produced before
+		// the subscription began: it is the backlog a join delivers, and the join lasts until it
+		// has all arrived.
+		if (this.#start === undefined) {
+			this.#start = arrival;
+			this.#joined = arrival;
+		} else if (media + this.#fastest() < this.#start) {
+			this.#joined = Math.max(this.#joined, arrival);
+		}
+
+		// The fastest frame in the window at or before this one, so delay is measured
+		// against the best-case path instead of against the previous frame. A frame
+		// older than the whole window has nothing to be measured against.
+		let reference: Arrival | undefined;
+		for (const entry of this.#history) {
+			if (entry.media > media) break;
+			if (reference === undefined || entry.arrival - entry.media < reference.arrival - reference.media) {
+				reference = entry;
+			}
+		}
+		if (reference === undefined) return;
+
+		const delay = Math.max(0, arrival - reference.arrival - (media - reference.media));
+
+		if (this.#origin === undefined) {
+			this.#origin = arrival;
+			this.#peak = delay;
+			this.#oldest = media;
+			this.#note(arrival, delay);
+			return;
+		}
+
+		const interval = Math.floor((arrival - this.#origin) / RESAMPLE);
+		const resumed = this.#ended;
+		this.#ended = false;
+		if (interval <= this.#interval) {
+			this.#peak = Math.max(this.#peak, delay);
+			this.#oldest = Math.min(this.#oldest, media);
+			this.#note(arrival, delay);
+			return;
+		}
+
+		// An interval holding a frame due before the join's backlog finished arriving measured the
+		// join, not the path: those frames queued behind the backlog, and the player skipped onto
+		// the clock past all of it. It folds nothing, like an interval with no arrival.
+		if (this.#oldest + this.#fastest() < this.#joined) this.#pending += 1;
+		else this.#close(Math.min(BUCKETS - 1, Math.floor(this.#peak / BUCKET)));
+
+		if (resumed) {
+			// The publisher declared the silence, so it is not evidence of anything: the
+			// estimate keeps what it had and a fresh interval starts at this arrival.
+			this.#settle();
+			this.#origin = arrival;
+			this.#interval = 0;
+		} else {
+			// Held until this interval closes: a stall it holds owns them.
+			this.#pending += interval - this.#interval - 1;
+			this.#interval = interval;
+		}
+		this.#peak = delay;
+		this.#oldest = media;
+		this.#due = Number.POSITIVE_INFINITY;
+		this.#late = Number.NEGATIVE_INFINITY;
+		this.#note(arrival, delay);
+	}
+
+	// The window's smallest `arrival - media`: the fastest path seen, which a frame's due time is
+	// read from.
+	#fastest(): number {
+		let fastest = Number.POSITIVE_INFINITY;
+		for (const entry of this.#history) fastest = Math.min(fastest, entry.arrival - entry.media);
+		return fastest;
+	}
+
+	// A frame later than a whole interval was due in an earlier one, so it is stalled.
+	#note(arrival: number, delay: number): void {
+		if (delay > RESAMPLE) {
+			this.#due = Math.min(this.#due, arrival - delay);
+			this.#late = Math.max(this.#late, arrival);
+		}
+	}
+
+	// An interval whose stalled frames were due before the open stall's last one arrived is
+	// still behind that stall, so it joins it rather than counting again, for up to a
+	// window of due time: back-to-back flushes are a recurring stall, not one.
+	#close(bucket: number): void {
+		const stalled = this.#late !== Number.NEGATIVE_INFINITY;
+		const pending = this.#pending;
+		this.#pending = 0;
+		if (
+			stalled &&
+			this.#stall !== undefined &&
+			this.#due < this.#stallLate &&
+			this.#due - this.#stallDue < WINDOW
+		) {
+			this.#stall = Math.max(this.#stall, bucket);
+			this.#span += pending + 1;
+			this.#stallLate = this.#late;
+			return;
+		}
+
+		this.#settle();
+		if (stalled) {
+			this.#stall = bucket;
+			this.#span = pending;
+			this.#stallLate = this.#late;
+			this.#stallDue = this.#due;
+		} else {
+			for (let i = 0; i < Math.min(pending, IDLE_MAX); i++) this.#fold(undefined);
+			this.#fold(bucket);
+		}
+	}
+
+	// A stall is one observation, its largest delay, and every other interval it spanned is idle.
+	#settle(): void {
+		if (this.#stall === undefined) return;
+		this.#fold(this.#stall);
+		for (let i = 0; i < Math.min(this.#span, IDLE_MAX); i++) {
+			this.#fold(undefined);
+		}
+		this.#stall = undefined;
+	}
+
+	/** A declared end lies between the previous observation and the next. */
+	end(): void {
+		// Before any observation there is no interval for the silence to stretch.
+		if (this.#origin !== undefined) this.#ended = true;
+	}
+
+	/** The target the receiver holds, in milliseconds. */
+	get target(): number {
+		let cumulative = 0;
+		let measured = BUCKETS * BUCKET;
+		for (let i = 0; i < BUCKETS; i++) {
+			cumulative += this.#histogram[i];
+			if (cumulative > QUANTILE) {
+				measured = (i + 1) * BUCKET;
+				break;
+			}
+		}
+
+		return Math.max(measured, this.#advertised) + this.#frame;
+	}
+
+	// Evidence decays by FORGET and the prior holds the rest, of which an observation
+	// takes up to FRESH_MAX. Once the prior is gone that is `h = f*h + (1-f)*x`. An
+	// interval that held no arrival takes nothing, so its share returns to the prior and
+	// the estimate relaxes toward cold start at the same time constant.
+	#fold(bucket: number | undefined): void {
+		const rest = 1 - FORGET * (1 - this.#prior);
+		const fresh = bucket === undefined ? 0 : Math.min(FRESH_MAX, rest);
+		const left = rest - fresh;
+		const seed = left - FORGET * this.#prior;
+
+		for (let i = 0; i < BUCKETS; i++) {
+			this.#histogram[i] = FORGET * this.#histogram[i] + seed * PRIOR[i];
+		}
+		if (bucket !== undefined) this.#histogram[bucket] += fresh;
+		this.#prior = left;
+	}
+}

@@ -1,7 +1,7 @@
 //! AAC constraints, the sibling of the `opus` and `pcm` modules.
 //!
-//! Only the decode side exists: there is no Rust AAC encoder, so this crate
-//! publishes Opus or PCM and reads AAC that a gateway produced.
+//! The decode side. There is no Rust AAC encoder, so `encode` produces AAC only
+//! through a platform backend and otherwise reads AAC that a gateway produced.
 
 use crate::Error;
 
@@ -45,9 +45,9 @@ fn validate(config: &moq_mux::codec::aac::Config) -> Result<(), Error> {
 /// The AudioSpecificConfig to open a decoder with, validated as AAC-LC.
 ///
 /// Prefers the catalog `description` verbatim, since re-encoding the parsed
-/// fields would drop any extension it carries. A catalog without one (an MSF
-/// track, or a producer that only filled in the plain fields) gets one
-/// synthesized from the declared profile, rate, and channel count.
+/// fields would drop any extension it carries. Without one, the decoder's config is
+/// synthesized from the declared profile, rate, and channels. Legacy and LOC packets
+/// then carry ADTS headers that must agree with it; CMAF samples remain raw.
 ///
 /// The profile is read back out of the resulting config rather than taken from
 /// the catalog codec string: the description is what the decoder acts on, and
@@ -72,24 +72,20 @@ pub(crate) fn description(catalog: &hang::catalog::AudioConfig, profile: u8) -> 
 				));
 			}
 
-			let config = moq_mux::codec::aac::Config {
-				profile,
-				sample_rate: catalog.sample_rate,
-				channel_count: catalog.channel_count,
-			};
+			let config = moq_mux::codec::aac::Config::new(profile, catalog.sample_rate, catalog.channel_count);
 
-			// Synthesis is lossy in every field: the encoder masks the object type to
-			// the five bits it has, rewrites a channel count the config table can't
-			// name, and drops the sample rate's bits past 24. A rendition we can't
-			// decode would come back out of it looking like decodable stereo, so
-			// check the catalog's own numbers before encoding them.
+			// Only AAC-LC decodes, and synthesis still truncates the sample rate to 24
+			// bits. Encode refuses a channel count that does not pick a
+			// channelConfiguration, but check the catalog first so the error stays the
+			// decoder's.
 			validate(&config)?;
 
-			config.encode()
+			config.encode().map_err(moq_mux::Error::from)?
 		}
 	};
 
-	let parsed = moq_mux::codec::aac::Config::parse(&mut description.as_ref()).map_err(moq_mux::Error::from)?;
+	let parsed = moq_mux::codec::aac::Config::parse(&mut description.as_ref())
+		.map_err(|err| Error::Unsupported(format!("invalid AAC description: {err}")))?;
 	validate(&parsed)?;
 
 	// HE-AAC has two spellings. `validate` catches the one that leads with SBR or
@@ -142,7 +138,7 @@ fn declares_sbr(description: &[u8]) -> bool {
 
 		// The sync extension itself. Padding can't be mistaken for it: the pattern
 		// has to match, name SBR or PS, and then set the flag.
-		if bits.left() < 16 || bits.read(11)? != SYNC_EXTENSION {
+		if bits.read(11)? != SYNC_EXTENSION {
 			return Some(false);
 		}
 		if !matches!(object_type(bits)?, OBJECT_TYPE_SBR | OBJECT_TYPE_PS) {
@@ -152,7 +148,7 @@ fn declares_sbr(description: &[u8]) -> bool {
 		Some(bits.read(1)? == 1)
 	}
 
-	scan(&mut Bits::new(description)).unwrap_or(false)
+	scan(&mut Bits::endian(description, bitstream_io::BigEndian)).unwrap_or(false)
 }
 
 /// An audioObjectType, which escapes to a second field once it runs out of room.
@@ -164,34 +160,16 @@ fn object_type(bits: &mut Bits) -> Option<u8> {
 }
 
 /// A big-endian bit cursor, which is how an AudioSpecificConfig is packed.
-struct Bits<'a> {
-	data: &'a [u8],
-	pos: usize,
+type Bits<'a> = bitstream_io::BitReader<&'a [u8], bitstream_io::BigEndian>;
+
+/// Reads the next `count` bits, or `None` when the config is shorter than that.
+trait ReadBits {
+	fn read(&mut self, count: u32) -> Option<u32>;
 }
 
-impl<'a> Bits<'a> {
-	fn new(data: &'a [u8]) -> Self {
-		Self { data, pos: 0 }
-	}
-
-	fn left(&self) -> usize {
-		self.data.len() * 8 - self.pos
-	}
-
-	/// The next `count` bits, or `None` when the config is shorter than that.
-	fn read(&mut self, count: usize) -> Option<u32> {
-		if count > 32 || self.left() < count {
-			return None;
-		}
-
-		let mut value = 0;
-		for _ in 0..count {
-			let bit = (self.data[self.pos / 8] >> (7 - self.pos % 8)) & 1;
-			value = (value << 1) | u32::from(bit);
-			self.pos += 1;
-		}
-
-		Some(value)
+impl ReadBits for Bits<'_> {
+	fn read(&mut self, count: u32) -> Option<u32> {
+		bitstream_io::BitRead::read_var(self, count).ok()
 	}
 }
 
@@ -230,24 +208,23 @@ mod tests {
 	}
 
 	#[test]
-	fn rejects_an_extended_profile_before_synthesis_masks_it() {
-		// mp4a.40.34 is MP3-in-MP4. The 5-bit object type field can't hold 34, so
-		// synthesizing a config would mask it down to 2 and read back as AAC-LC.
+	fn rejects_an_extended_profile_before_synthesis() {
+		// mp4a.40.34 is MP3-in-MP4, which this decoder can't play: validate refuses
+		// any profile but AAC-LC before a config is synthesized.
 		let err = description(&catalog(34, 44_100, 2), 34).unwrap_err();
 		assert!(matches!(err, Error::Unsupported(msg) if msg.contains("mp4a.40.34")));
 	}
 
 	#[test]
 	fn rejects_more_than_stereo() {
-		// Synthesis would rewrite an unnameable count to stereo; 6 is nameable but
-		// still past what the decoder opens.
+		// 12 has no channelConfiguration; 6 does, but the decoder only opens mono and stereo.
 		assert!(matches!(
 			description(&catalog(2, 48_000, 12), 2),
-			Err(Error::Unsupported(_))
+			Err(Error::Unsupported(msg)) if msg.contains("limited to mono and stereo")
 		));
 		assert!(matches!(
 			description(&catalog(2, 48_000, 6), 2),
-			Err(Error::Unsupported(_))
+			Err(Error::Unsupported(msg)) if msg.contains("limited to mono and stereo")
 		));
 	}
 
@@ -284,8 +261,8 @@ mod tests {
 	#[test]
 	fn rejects_description_disagreeing_with_the_codec_string() {
 		// The catalog claims LC while the description says HE-AAC; the description wins.
-		let mut config = catalog(2, 44_100, 2);
-		config.description = Some(bytes::Bytes::from_static(&[0x2A, 0x10]));
+		let mut config = catalog(2, 48_000, 2);
+		config.description = Some(bytes::Bytes::from_static(&[0x2B, 0x11, 0x88, 0x00]));
 
 		assert!(matches!(description(&config, 2), Err(Error::Unsupported(_))));
 	}

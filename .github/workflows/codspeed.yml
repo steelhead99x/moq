@@ -1,0 +1,50 @@
+name: CodSpeed
+
+# CPU-simulated instruction counts for the deterministic Criterion benches,
+# nightly on main. An extra signal beside Nightly's paired timing, which still
+# measures every bench and is the only gate; see bench/README.md.
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  codspeed:
+    name: CodSpeed (${{ matrix.shard }})
+    if: github.ref == 'refs/heads/main'
+    # One upload of every bench is over CodSpeed's per-run limit, so each shard
+    # uploads separately and CodSpeed merges this workflow's shards.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [net, mux, rest]
+    # CodSpeed's simulation runner supports x86 hosted runners.
+    runs-on: ubuntu-24.04
+    environment: cache-write
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      # CodSpeed authenticates the upload with GitHub OIDC; no token secret.
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/nix
+      - uses: ./.github/actions/rust-cache
+        with:
+          access-key-id: ${{ secrets.MBX_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MBX_R2_SECRET_ACCESS_KEY }}
+
+      # The runner measures its whole command, so the benches run on the dev
+      # shell's PATH rather than inside a `nix develop` it would also measure.
+      - name: Build
+        run: |
+          nix develop --command just rs codspeed ${{ matrix.shard }}
+          echo "DEV_PATH=$(nix develop --command printenv PATH)" >> "$GITHUB_ENV"
+
+      - uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
+        with:
+          mode: simulation
+          run: env PATH="$DEV_PATH" cargo codspeed run

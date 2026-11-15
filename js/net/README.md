@@ -12,7 +12,7 @@ A TypeScript [Media over QUIC](https://moq.dev/) (MoQ) client for both browsers 
 
 Check out [hang](../hang) for a higher-level media library that uses this package.
 
-> **Note:** moq-lite is a subset of moq-transport and is forwards compatible with it, so this client works with any moq-transport CDN (ex. [Cloudflare](https://moq.dev/blog/first-cdn/)). See the [compatibility docs](https://doc.moq.dev/concept/moq-lite#compatibility) for details.
+> **Note:** moq-lite is a subset of moq-transport and is forwards compatible with it, so this client works with any moq-transport CDN (ex. [Cloudflare](https://moq.dev/blog/first-cdn/)). See the [compatibility docs](https://doc.moq.dev/concept/moq-lite#what-moq-lite-leaves-out) for details.
 
 ## Quick Start
 
@@ -62,6 +62,12 @@ await quicheLoaded; //This is a promise, connect after it resolves
 - **[Discovery](examples/discovery.ts)** - Discover broadcasts announced by the server
 - **[Waiting](examples/wait.ts)** - Wait for one known broadcast to come online, and follow it
 - **[Server side usage](https://github.com/sb2702/webcodecs-examples/tree/main/src/moq-server)** - Publish from browser to a server
+
+## Integer precision
+
+Group identities and relative group counts use `bigint`. Frame indices, timestamps,
+and durations use bounded numbers and refuse unsafe wire values. See
+[wire integer precision](INTEGERS.md) for the field-by-field limits.
 
 ## License
 

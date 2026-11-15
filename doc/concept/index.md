@@ -13,17 +13,19 @@ what lets it forward media it can't parse.
 | Application | Your product: rooms, auth, custom tracks. | You |
 | [hang](/concept/hang) | Media: a catalog of tracks, codec config, timestamped frames. | `hang`, `@moq/hang` |
 | [moq-lite](/concept/moq-lite) | Generic live pub/sub: broadcasts, tracks, groups, frames. | `moq-net`, `@moq/net`, relays, CDNs |
-| [Transport](/concept/transport) | QUIC streams, via WebTransport in browsers, with a WebSocket fallback. | The browser, `moq-native` |
+| [Transport](/concept/transport) | QUIC streams, via WebTransport in browsers, with a WebSocket fallback. | The browser, `moq-tokio` |
 
 ## The model in one paragraph
 
 A **broadcast** is a named, discoverable collection of **tracks** from one
 publisher. A **track** is a live sequence of **groups**, and each group is a
 sequence of **frames** delivered reliably and in order over its own QUIC
-stream (or, for a tiny single frame, as one unreliable datagram). Groups are independent: they can arrive out of order, be prioritized
+stream. Groups are independent: they can arrive out of order, be prioritized
 against each other, and be dropped under congestion without corrupting the
 rest. For video a group is a GoP starting at a keyframe; for audio it's a
 second or so of samples; for data it's whatever unit can be skipped as a whole.
+A track can instead be a [datagram track](/concept/moq-lite#datagrams): small
+unreliable payloads with no groups.
 
 Subscribers pull. Nothing is transmitted until someone subscribes, duplicate
 subscriptions are merged at every relay on the way upstream, and a publisher
@@ -33,8 +35,26 @@ watched at 100 ms by one viewer and 10 s by another.
 
 ## Sections
 
-- [Transport](/concept/transport): why QUIC, and the WebTransport, WebSocket, raw QUIC, and iroh paths onto it.
-- [moq-lite](/concept/moq-lite): the pub/sub protocol, discovery, subscriptions, and congestion behavior.
-- [hang](/concept/hang): the media catalog, containers, and how to extend both.
-- [Standards](/concept/standard): how this relates to the IETF moq-transport, MSF, and LOC drafts.
+- [Transport](/concept/transport): why QUIC, and the WebTransport, WebSocket, and raw QUIC paths onto it.
+- [moq-lite](/concept/moq-lite): the pub/sub protocol, discovery, path patterns, subscriptions, and congestion behavior.
+- [Identity and recovery](/concept/identity): choosing stream instances, following restarts, and answering work on demand without mixing streams.
+- [Sockets](/concept/socket): dial and accept point-to-point sessions through relays, each a track of messages each way.
+- [hang](/concept/hang): the media catalog, containers, encryption, and how to extend both.
+- [Archives](/concept/archives): record listed tracks into object storage and serve them back from a host.
+- [Audio jitter](/concept/audio-jitter): how a receiver sizes its audio playout target from arrival timing.
+- [Compressed tracks](/concept/compression): when to compress a track, what each protocol version receives, and the relay's cost.
+- [Stats](/concept/stats): the traffic counters a relay publishes as broadcasts, and how to read them.
+- [Standards](/concept/standard): how this relates to the IETF moq-transport, MSF, LOC, and this project's own drafts, including [e2ee](/draft/moq-e2ee).
 - [Use cases](/concept/use-case/): MoQ compared with HLS/DASH, RTMP/SRT, WebRTC, and used for AI.
+
+## Find a feature
+
+| Question | Next step |
+| --- | --- |
+| Who may publish or subscribe? | [Relay authentication](/bin/relay/auth) |
+| How do I add chat, state, or custom tracks? | [JSON tracks](/lib/js/json), [rooms](/lib/js/room), or [raw pub/sub](/lib/rs/moq-net) |
+| How does media encryption fit in? | [hang](/concept/hang) and the [E2EE draft](/draft/moq-e2ee) |
+| How do multiple relays or redundant sources fit together? | [Clustering](/bin/relay/cluster) and [redundant ingest](/setup/redundancy) |
+| How do restarts and failover keep content apart? | [Identity and recovery](/concept/identity) |
+| Which package implements this layer? | [Libraries](/lib/) to integrate it, [repository map](/setup/repository) to change it |
+| How can I observe a running system? | [Inspect a relay](/bin/inspect) and [stats](/concept/stats) |

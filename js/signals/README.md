@@ -26,7 +26,7 @@ const dispose = count.subscribe(n => console.log(n)); // subscribe to changes ma
 ```
 
 Updates are batched, coalescing multiple updates into a single microtask.
-The old and new values are then compared with deep equality ([dequal](https://github.com/lukeed/dequal)) to avoid unnecessary wakeups.
+The old and new values are then compared to avoid unnecessary wakeups: plain objects and arrays by their keys, length, and contents, everything else like a `Set` would (class instances by identity except the clock's immutable values, which compare by value; `NaN` equal to itself).
 It's possible to skip this check, but please benchmark it first...
 
 ### Effect
@@ -131,7 +131,7 @@ age.set(21); // only the nested effect reruns: "You are 21 years old!"
 ### effect.abort
 
 An `AbortSignal` that is aborted when the effect reruns or closes.
-Pass it to any API that accepts an `AbortSignal` — `fetch`, `addEventListener`, streams, etc.
+Pass it to any API that accepts an `AbortSignal` - `fetch`, `addEventListener`, streams, etc.
 
 ```ts
 const url = new Signal("/api/data");
@@ -153,23 +153,15 @@ const effect = new Effect((effect) => {
 Effects also provide lifecycle helpers that auto-cleanup:
 
 - **`effect.set(signal, value, cleanup)`** - temporarily set the value of a signal for the duration of the effect
-- **`effect.timer(fn, ms)`** - `setTimeout` that cancels on cleanup
-- **`effect.interval(fn, ms)`** - `setInterval` that cancels on cleanup
+- **`effect.timer(fn, duration)`** - run once after a `Duration` on the `@moq/clock` clock, cancelled on cleanup
+- **`effect.timeout(fn, duration)`** - run a nested effect until a `Duration` elapses
+- **`effect.interval(fn, period)`** - run every `Duration` period on the `@moq/clock` clock, cancelled on cleanup
 - **`effect.animate(fn)`** - `requestAnimationFrame` that cancels on cleanup
 - **`effect.event(target, type, fn)`** - `addEventListener` that removes on cleanup/rerun via `AbortSignal`
 - **`effect.subscribe(signal, fn)`** - shorthand: run `fn` each time `signal` changes
 - **`effect.getAll(signals)`** - get the values of multiple signals, only if they are all truthy
 
 ## Framework Integrations
-
-### Solid.js
-
-```ts
-import { createAccessor } from "@moq/signals/solid";
-
-const count = new Signal(0);
-const value = createAccessor(count); // returns a Solid Accessor
-```
 
 ### React
 

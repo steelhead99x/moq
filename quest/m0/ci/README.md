@@ -1,0 +1,196 @@
+# CI cost and latency
+
+## Goal
+
+Pull requests are validated locally with `just ci` and get their cloud verdict
+from the [merge queue](https://github.com/moq-dev/moq/blob/17a81d6c64/quest/m0/ci/land.md) without waiting behind the
+hosted runner limits, and every job spends its minutes on the work its diff
+selected rather than on setup, cold caches, or repeated builds. Concurrent local agents share
+expensive-command capacity, and retained tests earn their cost through useful
+regression signal. Valuable checks stay gated or move to an appropriate queue
+or nightly run; measured low-value redundancy may be retired.
+
+## Plan
+
+Measured 2026-10-13 from the org billing API (Oct 1-13, all moq) and a 1-in-4
+sample of job timings:
+
+| Runner    | Minutes | List price |
+| --------- | ------- | ---------- |
+| macOS     | 33k     | $2,066     |
+| ARM Linux | 98k     | $492       |
+| Windows   | 34k     | $344       |
+| x86 Linux | 30k     | $178       |
+
+Public repositories are not billed, but the org is capped at 60 concurrent
+hosted jobs and 5 macOS jobs (Team plan), and that macOS cap is the queue.
+In the sample, macOS spend came from Platform on PRs (about a third),
+OBS (a quarter), Nightly's release tarballs, Swift, and the Release Dart FFI
+dry run on PRs (five macOS builds per run). On Linux the PR Check and Test
+jobs and the `cache.yml` warm dominate. A branch's PR Check runs a median 2
+and a p90 5 times before it merges.
+
+Decisions (maintainer, 2026-10-13):
+
+- macOS and Windows run in the merge queue, not on every PR push. The fast
+  platform test suites move with them; the rest of Nightly stays nightly.
+  Superseded 2026-10-19: they run nightly on `main` and are required on
+  `release`.
+- Caches move to Cloudflare R2: mbx's S3 backend for Rust, and `nix.moq.dev`
+  replacing Cachix for Nix. The infra lives in `infra/` beside apt and rpm,
+  checked in where wrangler allows; one-time commands where it does not.
+- Untrusted runs only read. Write credentials live in GitHub Environments
+  whose deployment policy allows only `main` (plus release tags for the Nix
+  signing key), so a pull request job cannot read them even from the same
+  repository. Fork PRs get no secrets
+  and run uncached.
+- Decided 2026-10-19: the merge queue is trusted like `main`, since a queued
+  PR is about to land. Rust cache writers are the jobs on `main` and in its
+  queue, and no separate warm rebuilds what landed. Since
+  [#6040](https://github.com/moq-dev/moq/pull/6040) the queue runs on the
+  self-hosted `moq-queue` runner with mbx's local store, so the R2 writers are
+  the hosted scheduled jobs on `main`: Nightly and the workflows it calls,
+  CodSpeed, Interop and TS.
+- Self-hosted CI is dropped: hosted runners plus the R2 caches replace the
+  spare-desktop runner, its cache server, and the cache release it waited on.
+  Reopened 2026-10-19, conditionally, to compare runners once the pipeline
+  was optimized. Decided 2026-10-22 (maintainer): the queue runs on a
+  persistent self-hosted runner, in use since 2026-10-20. Over 32 one-pass
+  entries it took a median 5.5 minutes per merged PR (p90 11.9, at most 24.2)
+  against 21 minutes on a hosted runner, with no per-minute bill. Blacksmith
+  is not pursued.
+- Decided 2026-10-25 (maintainer), superseding the 2026-10-22 choice of the
+  `nix/runner` VM: no VM. The queue runner is the deployed systemd-nspawn
+  container `container@moq-ci`, and new queue runners go into it. Reason: the
+  CI host should run mostly sandboxed through kernel primitives (namespaces,
+  cgroups and slices, seccomp), which the container already uses, so a VM is
+  not needed for isolation. The `nix/runner` VM module is not the deployment
+  target.
+
+Decided 2026-10-26 (maintainer), from 414 queue merges over 2026-10-23 to
+10-26: the queue's latency is serial waiting (98%), not GitHub's overhead
+(about 1 minute per merge), with a median of 18 entries ahead and 12.7% of
+runs failing. GitHub's merge queue cannot test several PRs in one run, so a
+batched gate replaces it: `quest land`, shared through moq-dev/quest, lands
+a tested chain of squash commits ([land](https://github.com/moq-dev/moq/blob/17a81d6c64/quest/m0/ci/land.md)). Decided
+2026-10-30 (maintainer): it runs as a daemon on the maintainer's host, not as
+a workflow on the self-hosted runner. This supersedes concurrent queue
+entries on a second runner. Batching gains most when failures are rare, so the
+[flake epic](/quest/m0/test-flakes-2/README.md) moved to m0 and
+`MIGRATE.md` Unreleased sections, a top source of conflicts, stop being
+written per PR. The batched gate was superseded 2026-11-01, below.
+
+Decided 2026-11-01 (maintainer), reversing 2026-10-26: moq serializes
+through GitHub's merge queue again, one entry at a time on the self-hosted
+runner, and moq-dev/quest's queue watcher resolves dropped PRs' conflicts and
+re-enqueues them. Batching and pre-checks are dropped, and the host gate is
+frozen. The landing quest closed 2026-11-04 with busy hours merging a median
+11.0 PRs against the queue baseline's 6.0 (its
+[last version](https://github.com/moq-dev/moq/blob/17a81d6c64/quest/m0/ci/land.md)
+holds the cutover record). Decided 2026-11-06 (maintainer, /quest-unblock):
+✅ drop the trial of a second concurrent entry, which ran out of shared runner
+disk on 2026-11-05; the queue stays at one entry. Not chosen: retrying it after
+kixel-ai/nixos#26's inode fix.
+
+Decided 2026-10-23 (maintainer), to speed up the serial queue: structural
+changes first (concurrent entries, parallel modules, one test build), then a
+measured nightly-compiler experiment.
+
+Measured 2026-11-04, after the landing quest closed: the queue keeps stable
+rustc, without Cranelift (decided 2026-10-27) or the parallel frontend
+([moq-dev/moq#7900](https://github.com/moq-dev/moq/pull/7900)). On the
+queue's test build after a moq-net edit (jobs 8, 12 CPUs, 5 interleaved
+runs each), the pinned nightly's `--jobs-frontend=8` took 15% longer and
+21% more CPU than the same nightly without it, against a 6% A/A spread, and
+did not shorten the critical `moq-net` test unit. moq-dev/rust2's nightly
+benchmark agrees across 8 runs: clean builds 1-7% slower, a hub edit 2-6%
+faster, for 8-15% more CPU. The ceiling is small anyway: the queue's test
+build is 37% of its job time, and cargo runs fewer than 8 units for only
+27% of it. The pinned nightly also fails the gate today, since it deprecates
+`fetch_update` and the gate denies warnings.
+
+Decided 2026-10-15: local CPU admission, test-cost reductions, and setup
+reductions are all m0. `quest gate` owns generic command admission; repositories
+adopt it through their entrypoints. Agents remain concurrent. Selective test
+retirement is allowed with evidence and an explicit coverage tradeoff, replacing
+the earlier blanket no-shrink constraint. Check/Test remain on PRs and the queue
+(superseded 2026-10-19, below).
+
+Decided 2026-10-19, to cut review-to-merge latency and CI spend: cloud CI runs
+only in the merge queue, and contributors and agents run `just ci` locally
+before pushing. The queue's Linux gate becomes one job once Check sheds its
+feature permutations and release-profile builds. Expensive and optional checks
+run nightly on `main` and are required on `release`. Faster runners come last,
+chosen from measurements of the optimized pipeline. Each CI pass costs twice
+per merged PR today (PR and queue), at 13 minutes median and 26 minutes p90 of
+wall time per PR run. Superseded in part 2026-10-24: the PR gate checks
+feature shapes for the crates a branch changes; Nightly keeps the full matrix.
+
+Decided 2026-10-31 (maintainer), reversing 2026-10-24: "revert the moq-tokio
+features change. It's dumb to build all of the permutations. Maybe as a nightly
+but tbh I don't care, just test the default features (or all-features)." On
+the wasm32 pass: "nobody uses it and it's going to be replaced soon"; on
+io_uring: "keep testing uring in CI, but I guess add it to the default features
+on CI". The land gate's Rust lane is the default-feature test build (with the
+device features, and on Linux the relay's io_uring runtime) plus fmt, doc,
+shear, and sort. It drops the isolated feature
+shapes (`rs_shapes`, cargo-hack), the net, QUIC, tokio, and media feature
+contracts, and the wasm32 and io_uring clippy passes; `just rs features` keeps
+the feature matrix in the Features workflow (nightly and release PRs). On a host land batch the Rust lane had taken about 1,340 s, 691 s
+of it `rs_shapes` and 238 s `tokio-features`.
+
+Decided 2026-10-31 (maintainer), on the gate's remaining lint compiles: "Remove
+loom entirely": moq's history holds only upkeep of the loom models
+([moq-dev/moq#2543](https://github.com/moq-dev/moq/pull/2543) added them, later
+PRs bounded them so Nightly finishes, fixed them after code changes, and
+restored their gate compile checks) and no commit where loom found a race. The
+gate drops `loom-check` and Nightly its loom job; a separate PR deletes the
+models. On Send-depth: "Move it to Nightly." It guards a real downstream
+breakage (moq-net futures not Send at the default recursion limit), so
+`just rs send-depth` keeps its pinned nightly and runs as its own Nightly job
+instead of in the land gate. Superseded 2026-11-13 (maintainer): it gates
+moq-net changes again, since a Nightly-only check let a break land on `main`.
+
+Decided 2026-10-25 (maintainer): across moq's many CI and release builds
+(targets, features, FFI languages, Nix packages), each crate configuration
+compiles once and is reused through the cache, and each run builds and tests
+only what its diff can affect, measured in runner CPU time. Wall clock for its
+own sake and replacing cargo are non-goals. mbx already caches each compilation,
+so the work is making builds identical enough to hit it (flags in
+`.cargo/config.toml`, cargo-hakari), and auditing the package selection `just ci`
+already does. Nix builds run sandboxed and cannot reach R2, so they stay on crane
+for packaging only (superseded 2026-11-13, below: per crate); CI builds with cargo
+and mbx. Decided 2026-10-26 from
+moq-dev/rust2's [Nix build benchmark](https://github.com/moq-dev/rust2/pull/63),
+in billions of instructions over a clean build, a second package, the moq-net edit,
+and a lockfile bump: cargo with mbx totals 9,692 and crane 14,756. crate2nix built
+to the release profile totals 14,538: it wins only the lockfile bump (1,255 against
+crane's 3,681) and costs 11-27% more on the rest.
+
+Decided 2026-11-13 (maintainer), from the spike in
+[moq-dev/moq#8662](https://github.com/moq-dev/moq/pull/8662): ✅ Nix builds
+moq's Rust packages per crate, with crate2nix's generated `nix/Cargo.nix` on
+nixpkgs' `buildRustCrate`, replacing crane. A change rebuilds only the crates
+whose source, features, or dependencies moved, where crane rebuilt every
+workspace crate on any edit and every dependency on any lock change. Crates
+only the final fat-LTO link reads compile to bitcode alone, as cargo does:
+the spike measured that ~11% cheaper than crane cold and modeled it 49% cheaper
+over a week of `main`. Those builds run on free GitHub-hosted runners today,
+but many of these jobs are planned to move to self-hosted runners, where the
+saving lands on our own hosts. The generated file, and the release profile
+restated in `nix/crates.nix`, are accepted for that caching. Measured
+2026-11-14 by the [feature review](/quest/m3/release/feature-review.md): the
+Cache job's Runtime step took a median 13.1 min over 32 crane builds and
+11.9 min over 21 crate2nix builds, so the wall-time saving waits on that move,
+which no quest plans yet; per-PR cost is small (`just rs cargo-nix --check`
+takes about 3 s, and `nix/Cargo.nix` changed in 2 of the next 57 commits).
+
+Decided 2026-10-25 (maintainer), from a profile of moq-net: monomorphized
+generics dominate its build (53% of the library's CPU), and its test target
+costs 3x the library. A "thin generics" profile shrinks them: generic entry
+points delegate to non-generic bodies, and BTreeMap instantiations are shared.
+moq-dev/rust2's driver lints the rule later. Making IETF support a cargo
+feature was considered and not planned: the churn outweighs the build saving.
+
+Measure each change against a current baseline and record the result in its PR.
+The historical samples locate candidates; they are not controlled benchmarks.

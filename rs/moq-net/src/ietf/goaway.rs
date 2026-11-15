@@ -1,52 +1,74 @@
-//! IETF moq-transport-14 goaway message
+//! The moq-transport GOAWAY message.
 
 use std::borrow::Cow;
 
 use crate::coding::*;
 
-use super::Message;
+use super::{Message, RequestId};
 
 use super::Version;
 
 /// GoAway message (0x10)
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GoAway<'a> {
 	pub new_session_uri: Cow<'a, str>,
-	/// Draft-17: timeout in milliseconds before closing the session
+	/// Timeout in milliseconds before closing the session.
 	pub timeout: u64,
+	/// Draft-18 only: the smallest of the receiver's Request IDs the sender has not
+	/// processed. Required on the control stream and absent on a request stream.
+	pub request_id: Option<RequestId>,
 }
 
-impl Message for GoAway<'_> {
+impl std::fmt::Debug for GoAway<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		// The new session URI carries whatever credentials the peer needs to dial it.
+		f.debug_struct("GoAway")
+			.field("new_session_uri_len", &self.new_session_uri.len())
+			.field("timeout", &self.timeout)
+			.field("request_id", &self.request_id)
+			.finish()
+	}
+}
+
+impl<'a> Message<'a> for GoAway<'a> {
 	const ID: u64 = 0x10;
 
-	fn encode_msg<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
-		self.new_session_uri.encode(w, version)?;
-		// Draft-17+ adds a timeout field; draft-18 also adds an optional trailing Request ID
-		// (#1559) which we never emit.
-		if !matches!(version, Version::Draft14 | Version::Draft15 | Version::Draft16) {
-			self.timeout.encode(w, version)?;
+	fn encode_msg(&self, w: &mut Encoder<'_>, version: Version) -> Result<(), EncodeError> {
+		w.string(&self.new_session_uri)?;
+		w.varint(self.timeout)?;
+		// Draft-18 (#1559) added the Request ID; draft-22 removed it again (#1623).
+		if version == Version::Draft18
+			&& let Some(request_id) = self.request_id
+		{
+			request_id.encode(w, version)?;
 		}
 		Ok(())
 	}
 
-	fn decode_msg<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
-		let new_session_uri = Cow::<str>::decode(r, version)?;
-		let timeout = match version {
-			Version::Draft14 | Version::Draft15 | Version::Draft16 => 0,
-			Version::Draft17 => u64::decode(r, version)?,
-			_ => {
-				let timeout = u64::decode(r, version)?;
-				// Draft-18+: optional trailing Request ID (#1559). Drain if present;
-				// moq-lite doesn't act on per-request GOAWAY so the value is discarded.
-				if r.has_remaining() {
-					let _ = u64::decode(r, version)?;
-				}
-				timeout
+	fn decode_msg(r: &mut Decoder<'a>, version: Version) -> Result<Self, DecodeError> {
+		let new_session_uri = Cow::Borrowed(r.str()?);
+		// All drafts cap the New Session URI at 8,192 bytes; a longer one is a
+		// protocol violation.
+		if new_session_uri.len() > 8192 {
+			return Err(DecodeError::InvalidValue);
+		}
+		let (timeout, request_id) = match version {
+			// The Request ID is present only on the control stream; each caller checks it
+			// against the stream it read from.
+			Version::Draft18 => {
+				let timeout = r.varint()?;
+				let request_id = match r.is_empty() {
+					true => None,
+					false => Some(RequestId::decode(r, version)?),
+				};
+				(timeout, request_id)
 			}
+			_ => (r.varint()?, None),
 		};
 		Ok(Self {
 			new_session_uri,
 			timeout,
+			request_id,
 		})
 	}
 }
@@ -54,17 +76,17 @@ impl Message for GoAway<'_> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use bytes::BytesMut;
 
-	fn encode_message<M: Message>(msg: &M) -> Vec<u8> {
-		let mut buf = BytesMut::new();
-		msg.encode_msg(&mut buf, Version::Draft14).unwrap();
+	fn encode_message<'m, M: Message<'m>>(msg: &M) -> Vec<u8> {
+		let mut buf = Vec::new();
+		msg.encode_msg(&mut Encoder::new(&mut buf, Version::Draft22.into()), Version::Draft22)
+			.unwrap();
 		buf.to_vec()
 	}
 
-	fn decode_message<M: Message>(bytes: &[u8]) -> Result<M, DecodeError> {
-		let mut buf = bytes::Bytes::from(bytes.to_vec());
-		M::decode_msg(&mut buf, Version::Draft14)
+	fn decode_message<'m, M: Message<'m>>(bytes: &'m [u8]) -> Result<M, DecodeError> {
+		let mut buf = bytes;
+		crate::coding::decode_from(&mut buf, Version::Draft22, |r, v| M::decode_msg(r, v))
 	}
 
 	#[test]
@@ -72,6 +94,7 @@ mod tests {
 		let msg = GoAway {
 			new_session_uri: "https://example.com/new".into(),
 			timeout: 0,
+			request_id: None,
 		};
 
 		let encoded = encode_message(&msg);
@@ -85,6 +108,7 @@ mod tests {
 		let msg = GoAway {
 			new_session_uri: "".into(),
 			timeout: 0,
+			request_id: None,
 		};
 
 		let encoded = encode_message(&msg);
@@ -94,76 +118,70 @@ mod tests {
 	}
 
 	#[test]
-	fn test_goaway_v17_timeout() {
-		let msg = GoAway {
-			new_session_uri: "https://example.com/new".into(),
-			timeout: 5000,
-		};
-
-		let mut buf = BytesMut::new();
-		msg.encode_msg(&mut buf, Version::Draft17).unwrap();
-
-		let mut bytes = bytes::Bytes::from(buf.to_vec());
-		let decoded: GoAway = GoAway::decode_msg(&mut bytes, Version::Draft17).unwrap();
-
-		assert_eq!(decoded.new_session_uri, "https://example.com/new");
-		assert_eq!(decoded.timeout, 5000);
-	}
-
-	#[test]
 	fn test_goaway_v18_timeout() {
 		let msg = GoAway {
 			new_session_uri: "moqt://relay.example/".into(),
 			timeout: 5000,
+			request_id: Some(RequestId(1)),
 		};
 
-		let mut buf = BytesMut::new();
-		msg.encode_msg(&mut buf, Version::Draft18).unwrap();
+		let mut buf = Vec::new();
+		msg.encode_msg(&mut Encoder::new(&mut buf, Version::Draft18.into()), Version::Draft18)
+			.unwrap();
 
-		let mut bytes = bytes::Bytes::from(buf.to_vec());
-		let decoded: GoAway = GoAway::decode_msg(&mut bytes, Version::Draft18).unwrap();
+		// Draft-18 requires a trailing Request ID on the control stream, so the
+		// v18 body must be exactly one varint longer than the v19 body.
+		let mut buf19 = Vec::new();
+		msg.encode_msg(&mut Encoder::new(&mut buf19, Version::Draft22.into()), Version::Draft22)
+			.unwrap();
+		assert_eq!(buf.len(), buf19.len() + 1, "v18 must append the Request ID varint");
+
+		let decoded: GoAway = crate::coding::decode_from(&mut &buf[..], Version::Draft18, GoAway::decode_msg).unwrap();
 
 		assert_eq!(decoded.new_session_uri, "moqt://relay.example/");
 		assert_eq!(decoded.timeout, 5000);
+		assert_eq!(decoded.request_id, Some(RequestId(1)));
 	}
 
-	/// Draft-19 (#1623) removed the Request ID again: the body is just URI + timeout,
+	/// Draft-22 (#1623) removed the Request ID again: the body is just URI + timeout,
 	/// same bytes we already emit. Round-trip to lock that in.
 	#[test]
 	fn test_goaway_v19_timeout() {
 		let msg = GoAway {
 			new_session_uri: "moqt://relay.example/".into(),
 			timeout: 5000,
+			request_id: None,
 		};
 
-		let mut buf = BytesMut::new();
-		msg.encode_msg(&mut buf, Version::Draft19).unwrap();
+		let mut buf = Vec::new();
+		msg.encode_msg(&mut Encoder::new(&mut buf, Version::Draft18.into()), Version::Draft18)
+			.unwrap();
 
-		let mut bytes = bytes::Bytes::from(buf.to_vec());
-		let decoded: GoAway = GoAway::decode_msg(&mut bytes, Version::Draft19).unwrap();
+		let decoded: GoAway = crate::coding::decode_from(&mut &buf[..], Version::Draft18, GoAway::decode_msg).unwrap();
 
 		assert_eq!(decoded.new_session_uri, "moqt://relay.example/");
 		assert_eq!(decoded.timeout, 5000);
 	}
 
 	/// Draft-18 added an optional trailing Request ID (#1559). A peer that emits
-	/// one must not break our decoder; we drain and discard it.
+	/// one must not break our decoder; we keep it for the parity check.
 	#[test]
 	fn test_goaway_v18_drains_optional_request_id() {
-		use bytes::Buf;
-
 		// Hand-construct a draft-18 GOAWAY body that includes the optional Request ID.
-		let mut buf = BytesMut::new();
-		"moqt://relay.example/".encode(&mut buf, Version::Draft18).unwrap();
-		5000u64.encode(&mut buf, Version::Draft18).unwrap();
+		let mut buf = Vec::new();
+		Encoder::new(&mut buf, Version::Draft18.into())
+			.string("moqt://relay.example/")
+			.unwrap();
+		Encoder::new(&mut buf, Version::Draft18.into()).varint(5000u64).unwrap();
 		// Optional trailing Request ID:
-		42u64.encode(&mut buf, Version::Draft18).unwrap();
+		Encoder::new(&mut buf, Version::Draft18.into()).varint(42u64).unwrap();
 
-		let mut bytes = bytes::Bytes::from(buf.to_vec());
-		let decoded: GoAway = GoAway::decode_msg(&mut bytes, Version::Draft18).unwrap();
+		let mut rest = &buf[..];
+		let decoded: GoAway = crate::coding::decode_from(&mut rest, Version::Draft18, GoAway::decode_msg).unwrap();
 
 		assert_eq!(decoded.new_session_uri, "moqt://relay.example/");
 		assert_eq!(decoded.timeout, 5000);
-		assert!(!bytes.has_remaining(), "trailing Request ID should be consumed");
+		assert_eq!(decoded.request_id, Some(RequestId(42)));
+		assert!(rest.is_empty(), "trailing Request ID should be consumed");
 	}
 }

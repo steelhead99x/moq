@@ -1,16 +1,22 @@
 /**
- * The lite-05 SETUP message: each endpoint advertises its capabilities once, as the
+ * The lite-05+ SETUP message: each endpoint advertises its capabilities once, as the
  * sole message on a unidirectional Setup Stream ({@link DataType.Setup}), then closes it.
  *
  * @module
  */
 
-import { type Origin, OriginSchema } from "../origin.ts";
-import type { Reader, Writer } from "../stream.ts";
+import { type Hop, toHop, wireHop } from "../hop.ts";
+import { encodeVarint, Reader, type Writer } from "../stream.ts";
 import { decodeUtf8 } from "../util/utf8.ts";
-import * as Varint from "../varint.ts";
 import * as Message from "./message.ts";
-import { hasSetupStream, type Version } from "./version.ts";
+import { hasAuth, hasImplementation, hasRouteKey, hasRoutes, hasSetupStream, type Version } from "./version.ts";
+
+const clientParameters = new WeakSet<Setup>();
+
+/** Whether the peer's SETUP carried Path, Role, or Token; raw presence matters even when an unknown Role decodes as Both. */
+export function hasClientParameters(setup: Setup): boolean {
+	return clientParameters.has(setup);
+}
 
 /** Setup Parameter id for the Probe capability level. */
 const PARAM_PROBE = 0x1n;
@@ -18,11 +24,21 @@ const PARAM_PROBE = 0x1n;
 const PARAM_PATH = 0x2n;
 /** Setup Parameter id for the client's intended {@link Role} (client-only). */
 const PARAM_ROLE = 0x3n;
-/** Setup Parameter id for the endpoint's origin (hop) id. */
-const PARAM_ORIGIN = 0x5n;
+/** Setup Parameter id for the endpoint's Hop ID, or from lite-07 its Node ID. */
+const PARAM_HOP = 0x5n;
+/** The top bit, which marks a Node ID a relay qualified; an endpoint never declares one. */
+const QUALIFIED = 1n << 63n;
+/** Setup Parameter id for the endpoint's implementation name and version. */
+const PARAM_IMPLEMENTATION = 0x6n;
+/** Setup Parameter id for the client's connection credential (client-only, lite-07+). */
+const PARAM_TOKEN = 0x7n;
+/** Setup Parameter id for the sender's route key proof (lite-07+). */
+const PARAM_ROUTE_KEY = 0x8n;
+/** A route key proof's size: an Ed25519 public key, then its signature. */
+const ROUTE_KEY_PROOF_SIZE = 96;
 
-/** Cap on the number of parameters in a bag, matching the Rust decoder. */
-const MAX_PARAMS = 64;
+/** SETUP only carries negotiation parameters, so it gets a far smaller cap than other messages. */
+const MAX_SETUP_SIZE = 0xffff;
 
 /**
  * The probe capability an endpoint advertises in SETUP.
@@ -111,27 +127,24 @@ class Parameters {
 		return this.#entries.get(id);
 	}
 
-	/** Set a parameter to a varint value, replacing any existing entry. */
-	setVarint(id: bigint, value: number | bigint) {
-		this.#entries.set(id, Varint.encode(Number(value)));
+	/** Set a parameter to a varint value in `version`'s encoding, replacing any existing entry. */
+	setVarint(id: bigint, value: number | bigint, version: Version) {
+		this.#entries.set(id, encodeVarint(value, version));
 	}
 
-	/** Decode a parameter as a single varint, if present. Throws if trailing bytes remain. */
-	getVarint(id: bigint): bigint | undefined {
+	/** Decode a parameter as a single varint in `version`'s encoding, if present. Throws if trailing bytes remain. */
+	async getVarint(id: bigint, version: Version): Promise<bigint | undefined> {
 		const bytes = this.#entries.get(id);
 		if (bytes === undefined) return undefined;
-		const [value, remain] = Varint.decode(bytes);
-		if (remain.byteLength !== 0) {
+		const r = new Reader(undefined, bytes, version);
+		const value = await r.u62();
+		if (!(await r.done())) {
 			throw new Error("trailing bytes after varint parameter");
 		}
-		return BigInt(value);
+		return value;
 	}
 
 	async encode(w: Writer) {
-		if (this.#entries.size > MAX_PARAMS) {
-			throw new Error("too many parameters");
-		}
-
 		await w.u53(this.#entries.size);
 		for (const [id, value] of this.#entries) {
 			await w.u62(id);
@@ -144,10 +157,6 @@ class Parameters {
 		const params = new Parameters();
 
 		const count = await r.u53();
-		if (count > MAX_PARAMS) {
-			throw new Error("too many parameters");
-		}
-
 		for (let i = 0; i < count; i++) {
 			const id = await r.u62();
 			if (params.#entries.has(id)) {
@@ -170,8 +179,14 @@ export interface SetupProps {
 	path?: string;
 	/** See {@link Setup.role}. Defaults to {@link Role.Both}. */
 	role?: Role;
-	/** See {@link Setup.origin}. Omitted by default. */
-	origin?: Origin;
+	/** See {@link Setup.hop}. Omitted by default. */
+	hop?: Hop;
+	/** See {@link Setup.token}. Omitted by default. */
+	token?: Uint8Array;
+	/** See {@link Setup.implementation}. Omitted by default. */
+	implementation?: string;
+	/** See {@link Setup.routeKey}. Omitted by default. */
+	routeKey?: Uint8Array;
 }
 
 /**
@@ -202,18 +217,41 @@ export class Setup {
 	role: Role;
 
 	/**
-	 * This endpoint's origin (hop) id. The peer uses it to filter announcements and
+	 * This endpoint's Hop ID. The peer uses it to filter announcements and
 	 * subscriptions whose route flows through this endpoint (lite-06 removed the
 	 * per-stream `exclude_hop` in its favor). `undefined` when the endpoint declares
-	 * no identity; a wire value of 0 decodes the same way.
+	 * no identity; a wire value of 0 decodes the same way. From lite-07 it is the
+	 * endpoint's Node ID instead, never 0 or with the top bit set, so a peer that
+	 * receives its own has reached itself.
 	 */
-	origin?: Origin;
+	hop?: Hop;
 
-	constructor({ probe, path, role, origin }: SetupProps = {}) {
+	/**
+	 * The connection credential (lite-07+), which the empty-token Auth Stream names. Sent
+	 * only by the client. Never empty: an empty value is no credential.
+	 */
+	token?: Uint8Array;
+
+	/**
+	 * This endpoint's implementation and version, such as `moq-net-js/0.4.2`. Opaque and
+	 * peer-controlled, so only for logs and rollout counts. `undefined` or empty sends nothing.
+	 */
+	implementation?: string;
+
+	/**
+	 * Proof that the sender holds its route key, bound to this session (lite-07+): the
+	 * Ed25519 public key, then its signature over keying material exported from the session.
+	 */
+	routeKey?: Uint8Array;
+
+	constructor({ probe, path, role, hop, token, implementation, routeKey }: SetupProps = {}) {
 		this.probe = probe ?? ProbeLevel.None;
 		this.path = path;
 		this.role = role ?? Role.Both;
-		this.origin = origin;
+		this.hop = hop;
+		this.token = token;
+		this.implementation = implementation;
+		this.routeKey = routeKey;
 	}
 
 	static #guard(version: Version) {
@@ -222,29 +260,43 @@ export class Setup {
 		}
 	}
 
-	async #encode(w: Writer) {
+	async #encode(w: Writer, version: Version) {
 		const params = new Parameters();
 		// None is the wire default, so omit it to keep the message empty when nothing is set.
 		if (this.probe !== ProbeLevel.None) {
-			params.setVarint(PARAM_PROBE, this.probe);
+			params.setVarint(PARAM_PROBE, this.probe, version);
 		}
 		if (this.path !== undefined) {
 			params.setBytes(PARAM_PATH, new TextEncoder().encode(this.path));
 		}
 		// Both is the wire default, sent as the absence of the parameter.
 		if (this.role !== Role.Both) {
-			params.setVarint(PARAM_ROLE, this.role);
+			params.setVarint(PARAM_ROLE, this.role, version);
 		}
-		if (this.origin !== undefined && this.origin !== 0n) {
-			params.setVarint(PARAM_ORIGIN, this.origin);
+		if (this.hop !== undefined && this.hop !== 0n) {
+			if (hasRoutes(version) && this.hop >= QUALIFIED) throw new Error("setup Node ID cannot be qualified");
+			params.setVarint(PARAM_HOP, wireHop(this.hop, version), version);
+		}
+		if (this.implementation) {
+			params.setBytes(PARAM_IMPLEMENTATION, new TextEncoder().encode(this.implementation));
+		}
+		if (this.token !== undefined) {
+			if (!hasAuth(version)) throw new Error("setup token not supported for this version");
+			if (this.token.byteLength === 0) throw new Error("setup token cannot be empty");
+			params.setBytes(PARAM_TOKEN, this.token);
+		}
+		if (this.routeKey !== undefined) {
+			if (!hasRouteKey(version)) throw new Error("setup route key not supported for this version");
+			if (this.routeKey.byteLength !== ROUTE_KEY_PROOF_SIZE) throw new Error("setup route key must be 96 bytes");
+			params.setBytes(PARAM_ROUTE_KEY, this.routeKey);
 		}
 		await params.encode(w);
 	}
 
-	static async #decode(r: Reader): Promise<Setup> {
+	static async #decode(r: Reader, version: Version): Promise<Setup> {
 		const params = await Parameters.decode(r);
 
-		const probeCode = params.getVarint(PARAM_PROBE);
+		const probeCode = await params.getVarint(PARAM_PROBE, version);
 		const probe = probeCode === undefined ? ProbeLevel.None : probeFromCode(probeCode);
 
 		// An empty path is valid and means the same as omitting the parameter, so a
@@ -252,25 +304,44 @@ export class Setup {
 		const pathBytes = params.getBytes(PARAM_PATH);
 		const path = pathBytes === undefined ? undefined : decodeUtf8(pathBytes);
 
-		const roleCode = params.getVarint(PARAM_ROLE);
+		const roleCode = await params.getVarint(PARAM_ROLE, version);
 		const role = roleCode === undefined ? Role.Both : roleFromCode(roleCode);
 
-		// 0 carries no identity (it cannot be excluded), so it decodes as absent.
-		const originRaw = params.getVarint(PARAM_ORIGIN);
-		const origin = originRaw === undefined || originRaw === 0n ? undefined : OriginSchema.parse(originRaw);
+		// Before lite-07, 0 carries no identity (it cannot be excluded), so it decodes as
+		// absent. A lite-07 Node ID is never 0 or qualified.
+		const hopRaw = await params.getVarint(PARAM_HOP, version);
+		if (hopRaw !== undefined && hasRoutes(version) && (hopRaw === 0n || hopRaw >= QUALIFIED)) {
+			throw new Error("setup Node ID must be non-zero and unqualified");
+		}
+		const hop = hopRaw === undefined || hopRaw === 0n ? undefined : toHop(hopRaw);
 
-		return new Setup({ probe, path, role, origin });
+		// An older version does not know the token parameter, so it ignores it like any other.
+		const token = hasAuth(version) ? params.getBytes(PARAM_TOKEN) : undefined;
+		if (token?.byteLength === 0) throw new Error("setup token cannot be empty");
+
+		const implementationBytes = hasImplementation(version) ? params.getBytes(PARAM_IMPLEMENTATION) : undefined;
+		const implementation = implementationBytes === undefined ? undefined : decodeUtf8(implementationBytes);
+
+		// Kept but not verified: nothing here files routes under the sender's key.
+		const routeKey = hasRouteKey(version) ? params.getBytes(PARAM_ROUTE_KEY) : undefined;
+		if (routeKey !== undefined && routeKey.byteLength !== ROUTE_KEY_PROOF_SIZE) {
+			throw new Error("setup route key must be 96 bytes");
+		}
+
+		const setup = new Setup({ probe, path, role, hop, token, implementation, routeKey });
+		if (pathBytes !== undefined || roleCode !== undefined || token !== undefined) clientParameters.add(setup);
+		return setup;
 	}
 
 	/** Encode the SETUP message with its size prefix. Throws on pre-lite-05 versions. */
 	async encode(w: Writer, version: Version): Promise<void> {
 		Setup.#guard(version);
-		return Message.encode(w, this.#encode.bind(this));
+		return Message.encode(w, (w) => this.#encode(w, version), { max: MAX_SETUP_SIZE });
 	}
 
 	/** Decode a SETUP message with its size prefix. Throws on pre-lite-05 versions. */
 	static async decode(r: Reader, version: Version): Promise<Setup> {
 		Setup.#guard(version);
-		return Message.decode(r, Setup.#decode);
+		return Message.decode(r, (r) => Setup.#decode(r, version), MAX_SETUP_SIZE);
 	}
 }

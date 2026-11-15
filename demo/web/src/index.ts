@@ -17,6 +17,7 @@
  */
 
 import "./highlight";
+import { Duration, now } from "@moq/clock";
 import * as Json from "@moq/json";
 import "@moq/watch/element"; // defines <moq-watch>
 import "@moq/watch/ui"; // defines <moq-watch-ui>
@@ -78,8 +79,14 @@ const metaSignal = new Signals.Signal<unknown>(undefined);
 // tile's <moq-watch> follow it reactively.
 const relayUrl = new Signals.Signal<URL | undefined>(new URL(RELAY_URL));
 
+// This page's feedback name: a tile whose catalog solicits feedback publishes
+// `<echo path>/<VIEWER>-<tile>.echo`, which `moq export echo` reads. Each tile takes its own name,
+// since a feedback broadcast belongs to one catalog and two broadcasts may solicit the same path.
+const VIEWER = `viewer-${crypto.randomUUID().slice(0, 8)}`;
+let tileCount = 0;
+
 // Discovery connection (the tiles each open their own connection internally).
-const connection = new Net.Connection.Reload({ url: relayUrl, enabled: true });
+const connection = new Net.Connection({ url: relayUrl });
 
 // ---------------------------------------------------------------------------
 // Per-broadcast tile (a <moq-watch-ui> in the left column)
@@ -118,10 +125,8 @@ function createTile(name: string): WatchTile {
 	// `broadcast` and decoders, so the shared inspector panel reflects the active tile.
 	const watch = document.createElement("moq-watch") as MoqWatch;
 	watch.name = name;
+	watch.echo = `${VIEWER}-${++tileCount}`;
 	watch.muted = true; // unmuted only while active (see below)
-	// Default to a fixed 100ms jitter buffer (instead of adaptive "real-time") so
-	// the latency visualization has something to show. Drag it in the panel.
-	watch.setAttribute("latency", "100");
 	const canvas = document.createElement("canvas");
 	canvas.style.cssText = "width: 100%; height: auto;";
 	watch.appendChild(canvas);
@@ -176,26 +181,26 @@ function createTile(name: string): WatchTile {
 // ---------------------------------------------------------------------------
 //
 // Subscribe to announcements under the prefix and keep a live set of active broadcasts.
-// `announced.next()` drains the update stream, so we track membership ourselves: active=true adds the
-// path, active=false removes it. `Reload.announced()` spans reconnects (it retracts everything on
+// `announced.next()` drains the event stream, so we track membership ourselves: an announcement adds the
+// path, a retraction removes it. `Connection.announced()` spans reconnects (it retracts everything on
 // disconnect and re-announces on reconnect), so the set self-heals without any extra wiring here.
 const discovery = new Signals.Effect();
 discovery.run((effect) => {
 	const prefix = prefixPath(effect.get(prefixInput));
-	const announced = connection.announced(prefix);
+	const announced = connection.announced(Net.Path.Pattern.subtree(prefix));
 	effect.cleanup(() => announced.close());
 
 	const live = new Set<string>();
 	effect.spawn(async () => {
 		for (;;) {
-			const entry = await Promise.race([effect.cancel, announced.next()]);
+			const entry = await effect.race(announced.next());
 			if (!entry) break;
-			const path = Net.Path.join(prefix, entry.path);
+			const path = entry.prefix;
 			// Only catalog-backed broadcasts are watchable streams; this skips the relay's
 			// `.stats` broadcast (see the stats dashboard demo for that one).
 			if (!path.endsWith(".hang") && !path.endsWith(".msf")) continue;
-			if (entry.active) live.add(path);
-			else live.delete(path);
+			if (entry.kind === "absent") live.delete(path);
+			else live.add(path);
 			broadcasts.set([...live].sort());
 		}
 	});
@@ -293,12 +298,15 @@ ui.run((effect) => {
 	);
 });
 
-// Broadcast pill: Online when the active broadcast is live, else Loading/Offline.
+// Broadcast pill: show whether to wait, update the player, or choose another broadcast.
 ui.run((effect) => {
 	const watch = effect.get(activeWatch);
-	const stream = watch ? effect.get(watch.broadcast.out.status) : "offline"; // offline | loading | live
+	const stream = watch ? effect.get(watch.broadcast.out.status) : "offline";
 	if (stream === "live") setPill("bcast-status", "bcast-text", "Online", "ok");
+	else if (stream === "unsupported") setPill("bcast-status", "bcast-text", "Update player", "bad");
+	else if (stream === "error") setPill("bcast-status", "bcast-text", "Refused", "bad");
 	else if (watch && stream === "loading") setPill("bcast-status", "bcast-text", "Loading", "wait");
+	else if (watch && stream === "connecting") setPill("bcast-status", "bcast-text", "Connecting", "wait");
 	else setPill("bcast-status", "bcast-text", "Offline", "bad");
 });
 
@@ -382,8 +390,10 @@ ui.run((effect) => {
 	section.hidden = false;
 
 	// Report the transport negotiated by the live connection.
-	const conn = effect.get(connection.established);
-	$("network-transport").textContent = conn ? (conn.transport === "websocket" ? "WebSocket" : "WebTransport") : "";
+	const transport = effect.get(connection.transport);
+	$("network-transport").textContent = transport
+		? { websocket: "WebSocket", webtransport: "WebTransport", webrtc: "WebRTC" }[transport]
+		: "";
 
 	const video = effect.get(watch.video.out.stats);
 	const audio = effect.get(watch.audio.out.stats);
@@ -431,16 +441,18 @@ ui.run((effect) => {
 		return;
 	}
 
-	const track = broadcast.track(trackName).subscribe({ priority: Hang.Catalog.PRIORITY.catalog });
-	effect.cleanup(() => track.close());
-	const consumer = new Json.Snapshot.Consumer<unknown>(track);
+	const consumer = new Json.Snapshot.Consumer<unknown>({
+		track: broadcast.track(trackName),
+		priority: Hang.Catalog.PRIORITY.catalog,
+	});
+	effect.cleanup(() => consumer.close());
 
 	effect.spawn(async () => {
 		try {
 			for (;;) {
-				const value = await Promise.race([effect.cancel, consumer.next()]);
-				if (value === undefined) break;
-				metaSignal.set(value);
+				const state = await effect.race(consumer.latest());
+				if (state === undefined) break;
+				metaSignal.set(state.value);
 			}
 		} catch (err) {
 			console.warn("error reading metadata", err);
@@ -490,12 +502,18 @@ $("network-graphs").append(throughputGraph.el, rttGraph.el);
 
 const allGraphs = [videoBitrateGraph, audioBitrateGraph, fpsGraph, throughputGraph, rttGraph];
 
+// The RTT graph samples with peek(), which requests no estimates, so subscribe to keep them coming.
+viz.run((effect) => {
+	const watch = effect.get(activeWatch);
+	if (watch) effect.cleanup(watch.connection.probe.subscribe(() => {}));
+});
+
 // Sample the active tile's byte/frame counters and push per-second rates.
 let prevWatch: MoqWatch | undefined;
-let prev = { frames: 0, videoBytes: 0, audioBytes: 0, when: performance.now() };
+let prev = { frames: 0, videoBytes: 0, audioBytes: 0, when: now() };
 viz.interval(() => {
 	const watch = activeWatch.peek();
-	const now = performance.now();
+	const at = now();
 
 	// Reset baselines when switching tiles (or when idle) so the first sample
 	// isn't a huge spike from the counter difference.
@@ -507,7 +525,7 @@ viz.interval(() => {
 			frames: video?.frameCount ?? 0,
 			videoBytes: video?.bytesReceived ?? 0,
 			audioBytes: audio?.bytesReceived ?? 0,
-			when: now,
+			when: at,
 		};
 		for (const g of allGraphs) g.push(undefined);
 		return;
@@ -518,7 +536,7 @@ viz.interval(() => {
 	const videoBytes = v?.bytesReceived ?? 0;
 	const audioBytes = a?.bytesReceived ?? 0;
 	const frames = v?.frameCount ?? 0;
-	const elapsed = now - prev.when;
+	const elapsed = at.since(prev.when).asMillis();
 
 	const perSec = (delta: number) => (delta >= 0 ? (delta * 1000) / elapsed : undefined);
 	let videoBitrate: number | undefined;
@@ -536,11 +554,11 @@ viz.interval(() => {
 	fpsGraph.push(fps);
 	throughputGraph.push(throughput);
 
-	const rtt = watch.connection.probe.peek()?.rtt as unknown as number | undefined;
+	const rtt = watch.connection.probe.peek()?.rtt?.asMillis();
 	rttGraph.push(rtt && rtt > 0 ? rtt : undefined);
 
-	prev = { frames, videoBytes, audioBytes, when: now };
-}, 250);
+	prev = { frames, videoBytes, audioBytes, when: at };
+}, Duration.millis(250));
 
 // Rebuild the buffer visualization whenever the active tile changes; it binds to
 // one element and runs its own animation loop until its child effect closes.

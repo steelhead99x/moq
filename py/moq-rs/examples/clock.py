@@ -1,4 +1,4 @@
-"""Publish or subscribe to a clock track. Python twin of `rs/moq-native/examples/clock.rs`.
+"""Publish or subscribe to a clock track. Python twin of `rs/moq-tokio/examples/clock.rs`.
 
 Each minute is a new group; each second is a frame inside that group. The first
 frame of every group is the "YYYY-MM-DD HH:MM:" prefix, followed by one "SS"
@@ -15,32 +15,34 @@ from datetime import datetime, timezone
 import moq
 
 
-async def publish(url: str, broadcast_name: str, track_name: str, tls_verify: bool) -> None:
-    async with moq.Client(url, tls_verify=tls_verify) as client:
-        broadcast = client.create_broadcast(broadcast_name)
-        track = broadcast.publish_track(track_name)
+async def publish(url: str, broadcast_name: str, track_name: str, insecure: bool) -> None:
+    async with moq.Client(url, tls=moq.ClientTls(insecure=insecure)) as client:
+        route = client.route(broadcast_name, hidden=True)
+        track = route.broadcast.publish_track(track_name, moq.TrackInfo(timescale=1_000_000))
+        route.announce()
         print(f"publishing {broadcast_name!r} track={track_name!r} at {url}")
 
         while True:
             now = datetime.now(timezone.utc).replace(microsecond=0)
-            timestamp_us = int(now.timestamp()) * 1_000_000
+            timestamp = moq.Timestamp(int(now.timestamp()), 1)
             group = track.append_group()
-            group.write_frame(now.strftime("%Y-%m-%d %H:%M:").encode(), timestamp_us)
+            group.write_frame(now.strftime("%Y-%m-%d %H:%M:").encode(), timestamp)
 
             current_minute = now.minute
             while now.minute == current_minute:
-                timestamp_us = int(now.timestamp()) * 1_000_000
-                group.write_frame(now.strftime("%S").encode(), timestamp_us)
+                timestamp = moq.Timestamp(int(now.timestamp()), 1)
+                group.write_frame(now.strftime("%S").encode(), timestamp)
                 await asyncio.sleep(1 - datetime.now(timezone.utc).microsecond / 1_000_000)
                 now = datetime.now(timezone.utc).replace(microsecond=0)
 
             group.finish()
 
 
-async def subscribe(url: str, broadcast_name: str, track_name: str, tls_verify: bool) -> None:
-    async with moq.Client(url, tls_verify=tls_verify) as client:
+async def subscribe(url: str, broadcast_name: str, track_name: str, insecure: bool) -> None:
+    async with moq.Client(url, tls=moq.ClientTls(insecure=insecure)) as client:
         print(f"waiting for {broadcast_name!r} at {url}")
-        broadcast = await client.announced_broadcast(broadcast_name)
+        broadcast = await client.follow(broadcast_name)
+        assert broadcast is not None
 
         print(f"subscribed to {broadcast_name!r} track={track_name!r}")
         track = await broadcast.subscribe_track(track_name)
@@ -65,7 +67,7 @@ def main() -> None:
 
     runner = publish if args.role == "publish" else subscribe
     try:
-        asyncio.run(runner(args.url, args.broadcast, args.track, tls_verify=not args.no_tls_verify))
+        asyncio.run(runner(args.url, args.broadcast, args.track, insecure=args.no_tls_verify))
     except KeyboardInterrupt:
         pass
 

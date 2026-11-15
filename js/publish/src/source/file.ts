@@ -1,10 +1,15 @@
+import { Duration, Instant, now } from "@moq/clock";
+import * as Util from "@moq/hang/util";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
-import type * as Audio from "../audio";
-import type { StreamTrack as VideoStreamTrack } from "../video/types";
+import type { InputAudioTrack, InputVideoTrack, VideoSample } from "mediabunny";
+import { hosted } from "../assets";
+import { pace, sleepUntil } from "./pace";
+import { Timeline } from "./timeline";
+import type { Media } from "./types";
 
-// Signals the file source reads.
+/** Signals the file source reads. */
 export type FileInput = {
-	// Whether to decode the file. When false the tracks are stopped and `out.source` clears.
+	// Whether to decode the file. Defaults to true. When false the decode stops and `out.source` clears.
 	enabled: Getter<boolean>;
 };
 
@@ -14,31 +19,47 @@ export interface FileProps extends Inputs<FileInput> {
 	file?: globalThis.File | Signal<globalThis.File | undefined>;
 }
 
-type FileOutput = {
-	// The tracks decoded from the file, empty while disabled or undecodable.
-	source: Signal<{ video?: VideoStreamTrack; audio?: Audio.Source }>;
+/** Signals the file source derives. */
+export type FileOutput = {
+	// The sources decoded from the file, undefined while disabled or undecodable.
+	source: Signal<Media | undefined>;
 };
 
 // Image, video, and audio files we know how to decode (see #decode).
 const ACCEPT = "image/*,video/*,audio/*";
 
-/** Decodes a local file into looping capture tracks. */
+// A still image has no cadence of its own, so republish it at this rate. Delta coding makes the
+// repeats nearly free, and a steady stream keeps the encoder's keyframe interval honest.
+const IMAGE_FRAME_RATE = 30;
+
+// How many packets to measure when estimating the file's frame rate.
+const FRAME_RATE_SAMPLES = 100;
+
+/**
+ * Decodes a local file into looping publish sources.
+ *
+ * The file is demuxed and decoded directly rather than played through a `<video>` element, so the
+ * frames carry the container's own timestamps, audio works on every browser, and nothing stops when
+ * the window isn't composited.
+ */
 export class File {
+	/** The wired inputs, read-only. */
 	readonly in: Readonlys<FileInput>;
 
 	/** The file to decode. Written by {@link prompt}, or set it directly. */
 	file: Signal<globalThis.File | undefined>;
 
 	readonly #out: FileOutput = {
-		source: new Signal<{ video?: VideoStreamTrack; audio?: Audio.Source }>({}),
+		source: new Signal<Media | undefined>(undefined),
 	};
+	/** The derived outputs, read-only. */
 	readonly out = readonlys(this.#out);
 
 	#signals = new Effect();
 
 	constructor(props?: FileProps) {
 		this.in = {
-			enabled: getter(props?.enabled ?? false),
+			enabled: getter(props?.enabled ?? true),
 		};
 		this.file = Signal.from(props?.file);
 
@@ -69,109 +90,129 @@ export class File {
 	}
 
 	async #decode(file: globalThis.File, effect: Effect) {
-		const type = file.type;
-
-		if (type.startsWith("image/")) {
+		// Only images are routed by MIME type. Everything else goes to the demuxer, which sniffs the
+		// container itself and so still works for the files browsers report with an empty type.
+		if (file.type.startsWith("image/")) {
 			await this.#decodeImage(file, effect);
-		} else if (type.startsWith("video/") || type.startsWith("audio/")) {
-			await this.#decodeMedia(file, effect);
 		} else {
-			throw new Error(`Unsupported file type: ${type}`);
+			await this.#decodeMedia(file, effect);
 		}
 	}
 
 	async #decodeImage(file: globalThis.File, effect: Effect) {
-		const img = new Image();
-		const url = URL.createObjectURL(file);
-		img.src = url;
-		await img.decode();
+		const signal = effect.abort;
 
-		effect.cleanup(() => URL.revokeObjectURL(url));
+		const bitmap = await createImageBitmap(file);
+		effect.cleanup(() => bitmap.close());
+		if (signal.aborted) return;
 
-		const videoTrack = this.#captureCanvas(img, img.width, img.height, effect);
-		effect.set(this.#out.source, { video: videoTrack }, {});
+		const zero = now();
+		let index = 0;
+
+		const frames = new ReadableStream<VideoFrame>(
+			{
+				async pull(controller) {
+					// Every repeat is the same picture, so a reader returning after a gap skips to the
+					// slot due now instead of replaying each one it missed.
+					const due = Math.floor(now().since(zero).asSecs() * IMAGE_FRAME_RATE);
+					index = Math.max(index, due);
+
+					const at = zero.saturatingAdd(Duration.secs(index / IMAGE_FRAME_RATE));
+					index++;
+
+					await sleepUntil(at, signal);
+
+					// The bitmap is closed on teardown, so stop before building a frame from a dead one.
+					if (signal.aborted) {
+						controller.close();
+						return;
+					}
+
+					controller.enqueue(
+						new VideoFrame(bitmap, { timestamp: Math.round(at.since(Instant.ZERO).asMicros()) }),
+					);
+				},
+			},
+			// Prefetching would park a stale frame in the queue while nothing reads, and hand it out on resume.
+			{ highWaterMark: 0 },
+		);
+
+		effect.set(this.#out.source, { video: { frames, frameRate: IMAGE_FRAME_RATE } }, undefined);
 	}
 
 	async #decodeMedia(file: globalThis.File, effect: Effect) {
-		const video = document.createElement("video");
+		const signal = effect.abort;
+		// Keep the picker and image path available without downloading the media demuxers.
+		const { ALL_FORMATS, AudioSampleSink, BlobSource, Input, VideoSampleSink } = await import("mediabunny");
+		if (signal.aborted) return;
 
-		const url = URL.createObjectURL(file);
-		video.src = url;
-		video.loop = true;
-		video.muted = true;
+		const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
+		effect.cleanup(() => input.dispose());
 
-		await new Promise<void>((resolve, reject) => {
-			video.onloadedmetadata = () => resolve();
-			video.onerror = () => reject(new Error(`Failed to load file: ${file.name}`));
-		});
-
-		await video.play();
-
-		effect.cleanup(() => {
-			video.pause();
-			URL.revokeObjectURL(url);
-		});
-
-		// Chrome and Firefox can pull live tracks (video and audio) straight off the media element.
-		if (supportsCaptureStream(video)) {
-			const stream = video.captureStream();
-			const videoTrack = stream.getVideoTracks()[0];
-			const audioTrack = stream.getAudioTracks()[0];
-
-			if (!videoTrack && !audioTrack) {
-				throw new Error("Failed to capture any tracks from file");
-			}
-
-			effect.set(
-				this.#out.source,
-				{
-					video: videoTrack as VideoStreamTrack | undefined,
-					audio: audioTrack ? { track: audioTrack as Audio.StreamTrack, kind: "auto" } : undefined,
-				},
-				{},
-			);
-			return;
+		if (!(await input.canRead())) {
+			// Disposing the input mid-read is a teardown, not a broken file.
+			if (signal.aborted) return;
+			throw new Error(`Cannot publish "${file.name}": unrecognized container format.`);
 		}
 
-		// WebKit (Safari) doesn't implement HTMLMediaElement.captureStream, so sample the decoded
-		// frames onto a canvas instead (canvas.captureStream is supported everywhere). Audio can't
-		// come along: WebKit only exposes a media element's audio via the Web Audio API, and only
-		// once a microphone permission is granted. So a video file publishes video-only, while an
-		// audio-only file has nothing to fall back to and fails with a clear message.
-		if (video.videoWidth === 0 || video.videoHeight === 0) {
-			throw new Error(
-				`Cannot publish "${file.name}": this browser can't capture audio from files, and this file has no video.`,
-			);
+		const [video, audio] = await Promise.all([input.getPrimaryVideoTrack(), input.getPrimaryAudioTrack()]);
+
+		// Install the WebCodecs polyfill before probing: canDecode() reports false when AudioDecoder
+		// is missing rather than throwing, so probing first would drop the audio track on an engine
+		// the polyfill could have covered. A no-op wherever WebCodecs is native.
+		if (audio) await Util.Libav.polyfill(hosted.url);
+
+		// A codec this browser can't decode drops just its own track: the other one is usually still
+		// publishable, and a video-only publish beats failing outright.
+		const [videoOk, audioOk] = await Promise.all([decodable(video, file), decodable(audio, file)]);
+		if (!videoOk && !audioOk) {
+			if (signal.aborted) return;
+			throw new Error(`Cannot publish "${file.name}": no decodable audio or video track.`);
 		}
 
-		console.warn(`Publishing "${file.name}" without audio: this browser can't capture audio from files.`);
+		const duration = await input.computeDuration();
 
-		const videoTrack = this.#captureCanvas(video, video.videoWidth, video.videoHeight, effect);
-		effect.set(this.#out.source, { video: videoTrack }, {});
-	}
+		// The encoder sizes its bitrate off this, and a file's real cadence beats assuming 30fps.
+		const frameRate =
+			video && videoOk ? (await video.computePacketStats(FRAME_RATE_SAMPLES)).averagePacketRate : undefined;
+		const toFrame = video && videoOk ? await converter(video) : undefined;
+		const format =
+			audio && audioOk
+				? { sampleRate: await audio.getSampleRate(), channelCount: await audio.getNumberOfChannels() }
+				: undefined;
 
-	// Sample a drawable source onto a canvas at 30fps and return the captured video track. We route
-	// through a canvas because canvas.captureStream is implemented everywhere, unlike the media-element
-	// variant WebKit lacks (see #decodeMedia).
-	#captureCanvas(source: CanvasImageSource, width: number, height: number, effect: Effect): VideoStreamTrack {
-		const canvas = document.createElement("canvas");
-		canvas.width = width;
-		canvas.height = height;
+		// Pin the clock last. Probing the file takes a moment, and anchoring before that would leave
+		// the first samples already overdue, so playback would open with a catch-up burst.
+		//
+		// One timeline for both tracks, so they restart together and stay in sync across loops.
+		const timeline = new Timeline(now(), duration);
 
-		const ctx = canvas.getContext("2d");
-		if (!ctx) {
-			throw new Error("Failed to create 2D canvas context");
-		}
+		const source: Media = {
+			video:
+				video && toFrame
+					? {
+							frames: pace(new VideoSampleSink(video), timeline, toFrame, signal),
+							frameRate,
+						}
+					: undefined,
+			audio:
+				audio && format
+					? {
+							samples: pace(
+								new AudioSampleSink(audio),
+								timeline,
+								(sample) => sample.toAudioData(),
+								signal,
+							),
+							...format,
+							// A file is whatever the user picked, so leave the Opus tuning to the encoder.
+							kind: "auto",
+						}
+					: undefined,
+		};
 
-		effect.interval(() => ctx.drawImage(source, 0, 0), 1000 / 30);
-
-		const stream = canvas.captureStream(30);
-		const videoTrack = stream.getVideoTracks()[0];
-		if (!videoTrack) {
-			throw new Error("Failed to capture video track from canvas stream");
-		}
-
-		return videoTrack as VideoStreamTrack;
+		if (signal.aborted) return;
+		effect.set(this.#out.source, source, undefined);
 	}
 
 	/** Stop decoding and release the file. */
@@ -180,8 +221,30 @@ export class File {
 	}
 }
 
-// HTMLMediaElement.captureStream isn't in the standard DOM typings and WebKit doesn't implement it,
-// so feature-detect it rather than casting unconditionally.
-function supportsCaptureStream(video: HTMLVideoElement): video is HTMLVideoElement & { captureStream(): MediaStream } {
-	return typeof (video as { captureStream?: unknown }).captureStream === "function";
+// Phone footage is usually stored sideways with rotation metadata, which toVideoFrame() ignores
+// because a VideoFrame can't carry it. Drawing through a canvas is the only way to bake it in.
+async function converter(track: InputVideoTrack): Promise<(sample: VideoSample) => VideoFrame> {
+	if ((await track.getRotation()) === 0) return (sample) => sample.toVideoFrame();
+
+	const canvas = new OffscreenCanvas(await track.getDisplayWidth(), await track.getDisplayHeight());
+
+	const ctx = canvas.getContext("2d");
+	if (!ctx) throw new Error("Failed to create 2D canvas context");
+
+	return (sample) => {
+		sample.draw(ctx, 0, 0, canvas.width, canvas.height);
+		return new VideoFrame(canvas, { timestamp: sample.microsecondTimestamp });
+	};
+}
+
+// Whether we can decode this track, warning (rather than throwing) when we can't so the file's other
+// track still publishes.
+async function decodable(track: InputVideoTrack | InputAudioTrack | null, file: globalThis.File): Promise<boolean> {
+	if (!track) return false;
+	if (await track.canDecode()) return true;
+
+	console.warn(
+		`Publishing "${file.name}" without its ${track.type} track: this browser can't decode ${await track.getCodec()}.`,
+	);
+	return false;
 }

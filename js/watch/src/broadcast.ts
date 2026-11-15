@@ -2,43 +2,80 @@ import * as Catalog from "@moq/hang/catalog";
 import * as Json from "@moq/json";
 import * as Msf from "@moq/msf";
 import type * as Moq from "@moq/net";
-import { Path } from "@moq/net";
-import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
+import { Instance, Error as NetError, Path, StreamCode, Track } from "@moq/net";
+import {
+	Derived,
+	Effect,
+	type Getter,
+	type GetterType,
+	getter,
+	type Inputs,
+	type Readonlys,
+	readonlys,
+	Signal,
+} from "@moq/signals";
 
 import { toHang } from "./msf";
 
-// Connections already warned about missing broadcast-discovery support, so the
-// announcement check logs at most once per connection.
-const warnedNoDiscovery = new WeakSet<Moq.Connection.Established>();
-
-// Whether to skip the announcement gate for a cross-broadcast reference: without discovery,
-// waiting on an announcement would hang forever, so subscribe immediately and warn once per
-// connection. The main broadcast doesn't need this; @moq/net's `announcedBroadcast` falls back
-// on its own.
-function skipDiscovery(conn: Moq.Connection.Established): boolean {
-	if (conn.discovery) return false;
-	if (!warnedNoDiscovery.has(conn)) {
-		warnedNoDiscovery.add(conn);
-		console.warn("relay does not support broadcast discovery; subscribing to siblings blind.");
-	}
-	return true;
-}
-
 type ReferencedRendition = {
-	broadcast?: string;
+	broadcast?: Path.Relative;
+	instance?: Catalog.ReferenceInstance;
 };
+
+// Whether a rendition's reference names something this consumer can play.
+type Usable = (rel: Path.Relative | undefined, instance: Moq.Instance.Valid | undefined) => boolean;
 
 // Either the catalog's own broadcast, or a sibling to consume by path.
 type RelativeTarget = { local: true } | { local: false; path: Moq.Path.Valid };
 
 function filterRenditions<T extends ReferencedRendition>(
 	renditions: Record<string, T>,
-	usable: (rel: string | undefined) => boolean,
+	usable: Usable,
 ): Record<string, T> {
-	return Object.fromEntries(Object.entries(renditions).filter(([, config]) => usable(config.broadcast)));
+	return Object.fromEntries(
+		Object.entries(renditions).filter(([, config]) => usable(config.broadcast, config.instance)),
+	);
 }
 
-function filterCatalog(catalog: Catalog.Root, usable: (rel: string | undefined) => boolean): Catalog.Root {
+// Whether `active` is proven to be another stream than `instance` names. A route over a wire
+// that carries no instance has one its session minted, which proves nothing, so only a known
+// mismatch counts.
+function provesOther(active: Moq.Broadcast.Consumer | undefined, instance: Moq.Instance.Valid | undefined): boolean {
+	if (instance === undefined || active?.instance === undefined) return false;
+	return !Instance.isMinted(active.instance) && active.instance !== instance;
+}
+
+// Whether an announced route covers `path`, and whether the origin has heard every attached
+// session's initial announcements for it, until closed. Hidden routes count: a service claim
+// under a `.`-named prefix is kept out of listings, but it still covers the renditions it would
+// produce, and this is never shown to anyone.
+function watchCovered(
+	origin: Moq.Origin.Reader,
+	path: Moq.Path.Valid,
+): { covered: Getter<boolean>; synced: Getter<boolean>; close: () => void } {
+	const announced = origin.announced(Path.Pattern.literal(path), { hidden: true, covering: true });
+	const covered = new Signal(false);
+	const active = new Set<Moq.Path.Valid>();
+	void (async () => {
+		try {
+			for (;;) {
+				const entry = await announced.next();
+				if (!entry) break;
+				if (entry.kind === "absent" || entry.kind === "offline") active.delete(entry.prefix);
+				else if (entry.kind === "present") active.add(entry.prefix);
+				covered.set([...active].some((prefix) => Path.hasPrefix(prefix, path)));
+			}
+		} catch {
+			// The origin closed under the watch; nothing covers the path any more.
+		}
+		covered.set(false);
+	})();
+	return { covered, synced: announced.synced, close: () => announced.close() };
+}
+
+// Every section carrying a `broadcast` reference must be listed here, same as `Catalog.checkResolvable`;
+// one left out silently exempts its tracks from the reachability filter.
+function filterCatalog(catalog: Catalog.Root, usable: Usable): Catalog.Root {
 	return {
 		...catalog,
 		video: catalog.video
@@ -47,81 +84,242 @@ function filterCatalog(catalog: Catalog.Root, usable: (rel: string | undefined) 
 		audio: catalog.audio
 			? { ...catalog.audio, renditions: filterRenditions(catalog.audio.renditions, usable) }
 			: undefined,
+		text: catalog.text
+			? { ...catalog.text, renditions: filterRenditions(catalog.text.renditions, usable) }
+			: undefined,
+		json: catalog.json ? { ...catalog.json, tracks: filterRenditions(catalog.json.tracks, usable) } : undefined,
+		binary: catalog.binary
+			? { ...catalog.binary, tracks: filterRenditions(catalog.binary.tracks, usable) }
+			: undefined,
 	};
 }
 
-// Watch supports the on-the-wire catalog formats from @moq/hang, plus "hangz" (the
-// DEFLATE-compressed `catalog.json.z` track) and a "manual" mode where the user supplies the
-// catalog directly without fetching. "hangz" is opt-in only: it shares the `.hang` broadcast suffix
-// and is never auto-detected, so set it explicitly via `catalogFormat`.
-export const CATALOG_FORMATS = [...Catalog.FORMATS, "hangz", "manual"] as const;
-export type CatalogFormat = (typeof CATALOG_FORMATS)[number];
+// An include whose catalog has been read: its ID, its broadcast's path, and the stream it names.
+type Included = { id: string; path: Moq.Path.Valid; instance?: Catalog.ReferenceInstance; catalog: Catalog.Root };
 
-export function parseCatalogFormat(value: string | null): CatalogFormat | undefined {
-	if (value === null) return undefined;
-	return CATALOG_FORMATS.find((f) => f === value);
+type Rendition = Catalog.VideoConfig | Catalog.AudioConfig;
+
+// The broadcast and track a rendition reads, as one key: two entries with the same key are the
+// same media, whatever their IDs.
+function identity(path: Moq.Path.Valid, track: string): string {
+	return JSON.stringify([path, track]);
 }
 
-type Status = "offline" | "loading" | "live";
+// Merge each include's usable renditions of one kind into `own`, keyed `<include>/<id>` and rebased
+// so their `broadcast` reference resolves from `base`. Skips one that reads media already listed, such
+// as the source an include relists, and one whose ID is taken, so the root's IDs are never shadowed.
+// `first` is the first include that contributed a rendition.
+function mergeRenditions<T extends Rendition>(
+	own: Record<string, T> | undefined,
+	includes: { include: Included; renditions: Record<string, T> | undefined }[],
+	base: Moq.Path.Valid,
+	taken: Set<string>,
+	seen: Set<string>,
+	usable: Usable,
+): { renditions: Record<string, T>; first?: Included } {
+	const merged: [string, T][] = Object.entries(own ?? {});
+	let first: Included | undefined;
+	for (const { include, renditions } of includes) {
+		for (const [id, config] of Object.entries(renditions ?? {})) {
+			// The include's catalog was checked against its own path, so this always resolves.
+			const target =
+				config.broadcast === undefined ? include.path : Path.tryResolve(include.path, config.broadcast);
+			const name = `${include.id}/${id}`;
+			if (target === undefined || taken.has(name)) continue;
+			const track = Catalog.track(id, config);
+			const key = identity(target, track);
+			if (seen.has(key)) continue;
+			const broadcast = target === base ? undefined : Path.relative(target, base);
+			if (target !== base && broadcast === undefined) continue;
 
-// Signals the component reads. Whoever owns the backing Signal (the caller, or
-// another component whose output is wired in) does the writing.
+			// One reading the include's own broadcast inherits the stream its entry names.
+			const instance = target === include.path ? (config.instance ?? include.instance) : config.instance;
+			if (!usable(broadcast, instance)) continue;
+			const { broadcast: _broadcast, instance: _instance, ...rest } = config;
+			const rebased = { ...rest, track } as T;
+			if (broadcast !== undefined) rebased.broadcast = broadcast;
+			if (instance !== undefined) rebased.instance = instance;
+
+			merged.push([name, rebased]);
+			first ??= include;
+			taken.add(name);
+			seen.add(key);
+		}
+	}
+	// fromEntries defines each ID as its own key, so `__proto__` stays a rendition.
+	return { renditions: Object.fromEntries(merged), first };
+}
+
+// The root catalog with each read include's usable video and audio renditions beside its own, as one
+// set to select from. The root's settings govern them all, since an include shares its timeline.
+// `root` is already filtered, so a stale entry of its own never hides an include's playable one, while
+// `raw` keeps every ID the root publishes reserved, so an include's ID never takes one over.
+function withIncludes(
+	raw: Catalog.Root,
+	root: Catalog.Root,
+	base: Moq.Path.Valid,
+	includes: Included[],
+	usable: Usable,
+): Catalog.Root {
+	if (includes.length === 0) return root;
+
+	const taken = new Set([...Object.keys(raw.video?.renditions ?? {}), ...Object.keys(raw.audio?.renditions ?? {})]);
+	const seen = new Set<string>();
+	for (const renditions of [root.video?.renditions, root.audio?.renditions]) {
+		for (const [id, config] of Object.entries(renditions ?? {})) {
+			const path = config.broadcast === undefined ? base : Path.tryResolve(base, config.broadcast);
+			if (path !== undefined) seen.add(identity(path, Catalog.track(id, config)));
+		}
+	}
+
+	const video = mergeRenditions(
+		root.video?.renditions,
+		includes.map((include) => ({ include, renditions: include.catalog.video?.renditions })),
+		base,
+		taken,
+		seen,
+		usable,
+	);
+	const audio = mergeRenditions(
+		root.audio?.renditions,
+		includes.map((include) => ({ include, renditions: include.catalog.audio?.renditions })),
+		base,
+		taken,
+		seen,
+		usable,
+	);
+
+	// A root without a section of its own takes the display settings of the first include whose
+	// renditions made it in, so they describe media actually listed.
+	const videoSection = root.video ?? video.first?.catalog.video;
+	const audioSection = root.audio ?? audio.first?.catalog.audio;
+	return {
+		...root,
+		video: videoSection && { ...videoSection, renditions: video.renditions },
+		audio: audioSection && { ...audioSection, renditions: audio.renditions },
+	};
+}
+
+/**
+ * Watch supports the on-the-wire catalog formats from `@moq/hang`, plus a "manual" mode where the
+ * user supplies the catalog directly without fetching.
+ */
+export const CATALOG_FORMATS = [...Catalog.FORMATS, "manual"] as const;
+/** A catalog format the watcher can read; see {@link CATALOG_FORMATS}. */
+export type CatalogFormat = (typeof CATALOG_FORMATS)[number];
+
+/**
+ * Signals the component reads. Whoever owns the backing Signal (the caller, or
+ * another component whose output is wired in) does the writing.
+ */
 export type BroadcastInput = {
-	connection: Getter<Moq.Connection.Established | undefined>;
+	// The read-side origin to borrow. Independent of any connection: whichever sessions feed
+	// the origin resolve the broadcast, and the handle spans their reconnects.
+	// Unset reads "connecting", like an origin with no session attached, never "offline".
+	origin: Getter<Moq.Origin.Reader | undefined>;
 
-	// Whether to start downloading the broadcast.
-	// Defaults to false so you can make sure everything is ready before starting.
+	// Whether to start downloading the broadcast. Defaults to true.
 	enabled: Getter<boolean>;
 
 	// The broadcast name.
 	name: Getter<Moq.Path.Valid>;
 
-	// Whether to reload the broadcast when it goes offline.
-	// Defaults to true; pass false to subscribe immediately without waiting for an announcement.
-	reload: Getter<boolean>;
+	// Whether to follow the broadcast's announcements (`Origin.follow`), waiting for one before
+	// subscribing and moving to each restart. Defaults to true; pass false to request it once
+	// (`Origin.request`), subscribing immediately without waiting for an announcement.
+	follow: Getter<boolean>;
 
 	// Which catalog format to use. When `undefined` (the default), the format is
 	// auto-detected from the broadcast name extension (`.hang`, `.msf`), falling
 	// back to `"hang"` if the name has no recognized extension. Set to a
-	// specific value to override auto-detection. `"hangz"` (the compressed
-	// `catalog.json.z` track) is opt-in only and never auto-detected.
+	// specific value to override auto-detection.
 	catalogFormat: Getter<CatalogFormat | undefined>;
 
 	// The manual-mode catalog source. Used directly when catalogFormat is "manual";
 	// ignored otherwise. Read `output.catalog` for the effective catalog in any mode.
 	catalog: Getter<Catalog.Root | undefined>;
+
+	// Whether playback still has media of the broadcast left to play once its publisher finished it.
+	// A finished broadcast reads "live" until this is false. Defaults to true, so a broadcast nothing
+	// plays out (one no Player drives, or an included one) reads "live" until it closes.
+	tail: Getter<boolean>;
 };
 
-type BroadcastOutput = {
-	status: Signal<Status>;
+/** Signals the component derives. */
+export type BroadcastOutput = {
+	// "connecting" means no session can answer yet: none is attached, as while the connection
+	// dials, redials, or was refused, or one is still delivering its initial announcements.
+	// "offline" means one could answer and the broadcast is not there, or its publisher finished it
+	// and `tail` says nothing is left to play.
+	// "error" means the origin refused the broadcast; `error` says why.
+	// "unsupported" means its catalog requires a newer player.
+	status: Signal<"connecting" | "offline" | "loading" | "live" | "error" | "unsupported">;
 	active: Signal<Moq.Broadcast.Consumer | undefined>;
+
+	// Why the origin refused the broadcast, while `status` is "error". A refusal is final:
+	// only a fresh request (a new `name`, `origin`, or `follow`, or re-enabling) clears it and asks again.
+	error: Signal<Error | undefined>;
 
 	// The effective catalog: the fetched one, or a copy of input.catalog in manual mode, minus
 	// any rendition this consumer can't use (see `#runFiltered`). A rendition referencing another
 	// broadcast appears once that broadcast is announced, so this can change without a new catalog.
+	//
+	// It selects every include the catalog lists, as an HLS master does: it reads each include's
+	// catalog and lists its video and audio renditions beside its own as `<include>/<id>`, with a
+	// `broadcast` reference to where the media lives, so one selection spans them all. Only the
+	// selected rendition subscribes to media. One reading media already listed, such as the source
+	// an include relists, is left out, and an include's own `include` is never expanded.
 	catalog: Signal<Catalog.Root | undefined>;
 };
 
-// A catalog source that (optionally) reloads automatically when live/offline.
+type Status = GetterType<BroadcastOutput["status"]>;
+
+// What the catalog run reports, where "absent" means no handle to read; `#runStatus` turns that
+// into "connecting" or "offline".
+type Progress = Exclude<Status, "connecting" | "offline"> | "absent";
+
+/** A catalog source that can wait for announcement before subscribing. */
 export class Broadcast {
+	/** The wired inputs, read-only. */
 	readonly in: Readonlys<BroadcastInput>;
 
 	readonly #out: BroadcastOutput = {
-		status: new Signal<Status>("offline"),
+		status: new Signal<Status>("connecting"),
 		active: new Signal<Moq.Broadcast.Consumer | undefined>(undefined),
+		error: new Signal<Error | undefined>(undefined),
 		catalog: new Signal<Catalog.Root | undefined>(undefined),
 	};
+	/** The derived outputs, read-only. */
 	readonly out = readonlys(this.#out);
 
-	// The set of announced paths on the connection, for cross-broadcast (`broadcast: ../`) references
-	// so `relativeBroadcast` can gate on whether a sibling is announced. `undefined` until the stream
-	// is open. Opened lazily; the main broadcast doesn't use it (`#runBroadcast` drives off its own
-	// name-scoped stream).
-	readonly #announced = new Signal<Set<Moq.Path.Valid> | undefined>(undefined);
+	// One announcement watch per referenced broadcast, shared by callers, so the origin only asks
+	// its relay about the broadcasts a catalog actually references.
+	readonly #watches = new Map<
+		Moq.Path.Valid,
+		{
+			origin: Moq.Origin.Reader;
+			covered: Getter<boolean>;
+			synced: Getter<boolean>;
+			close: () => void;
+			users: number;
+		}
+	>();
 
-	// Set true the first time a relative reference needs the announcement gate, so a broadcast with
-	// no cross-broadcast renditions never opens the (broad) connection-scoped announcement stream.
-	readonly #wantAnnounced = new Signal(false);
+	// `#runCatalog`'s view of the broadcast, before "absent" is told apart.
+	readonly #progress = new Signal<Progress>("absent");
+	// Whether the publisher finished the catalog, which it does only when it ends the broadcast.
+	readonly #finished = new Signal(false);
+
+	// Requests are shared by callers; each owns its restart watch in the origin.
+	readonly #references = new Map<
+		Moq.Path.Valid,
+		{
+			origin: Moq.Origin.Reader;
+			follow: boolean;
+			request: Moq.Origin.Requesting | Moq.Origin.Following;
+			users: number;
+		}
+	>();
 
 	// The catalog as published, before renditions this consumer cannot use are dropped. Kept
 	// separate so the effective catalog can be re-derived when a reference becomes reachable.
@@ -131,113 +329,239 @@ export class Broadcast {
 	// strands the filtered copy on the previous contents.
 	readonly #raw = new Signal<Catalog.Root | undefined>(undefined);
 
-	#signals = new Effect();
+	// The include IDs the published catalog lists, notifying only when the set changes.
+	readonly #includeIds: Getter<string[] | undefined>;
+
+	// The include this root selects for each ID, kept across catalog updates so a new entry opens
+	// only its own catalog. Its owner closes it once the entry is gone.
+	readonly #children = new Map<string, { owner: Effect; child: Broadcast }>();
+	readonly #included = new Signal<[string, Broadcast][]>([]);
+
+	// Set only on an include: its broadcast resolves through the parent catalog's references,
+	// so the two never resolve one path independently.
+	readonly #resolve = new Signal<((effect: Effect) => Moq.Broadcast.Consumer | undefined) | undefined>(undefined);
+
+	#signals: Effect;
 
 	constructor(props?: Inputs<BroadcastInput>) {
+		for (const renamed of ["reload", "announced"]) {
+			if (props && renamed in props) throw new Error(`Watch.Broadcast: \`${renamed}\` was renamed to \`follow\``);
+		}
+		this.#signals = new Effect();
 		this.in = {
-			connection: getter(props?.connection),
+			origin: getter(props?.origin),
 			name: getter(props?.name ?? Path.empty()),
-			enabled: getter(props?.enabled ?? false),
-			reload: getter(props?.reload ?? true),
+			enabled: getter(props?.enabled ?? true),
+			follow: getter(props?.follow ?? true),
 			catalogFormat: getter<CatalogFormat | undefined>(props?.catalogFormat),
 			catalog: getter(props?.catalog),
+			tail: getter(props?.tail ?? true),
 		};
 
-		this.#signals.run(this.#runAnnounced.bind(this));
+		this.#includeIds = this.#signals.computed((effect) => Object.keys(effect.get(this.#raw)?.include ?? {}));
+
 		this.#signals.run(this.#runBroadcast.bind(this));
 		this.#signals.run(this.#runCatalog.bind(this));
+		this.#signals.run(this.#runIncludes.bind(this));
 		this.#signals.run(this.#runFiltered.bind(this));
+		this.#signals.run(this.#runStatus.bind(this));
 	}
 
-	// Maintain the set of announced paths used by `relativeBroadcast`, by draining a connection-scoped
-	// announcement stream. Only opened once a relative reference asks for it (see `#wantAnnounced`),
-	// and reopened per connection.
-	#runAnnounced(effect: Effect): void {
-		this.#announced.set(undefined);
+	// Without a handle, the broadcast is offline only once a session could have announced it.
+	// A connection holds the origin's announcements unsynced while it is not established, and
+	// a bare origin has no session at all; either way nobody has answered yet.
+	#runStatus(effect: Effect): void {
+		const progress = effect.get(this.#progress);
+		if (progress === "live" && effect.get(this.#finished) && !effect.get(this.in.tail)) {
+			this.#out.status.set("offline");
+			return;
+		}
+		if (progress !== "absent") {
+			this.#out.status.set(progress);
+			return;
+		}
 
-		if (!effect.get(this.#wantAnnounced)) return;
-		if (!effect.get(this.in.reload)) return;
+		// A disabled broadcast asks nobody, so there is no answer to wait for.
+		if (!effect.get(this.in.enabled)) {
+			this.#out.status.set("offline");
+			return;
+		}
 
-		const conn = effect.get(this.in.connection);
-		if (!conn || skipDiscovery(conn)) return;
-
-		const announced = conn.announced(Path.empty());
-		effect.cleanup(() => announced.close());
-		this.#announced.set(new Set());
-
-		effect.spawn(async () => {
-			for (;;) {
-				const entry = await Promise.race([effect.cancel, announced.next()]);
-				if (!entry) break;
-				this.#announced.mutate((active) => {
-					if (!active) return;
-					if (entry.active) active.add(entry.path);
-					else active.delete(entry.path);
-				});
-			}
-		});
+		const origin = effect.get(this.in.origin);
+		const discovery = origin && effect.get(origin.discovery);
+		let connecting = discovery === undefined;
+		// A session without discovery never announces, so there is nothing to wait for.
+		if (origin && discovery === true) {
+			connecting = !effect.get(this.#watchPath(effect, origin, effect.get(this.in.name)).synced);
+		}
+		this.#out.status.set(connecting ? "connecting" : "offline");
 	}
 
-	// Publish the catalog minus every rendition this consumer cannot use: one whose reference
-	// escapes above the root, or names a broadcast that isn't announced to us. Selecting one of
-	// those would render nothing, since `relativeBroadcast` resolves it to no broadcast at all.
-	// Reruns as announcements arrive, so a rendition appears once its broadcast does.
+	// Publish the catalog minus every rendition this consumer cannot use: one naming a
+	// broadcast that isn't announced to us, or one whose broadcast proves another instance than it
+	// names. Selecting one of those would render nothing, since `relativeBroadcast` resolves it to
+	// no broadcast at all. Reruns as announcements arrive, so a rendition appears once its
+	// broadcast does. Only a rendition naming an instance resolves its broadcast here, sharing the
+	// request playback uses.
 	#runFiltered(effect: Effect): void {
 		const raw = effect.get(this.#raw);
-		const usable = (rel: string | undefined) => this.#relativeTarget(effect, rel) !== undefined;
-		effect.set(this.#out.catalog, raw ? filterCatalog(raw, usable) : undefined);
+		if (!raw) return;
+
+		const included: Included[] = [];
+		for (const [id, child] of effect.get(this.#included)) {
+			const entry = raw.include && Object.hasOwn(raw.include, id) ? raw.include[id] : undefined;
+			const catalog = effect.get(child.out.catalog);
+			if (entry && catalog)
+				included.push({ id, path: effect.get(child.in.name), instance: entry.instance, catalog });
+		}
+
+		const usable: Usable = (rel, instance) =>
+			this.#relativeTarget(effect, rel) !== undefined &&
+			(instance === undefined || !provesOther(this.#relativeActive(effect, rel), instance));
+		effect.set(
+			this.#out.catalog,
+			withIncludes(raw, filterCatalog(raw, usable), effect.get(this.in.name), included, usable),
+		);
 	}
 
-	// Whether `path` is currently announced, for `relativeBroadcast`'s cross-broadcast refs. Returns
-	// true (subscribe immediately) when the gate can't apply: reload is off, or the relay doesn't
-	// support discovery. Opens the announcement stream on first use.
-	#isPathAnnounced(effect: Effect, path: Moq.Path.Valid): boolean {
-		if (!effect.get(this.in.reload)) return true;
-
-		const conn = effect.get(this.in.connection);
-		// Nothing to ask yet. `relativeBroadcast` still bails on the missing connection, and this
-		// keeps a reconnect from briefly hiding every cross-broadcast rendition from selection.
-		if (!conn) return true;
-		if (skipDiscovery(conn)) return true;
-
-		this.#wantAnnounced.set(true);
-
-		const active = effect.get(this.#announced);
-		if (!active) return false; // stream not open yet: wait rather than subscribe to a maybe-absent path
-		return active.has(path);
+	// Select every include the catalog lists, opening each one's catalog but none of its media. An
+	// include never expands its own includes: each needs a selection of its own.
+	#runIncludes(effect: Effect): void {
+		const ids = new Set(effect.get(this.#resolve) ? [] : effect.get(this.#includeIds));
+		for (const [id, { owner }] of this.#children) {
+			if (ids.has(id)) continue;
+			owner.close();
+			this.#children.delete(id);
+		}
+		for (const id of ids) {
+			if (this.#children.has(id)) continue;
+			const owner = new Effect();
+			this.#children.set(id, { owner, child: this.include(owner, id) });
+		}
+		this.#included.set([...this.#children].map(([id, { child }]) => [id, child]));
 	}
 
-	// Subscribe to the broadcast, waiting for its announcement so we never race a publisher that
-	// comes online after us. @moq/net drives the re-consume on a same-name republish and the blind
-	// fallback on a relay without discovery; mirror its handle into `active`.
+	// Watch the announcements covering exactly `path`, shared by every caller asking about it
+	// until the effect reruns. `covered` gates `relativeBroadcast`'s cross-broadcast refs:
+	// announcements are prefix routes, so a route at "room/" covers "room/alice/cam.hang" without
+	// naming it. That is how a rendition produced only on demand gets selected: its service claims
+	// a covering prefix, and nothing announces the exact path until this subscribes. `synced` tells
+	// `#runStatus` whether the broadcast's absence is known yet.
+	#watchPath(
+		effect: Effect,
+		origin: Moq.Origin.Reader,
+		path: Moq.Path.Valid,
+	): { covered: Getter<boolean>; synced: Getter<boolean> } {
+		let entry = this.#watches.get(path);
+		if (!entry || entry.origin !== origin) {
+			entry?.close();
+			entry = { origin, ...watchCovered(origin, path), users: 0 };
+			this.#watches.set(path, entry);
+		}
+
+		const held = entry;
+		held.users += 1;
+		effect.cleanup(() => {
+			held.users -= 1;
+			// Deferred, so a caller's rerun reuses the watch rather than closing and reopening it.
+			queueMicrotask(() => {
+				if (held.users > 0 || this.#watches.get(path) !== held) return;
+				this.#watches.delete(path);
+				held.close();
+			});
+		});
+		return held;
+	}
+
+	// Share one origin request across callers reading the same referenced broadcast.
+	#requestBroadcast(
+		effect: Effect,
+		origin: Moq.Origin.Reader,
+		path: Moq.Path.Valid,
+	): Moq.Broadcast.Consumer | undefined {
+		const follow = effect.get(this.in.follow);
+		let entry = this.#references.get(path);
+		if (!entry || entry.origin !== origin || entry.follow !== follow) {
+			entry?.request.close();
+			entry = { origin, follow, request: follow ? origin.follow(path) : origin.request(path), users: 0 };
+			this.#references.set(path, entry);
+		}
+
+		const held = entry;
+		held.users += 1;
+		effect.cleanup(() => {
+			held.users -= 1;
+			// Deferred, so a caller's rerun reuses the request rather than closing and reopening it.
+			queueMicrotask(() => {
+				if (held.users > 0 || this.#references.get(path) !== held) return;
+				this.#references.delete(path);
+				held.request.close();
+			});
+		});
+		return effect.get(held.request.active);
+	}
+
+	// The origin owns restart following; mirror its current handle and terminal refusal.
 	#runBroadcast(effect: Effect): void {
 		const enabled = effect.get(this.in.enabled);
 		if (!enabled) return;
 
-		const conn = effect.get(this.in.connection);
-		if (!conn) return;
-
-		const name = effect.get(this.in.name);
-
-		// No announcement gate: subscribe immediately.
-		if (!effect.get(this.in.reload)) {
-			const broadcast = conn.consume(name);
-			effect.cleanup(() => broadcast.close());
-			effect.set(this.#out.active, broadcast, undefined);
+		const resolve = effect.get(this.#resolve);
+		if (resolve) {
+			// Like the origin request below, a path outside the origin's scope throws.
+			let active: Moq.Broadcast.Consumer | undefined;
+			try {
+				active = resolve(effect);
+			} catch (err) {
+				effect.set(this.#out.error, err instanceof Error ? err : new Error(String(err)), undefined);
+				return;
+			}
+			effect.set(this.#out.active, active, undefined);
 			return;
 		}
 
-		const announced = conn.announcedBroadcast(name);
-		effect.cleanup(() => announced.close());
+		const origin = effect.get(this.in.origin);
+		if (!origin) return;
 
+		const name = effect.get(this.in.name);
+		const follow = effect.get(this.in.follow);
+
+		let request: Moq.Origin.Requesting | Moq.Origin.Following;
+		try {
+			request = follow ? origin.follow(name) : origin.request(name);
+		} catch (err) {
+			effect.set(this.#out.error, err instanceof Error ? err : new Error(String(err)), undefined);
+			return;
+		}
+		effect.cleanup(() => request.close());
+		let resolved = false;
 		effect.run((nested) => {
-			nested.set(this.#out.active, nested.get(announced.active), undefined);
+			const active = nested.get(request.active);
+			if (active) resolved = true;
+			nested.set(this.#out.active, active, undefined);
+		});
+		effect.run((nested) => {
+			const closed = nested.get(request.closed);
+			if (!closed) return;
+			// A follower outlives its instances, so only a refusal ends it. A plain request
+			// ends with its accepted instance, which reads as offline rather than an error.
+			const offline =
+				!follow && resolved && closed instanceof NetError.Stream && closed.code === StreamCode.Unroutable;
+			if (!offline) nested.set(this.#out.error, closed, undefined);
 		});
 	}
 
 	#runCatalog(effect: Effect): void {
 		const enabled = effect.get(this.in.enabled);
 		if (!enabled) return;
+
+		// Even a manual catalog is unplayable once the origin refuses its media. `#runBroadcast`
+		// clears the error on a fresh request, and this run's cleanup drops back to "absent".
+		if (effect.get(this.#out.error)) {
+			effect.set(this.#progress, "error", "absent");
+			return;
+		}
+		effect.cleanup(() => this.#progress.set("absent"));
 
 		const catalogFormat = effect.get(this.in.catalogFormat);
 		const name = effect.get(this.in.name);
@@ -247,57 +571,131 @@ export class Broadcast {
 		const format: CatalogFormat = catalogFormat ?? Catalog.detectFormat(name) ?? Catalog.DEFAULT_FORMAT;
 
 		if (format === "manual") {
-			// Mirror the caller-supplied catalog into the effective output.
+			// Parse the caller-supplied catalog into the effective output with the same schema and
+			// checks as a fetched one, minus the throw: this runs in the effect body, where an
+			// exception would surface as an unhandled error.
 			const catalog = effect.get(this.in.catalog);
-			this.#raw.set(catalog, true);
+			let accepted: Catalog.Root | undefined;
+			let status: Progress = "loading";
+			try {
+				accepted =
+					catalog &&
+					Catalog.checkResolvable(Catalog.checkRenditions(Catalog.RootSchema.parse(catalog)), name);
+				if (accepted) status = "live";
+			} catch (err) {
+				if (err instanceof Catalog.UnsupportedVersion) status = "unsupported";
+				console.error("rejecting catalog", name, err);
+			}
+			this.#raw.set(accepted, true);
 			effect.cleanup(() => this.#raw.set(undefined, true));
-			this.#out.status.set(catalog ? "live" : "loading");
+			this.#progress.set(status);
 			return;
 		}
 
 		const broadcast = effect.get(this.out.active);
-		if (!broadcast) return;
+		// A withdrawn handle can close before its removal propagates through the active signal.
+		if (!broadcast || effect.get(broadcast.closed) !== undefined) return;
 
-		this.#out.status.set("loading");
+		this.#progress.set("loading");
 
-		const trackName = format === "hang" ? Catalog.TRACK : format === "hangz" ? Catalog.TRACK_COMPRESSED : "catalog";
-		const track = broadcast.track(trackName).subscribe({ priority: Catalog.PRIORITY.catalog });
-		effect.cleanup(() => track.close());
-
-		// The hang catalog is reconstructed from snapshots (and future deltas) via @moq/json, with
-		// "hangz" decompressing the `.z` track; MSF stays on its own one-blob-per-group fetch.
+		// The hang catalog is reconstructed from snapshots (and future deltas) via @moq/json, which reads
+		// it compressed or not and subscribes itself; MSF stays on its own one-blob-per-group fetch.
 		let fetchNext: () => Promise<Catalog.Root | undefined>;
-		if (format === "hang" || format === "hangz") {
-			const consumer = new Json.Snapshot.Consumer<Catalog.Root>(track, {
+		if (format === "hang") {
+			const consumer = new Json.Snapshot.Consumer<Catalog.Root>({
+				track: broadcast.track(Catalog.TRACK),
 				schema: Catalog.RootSchema,
-				compression: format === "hangz",
+				priority: Catalog.PRIORITY.catalog,
 			});
-			fetchNext = () => consumer.next();
+			effect.cleanup(() => consumer.close());
+			fetchNext = async () => (await consumer.latest())?.value;
 		} else {
+			const track = broadcast.track("catalog").subscribe({
+				...Track.Subscription.default(),
+				priority: Catalog.PRIORITY.catalog,
+			});
+			effect.cleanup(() => track.close());
+			const ordered = track.ordered();
 			fetchNext = async () => {
-				const update = await Msf.fetch(track);
-				return update ? toHang(update) : undefined;
+				const update = await Msf.fetch(ordered);
+				return update ? toHang(update, name) : undefined;
 			};
 		}
 
+		// The snapshot outlives a clean end of the catalog track, so it clears with this run.
+		effect.cleanup(() => {
+			this.#raw.set(undefined);
+			this.#finished.set(false);
+		});
+
 		effect.spawn(async () => {
+			let status: Progress = "absent";
+			let received = false;
+			let finished = false;
 			try {
 				for (;;) {
-					const update = await Promise.race([effect.cancel, fetchNext()]);
-					if (!update) break;
+					const update = await effect.race(fetchNext());
+					// A finished catalog means the publisher ended the broadcast. It keeps serving its tail
+					// until it closes or is withdrawn, which reruns this, so keep playing it, and read
+					// offline once `tail` has nothing left. One that ended empty has nothing to play.
+					if (!update) {
+						finished = received;
+						// A rerun cancelling the read ends it the same way, which says nothing of the publisher.
+						if (!effect.abort.aborted) this.#finished.set(finished);
+						break;
+					}
+					received = true;
 
 					console.debug("received catalog", format, this.in.name.peek(), update);
 
-					this.#raw.set(update, true);
-					this.#out.status.set("live");
+					this.#raw.set(Catalog.checkResolvable(Catalog.checkRenditions(update), name), true);
+					this.#progress.set("live");
 				}
 			} catch (err) {
-				console.warn("error fetching catalog", this.in.name.peek(), err);
+				if (err instanceof Catalog.UnsupportedVersion) status = "unsupported";
+				if (err instanceof NetError.Stream)
+					console.debug("catalog subscription ended", this.in.name.peek(), err);
+				else console.error("error fetching catalog", this.in.name.peek(), err);
 			} finally {
-				this.#raw.set(undefined);
-				this.#out.status.set("offline");
+				if (!finished) {
+					this.#raw.set(undefined);
+					this.#progress.set(status);
+				}
 			}
 		});
+	}
+
+	// Where a rendition's `broadcast` reference points once resolved and gated on the announcement
+	// stream, or `undefined` when it names nothing consumable right now. Playback and rendition
+	// selection both go through this so they cannot disagree about what is reachable.
+	#relativeTarget(effect: Effect, rel: Path.Relative | undefined): RelativeTarget | undefined {
+		if (!rel) return { local: true };
+
+		const base = effect.get(this.in.name);
+		const resolved = Path.tryResolve(base, rel);
+		if (resolved === undefined) {
+			console.warn("ignoring rendition: broadcast reference escapes the root", base, rel);
+			return undefined;
+		}
+
+		// A reference that walks back to the catalog's own broadcast is served by the
+		// catalog broadcast itself, avoiding a duplicate subscription on the same path.
+		if (resolved === base) return { local: true };
+
+		const origin = effect.get(this.in.origin);
+		// Nothing to ask yet. `relativeBroadcast` still bails on the missing origin, and this
+		// keeps a reconnect from briefly hiding every cross-broadcast rendition from selection.
+		if (!origin) return { local: false, path: resolved };
+
+		// Without an announcement gate (disabled, or no session supports discovery),
+		// resolve blind rather than waiting for an announcement that never comes. With the
+		// gate, only report the path usable once it is announced: the request then resolves
+		// from the table, never blind.
+		if (effect.get(this.in.follow) && effect.get(origin.discovery) !== false) {
+			if (!effect.get(this.#watchPath(effect, origin, resolved).covered)) return undefined;
+		}
+
+		return { local: false, path: resolved };
 	}
 
 	/**
@@ -307,46 +705,107 @@ export class Broadcast {
 	 * relative to this broadcast's name and consume the resolved broadcast on the same
 	 * connection. Otherwise return the catalog's own active broadcast.
 	 *
+	 * Returns `undefined` for a reference that walks above the root: hang requires such a
+	 * rendition to be ignored, since clamping at the root would point it at an unrelated
+	 * broadcast.
+	 *
 	 * The consumer is scoped to the caller's `effect` (closed on its next run), so a
 	 * reference resolves lazily and reacts to `enabled` / connection / announcement
 	 * changes exactly like the catalog broadcast.
+	 *
+	 * `instance` is the rendition's `instance` field, the stream the reference names. Returns
+	 * `undefined` while the followed broadcast is proven to be another stream, rather than
+	 * reading it. A route over a wire that carries no instance cannot prove one, so there it is
+	 * best effort.
+	 *
+	 * @internal
 	 */
-	// Where a rendition's `broadcast` reference points once resolved and gated on the announcement
-	// stream, or `undefined` when it names nothing consumable right now. Playback and rendition
-	// selection both go through this so they cannot disagree about what is reachable.
-	#relativeTarget(effect: Effect, rel: string | undefined): RelativeTarget | undefined {
-		if (!rel) return { local: true };
-
-		const base = effect.get(this.in.name);
-		const resolved = Path.tryResolve(base, rel);
-
-		// Ignore a rendition whose reference escapes above the root. A valid empty result
-		// names the root broadcast, while a reference back to the catalog uses its active handle.
-		if (resolved === undefined) return undefined;
-		if (resolved === base) return { local: true };
-
-		if (!this.#isPathAnnounced(effect, resolved)) return undefined;
-
-		return { local: false, path: resolved };
+	relativeBroadcast(
+		effect: Effect,
+		rel: Path.Relative | undefined,
+		instance?: Moq.Instance.Valid,
+	): Moq.Broadcast.Consumer | undefined {
+		const active = this.#relativeActive(effect, rel);
+		if (!active || !provesOther(active, instance)) return active;
+		console.warn(
+			"ignoring rendition: its broadcast serves another instance",
+			active.path,
+			active.instance,
+			instance,
+		);
+		return undefined;
 	}
 
-	/** Resolve a rendition's `broadcast` reference to a consumer, or `undefined` if unreachable. */
-	relativeBroadcast(effect: Effect, rel: string | undefined): Moq.Broadcast.Consumer | undefined {
+	#relativeActive(effect: Effect, rel: Path.Relative | undefined): Moq.Broadcast.Consumer | undefined {
 		const target = this.#relativeTarget(effect, rel);
 		if (!target) return undefined;
 		if (target.local) return effect.get(this.out.active);
 
 		if (!effect.get(this.in.enabled)) return undefined;
 
-		const conn = effect.get(this.in.connection);
-		if (!conn) return undefined;
+		const origin = effect.get(this.in.origin);
+		if (!origin) return undefined;
 
-		const broadcast = conn.consume(target.path);
-		effect.cleanup(() => broadcast.close());
-		return broadcast;
+		return this.#requestBroadcast(effect, origin, target.path);
 	}
 
+	/**
+	 * Read a whole include on its own, opening its catalog only while the caller owns this effect.
+	 *
+	 * `out.catalog` already lists every include's renditions; this reads one include's catalog
+	 * as its own broadcast, such as to play it apart from the root. The child tracks
+	 * the catalog entry and resolves through this broadcast's `relativeBroadcast`, sharing
+	 * its request: while following announcements it follows the include's restarts, and
+	 * otherwise it requests the first instance once. With an `instance` it is offline while its
+	 * broadcast resolves another stream. An absent entry leaves the child disabled, and an
+	 * unavailable include reads as offline. Its rendition IDs are its own catalog's, and it never
+	 * expands its own includes.
+	 *
+	 * ```ts
+	 * effects.run((effect) => {
+	 *   const child = broadcast.include(effect, "alice");
+	 *   const source = new Video.Source({ broadcast: child, supported: Video.Decoder.supported });
+	 *   effect.cleanup(() => source.close());
+	 *   // Feed source into a decoder as with any broadcast.
+	 * });
+	 * ```
+	 */
+	include(effect: Effect, id: string): Broadcast {
+		// Each computed notifies only on a real change, so an update that leaves the child's path
+		// alone (such as a new `instance`) never restarts its catalog.
+		const entry = effect.computed((run) => {
+			// The published catalog, since the effective one is derived from this include's own.
+			const include = run.get(this.#raw)?.include;
+			return include && Object.hasOwn(include, id) ? include[id] : undefined;
+		});
+		const name = effect.computed((run) => {
+			// An empty reference is present: it names the catalog's own broadcast.
+			const selected = run.get(entry);
+			return selected && Path.tryResolve(run.get(this.in.name), selected.broadcast);
+		});
+		const enabled = effect.computed((run) => run.get(entry) !== undefined);
+		const child = new Broadcast({
+			origin: this.in.origin,
+			name: new Derived([name], (name) => name ?? Path.empty()),
+			enabled: new Derived([enabled], (enabled) => enabled === true),
+			follow: this.in.follow,
+		});
+		child.#resolve.set((run) => {
+			const selected = run.get(entry);
+			return selected && this.relativeBroadcast(run, selected.broadcast, selected.instance);
+		});
+		effect.cleanup(() => child.close());
+		return child;
+	}
+
+	/** Stop and release everything this holds. */
 	close() {
 		this.#signals.close();
+		for (const entry of this.#references.values()) entry.request.close();
+		this.#references.clear();
+		for (const entry of this.#watches.values()) entry.close();
+		this.#watches.clear();
+		for (const { owner } of this.#children.values()) owner.close();
+		this.#children.clear();
 	}
 }

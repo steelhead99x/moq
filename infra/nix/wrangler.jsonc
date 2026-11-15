@@ -1,0 +1,37 @@
+{
+	// Cloudflare Wrangler configuration for the Nix binary cache worker.
+	// Serves nix.moq.dev from two R2 buckets: released packages, kept forever,
+	// and CI dev shells, which a lifecycle rule expires.
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "nix-moq-dev",
+	"main": "src/worker.ts",
+	"compatibility_date": "2025-07-09",
+	"account_id": "dd618f5dbd5da77b8296f1613c301f5c",
+	"workers_dev": false,
+	"route": {
+		"pattern": "nix.moq.dev",
+		"custom_domain": true
+	},
+	// R2 bucket bindings
+	"r2_buckets": [
+		{
+			"binding": "RELEASE",
+			"bucket_name": "nix-moq-dev",
+			"remote": true
+		},
+		{
+			"binding": "CI",
+			"bucket_name": "nix-ci-moq-dev",
+			"remote": true
+		}
+	],
+	// Observability: keep console lines (cache read errors) but skip the
+	// per-request invocation log, which was about a quarter of the account's
+	// Workers Logs volume (503K events in 3 days at about 5 kB each).
+	"observability": {
+		"logs": {
+			"enabled": true,
+			"invocation_logs": false
+		}
+	}
+}

@@ -1,0 +1,81 @@
+name: Dependabot
+
+# Requests landing for Dependabot updates through the same pinned-head gate
+# as other PRs. dependabot.yml holds new versions for seven days.
+#
+# `pull_request_target` rather than `pull_request`: Dependabot runs with a
+# read-only token and no access to secrets, so a `pull_request` run could
+# neither read APP_PRIVATE_KEY nor request landing. That trigger is only safe
+# because this job never checks out or executes the pull request's code; it
+# reads the pull request files and runs Quest from main, never from its head.
+#
+# The host land daemon picks up the head-pinned auto-merge moq-bot enables.
+
+permissions: {}
+
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] justified above.
+    types: [opened, reopened, synchronize]
+
+jobs:
+  request-landing:
+    name: Request landing
+    permissions:
+      contents: read
+      pull-requests: read
+    # head.repo guards the `pull_request_target` trigger: Dependabot pushes its
+    # branches to this repository, so a pull request from a fork claiming to be
+    # Dependabot is not one.
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # The moq-bot key lives in the `bot` Environment, which only protected
+    # refs can deploy to; pull_request_target runs on the base branch.
+    environment: bot
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: ./.github/actions/nix
+      - name: Install trusted quest
+        run: | # zizmor: ignore[github-env] the path is a build of main's flake, not of the PR.
+          mkdir -p .tmp
+          nix build --out-link .tmp/quest-cli .#quest
+          echo "$PWD/.tmp/quest-cli/bin" >> "$GITHUB_PATH"
+      # Smoke's flake and npm Playwright pin move together through its updater.
+      # A lock-only Dependabot PR is discovery, not a change safe to auto-enqueue.
+      - name: Require a coupled smoke update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: >-
+          gh pr view "$PR_URL" --json files --jq
+          'if any(.files[]; .path == "test/smoke/flake.lock") then
+          error("Use the Smoke toolchain update workflow for the coupled lock and Playwright bump")
+          else "Update can request landing" end'
+
+      - name: Generate moq-bot token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        id: token
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: moq-dev
+          repositories: moq
+          # Only the permissions needed to pin and enqueue a landing.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-merge-queues: write
+
+      - name: Request checked landing
+        env:
+          # Token is minted fresh per run, expires in 1 hour, never at rest.
+          BOT_TOKEN: ${{ steps.token.outputs.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          export GH_TOKEN="$BOT_TOKEN"
+          quest merge "$PR_URL" --land "$PR_HEAD"

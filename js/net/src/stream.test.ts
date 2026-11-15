@@ -1,6 +1,27 @@
-import { expect, test } from "bun:test";
-import { RemoteError } from "./error.ts";
-import { Reader, Stream, Writer } from "./stream.ts";
+import { heapStats } from "bun:jsc";
+import { expect, spyOn, test } from "bun:test";
+import { yieldNow } from "@moq/clock";
+import {
+	FrameTooLarge,
+	GroupTooLarge,
+	Lagged,
+	NotFound,
+	ProtocolViolation,
+	SessionCode,
+	SessionError,
+	StreamCode,
+	StreamError,
+} from "./error.ts";
+import { Version } from "./ietf/version.ts";
+import { Version as Lite } from "./lite/version.ts";
+import { createMockTransportPair } from "./mock.ts";
+import { acceptBudget, type Cursor, Reader, Readers, Stream, type StreamVersion, Writer } from "./stream.ts";
+import { TimeoutError } from "./util/timeout.ts";
+import { U64 } from "./util/u64.ts";
+import { Budget } from "./util/yield.ts";
+
+// The generic tests below read and write QUIC varints on the moq-lite stream code registry.
+const QUIC = Lite.DRAFT_06;
 
 // Helper to create a writable stream that captures written data
 function createTestWritableStream(): { stream: WritableStream<Uint8Array>; written: Uint8Array[] } {
@@ -27,7 +48,7 @@ function concatChunks(chunks: Uint8Array[]): Uint8Array {
 
 test("Writer u8", async () => {
 	const { stream, written } = createTestWritableStream();
-	const writer = new Writer(stream);
+	const writer = new Writer(stream, QUIC);
 
 	await writer.u8(42);
 	await writer.u8(255);
@@ -40,9 +61,20 @@ test("Writer u8", async () => {
 	expect(written[1]).toEqual(new Uint8Array([255]));
 });
 
+test("Writer u8 refuses out of range values before emitting bytes", async () => {
+	for (const value of [-1, 1.5, 256, Number.NaN, Number.POSITIVE_INFINITY]) {
+		const { stream, written } = createTestWritableStream();
+		const writer = new Writer(stream, QUIC);
+		await expect(writer.u8(value)).rejects.toThrow(RangeError);
+		writer.close();
+		await writer.closed;
+		expect(written).toEqual([]);
+	}
+});
+
 test("Writer i32", async () => {
 	const { stream, written } = createTestWritableStream();
-	const writer = new Writer(stream);
+	const writer = new Writer(stream, QUIC);
 
 	await writer.i32(0);
 	await writer.i32(-1);
@@ -63,13 +95,14 @@ test("Writer i32", async () => {
 
 test("Writer u53", async () => {
 	const { stream, written } = createTestWritableStream();
-	const writer = new Writer(stream);
+	const writer = new Writer(stream, QUIC);
 
 	await writer.u53(0);
 	await writer.u53(63); // MAX_U6
 	await writer.u53(64); // MIN for 2-byte varint
 	await writer.u53(16383); // MAX_U14
 	await writer.u53(16384); // MIN for 4-byte varint
+	await writer.u53(Number.MAX_SAFE_INTEGER);
 
 	writer.close();
 	await writer.closed;
@@ -80,11 +113,31 @@ test("Writer u53", async () => {
 	expect(written[2].byteLength).toBe(2); // 64 needs 2 bytes
 	expect(written[3].byteLength).toBe(2); // 16383 fits in 2 bytes
 	expect(written[4].byteLength).toBe(4); // 16384 needs 4 bytes
+	expect(written[5].byteLength).toBe(8); // MAX_SAFE_INTEGER needs 8 bytes
+});
+
+test("Writer u53 refuses unsafe values before emitting bytes", async () => {
+	for (const value of [
+		-1,
+		1.5,
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+		Number.MAX_SAFE_INTEGER + 1,
+		2 ** 62,
+		2 ** 62 + 1,
+	]) {
+		const { stream, written } = createTestWritableStream();
+		const writer = new Writer(stream, QUIC);
+		await expect(writer.u53(value)).rejects.toThrow(RangeError);
+		writer.close();
+		await writer.closed;
+		expect(written).toEqual([]);
+	}
 });
 
 test("Writer string", async () => {
 	const { stream, written } = createTestWritableStream();
-	const writer = new Writer(stream);
+	const writer = new Writer(stream, QUIC);
 
 	await writer.string("hello");
 	await writer.string("🎉");
@@ -95,7 +148,7 @@ test("Writer string", async () => {
 	const result = concatChunks(written);
 
 	// Create a reader to parse the result
-	const reader = new Reader(undefined, result);
+	const reader = new Reader(undefined, result, QUIC);
 
 	const str1 = await reader.string();
 	const str2 = await reader.string();
@@ -105,14 +158,14 @@ test("Writer string", async () => {
 });
 
 test("Reader string rejects malformed UTF-8", async () => {
-	const reader = new Reader(undefined, new Uint8Array([2, 0xc3, 0x28]));
+	const reader = new Reader(undefined, new Uint8Array([2, 0xc3, 0x28]), QUIC);
 
 	await expect(reader.string()).rejects.toThrow();
 });
 
 test("Reader u8", async () => {
 	const data = new Uint8Array([42, 255, 0, 128]);
-	const reader = new Reader(undefined, data);
+	const reader = new Reader(undefined, data, QUIC);
 
 	expect(await reader.u8()).toBe(42);
 	expect(await reader.u8()).toBe(255);
@@ -124,7 +177,7 @@ test("Reader u8", async () => {
 
 test("Reader read with exact sizes", async () => {
 	const data = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
-	const reader = new Reader(undefined, data);
+	const reader = new Reader(undefined, data, QUIC);
 
 	const chunk1 = await reader.read(3);
 	expect(chunk1).toEqual(new Uint8Array([1, 2, 3]));
@@ -140,7 +193,7 @@ test("Reader read with exact sizes", async () => {
 
 test("Reader read with zero size", async () => {
 	const data = new Uint8Array([1, 2, 3]);
-	const reader = new Reader(undefined, data);
+	const reader = new Reader(undefined, data, QUIC);
 
 	const chunk = await reader.read(0);
 	expect(chunk).toEqual(new Uint8Array([]));
@@ -152,7 +205,7 @@ test("Reader read with zero size", async () => {
 
 test("Reader readAll", async () => {
 	const data = new Uint8Array([1, 2, 3, 4, 5]);
-	const reader = new Reader(undefined, data);
+	const reader = new Reader(undefined, data, QUIC);
 
 	// Read some data first
 	await reader.read(2);
@@ -169,7 +222,7 @@ test("Reader u53 varint decoding", async () => {
 	const testValues = [0, 63, 64, 16383, 16384, 1073741823, 1073741824, Number.MAX_SAFE_INTEGER];
 
 	const { stream, written } = createTestWritableStream();
-	const testWriter = new Writer(stream);
+	const testWriter = new Writer(stream, QUIC);
 
 	for (const value of testValues) {
 		await testWriter.u53(value);
@@ -179,7 +232,7 @@ test("Reader u53 varint decoding", async () => {
 	await testWriter.closed;
 
 	const data = concatChunks(written);
-	const reader = new Reader(undefined, data);
+	const reader = new Reader(undefined, data, QUIC);
 
 	for (const expectedValue of testValues) {
 		const actualValue = await reader.u53();
@@ -194,29 +247,25 @@ test("Reader u53 rejects integers that cannot be represented exactly", async () 
 	const wireValues = [firstUnsafe, firstUnsafe + 1n];
 	expect(Number(wireValues[0])).toBe(Number(wireValues[1]));
 
-	const { stream, written } = createTestWritableStream();
-	const writer = new Writer(stream);
-
 	for (const value of wireValues) {
+		const { stream, written } = createTestWritableStream();
+		const writer = new Writer(stream, QUIC);
 		await writer.u62(value);
-	}
+		writer.close();
+		await writer.closed;
 
-	writer.close();
-	await writer.closed;
-
-	const reader = new Reader(undefined, concatChunks(written));
-	for (const value of wireValues) {
+		// A failed decode consumes nothing; the stream is unusable after it anyway.
+		const reader = new Reader(undefined, concatChunks(written), QUIC);
 		await expect(reader.u53()).rejects.toThrow(`value larger than 53-bits: ${value}`);
+		expect(await reader.done()).toBe(false);
 	}
-
-	expect(await reader.done()).toBe(true);
 });
 
 test("Reader u62 varint decoding", async () => {
 	const testValues = [0n, 63n, 64n, 16383n, 16384n, 1073741823n, 1073741824n, 9007199254740991n]; // MAX_U53
 
 	const { stream, written } = createTestWritableStream();
-	const testWriter = new Writer(stream);
+	const testWriter = new Writer(stream, QUIC);
 
 	for (const value of testValues) {
 		await testWriter.u62(value);
@@ -226,7 +275,7 @@ test("Reader u62 varint decoding", async () => {
 	await testWriter.closed;
 
 	const data = concatChunks(written);
-	const reader = new Reader(undefined, data);
+	const reader = new Reader(undefined, data, QUIC);
 
 	for (const expectedValue of testValues) {
 		const actualValue = await reader.u62();
@@ -240,7 +289,7 @@ test("Reader string decoding", async () => {
 	const testStrings = ["hello", "🎉", "", "world with spaces", "multi\nline\nstring"];
 
 	const { stream, written } = createTestWritableStream();
-	const writer = new Writer(stream);
+	const writer = new Writer(stream, QUIC);
 
 	for (const str of testStrings) {
 		await writer.string(str);
@@ -250,7 +299,7 @@ test("Reader string decoding", async () => {
 	await writer.closed;
 
 	const data = concatChunks(written);
-	const reader = new Reader(undefined, data);
+	const reader = new Reader(undefined, data, QUIC);
 
 	for (const expectedString of testStrings) {
 		const actualString = await reader.string();
@@ -272,7 +321,7 @@ test("Reader from stream", async () => {
 		},
 	});
 
-	const reader = new Reader(stream);
+	const reader = new Reader(stream, undefined, QUIC);
 
 	// Read all data
 	const result = await reader.readAll();
@@ -291,7 +340,7 @@ test("Reader stream with partial reads", async () => {
 		},
 	});
 
-	const reader = new Reader(stream);
+	const reader = new Reader(stream, undefined, QUIC);
 
 	// Read specific amounts that cross chunk boundaries
 	const first = await reader.read(3); // Should span first two chunks
@@ -306,7 +355,7 @@ test("Reader stream with partial reads", async () => {
 	expect(await reader.done()).toBe(true);
 });
 
-test("Reader owns streamed chunks and preserves returned views across fills", async () => {
+test("Reader preserves returned views across fills", async () => {
 	const first = new Uint8Array([99, 1, 2, 99]);
 	const second = new Uint8Array([99, 3, 4, 5, 99]);
 	const stream = new ReadableStream<Uint8Array>({
@@ -316,12 +365,10 @@ test("Reader owns streamed chunks and preserves returned views across fills", as
 			controller.close();
 		},
 	});
-	const reader = new Reader(stream);
+	const reader = new Reader(stream, undefined, QUIC);
 	const head = await reader.read(1);
-	first.fill(0);
 	expect(head).toEqual(new Uint8Array([1]));
 	const joined = await reader.read(3);
-	second.fill(0);
 	expect(joined).toEqual(new Uint8Array([2, 3, 4]));
 	joined.fill(0);
 	expect(head).toEqual(new Uint8Array([1]));
@@ -329,17 +376,95 @@ test("Reader owns streamed chunks and preserves returned views across fills", as
 	expect(await reader.done()).toBe(true);
 });
 
+test("Reader returns a view of a chunk that already holds the read", async () => {
+	const chunk = new Uint8Array([1, 2, 3, 4]);
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(chunk);
+			controller.close();
+		},
+	});
+	const reader = new Reader(stream, undefined, QUIC);
+	const read = await reader.read(3);
+	expect(read.buffer).toBe(chunk.buffer);
+	expect(read).toEqual(new Uint8Array([1, 2, 3]));
+	expect(await reader.readAll()).toEqual(new Uint8Array([4]));
+});
+
+test("Reader joins every chunk a read spans", async () => {
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			for (let value = 0; value < 100; value++) controller.enqueue(new Uint8Array([value]));
+			controller.close();
+		},
+	});
+	const reader = new Reader(stream, undefined, QUIC);
+	expect(await reader.u8()).toBe(0);
+	expect(await reader.read(98)).toEqual(Uint8Array.from({ length: 98 }, (_, index) => index + 1));
+	expect(await reader.done()).toBe(false);
+	expect(await reader.readAll()).toEqual(new Uint8Array([99]));
+	expect(await reader.done()).toBe(true);
+});
+
 test("Reader u53 decodes two-byte stream type prefixes", async () => {
 	const { stream, written } = createTestWritableStream();
-	const writer = new Writer(stream);
+	const writer = new Writer(stream, QUIC);
 
 	await writer.u53(0x40);
 	writer.close();
 	await writer.closed;
 
-	const reader = new Reader(undefined, concatChunks(written));
+	const reader = new Reader(undefined, concatChunks(written), QUIC);
 	expect(await reader.u53()).toBe(0x40);
 	expect(await reader.done()).toBe(true);
+});
+
+/** A length-prefixed payload. */
+const sized = (c: Cursor) => c.read(c.u53());
+
+test("Reader tryDecode drains every buffered message, then consumes nothing from a partial one", async () => {
+	let controller!: ReadableStreamDefaultController<Uint8Array>;
+	const reader = new Reader(new ReadableStream<Uint8Array>({ start: (c) => (controller = c) }), undefined, QUIC);
+	controller.enqueue(new Uint8Array([1, 0xa, 2, 0xb, 0xc, 3, 0xd]));
+	expect(await reader.done()).toBe(false);
+
+	expect(reader.tryDecode(sized)).toEqual(new Uint8Array([0xa]));
+	expect(reader.tryDecode(sized)).toEqual(new Uint8Array([0xb, 0xc]));
+	expect(reader.tryDecode(sized)).toBeUndefined();
+	expect(reader.tryDecode(sized)).toBeUndefined();
+
+	const pending = reader.decode(sized);
+	controller.enqueue(new Uint8Array([0xe]));
+	controller.enqueue(new Uint8Array([0xf]));
+	expect(await pending).toEqual(new Uint8Array([0xd, 0xe, 0xf]));
+	controller.close();
+	expect(await reader.decodeMaybe(sized)).toBeUndefined();
+});
+
+test("Reader tryDecode holds only the decode that ran short to the bytes it needs", () => {
+	const reader = new Reader(undefined, new Uint8Array([2, 0xa]), QUIC);
+	expect(reader.tryDecode(sized)).toBeUndefined();
+	expect(reader.tryDecode((c) => c.u8())).toBe(2);
+});
+
+test("Reader decode rejects a stream that ends inside a message", async () => {
+	const reader = new Reader(undefined, new Uint8Array([3, 0xa]), QUIC);
+	expect(reader.tryDecode(sized)).toBeUndefined();
+	await expect(reader.decode(sized)).rejects.toThrow("unexpected end of stream");
+});
+
+test("Reader refuses an oversized value even when it is already buffered", async () => {
+	const size = 64 * 1024 * 1024 + 1;
+	const buffer = new Uint8Array(4 + size);
+	buffer.set([0x84, 0x00, 0x00, 0x01]); // the 4-byte varint for size
+	await expect(new Reader(undefined, buffer, QUIC).string()).rejects.toThrow("exceeds max size");
+	await expect(new Reader(undefined, buffer.subarray(4), QUIC).read(size)).rejects.toThrow("exceeds max size");
+});
+
+test("Reader refuses a buffered decode whose fields together exceed the max size", async () => {
+	const half = 32 * 1024 * 1024;
+	const reader = new Reader(undefined, new Uint8Array(2 * half + 1), QUIC);
+	await expect(reader.decode((c) => [c.read(half), c.read(half + 1)])).rejects.toThrow("exceeds max size");
 });
 
 /** A stream reset as a transport delivers one: the peer's code, and nothing else useful. */
@@ -360,14 +485,16 @@ test("Reader closed rejects with the decoded reset code", async () => {
 		new ReadableStream<Uint8Array>({
 			start: (controller) => controller.error(new Reset(2)),
 		}),
+		undefined,
+		QUIC,
 	);
 
 	const err = await reader.closed.then(
 		() => undefined,
 		(e: unknown) => e,
 	);
-	expect(err).toBeInstanceOf(RemoteError);
-	expect((err as RemoteError).code).toBe(2);
+	expect(err).toBeInstanceOf(StreamError);
+	expect((err as StreamError).code).toBe(StreamCode.DeliveryTimeout);
 });
 
 test("Writer closed rejects with the decoded reset code", async () => {
@@ -375,148 +502,315 @@ test("Writer closed rejects with the decoded reset code", async () => {
 		new WritableStream<Uint8Array>({
 			start: (controller) => controller.error(new Reset(31)),
 		}),
+		QUIC,
 	);
 
 	const err = await writer.closed.then(
 		() => undefined,
 		(e: unknown) => e,
 	);
-	expect(err).toBeInstanceOf(RemoteError);
-	expect((err as RemoteError).code).toBe(31);
+	expect(err).toBeInstanceOf(StreamError);
+	expect(Number((err as StreamError).code)).toBe(31);
+});
+
+test("Writer reset forwards only a stream error code", async () => {
+	const session = new SessionError(SessionCode.Unauthorized);
+	const sessionWriter = new Writer(new WritableStream<Uint8Array>(), QUIC);
+	sessionWriter.reset(session);
+	const sessionResult = await sessionWriter.closed.then(
+		() => undefined,
+		(err: unknown) => err,
+	);
+	// The session code means nothing on a stream; the stream only lost its route.
+	expect(sessionResult).toBeInstanceOf(StreamError);
+	expect((sessionResult as StreamError).code).toBe(StreamCode.Unroutable);
+
+	const stream = new StreamError(StreamCode.DeliveryTimeout);
+	const streamWriter = new Writer(new WritableStream<Uint8Array>(), QUIC);
+	streamWriter.reset(stream);
+	const streamResult = await streamWriter.closed.then(
+		() => undefined,
+		(err: unknown) => err,
+	);
+	expect(streamResult).toBeInstanceOf(StreamError);
+	expect((streamResult as StreamError).code).toBe(StreamCode.DeliveryTimeout);
 });
 
 test("closed is stable, so racing it per frame does not allocate", async () => {
-	const reader = new Reader(new ReadableStream<Uint8Array>());
+	const reader = new Reader(new ReadableStream<Uint8Array>(), undefined, QUIC);
 	expect(reader.closed).toBe(reader.closed);
 });
 
-// Deadlines for the stalled fixtures below: one they always blow through, and one they
-// never reach because the slot frees first. Neither is a delay any test waits out.
-const EXPIRES_MS = 10;
-const OUTLASTS_TEST_MS = 1000;
+test("reading to FIN builds no error", async () => {
+	// Fixtures built outside the window, and kept alive so an error they retain stays counted.
+	const readers = Array.from(
+		{ length: 32 },
+		() =>
+			new Reader(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new Uint8Array([7]));
+						controller.close();
+					},
+				}),
+				undefined,
+				QUIC,
+			),
+	);
+	const before = heapStats().objectTypeCounts;
+	for (const reader of readers) {
+		expect(await reader.u8()).toBe(7);
+		expect(await reader.done()).toBe(true);
+	}
+	const after = heapStats().objectTypeCounts;
+	expect(after.TypeError ?? 0).toBeLessThanOrEqual(before.TypeError ?? 0);
+	expect(after.Error ?? 0).toBeLessThanOrEqual(before.Error ?? 0);
+});
 
-// Builds a transport whose uni opens complete only once `freeSlot` is called, standing in
-// for a peer that has granted no stream credit. `aborted` settles when the stream it
-// eventually hands over is reset, so a test can await that rather than guess at a delay.
-function stalledTransport() {
-	let freeSlot!: () => void;
-	const slot = new Promise<void>((resolve) => {
-		freeSlot = resolve;
-	});
+test("stop after FIN allocates nothing and sends nothing", async () => {
+	const cancelled: unknown[] = [];
+	const reader = new Reader(
+		new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new Uint8Array([7]));
+				controller.close();
+			},
+			cancel(reason) {
+				cancelled.push(reason);
+			},
+		}),
+		undefined,
+		QUIC,
+	);
+	expect(await reader.u8()).toBe(7);
+	expect(await reader.done()).toBe(true);
 
-	let abort!: (reason: unknown) => void;
-	const aborted = new Promise<unknown>((resolve) => {
-		abort = resolve;
-	});
+	// Built outside the window. A caller that already holds an error, and one that passes only
+	// the code, must neither construct another nor hand the transport a reset.
+	const reason = new StreamError(StreamCode.Cancel, { message: "cancel" });
+	const before = heapStats().objectTypeCounts;
+	for (let i = 0; i < 32; i++) reader.stop(reason);
+	for (let i = 0; i < 32; i++) reader.stop(StreamCode.Cancel);
+	const after = heapStats().objectTypeCounts;
+	// A collection between the snapshots can only lower a live count. The regression
+	// retains an error and a promise per stop, which still shows up as a rise.
+	expect(after.Error ?? 0).toBeLessThanOrEqual(before.Error ?? 0);
+	expect(after.Promise ?? 0).toBeLessThanOrEqual(before.Promise ?? 0);
+	expect(cancelled).toEqual([]);
+	await reader.closed;
+});
 
-	const stream = new WritableStream<Uint8Array>({ abort });
+test("stop mid-stream still cancels with the code", async () => {
+	const cancelled = Promise.withResolvers<unknown>();
+	const reader = new Reader(
+		new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new Uint8Array([1]));
+			},
+			cancel: cancelled.resolve,
+		}),
+		undefined,
+		QUIC,
+	);
+	expect(await reader.u8()).toBe(1);
+	reader.stop(StreamCode.Cancel);
+	const stopped = await cancelled.promise;
+	expect((stopped as { streamErrorCode?: number }).streamErrorCode).toBe(StreamCode.Cancel);
+});
 
+test("Writer reset still reads a bare number as Internal", async () => {
+	const aborted = Promise.withResolvers<unknown>();
+	const writer = new Writer(new WritableStream({ abort: aborted.resolve }), Version.DRAFT_18);
+	writer.reset(StreamCode.GoingAway);
+	const reason = await aborted.promise;
+	expect((reason as { streamErrorCode?: number }).streamErrorCode).toBe(StreamCode.Internal);
+});
+
+// A transport standing in for a peer that has granted no stream credit: each create waits
+// until `grant` admits it, in the order they were made, as a browser's do.
+function creditTransport() {
+	const pending: (() => void)[] = [];
+	const created: number[] = [];
+	const streams: { sendOrder?: number }[] = [];
+	const create =
+		<T extends object>(stream: () => T) =>
+		async (options?: { sendOrder?: number }) => {
+			created.push(options?.sendOrder ?? 0);
+			await new Promise<void>((resolve) => pending.push(resolve));
+			const made = stream();
+			streams.push("writable" in made ? (made.writable as object) : made);
+			return made;
+		};
 	const quic = {
-		createUnidirectionalStream: async () => {
-			await slot;
-			return stream;
-		},
+		createUnidirectionalStream: create(() => new WritableStream<Uint8Array>()),
+		createBidirectionalStream: create(() => ({
+			readable: new ReadableStream<Uint8Array>(),
+			writable: new WritableStream<Uint8Array>(),
+		})),
 	} as unknown as WebTransport;
-
-	return { quic, freeSlot, aborted };
-}
-
-// The bidirectional counterpart, whose `discarded` settles when a stream handed over after
-// the deadline is thrown away.
-function stalledBidiTransport() {
-	let freeSlot!: () => void;
-	const slot = new Promise<void>((resolve) => {
-		freeSlot = resolve;
-	});
-
-	let discard!: (reason: unknown) => void;
-	const discarded = new Promise<unknown>((resolve) => {
-		discard = resolve;
-	});
-
-	const stream = {
-		readable: new ReadableStream<Uint8Array>({ cancel: discard }),
-		writable: new WritableStream<Uint8Array>({ abort: discard }),
+	const grant = async (streams = 1) => {
+		for (let i = 0; i < streams; i++) pending.shift()?.();
+		await yieldNow();
 	};
-
-	const quic = {
-		createBidirectionalStream: async () => {
-			await slot;
-			return stream;
-		},
-	} as unknown as WebTransport;
-
-	return { quic, freeSlot, discarded };
+	return { quic, grant, created, streams };
 }
 
-// Bidi opens have no group to drop, so they fail the way they did before
-// waitUntilAvailable rather than parking for as long as the peer withholds credit.
-test("open gives up on a peer that never frees a bidi slot", async () => {
-	const { quic, freeSlot, discarded } = stalledBidiTransport();
+// Record the index of each open as it resolves.
+function track(opens: Promise<unknown>[]): number[] {
+	const order: number[] = [];
+	opens.forEach((open, i) => void open.then(() => order.push(i)));
+	return order;
+}
 
-	await expect(Stream.open(quic, { timeout: EXPIRES_MS })).rejects.toThrow(/timed out/);
+test("opens past the peer's credit get streams by send order as it returns", async () => {
+	const { quic, grant } = creditTransport();
+	const opens = [1, 3, 2, 3].map((sendOrder) => Writer.open(quic, { sendOrder, version: QUIC }));
+	const order = track(opens);
+	for (let i = 0; i < opens.length; i++) await grant();
+	await Promise.all(opens);
+	// Equal send orders keep their arrival order.
+	expect(order).toEqual([1, 3, 2, 0]);
+});
 
-	freeSlot();
-	await discarded;
+test("the stream handed to another open takes that open's send order", async () => {
+	const { quic, grant, streams } = creditTransport();
+	const low = Writer.open(quic, { sendOrder: 1, version: QUIC });
+	const high = Writer.open(quic, { sendOrder: 9, version: QUIC });
+	// Admits the first create, which the low open made.
+	await grant();
+	await high;
+	expect(streams[0].sendOrder).toBe(9);
+	await grant();
+	await low;
+	expect(streams[1].sendOrder).toBe(1);
+});
+
+test("a waiting open's rank is read again when a stream is handed out", async () => {
+	const { quic, grant } = creditTransport();
+	let rank = 1;
+	const moving = Writer.tryOpen(quic, { sendOrder: () => rank, cancel: new Promise(() => {}), version: QUIC });
+	const fixed = Writer.open(quic, { sendOrder: 5, version: QUIC });
+	const order = track([moving, fixed]);
+	rank = 10;
+	await grant();
+	expect(await moving).toBeInstanceOf(Writer);
+	expect(order).toEqual([0]);
+	await grant();
+	await fixed;
+	expect(order).toEqual([0, 1]);
 });
 
 test("open waits for a bidi slot rather than failing on a busy session", async () => {
-	const { quic, freeSlot } = stalledBidiTransport();
+	const { quic, grant } = creditTransport();
 
-	const opening = Stream.open(quic, { timeout: OUTLASTS_TEST_MS });
-	expect(await Promise.race([opening.then(() => "opened"), Promise.resolve("waiting")])).toBe("waiting");
+	const opening = Stream.open(quic, { version: QUIC });
+	expect(await Promise.race([opening.then(() => "opened"), yieldNow().then(() => "waiting")])).toBe("waiting");
 
-	freeSlot();
+	await grant();
 	expect(await opening).toBeInstanceOf(Stream);
 });
 
 // A cancel that already settled has to win even when a slot is free, or a group whose
 // subscriber is long gone still goes out.
 test("tryOpen gives up on a cancel that settled before the open", async () => {
-	const { quic, freeSlot, aborted } = stalledTransport();
-	freeSlot();
+	const { quic, grant, created } = creditTransport();
+	expect(await Writer.tryOpen(quic, { cancel: Promise.resolve(), version: QUIC })).toBeUndefined();
+	expect(created).toHaveLength(0);
 
-	expect(await Writer.tryOpen(quic, { cancel: Promise.resolve() })).toBeUndefined();
-	await aborted;
+	// Nor does it take a stream kept for the next open.
+	const cancelled = Promise.withResolvers<void>();
+	const gaveUp = Writer.tryOpen(quic, { cancel: cancelled.promise, version: QUIC });
+	cancelled.resolve();
+	expect(await gaveUp).toBeUndefined();
+	await grant();
+	expect(await Writer.tryOpen(quic, { cancel: Promise.resolve(), version: QUIC })).toBeUndefined();
+	expect(await Writer.open(quic, { version: QUIC })).toBeInstanceOf(Writer);
+	expect(created).toHaveLength(1);
 });
 
-test("tryOpen gives up when cancelled, resetting a stream that opens afterwards", async () => {
-	const { quic, freeSlot, aborted } = stalledTransport();
+// Groups that expire while the peer withholds credit leave their creates to the next open,
+// so churn never queues more creates than opens wait.
+test("cancelled opens never queue more creates than opens wait", async () => {
+	const { quic, grant, created } = creditTransport();
+	for (let i = 0; i < 100; i++) {
+		const cancelled = Promise.withResolvers<void>();
+		const opening = Writer.tryOpen(quic, { cancel: cancelled.promise, version: QUIC });
+		cancelled.resolve();
+		expect(await opening).toBeUndefined();
+	}
+	expect(created).toHaveLength(1);
+	const open = Writer.open(quic, { version: QUIC });
+	await grant();
+	expect(await open).toBeInstanceOf(Writer);
+	expect(created).toHaveLength(1);
+});
 
-	let cancel!: () => void;
-	const cancelled = new Promise<void>((resolve) => {
-		cancel = resolve;
-	});
+test("tryOpen gives up when cancelled, handing a stream that opens afterwards to the next open", async () => {
+	const { quic, grant, created } = creditTransport();
+	const cancelled = Promise.withResolvers<void>();
 
-	const opening = Writer.tryOpen(quic, { cancel: cancelled });
-	cancel();
+	const opening = Writer.tryOpen(quic, { cancel: cancelled.promise, version: QUIC });
+	const next = Writer.open(quic, { version: QUIC });
+	cancelled.resolve();
 	expect(await opening).toBeUndefined();
 
-	freeSlot();
-	await aborted;
+	await grant();
+	expect(await next).toBeInstanceOf(Writer);
+	expect(created).toHaveLength(2);
 });
 
-// Without a deadline a peer that withholds stream credit while keeping the subscription
-// open queues work forever, since waitUntilAvailable never rejects.
-test("tryOpen gives up when the peer never frees a slot", async () => {
-	const { quic, freeSlot, aborted } = stalledTransport();
-
-	expect(await Writer.tryOpen(quic, { cancel: new Promise(() => {}), timeout: EXPIRES_MS })).toBeUndefined();
-
-	freeSlot();
-	await aborted;
+// A request abandoned while the peer withholds credit leaves the line, so the credit that
+// returns serves a live request instead of one that resets its stream at once.
+test("cancelled bidi opens leave the line to the next open", async () => {
+	const { quic, grant, created } = creditTransport();
+	for (let i = 0; i < 3; i++) {
+		const cancelled = new AbortController();
+		const opening = Stream.tryOpen(quic, { signal: cancelled.signal, version: QUIC });
+		cancelled.abort();
+		expect(await opening).toBeUndefined();
+	}
+	// One already aborted never joins the line.
+	expect(await Stream.tryOpen(quic, { signal: AbortSignal.abort(), version: QUIC })).toBeUndefined();
+	const live = Stream.open(quic, { version: QUIC });
+	await grant();
+	expect(await live).toBeInstanceOf(Stream);
+	expect(created).toHaveLength(1);
 });
 
-test("tryOpen returns the stream when a slot is available", async () => {
-	const { quic, freeSlot } = stalledTransport();
+test("tryOpen rethrows a rejected cancel", async () => {
+	const { quic } = creditTransport();
+	const cancelled = Promise.withResolvers<void>();
 
-	const opening = Writer.tryOpen(quic, { cancel: new Promise(() => {}), timeout: OUTLASTS_TEST_MS });
-	freeSlot();
-
-	expect(await opening).toBeInstanceOf(Writer);
+	const opening = Writer.tryOpen(quic, { cancel: cancelled.promise, version: QUIC });
+	cancelled.reject(new Error("stop sending"));
+	await expect(opening).rejects.toThrow("stop sending");
 });
 
-test("open waits for a stream slot instead of rejecting once the peer's limit is full", async () => {
+test("a failed create fails an open rather than leaving it waiting", async () => {
+	const quic = {
+		createUnidirectionalStream: async () => {
+			throw new Error("session closed");
+		},
+	} as unknown as WebTransport;
+	await expect(Writer.open(quic, { version: QUIC })).rejects.toThrow("session closed");
+});
+
+// A subscription hands the same `cancel` to every group it opens, so each open must not leave a
+// reaction behind on it for the life of the subscription.
+test("tryOpen shares one reaction on a cancel reused across opens", async () => {
+	const quic = {
+		createUnidirectionalStream: async () => new WritableStream<Uint8Array>(),
+	} as unknown as WebTransport;
+
+	const cancel = new Promise<void>(() => {});
+	const reactions = spyOn(cancel, "then");
+	for (let i = 0; i < 100; i++) {
+		expect(await Writer.tryOpen(quic, { cancel, version: QUIC })).toBeInstanceOf(Writer);
+	}
+	expect(reactions).toHaveBeenCalledTimes(1);
+});
+
+test("opens ask the transport to wait for a stream slot at their send order", async () => {
 	const options: unknown[] = [];
 	const quic = {
 		createBidirectionalStream: async (opts?: unknown) => {
@@ -529,14 +823,228 @@ test("open waits for a stream slot instead of rejecting once the peer's limit is
 		},
 	} as unknown as WebTransport;
 
-	await Stream.open(quic, { sendOrder: 7 });
-	await Writer.open(quic);
-	// The one path that opens faster than a peer can retire streams opts out.
-	await Writer.open(quic, { waitUntilAvailable: false });
+	await Stream.open(quic, { sendOrder: 7, version: QUIC });
+	await Writer.open(quic, { version: QUIC });
 
-	expect(options).toEqual([
-		{ sendOrder: 7, waitUntilAvailable: true },
-		{ sendOrder: undefined, waitUntilAvailable: true },
-		{ sendOrder: undefined, waitUntilAvailable: false },
-	]);
+	expect(options).toEqual([{ sendOrder: 7, waitUntilAvailable: true }, { waitUntilAvailable: true }]);
 });
+
+// A moq-transport code has to be one the negotiated draft assigns the same meaning to, so
+// each row says what it costs on a draft that predates the registration. TOO_FAR_BEHIND
+// arrived in draft-17, and moq-lite's own 48-63 codes are in no draft at all.
+for (const [version, tooFarBehind] of [
+	[QUIC, StreamCode.TooFarBehind],
+	[Version.DRAFT_18, StreamCode.TooFarBehind],
+	[Version.DRAFT_22, StreamCode.TooFarBehind],
+] as const) {
+	test(`stream resets select the negotiated registry (${version})`, async () => {
+		for (const [reason, expected] of [
+			[new Lagged(), tooFarBehind],
+			[new Reset(5), tooFarBehind],
+			[new FrameTooLarge(), version === QUIC ? StreamCode.FrameTooLarge : StreamCode.Internal],
+			[new GroupTooLarge(), version === QUIC ? StreamCode.GroupTooLarge : StreamCode.Internal],
+			[new NotFound("broadcast"), version === QUIC ? StreamCode.NotFound : StreamCode.Internal],
+			// Assigned by every draft, so these survive the translation intact.
+			[new TimeoutError("open"), StreamCode.DeliveryTimeout],
+			[new ProtocolViolation("bad message"), StreamCode.SessionClosed],
+			[new StreamError(StreamCode.Cancel), StreamCode.Cancel],
+		] as const) {
+			const aborted = Promise.withResolvers<unknown>();
+			const writer = new Writer(new WritableStream<Uint8Array>({ abort: aborted.resolve }), version);
+			writer.reset(reason);
+			const sent = await aborted.promise;
+			expect((sent as { streamErrorCode?: number }).streamErrorCode ?? 0).toBe(expected);
+			const cancelled = Promise.withResolvers<unknown>();
+			const reader = new Reader(
+				new ReadableStream<Uint8Array>({ cancel: cancelled.resolve }),
+				undefined,
+				version,
+			);
+			reader.stop(reason);
+			const stopped = await cancelled.promise;
+			expect((stopped as { streamErrorCode?: number }).streamErrorCode ?? 0).toBe(expected);
+		}
+	});
+	test(`received reset uses the negotiated registry (${version})`, async () => {
+		const reader = new Reader(
+			new ReadableStream<Uint8Array>({
+				start: (controller) => controller.error(new Reset(5)),
+			}),
+			undefined,
+			version,
+		);
+		const err = await reader.closed.catch((err: unknown) => err);
+		expect(err).toBeInstanceOf(StreamError);
+		// 0x5 is TOO_FAR_BEHIND only where the draft registers it; on draft-14 it means
+		// nothing, so reading it as a lag would invent a gap the peer never reported.
+		expect(err instanceof Lagged).toBe(tooFarBehind === StreamCode.TooFarBehind);
+		// Flattened where the draft does not register it, but the wire value still reaches a
+		// log rather than being lost.
+		if (tooFarBehind === StreamCode.Internal) expect((err as StreamError).message).toContain("5");
+	});
+
+	// EXCESSIVE_LOAD, which moq-lite names nothing for, so nothing can misread the value
+	// and it survives intact. Only a code moq-lite claims for something else is flattened.
+	test(`a code moq-lite does not claim keeps its value (${version})`, async () => {
+		const reader = new Reader(
+			new ReadableStream<Uint8Array>({
+				start: (controller) => controller.error(new Reset(0x9)),
+			}),
+			undefined,
+			version,
+		);
+		const err = await reader.closed.catch((err: unknown) => err);
+		expect(err).toBeInstanceOf(StreamError);
+		expect((err as StreamError).code).toBe(0x9 as StreamCode);
+	});
+
+	// moq-lite mints an application code for anything 64 and up, so an application compares
+	// against its own. moq-transport has no such range, so a code landing there from an IETF
+	// peer is never the application code it would look like.
+	test(`a foreign code in the application range is flattened (${version})`, async () => {
+		const reader = new Reader(
+			new ReadableStream<Uint8Array>({
+				start: (controller) => controller.error(new Reset(70)),
+			}),
+			undefined,
+			version,
+		);
+		const err = await reader.closed.catch((err: unknown) => err);
+		expect(err).toBeInstanceOf(StreamError);
+		expect((err as StreamError).code).toBe(version === QUIC ? StreamCode(70) : StreamCode.Internal);
+		if (version !== QUIC) expect((err as StreamError).message).toContain("70");
+	});
+}
+
+async function written(version: Lite, f: (w: Writer) => Promise<void>): Promise<number[]> {
+	const { stream, written } = createTestWritableStream();
+	const writer = new Writer(stream, version);
+	await f(writer);
+	writer.close();
+	await writer.closed;
+	return [...concatChunks(written)];
+}
+
+test("lite-07 varints count leading ones; lite-06 keeps the QUIC form", async () => {
+	expect(await written(Lite.DRAFT_06, (w) => w.u53(100))).toEqual([0x40, 0x64]);
+	expect(await written(Lite.DRAFT_07, (w) => w.u53(100))).toEqual([0x64]);
+	expect(await written(Lite.DRAFT_07, (w) => w.u62(2n ** 62n - 1n))).toEqual([
+		0xff, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	]);
+
+	expect(await new Reader(undefined, new Uint8Array([0x40, 0x64]), Lite.DRAFT_06).u53()).toBe(100);
+	expect(await new Reader(undefined, new Uint8Array([0x80, 0x64]), Lite.DRAFT_07).u53()).toBe(100);
+	// The 7-byte form, reserved only on draft-17.
+	const seven = new Uint8Array([0xfd, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd]);
+	expect(await new Reader(undefined, seven, Lite.DRAFT_07).u62()).toBe(0x1_2345_6789_abcdn);
+});
+
+test("the varint range follows the version: 64 bits on lite-07, 62 on lite-06", async () => {
+	const max = 2n ** 64n - 1n;
+	const wire = await written(Lite.DRAFT_07, (w) => w.u62(max));
+	expect(wire).toEqual(Array(9).fill(0xff));
+	expect(await new Reader(undefined, Uint8Array.from(wire), Lite.DRAFT_07).u62()).toBe(max);
+	await expect(written(Lite.DRAFT_06, (w) => w.u62(2n ** 62n))).rejects.toThrow("62-bits");
+});
+
+test("reset codes the registries share decode alike, and the rest as INTERNAL_ERROR", async () => {
+	const reset = async (version: StreamVersion, code: number) => {
+		const reader = new Reader(
+			new ReadableStream<Uint8Array>({
+				start: (controller) => controller.error(new Reset(code)),
+			}),
+			undefined,
+			version,
+		);
+		const err = await reader.closed.then(
+			() => undefined,
+			(e: unknown) => e,
+		);
+		return (err as StreamError).code;
+	};
+	// 0x4 is GOING_AWAY in both registries; 0x33 is NOT_FOUND on moq-lite only.
+	expect(await reset(Lite.DRAFT_07, 4)).toBe(StreamCode.GoingAway);
+	expect(await reset(Version.DRAFT_18, 4)).toBe(StreamCode.GoingAway);
+	expect(await reset(Lite.DRAFT_07, 0x33)).toBe(StreamCode.NotFound);
+	expect(await reset(Version.DRAFT_18, 0x33)).toBe(StreamCode.Internal);
+});
+
+test("Writer and Reader varint round-trip every size in both formats", async () => {
+	const values = [0n, 63n, 64n, 127n, 128n, 2n ** 14n, 2n ** 21n, 2n ** 28n, 2n ** 30n, 2n ** 32n, 2n ** 35n];
+	values.push(2n ** 42n, 2n ** 49n, 2n ** 53n, 2n ** 56n, 2n ** 62n - 1n);
+	for (const version of [Lite.DRAFT_06, Lite.DRAFT_07, Version.DRAFT_18]) {
+		// Only leading-ones varints reach past 62 bits.
+		const all = version === Lite.DRAFT_06 ? values : [...values, 2n ** 62n, 2n ** 64n - 1n];
+		const { stream, written } = createTestWritableStream();
+		const writer = new Writer(stream, version);
+		for (const value of all) await writer.varint(U64.fromBigInt(value));
+		writer.close();
+		await writer.closed;
+
+		const reader = new Reader(undefined, concatChunks(written), version);
+		for (const value of all) expect((await reader.varint()).toBigInt()).toBe(value);
+		expect(await reader.done()).toBe(true);
+	}
+});
+
+test("Reader u53 decodes every size in both formats, one byte per chunk", async () => {
+	const values = [0, 63, 64, 127, 128, 16383, 16384, 2 ** 21, 2 ** 28 - 1, 2 ** 28, 2 ** 30 - 1, 2 ** 30];
+	values.push(2 ** 35, 2 ** 42, 2 ** 49, Number.MAX_SAFE_INTEGER);
+	for (const version of [Lite.DRAFT_06, Lite.DRAFT_07, Version.DRAFT_18]) {
+		const { stream, written } = createTestWritableStream();
+		const writer = new Writer(stream, version);
+		for (const value of values) await writer.u53(value);
+		writer.close();
+		await writer.closed;
+
+		const bytes = concatChunks(written);
+		const chunked = new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (const byte of bytes) controller.enqueue(new Uint8Array([byte]));
+				controller.close();
+			},
+		});
+		const reader = new Reader(chunked, undefined, version);
+		for (const value of values) expect(await reader.u53()).toBe(value);
+		expect(await reader.done()).toBe(true);
+	}
+});
+
+// A peer keeping streams ready must not hold the host for as long as they keep arriving:
+// each accept resolves in a microtask, so only a yield lets a sibling task run in between.
+// The CPU slice is stubbed to pass on every check, so the yield does not depend on load.
+// biome-ignore lint/style/noRestrictedGlobals: stubs the host CPU clock the budget reads.
+const host = performance;
+for (const kind of ["uni", "bidi"] as const) {
+	test(`a flood of ${kind} streams yields to the host's other tasks`, async () => {
+		const STREAMS = 1024;
+		const { client, server } = createMockTransportPair();
+		for (let i = 0; i < STREAMS; i++) {
+			if (kind === "uni") await client.createUnidirectionalStream();
+			else await client.createBidirectionalStream();
+		}
+
+		let fakeNow = 0;
+		const clock = spyOn(host, "now").mockImplementation(() => (fakeNow += 5));
+		// The shared budget outlives Bun's file reruns, so isolate it with the stubbed CPU clock.
+		const budget = new Budget();
+		const poll = spyOn(acceptBudget, "poll").mockImplementation(() => budget.poll());
+		try {
+			const readers = kind === "uni" ? new Readers(server, QUIC) : undefined;
+			let accepted = 0;
+			let sibling: number | undefined;
+			void yieldNow().then(() => {
+				sibling = accepted;
+			});
+			for (; accepted < STREAMS; accepted++) {
+				const stream = readers ? await readers.next() : await Stream.accept(server, QUIC);
+				expect(stream).toBeDefined();
+			}
+			expect(sibling).toBeDefined();
+			expect(sibling).toBeLessThan(STREAMS);
+		} finally {
+			poll.mockRestore();
+			clock.mockRestore();
+		}
+	});
+}

@@ -1,9 +1,12 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import { Duration } from "@moq/clock";
+import { Manual } from "@moq/clock/test";
 import { Signal } from "@moq/signals";
 import { Camera } from "./camera";
 import { Microphone } from "./microphone";
 import { Retry } from "./retry";
 import { Screen } from "./screen";
+import type { Media } from "./types";
 
 // A MediaStreamTrack ends on its own when the device disappears or the OS revokes it. Only the bits
 // the sources touch, plus end() to fire it.
@@ -29,9 +32,11 @@ class FakeTrack extends EventTarget {
 
 class FakeMediaDevices extends EventTarget {
 	tracks: FakeTrack[] = [];
+	errors: Error[] = [];
 
 	// getUserMedia rejects, the way it does once the last device is gone.
 	missing = false;
+	denied = false;
 
 	// Hand back an already-dead track, the way a device that vanished mid-call would.
 	bornDead = false;
@@ -49,6 +54,9 @@ class FakeMediaDevices extends EventTarget {
 
 	async getUserMedia(): Promise<MediaStream> {
 		this.attempts += 1;
+		const error = this.errors.shift();
+		if (error) throw error;
+		if (this.denied) throw new DOMException("Permission denied", "NotAllowedError");
 		if (this.missing) throw new Error("NotFoundError");
 
 		const track = new FakeTrack();
@@ -120,60 +128,318 @@ function install<T extends EventTarget>(media: T): T & Disposable {
 	});
 }
 
+function installOrientation(type: OrientationType): { orientation: ScreenOrientation } & Disposable {
+	const original = Object.getOwnPropertyDescriptor(globalThis, "screen");
+	const orientation = new EventTarget() as ScreenOrientation;
+	Object.defineProperty(orientation, "type", { configurable: true, value: type });
+	Object.defineProperty(globalThis, "screen", { configurable: true, value: { orientation } });
+
+	return {
+		orientation,
+		[Symbol.dispose]() {
+			if (original) Object.defineProperty(globalThis, "screen", original);
+			else Reflect.deleteProperty(globalThis, "screen");
+		},
+	};
+}
+
 const flush = () => new Promise<void>((resolve) => queueMicrotask(resolve));
 async function settle(times = 20): Promise<void> {
 	for (let i = 0; i < times; i++) await flush();
 }
 
-/**
- * Poll until `pred` holds, so a regression fails the test instead of hanging it.
- *
- * A reopen waits out {@link Retry.DELAY} on a real timer, so microtask flushing alone never
- * reaches it. Polling rather than sleeping for the exact delay keeps a loaded runner from
- * deciding the outcome.
- */
-async function waitUntil(pred: () => boolean): Promise<void> {
-	const deadline = Date.now() + WAIT_TIMEOUT;
-	while (!pred()) {
-		if (Date.now() > deadline) throw new Error("timed out waiting for condition");
-		await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
-	}
+/** Wait out the longest backoff, so any reopen already scheduled has happened. */
+async function backoff(clock: Manual): Promise<void> {
+	// Let pending reruns arm their backoff before moving past it.
+	await clock.advance(Duration.ZERO);
+	await clock.advance(Duration.millis(Retry.DELAY.max));
 }
 
 /**
- * Poll until the capture stops reopening, meaning the budget is spent.
+ * Wait out backoffs until the capture stops reopening, meaning the budget is spent.
  *
  * Watches for quiet rather than an exact attempt count: a device-list change can refund the budget
- * mid-cascade and buy another round. The window outlasts the largest backoff, so quiet here means
+ * mid-cascade and buy another round. Each step outlasts the largest backoff, so a quiet step means
  * stopped rather than mid-wait.
  */
-async function waitSpent(media: FakeMediaDevices): Promise<void> {
-	const quiet = (Retry.DELAY.max ?? 0) + QUIET_MARGIN;
-
+async function waitSpent(media: FakeMediaDevices, clock: Manual): Promise<void> {
 	let seen = -1;
 	while (seen !== media.attempts) {
 		seen = media.attempts;
-		await new Promise((resolve) => setTimeout(resolve, quiet));
+		await backoff(clock);
 	}
-	await settle();
 }
 
-/** How long a `waitUntil` polls before calling the condition unreachable. */
-const WAIT_TIMEOUT = 10_000;
-/** How often `waitUntil` re-checks; short, since everything it watches is in-process. */
-const POLL_INTERVAL = 5;
-/** Quiet time past the largest backoff that proves the capture really stopped reopening. */
-const QUIET_MARGIN = 100;
-/** Burning the whole budget waits out every backoff, which outlasts the default per-test timeout. */
-const SPENT_TIMEOUT = 30_000;
-
 /** The track a source published, or undefined. */
-function published(source: { track: MediaStreamTrack } | MediaStreamTrack | undefined): unknown {
+function published(media: Media | undefined): unknown {
+	const source = media?.audio ?? media?.video;
 	if (!source) return undefined;
 	return "track" in source ? source.track : source;
 }
 
+function fakeTime(): Manual & Disposable {
+	const clock = new Manual();
+	const installed = clock.install();
+	return Object.assign(clock, { [Symbol.dispose]: () => installed.close() });
+}
+
+for (const [kind, create] of [
+	["camera", (enabled: Signal<boolean>) => new Camera({ enabled })],
+	["microphone", (enabled: Signal<boolean>) => new Microphone({ enabled })],
+] as const) {
+	for (const name of ["NotReadableError", "AbortError"]) {
+		test(`${kind} retries ${name} without reporting a terminal error`, async () => {
+			using time = fakeTime();
+			using media = install(new FakeMediaDevices());
+			const enabled = new Signal(false);
+			const source = create(enabled);
+			try {
+				// Settle discovery before starting so it cannot refund this attempt's budget.
+				await settle();
+				media.errors = [new DOMException("temporarily unavailable", name)];
+				enabled.set(true);
+				await settle();
+				expect(media.attempts).toBe(1);
+				expect(source.out.error.peek()).toBeUndefined();
+				expect(source.out.source.peek()).toBeUndefined();
+
+				await time.advance(Duration.millis(Retry.DELAY.initial));
+				await settle();
+				expect(media.attempts).toBe(2);
+				expect(published(source.out.source.peek())).toBe(media.latest());
+				expect(source.out.error.peek()).toBeUndefined();
+			} finally {
+				source.close();
+			}
+		});
+
+		test(`${kind} retains ${name} after exhausting the retry budget`, async () => {
+			using time = fakeTime();
+			using media = install(new FakeMediaDevices());
+			const enabled = new Signal(false);
+			const source = create(enabled);
+			try {
+				await settle();
+				const errors = Array.from(
+					{ length: Retry.LIMIT + 1 },
+					(_, i) => new DOMException(`failure ${i}`, name),
+				);
+				media.errors = [...errors];
+				enabled.set(true);
+				await settle();
+				for (let i = 0; i < Retry.LIMIT; i++) {
+					expect(media.attempts).toBe(i + 1);
+					expect(source.out.error.peek()).toBeUndefined();
+					await time.fire();
+					await settle();
+				}
+				expect(media.attempts).toBe(Retry.LIMIT + 1);
+				expect(source.out.source.peek()).toBeUndefined();
+				expect(source.out.error.peek()).toBe(errors.at(-1));
+				await time.advance(Duration.millis(Retry.SETTLED));
+				await settle();
+				expect(media.attempts).toBe(Retry.LIMIT + 1);
+				expect(source.out.error.peek()).toBe(errors.at(-1));
+
+				enabled.set(false);
+				await settle();
+				expect(source.out.error.peek()).toBeUndefined();
+				enabled.set(true);
+				await settle();
+				expect(media.attempts).toBe(Retry.LIMIT + 2);
+				expect(published(source.out.source.peek())).toBe(media.latest());
+			} finally {
+				source.close();
+			}
+		});
+	}
+
+	for (const error of [
+		new DOMException("denied", "NotAllowedError"),
+		new TypeError("bad constraints"),
+		new Error("unknown"),
+	]) {
+		test(`${kind} does not retry ${error.name}`, async () => {
+			using time = fakeTime();
+			using media = install(new FakeMediaDevices());
+			const enabled = new Signal(false);
+			const source = create(enabled);
+			try {
+				await settle();
+				media.errors = [error];
+				enabled.set(true);
+				await settle();
+				expect(source.out.error.peek()).toBe(error);
+				await time.advance(Duration.millis(Retry.SETTLED));
+				await settle();
+				expect(media.attempts).toBe(1);
+				expect(source.out.source.peek()).toBeUndefined();
+				expect(source.out.error.peek()).toBe(error);
+			} finally {
+				source.close();
+			}
+		});
+	}
+
+	for (const close of [false, true]) {
+		test(`${kind} cancels a pending retry when ${close ? "closed" : "disabled"}`, async () => {
+			using time = fakeTime();
+			using media = install(new FakeMediaDevices());
+			const enabled = new Signal(false);
+			const source = create(enabled);
+			try {
+				await settle();
+				media.errors = [new DOMException("busy", "NotReadableError")];
+				enabled.set(true);
+				await settle();
+				expect(media.attempts).toBe(1);
+				expect(source.out.error.peek()).toBeUndefined();
+				if (close) source.close();
+				else enabled.set(false);
+				await settle();
+				await time.advance(Duration.millis(Retry.SETTLED));
+				await settle();
+				expect(media.attempts).toBe(1);
+				expect(source.out.source.peek()).toBeUndefined();
+				expect(source.out.error.peek()).toBeUndefined();
+			} finally {
+				source.close();
+			}
+		});
+	}
+
+	for (const reject of [false, true]) {
+		test(`${kind} ignores a ${reject ? "rejection" : "stream"} arriving after cancellation`, async () => {
+			using time = fakeTime();
+			using media = install(new FakeMediaDevices());
+			const pending = Promise.withResolvers<MediaStream>();
+			const open = spyOn(media, "getUserMedia").mockImplementationOnce(() => pending.promise);
+			const enabled = new Signal(false);
+			const source = create(enabled);
+			try {
+				await settle();
+				enabled.set(true);
+				await settle();
+				expect(open).toHaveBeenCalledTimes(1);
+				enabled.set(false);
+				await settle();
+				const track = new FakeTrack();
+				if (reject) pending.reject(new DOMException("aborted", "AbortError"));
+				else pending.resolve({ getTracks: () => [track] } as unknown as MediaStream);
+				await settle();
+				if (!reject) expect(track.stopped).toBe(true);
+				await time.advance(Duration.millis(Retry.SETTLED));
+				await settle();
+				expect(open).toHaveBeenCalledTimes(1);
+				expect(source.out.error.peek()).toBeUndefined();
+				expect(source.out.source.peek()).toBeUndefined();
+			} finally {
+				source.close();
+				open.mockRestore();
+			}
+		});
+	}
+
+	test(`${kind} retries a refusal after toggling enabled`, async () => {
+		using _time = fakeTime();
+		using media = install(new FakeMediaDevices());
+		media.denied = true;
+		const enabled = new Signal(true);
+		const source = create(enabled);
+		try {
+			await settle();
+			expect(source.out.error.peek()?.name).toBe("NotAllowedError");
+			media.denied = false;
+			enabled.set(false);
+			await settle();
+			enabled.set(true);
+			await settle();
+			expect(enabled.peek()).toBe(true);
+			expect(source.out.error.peek()).toBeUndefined();
+			expect(source.out.source.peek()).toBeDefined();
+			expect(media.attempts).toBe(2);
+		} finally {
+			source.close();
+		}
+	});
+
+	test(`${kind} reports a refusal and stops retrying until capture is reset`, async () => {
+		using time = fakeTime();
+		using media = install(new FakeMediaDevices());
+		media.denied = true;
+		const enabled = new Signal(true);
+		const source = create(enabled);
+		await settle();
+
+		expect(source.out.error.peek()?.name).toBe("NotAllowedError");
+		expect(source.out.source.peek()).toBeUndefined();
+		await backoff(time);
+		expect(media.attempts).toBe(1);
+
+		media.denied = false;
+		enabled.set(false);
+		await settle();
+		expect(source.out.error.peek()).toBeUndefined();
+		enabled.set(true);
+		await settle();
+		expect(source.out.source.peek()).toBeDefined();
+		expect(media.attempts).toBe(2);
+		source.close();
+	});
+
+	test(`${kind} reports an ended track that exhausts the retry budget`, async () => {
+		using time = fakeTime();
+		using media = install(new FakeMediaDevices());
+		const enabled = new Signal(false);
+		const source = create(enabled);
+		try {
+			// Settle discovery before starting so it cannot refund this attempt's budget.
+			await settle();
+			enabled.set(true);
+			await settle();
+			expect(published(source.out.source.peek())).toBe(media.latest());
+			expect(source.out.error.peek()).toBeUndefined();
+
+			for (let i = 0; i < Retry.LIMIT; i++) {
+				media.latest().end();
+				await settle();
+				expect(source.out.error.peek()).toBeUndefined();
+				await time.fire();
+				await settle();
+				expect(media.attempts).toBe(i + 2);
+				expect(published(source.out.source.peek())).toBe(media.latest());
+				expect(source.out.error.peek()).toBeUndefined();
+			}
+
+			media.latest().end();
+			await settle();
+			expect(media.attempts).toBe(Retry.LIMIT + 1);
+			expect(source.out.source.peek()).toBeUndefined();
+			const error = source.out.error.peek();
+			expect(error?.name).toBe("AbortError");
+			expect(error?.message).toBe("The media track ended");
+
+			await time.advance(Duration.millis(Retry.SETTLED));
+			await settle();
+			expect(media.attempts).toBe(Retry.LIMIT + 1);
+			expect(source.out.error.peek()).toBe(error);
+
+			enabled.set(false);
+			await settle();
+			expect(source.out.error.peek()).toBeUndefined();
+			enabled.set(true);
+			await settle();
+			expect(media.attempts).toBe(Retry.LIMIT + 2);
+			expect(published(source.out.source.peek())).toBe(media.latest());
+			expect(source.out.error.peek()).toBeUndefined();
+		} finally {
+			source.close();
+		}
+	});
+}
+
 test("a microphone re-opens when its track dies", async () => {
+	using time = fakeTime();
 	using media = install(new FakeMediaDevices());
 
 	const mic = new Microphone({ enabled: true });
@@ -181,8 +447,8 @@ test("a microphone re-opens when its track dies", async () => {
 	expect(media.tracks).toHaveLength(1);
 
 	media.latest().end();
-	await waitUntil(() => media.tracks.length === 2);
-	await settle();
+	await backoff(time);
+	expect(media.tracks).toHaveLength(2);
 
 	// A second capture happened, and the live replacement is what got published.
 	expect(published(mic.out.source.peek())).toBe(media.latest());
@@ -191,6 +457,7 @@ test("a microphone re-opens when its track dies", async () => {
 });
 
 test("a camera re-opens when its track dies", async () => {
+	using time = fakeTime();
 	using media = install(new FakeMediaDevices());
 
 	const camera = new Camera({ enabled: true });
@@ -198,15 +465,48 @@ test("a camera re-opens when its track dies", async () => {
 	expect(media.tracks).toHaveLength(1);
 
 	media.latest().end();
-	await waitUntil(() => media.tracks.length === 2);
-	await settle();
+	await backoff(time);
+	expect(media.tracks).toHaveLength(2);
 
 	expect(published(camera.out.source.peek())).toBe(media.latest());
 
 	camera.close();
 });
 
+test("a camera reports the turn a portrait screen needs", async () => {
+	using _media = install(new FakeMediaDevices());
+	using display = installOrientation("portrait-primary");
+	const turn = (type: OrientationType) => {
+		Object.defineProperty(display.orientation, "type", { configurable: true, value: type });
+		display.orientation.dispatchEvent(new Event("change"));
+	};
+
+	const enabled = new Signal(true);
+	const camera = new Camera({ enabled });
+	await settle();
+	expect(camera.out.orientation.peek()).toBe(90);
+
+	turn("portrait-secondary");
+	await settle();
+	expect(camera.out.orientation.peek()).toBe(270);
+
+	turn("landscape-primary");
+	await settle();
+	expect(camera.out.orientation.peek()).toBe(0);
+
+	turn("portrait-primary");
+	await settle();
+	expect(camera.out.orientation.peek()).toBe(90);
+
+	enabled.set(false);
+	await settle();
+	expect(camera.out.orientation.peek()).toBe(0);
+
+	camera.close();
+});
+
 test("running out of retries clears the source instead of publishing a corpse", async () => {
+	using time = fakeTime();
 	using media = install(new FakeMediaDevices());
 
 	const mic = new Microphone({ enabled: true });
@@ -216,7 +516,8 @@ test("running out of retries clears the source instead of publishing a corpse", 
 	for (let i = 0; i < Retry.LIMIT; i++) {
 		const before = media.tracks.length;
 		media.latest().end();
-		await waitUntil(() => media.tracks.length > before);
+		await backoff(time);
+		expect(media.tracks.length).toBeGreaterThan(before);
 	}
 
 	// The budget is spent, so this death schedules nothing at all: a settle is enough to catch a
@@ -246,102 +547,90 @@ test("a track that arrives dead is not published", async () => {
 	mic.close();
 });
 
-test(
-	"a replug recovers a capture whose retries all failed",
-	async () => {
-		using media = install(new FakeMediaDevices());
+test("a replug recovers a capture whose retries all failed", async () => {
+	using time = fakeTime();
+	using media = install(new FakeMediaDevices());
 
-		const camera = new Camera({ enabled: true });
-		await settle();
-		expect(media.tracks).toHaveLength(1);
+	const camera = new Camera({ enabled: true });
+	await settle();
+	expect(media.tracks).toHaveLength(1);
 
-		// Unplug the only camera: the track dies and every reopen finds nothing.
-		media.missing = true;
-		media.replug([]);
-		media.latest().end();
-		await waitSpent(media);
+	// Unplug the only camera: the track dies and every reopen finds nothing.
+	media.missing = true;
+	media.replug([]);
+	media.latest().end();
+	await waitSpent(media, time);
 
-		const spent = media.tracks.length;
-		expect(camera.out.source.peek()).toBeUndefined();
+	const spent = media.tracks.length;
+	expect(camera.out.source.peek()).toBeUndefined();
 
-		// Plug it back in. Without the device-list refund this stays dead forever, because an unpinned
-		// `requested` is undefined both before and after, so nothing else reruns the capture.
-		media.missing = false;
-		media.replug([device("cam")]);
-		await waitUntil(() => media.tracks.length > spent);
-		await settle();
+	// Plug it back in. Without the device-list refund this stays dead forever, because an unpinned
+	// `requested` is undefined both before and after, so nothing else reruns the capture.
+	media.missing = false;
+	media.replug([device("cam")]);
+	await backoff(time);
 
-		expect(media.tracks.length).toBeGreaterThan(spent);
-		expect(published(camera.out.source.peek())).toBe(media.latest());
+	expect(media.tracks.length).toBeGreaterThan(spent);
+	expect(published(camera.out.source.peek())).toBe(media.latest());
 
-		camera.close();
-	},
-	SPENT_TIMEOUT,
-);
+	camera.close();
+});
 
-test(
-	"picking a different device revives a capture whose retries all failed",
-	async () => {
-		using media = install(new FakeMediaDevices());
-		media.devices = [device("cam"), device("cam2")];
+test("picking a different device revives a capture whose retries all failed", async () => {
+	using time = fakeTime();
+	using media = install(new FakeMediaDevices());
+	media.devices = [device("cam"), device("cam2")];
 
-		const camera = new Camera({ enabled: true });
-		await settle();
+	const camera = new Camera({ enabled: true });
+	await settle();
 
-		// Burn the budget: every attempt hands back a dead track.
-		media.bornDead = true;
-		camera.device.preferred.set("cam");
-		await waitSpent(media);
+	// Burn the budget: every attempt hands back a dead track.
+	media.bornDead = true;
+	camera.device.preferred.set("cam");
+	await waitSpent(media, time);
 
-		const spent = media.tracks.length;
-		expect(camera.out.source.peek()).toBeUndefined();
+	const spent = media.tracks.length;
+	expect(camera.out.source.peek()).toBeUndefined();
 
-		// Selecting another device is the user's obvious recovery, and the device list has not changed,
-		// so nothing else would rerun the capture.
-		media.bornDead = false;
-		camera.device.preferred.set("cam2");
-		await waitUntil(() => media.tracks.length > spent);
-		await settle();
+	// Selecting another device is the user's obvious recovery, and the device list has not changed,
+	// so nothing else would rerun the capture.
+	media.bornDead = false;
+	camera.device.preferred.set("cam2");
+	await backoff(time);
 
-		expect(media.tracks.length).toBeGreaterThan(spent);
-		expect(published(camera.out.source.peek())).toBe(media.latest());
+	expect(media.tracks.length).toBeGreaterThan(spent);
+	expect(published(camera.out.source.peek())).toBe(media.latest());
 
-		camera.close();
-	},
-	SPENT_TIMEOUT,
-);
+	camera.close();
+});
 
-test(
-	"changing the constraints revives a capture whose retries all failed",
-	async () => {
-		using media = install(new FakeMediaDevices());
+test("changing the constraints revives a capture whose retries all failed", async () => {
+	using time = fakeTime();
+	using media = install(new FakeMediaDevices());
 
-		const mic = new Microphone({ enabled: true, constraints: { channelCount: 99 } });
-		await settle();
+	const mic = new Microphone({ enabled: true, constraints: { channelCount: 99 } });
+	await settle();
 
-		// Spend the whole budget. The fake ignores constraints, so `missing` is what makes every
-		// attempt fail; the constraint edit only moves the settings the budget is keyed to.
-		media.missing = true;
-		mic.constraints.set({ channelCount: 98 });
-		await waitSpent(media);
+	// The fake ignores constraints, so `missing` causes a terminal failure. The next
+	// constraint edit is new intent and reopens the capture.
+	media.missing = true;
+	mic.constraints.set({ channelCount: 98 });
+	await waitSpent(media, time);
 
-		const spent = media.tracks.length;
-		expect(mic.out.source.peek()).toBeUndefined();
+	const spent = media.tracks.length;
+	expect(mic.out.source.peek()).toBeUndefined();
 
-		// Editing a constraint is new intent rather than another go at the same thing, so it buys a
-		// fresh budget. Nothing else here would rerun the capture: the device list never changed.
-		media.missing = false;
-		mic.constraints.set({ channelCount: 1 });
-		await waitUntil(() => media.tracks.length > spent);
-		await settle();
+	// Editing a constraint is new intent rather than another go at the same thing, so it buys a
+	// fresh budget. Nothing else here would rerun the capture: the device list never changed.
+	media.missing = false;
+	mic.constraints.set({ channelCount: 1 });
+	await backoff(time);
 
-		expect(media.tracks.length).toBeGreaterThan(spent);
-		expect(published(mic.out.source.peek())).toBe(media.latest());
+	expect(media.tracks.length).toBeGreaterThan(spent);
+	expect(published(mic.out.source.peek())).toBe(media.latest());
 
-		mic.close();
-	},
-	SPENT_TIMEOUT,
-);
+	mic.close();
+});
 
 test("unrelated device churn does not disturb a healthy capture", async () => {
 	using media = install(new FakeMediaDevices());
@@ -433,3 +722,25 @@ test("screen capture prompts again after being switched off and on", async () =>
 
 	screen.close();
 });
+
+for (const screenPixelRatio of [undefined, 2]) {
+	test(`screen capture maps pixel ratio ${screenPixelRatio} into source scale`, async () => {
+		using media = install(new FakeScreenDevices());
+		const settings = spyOn(media.video, "getSettings").mockReturnValue({
+			deviceId: "default",
+			screenPixelRatio,
+		} as MediaTrackSettings);
+		const screen = new Screen({ enabled: true });
+		try {
+			await settle();
+			const source = screen.out.source.peek()?.video;
+			expect(source).toMatchObject({ track: media.video, scale: screenPixelRatio });
+			settings.mockReturnValue({ deviceId: "default", screenPixelRatio: 1 } as MediaTrackSettings);
+			expect(source).toMatchObject({ track: media.video, scale: 1 });
+			expect(screen.out.source.peek()?.video).toBe(source);
+		} finally {
+			screen.close();
+			settings.mockRestore();
+		}
+	});
+}

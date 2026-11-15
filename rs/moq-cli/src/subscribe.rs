@@ -1,16 +1,20 @@
 use std::time::Duration;
 
-use clap::ValueEnum;
+use anyhow::Context;
 use hang::catalog::{AudioCodecKind, VideoCodecKind};
 use moq_mux::catalog::{self, CatalogFormat, Stream};
 use moq_mux::select;
-use tokio::io::AsyncWriteExt;
+use moq_net::track::Delay;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
-/// Container format written to stdout on the export (sink) side.
+/// Container format written on the export (sink) side.
 #[derive(Clone, Copy)]
 pub enum SubscribeFormat {
 	/// Fragmented MP4 (CMAF).
 	Fmp4,
+	/// Regular MP4, recorded to a file.
+	Mp4,
 	/// Matroska / WebM.
 	Mkv,
 	/// H.264 Annex-B elementary stream (no container).
@@ -23,13 +27,11 @@ pub enum SubscribeFormat {
 	Flv,
 }
 
-/// `clap` adapter for [`CatalogFormat`] (which is `#[non_exhaustive]` and so
+/// `Usage` adapter for [`CatalogFormat`] (which is `#[non_exhaustive]` and so
 /// can't derive `ValueEnum` itself).
-#[derive(ValueEnum, Clone, Copy)]
+#[derive(usage_rs::ValueEnum, Clone, Copy)]
 pub enum CatalogFormatArg {
 	Hang,
-	#[value(name = "hangz")]
-	HangZ,
 	Msf,
 }
 
@@ -37,14 +39,13 @@ impl From<CatalogFormatArg> for CatalogFormat {
 	fn from(format: CatalogFormatArg) -> Self {
 		match format {
 			CatalogFormatArg::Hang => Self::Hang,
-			CatalogFormatArg::HangZ => Self::HangZ,
 			CatalogFormatArg::Msf => Self::Msf,
 		}
 	}
 }
 
-/// `clap` adapter for [`VideoCodecKind`].
-#[derive(ValueEnum, Clone, Copy)]
+/// `Usage` adapter for [`VideoCodecKind`].
+#[derive(usage_rs::ValueEnum, Clone, Copy)]
 pub enum VideoCodecArg {
 	H264,
 	H265,
@@ -65,8 +66,8 @@ impl From<VideoCodecArg> for VideoCodecKind {
 	}
 }
 
-/// `clap` adapter for [`AudioCodecKind`].
-#[derive(ValueEnum, Clone, Copy)]
+/// `Usage` adapter for [`AudioCodecKind`].
+#[derive(usage_rs::ValueEnum, Clone, Copy)]
 pub enum AudioCodecArg {
 	Aac,
 	Opus,
@@ -83,64 +84,149 @@ impl From<AudioCodecArg> for AudioCodecKind {
 	}
 }
 
-/// Rendition selection flags for stdout container sinks and native playback.
-/// With no flags set, every rendition is kept.
-#[derive(clap::Args, Clone, Default)]
+/// Whether to select renditions of a medium.
+#[derive(usage_rs::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+	/// Keep renditions matching the name and codec filters.
+	On,
+	/// Select no rendition of this medium.
+	Off,
+}
+
+/// Rendition selection flags for the stdout container sinks that honor them and
+/// native playback. With no flags set, every rendition is kept.
+#[derive(usage_rs::Args, Clone, Default)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 pub struct SelectArgs {
 	/// Pick the video rendition with this exact name.
-	#[arg(long)]
+	#[usage(long)]
 	pub video_name: Option<String>,
 
 	/// Keep only video renditions whose codec family matches.
-	#[arg(long)]
+	#[usage(long, value_enum)]
 	pub video_codec: Option<VideoCodecArg>,
 
+	/// Select video (on by default); off leaves audio only and opens no playback window.
+	#[usage(long, value_enum)]
+	pub video: Option<Mode>,
+
 	/// Pick the audio rendition with this exact name.
-	#[arg(long)]
+	#[usage(long)]
 	pub audio_name: Option<String>,
 
 	/// Keep only audio renditions whose codec family matches.
-	#[arg(long)]
+	#[usage(long, value_enum)]
 	pub audio_codec: Option<AudioCodecArg>,
+
+	/// Select audio (on by default); off leaves video only.
+	#[usage(long, value_enum)]
+	pub audio: Option<Mode>,
 }
 
 impl SelectArgs {
+	/// Refuse contradictory filters and a selection with both media disabled.
+	pub(crate) fn validate(&self) -> anyhow::Result<()> {
+		anyhow::ensure!(
+			self.video != Some(Mode::Off) || self.audio != Some(Mode::Off),
+			"--video off and --audio off select no renditions"
+		);
+		anyhow::ensure!(
+			self.video != Some(Mode::Off) || (self.video_name.is_none() && self.video_codec.is_none()),
+			"--video off conflicts with --video-name and --video-codec"
+		);
+		anyhow::ensure!(
+			self.audio != Some(Mode::Off) || (self.audio_name.is_none() && self.audio_codec.is_none()),
+			"--audio off conflicts with --audio-name and --audio-codec"
+		);
+		Ok(())
+	}
+
 	/// Build the rendition selection shared by stdout exports and native playback.
 	///
 	/// `force` takes the place of `--video-codec`, for a sink whose format implies
 	/// one. Pass `None` to use the flag as given.
 	pub(crate) fn selection(&self, force: Option<VideoCodecKind>) -> select::Broadcast {
-		let mut video = select::Video::default();
-		if let Some(name) = &self.video_name {
-			video = video.name(name);
-		}
-		if let Some(codec) = force.or_else(|| self.video_codec.map(Into::into)) {
-			video = video.codec(codec);
+		let mut selection = select::Broadcast::default();
+
+		if self.video != Some(Mode::Off) {
+			let mut video = select::Video::default();
+			if let Some(name) = &self.video_name {
+				video = video.name(name);
+			}
+			if let Some(codec) = force.or_else(|| self.video_codec.map(Into::into)) {
+				video = video.codec(codec);
+			}
+			selection = selection.video(video);
 		}
 
-		let mut audio = select::Audio::default();
-		if let Some(name) = &self.audio_name {
-			audio = audio.name(name);
-		}
-		if let Some(codec) = self.audio_codec {
-			audio = audio.codec(codec.into());
+		if self.audio != Some(Mode::Off) {
+			let mut audio = select::Audio::default();
+			if let Some(name) = &self.audio_name {
+				audio = audio.name(name);
+			}
+			if let Some(codec) = self.audio_codec {
+				audio = audio.codec(codec.into());
+			}
+			selection = selection.audio(audio);
 		}
 
-		select::Broadcast::default().video(video).audio(audio)
+		selection
+	}
+
+	/// The first selection flag passed, to name it when a sink can't honor it.
+	pub(crate) fn flag(&self) -> Option<&'static str> {
+		[
+			(self.video_name.is_some(), "--video-name"),
+			(self.video_codec.is_some(), "--video-codec"),
+			(self.video.is_some(), "--video"),
+			(self.audio.is_some(), "--audio"),
+		]
+		.into_iter()
+		.find_map(|(given, flag)| given.then_some(flag))
+		.or_else(|| self.audio_flag())
+	}
+
+	/// The first flag passed that selects an audio rendition, for a sink with no audio.
+	pub(crate) fn audio_flag(&self) -> Option<&'static str> {
+		[
+			(self.audio == Some(Mode::On), "--audio"),
+			(self.audio_name.is_some(), "--audio-name"),
+			(self.audio_codec.is_some(), "--audio-codec"),
+		]
+		.into_iter()
+		.find_map(|(given, flag)| given.then_some(flag))
 	}
 }
 
-/// The resolved stdout export settings (built from the `export` flags + format).
+/// The resolved container export settings (built from the `export` flags + format).
 #[derive(Clone)]
 pub struct SubscribeArgs {
-	/// The format to write to stdout.
+	/// The format to write.
 	pub format: SubscribeFormat,
 
-	/// Maximum latency before skipping groups.
-	pub max_latency: Duration,
+	/// How far playback may drift from the live edge before skipping groups. TS also runs
+	/// this far behind the source (`--delay`).
+	pub max_delay: Duration,
 
-	/// Cap the output fragment duration (default: one GOP). Applies to fmp4 / mkv.
+	/// How long to wait for the broadcast, or with `stitch` a replacement, to come back after
+	/// it ends (TS only).
+	pub follow: Duration,
+
+	/// Follow another publisher instance replacing the broadcast, as a program switch (TS only).
+	pub stitch: bool,
+
+	/// Cap the output duration: publisher groups by default for fMP4, video GOPs for MKV.
 	pub fragment_duration: Option<Duration>,
+
+	/// Pad MPEG-TS output with null packets to this rate, in bits per second,
+	/// overriding the catalog's recorded multiplex rate.
+	pub mux_rate: Option<u64>,
+
+	/// Write the `m2ts` passthrough track back out instead of muxing the media (TS only).
+	pub passthrough: bool,
+
+	/// The file to record to (MP4 only); the other formats write to stdout.
+	pub output: Option<std::path::PathBuf>,
 
 	/// Catalog format for track discovery (default: detect from the broadcast suffix).
 	pub catalog: Option<CatalogFormatArg>,
@@ -165,7 +251,11 @@ impl SubscribeArgs {
 		match self.format {
 			SubscribeFormat::H264 => Some(VideoCodecKind::H264),
 			SubscribeFormat::H265 => Some(VideoCodecKind::H265),
-			SubscribeFormat::Fmp4 | SubscribeFormat::Mkv | SubscribeFormat::Ts | SubscribeFormat::Flv => None,
+			SubscribeFormat::Fmp4
+			| SubscribeFormat::Mp4
+			| SubscribeFormat::Mkv
+			| SubscribeFormat::Ts
+			| SubscribeFormat::Flv => None,
 		}
 	}
 
@@ -191,31 +281,73 @@ impl SubscribeArgs {
 	}
 }
 
-/// Exports one broadcast from the Origin to stdout in the requested format.
+/// Exports one broadcast from the Origin in the requested format, to stdout or a recording.
 pub struct Subscribe {
 	source: moq_mux::Source,
 	catalog: CatalogFormat,
 	args: SubscribeArgs,
+	/// Where a TS export sets its MPEG-TS sections, when it reports them.
+	sections: Option<crate::report::Sections>,
+	/// Cancelled to make a recording finish its file and return.
+	finish: CancellationToken,
+}
+
+/// Log how a TS export's release clock keeps up with the source.
+fn log_release(release: &moq_mux::container::ts::stats::Release, message: &'static str) {
+	tracing::info!(
+		dropped = release.dropped,
+		trimmed = release.trimmed,
+		gaps = release.gaps,
+		margin_ms = ?release.margin,
+		offset_ms = ?release.offset,
+		drift_ppm = ?release.drift,
+		out_of_tolerance = release.out_of_tolerance,
+		"{message}"
+	);
 }
 
 impl Subscribe {
-	/// Wrap the broadcast + resolved settings; [`run`](Self::run) drives it.
+	/// Export the resolved broadcast `source` with the resolved settings; [`run`](Self::run)
+	/// drives it.
 	pub fn new(source: moq_mux::Source, catalog: CatalogFormat, args: SubscribeArgs) -> Self {
-		Self { source, catalog, args }
+		Self {
+			source,
+			catalog,
+			args,
+			sections: None,
+			finish: CancellationToken::new(),
+		}
+	}
+
+	/// Finish a recording's file and return once `finish` is cancelled.
+	pub fn with_finish(mut self, finish: CancellationToken) -> Self {
+		self.finish = finish;
+		self
+	}
+
+	/// The resolved broadcast, whose [`stats`](moq_mux::Source::stats) count what the export reads.
+	pub fn source(&self) -> &moq_mux::Source {
+		&self.source
+	}
+
+	/// Set a TS export's per-PID rows and release clock in `sections` as it samples them.
+	pub fn with_sections(mut self, sections: crate::report::Sections) -> Self {
+		self.sections = Some(sections);
+		self
 	}
 
 	/// Build the catalog stream, narrowed by the rendition selection flags. The
-	/// catalog source honors the requested format (e.g. compressed `HangZ` or `Msf`).
+	/// catalog source honors the requested format (e.g. `Msf`).
 	async fn stream(&self) -> anyhow::Result<catalog::Select<catalog::Consumer>> {
-		let broadcast = self.source.broadcast().await?;
-		let consumer = catalog::Consumer::new(&broadcast, self.catalog).await?;
+		let consumer = self.source.catalog(self.catalog).await?;
 		Ok(consumer.select(self.args.selection()?))
 	}
 
-	/// Write the broadcast to stdout until it ends.
+	/// Write the broadcast until it ends.
 	pub async fn run(self) -> anyhow::Result<()> {
 		match self.args.format {
 			SubscribeFormat::Fmp4 => self.run_fmp4().await,
+			SubscribeFormat::Mp4 => self.run_mp4().await,
 			SubscribeFormat::Mkv => self.run_mkv().await,
 			SubscribeFormat::H264 => self.run_h264().await,
 			SubscribeFormat::H265 => self.run_h265().await,
@@ -231,7 +363,7 @@ impl Subscribe {
 		// yields moof+mdat fragments in timestamp order across tracks.
 		let stream = self.stream().await?;
 		let mut fmp4 = moq_mux::container::fmp4::Export::new(self.source, stream)
-			.with_latency(self.args.max_latency)
+			.with_delay(Delay::default().with_max(self.args.max_delay))
 			.with_fragment_duration(self.args.fragment_duration);
 
 		while let Some(chunk) = fmp4.next().await? {
@@ -242,6 +374,55 @@ impl Subscribe {
 		Ok(())
 	}
 
+	/// Record a regular MP4 until the broadcast ends or `finish` is cancelled, then finish it with
+	/// everything it received.
+	async fn run_mp4(self) -> anyhow::Result<()> {
+		let path = self.args.output.clone().context("an mp4 export records to --output")?;
+		let finish = self.finish.clone();
+		let stream = tokio::select! {
+			stream = self.stream() => stream?,
+			() = finish.cancelled() => return Ok(()),
+		};
+		let mut mp4 = moq_mux::container::mp4::Export::new(self.source, stream)
+			.with_delay(Delay::default().with_max(self.args.max_delay))
+			.with_fragment_duration(self.args.fragment_duration);
+		let mut file = tokio::fs::File::create_new(&path)
+			.await
+			.with_context(|| format!("failed to create {}", path.display()))?;
+
+		// A failed export still finishes what it recorded; a failed write leaves the file as is.
+		let mut stopped = false;
+		let ended = loop {
+			let next = tokio::select! {
+				next = mp4.next() => next,
+				// Write out what was received before finishing.
+				() = finish.cancelled(), if !stopped => {
+					mp4.stop();
+					stopped = true;
+					continue;
+				}
+			};
+			match next {
+				Ok(Some(data)) => file.write_all(&data).await?,
+				Ok(None) => break Ok(()),
+				Err(err) => break Err(err),
+			}
+		};
+
+		match mp4.finish()? {
+			Some(trailer) => {
+				write_finish(&mut file, &trailer).await?;
+				tracing::info!(path = %path.display(), "recording finished");
+			}
+			// Nothing reached the file, so there is no recording to keep.
+			None => {
+				drop(file);
+				tokio::fs::remove_file(&path).await?;
+			}
+		}
+		Ok(ended?)
+	}
+
 	async fn run_mkv(self) -> anyhow::Result<()> {
 		let mut stdout = tokio::io::stdout();
 
@@ -250,7 +431,11 @@ impl Subscribe {
 		// shape internally (synthesizing avcC/hvcC from inline parameter sets).
 		let stream = self.stream().await?;
 		let mut mkv = moq_mux::container::mkv::Export::new(self.source, stream)
-			.with_latency(self.args.max_latency)
+			.with_delay(
+				Delay::default()
+					.with_min(self.args.max_delay)
+					.with_max(self.args.max_delay),
+			)
 			.with_fragment_duration(self.args.fragment_duration);
 
 		while let Some(chunk) = mkv.next().await? {
@@ -265,7 +450,8 @@ impl Subscribe {
 		let mut stdout = tokio::io::stdout();
 
 		let stream = self.stream().await?;
-		let mut h264 = moq_mux::codec::h264::Export::new(self.source, stream).with_latency(self.args.max_latency);
+		let mut h264 = moq_mux::codec::h264::Export::new(self.source, stream)
+			.with_delay(Delay::default().with_max(self.args.max_delay));
 
 		while let Some(chunk) = h264.next().await? {
 			stdout.write_all(&chunk).await?;
@@ -279,7 +465,8 @@ impl Subscribe {
 		let mut stdout = tokio::io::stdout();
 
 		let stream = self.stream().await?;
-		let mut h265 = moq_mux::codec::h265::Export::new(self.source, stream).with_latency(self.args.max_latency);
+		let mut h265 = moq_mux::codec::h265::Export::new(self.source, stream)
+			.with_delay(Delay::default().with_max(self.args.max_delay));
 
 		while let Some(chunk) = h265.next().await? {
 			stdout.write_all(&chunk).await?;
@@ -290,41 +477,112 @@ impl Subscribe {
 	}
 
 	async fn run_ts(self) -> anyhow::Result<()> {
-		let mut stdout = tokio::io::stdout();
-
-		// TS emits PAT/PMT then a continuous PES stream (re-emitting PAT/PMT at
-		// keyframes for tune-in). Avc3/Hev1 sources pass through as Annex-B; AAC
-		// is re-framed as ADTS. `fragment_duration` does not apply to TS. `with_ts`
-		// selects the `mpegts` catalog extension so undecoded elementary streams
-		// (SCTE-35, teletext, DVB AC-3, ...) are re-emitted verbatim on their PIDs.
-		let mut ts = moq_mux::container::ts::Export::with_ts(self.source, self.catalog)
-			.await?
-			.with_latency(self.args.max_latency);
-
-		// A TS byte stream carries no per-frame timing, so delivery time is the only
-		// carrier of each frame's spacing: the exporter slices its output on the PCR
-		// grid and stamps each slice at its slot boundary, on the contract that the
-		// caller writes the bytes at the time the stamp asserts. Draining on arrival
-		// instead collapses the clock into position clusters no downstream stage can
-		// repair (#2984). See [`Delivery`] for how the pacing stays
-		// bounded; it needs to know whether each frame was waited for, hence the
-		// hand-rolled poll instead of `ts.next()`.
-		let mut delivery = Delivery::new(self.args.max_latency);
-		loop {
-			let mut waited = false;
-			let frame = hang::moq_net::kio::wait(|waiter| match ts.poll_next(waiter) {
-				std::task::Poll::Pending => {
-					waited = true;
-					std::task::Poll::Pending
-				}
-				ready => ready,
-			})
-			.await?;
-
-			let Some(frame) = frame else { break };
-			delivery.deliver(&frame, waited, &mut stdout).await?;
+		if self.args.passthrough {
+			return self.run_ts_passthrough().await;
 		}
 
+		self.write_ts(tokio::io::stdout()).await
+	}
+
+	/// Write the selected TS media to a writer after resolving its route.
+	pub(super) async fn write_ts(self, mut stdout: impl tokio::io::AsyncWrite + Unpin) -> anyhow::Result<()> {
+		// TS emits PAT/PMT then a continuous PES stream (re-emitting PAT/PMT at
+		// keyframes for tune-in). Avc3/Hev1 sources pass through as Annex-B; AAC
+		// is re-framed as ADTS. `fragment_duration` does not apply to TS. The catalog stream
+		// selects the `mpegts` catalog extension so undecoded elementary streams
+		// (SCTE-35, teletext, DVB AC-3, ...) are re-emitted verbatim on their PIDs.
+		let catalog = self.source.catalog::<moq_mux::container::ts::Ext>(self.catalog).await?;
+		let mut ts = moq_mux::container::ts::Export::new(self.source, catalog, self.args.max_delay);
+		if let Some(mux_rate) = self.args.mux_rate {
+			ts = ts.with_mux_rate(mux_rate);
+		}
+
+		// A TS byte stream carries no per-frame timing, so delivery time is the only
+		// carrier of each frame's spacing (#2984). The export lays each slice of the PCR
+		// grid out at its time on its own clock, which follows the source's, so each is
+		// written as it comes. The path's announcements carry it across the broadcast's
+		// returns, as they drive a player.
+		let mut ts = moq_mux::container::ts::Follower::new(ts)?
+			.with_follow(self.args.follow)
+			.with_stitch(self.args.stitch);
+		// Reports a track that stops reaching the output while the rest keeps flowing,
+		// the way `publish` reports one that stops arriving.
+		let mut log = moq_mux::container::ts::stats::Log::default();
+		let mut sampled = kio::clock::now();
+		// The export's drop, gap and out-of-tolerance counts, as last logged.
+		let mut reported = (0, 0, 0, 0);
+		let sections = self.sections;
+		let report = |stats: &moq_mux::container::ts::stats::Export| {
+			if let Some(sections) = &sections {
+				sections.set(|report| {
+					report.mpegts = Some(stats.clone().into());
+					report.release = Some(stats.release.clone());
+				});
+			}
+		};
+		let end = loop {
+			let frame = match ts.next().await {
+				Ok(Some(frame)) => frame,
+				Ok(None) => break Ok(()),
+				Err(err) => break Err(err),
+			};
+			stdout.write_all(&frame.payload).await?;
+			stdout.flush().await?;
+
+			if sampled.elapsed() >= moq_mux::container::ts::stats::Log::INTERVAL {
+				sampled = kio::clock::now();
+				let stats = ts.export().stats();
+				report(&stats);
+				let release = &stats.release;
+				let counts = (release.dropped, release.trimmed, release.gaps, release.out_of_tolerance);
+				if counts != reported {
+					reported = counts;
+					log_release(release, "TS export release clock");
+				}
+				log.sample(stats.into());
+			}
+		};
+		let stats = ts.export().stats();
+		report(&stats);
+		log_release(&stats.release, "TS export release clock");
+		match end {
+			Err(err @ moq_mux::Error::Replaced(_)) => {
+				Err(anyhow::Error::from(err).context("pass --stitch to follow a replacement as a program switch"))
+			}
+			end => Ok(end?),
+		}
+	}
+
+	/// Write the multiplex the broadcast's `m2ts` track carries, each run of packets as its
+	/// time on the source's PCR comes round.
+	async fn run_ts_passthrough(self) -> anyhow::Result<()> {
+		let mut stdout = tokio::io::stdout();
+		let mut release = moq_mux::container::ts::Release::new(self.source, self.catalog, self.args.max_delay).await?;
+		let report = |stats: &moq_mux::container::ts::stats::Release| {
+			if let Some(sections) = &self.sections {
+				sections.set(|report| report.release = Some(stats.clone()));
+			}
+		};
+		let mut sampled = kio::clock::now();
+		let mut reported = (0, 0, 0, 0);
+		while let Some(object) = release.next().await? {
+			stdout.write_all(&object.payload).await?;
+			stdout.flush().await?;
+
+			if sampled.elapsed() >= moq_mux::container::ts::stats::Log::INTERVAL {
+				sampled = kio::clock::now();
+				let stats = release.stats();
+				report(&stats);
+				let counts = (stats.dropped, stats.trimmed, stats.gaps, stats.out_of_tolerance);
+				if counts != reported {
+					reported = counts;
+					log_release(&stats, "TS passthrough release clock");
+				}
+			}
+		}
+		let stats = release.stats();
+		report(&stats);
+		log_release(&stats, "TS passthrough release clock");
 		Ok(())
 	}
 
@@ -335,9 +593,12 @@ impl Subscribe {
 		// frame interleaved by timestamp. Avc3 sources are transcoded to avc1 shape
 		// internally (synthesizing avcC from inline parameter sets). Only H.264 video
 		// and AAC audio are supported; `fragment_duration` does not apply to FLV.
-		let mut flv = moq_mux::container::flv::Export::with_catalog_format(self.source, self.catalog)
-			.await?
-			.with_latency(self.args.max_latency);
+		let stream = self.stream().await?;
+		let mut flv = moq_mux::container::flv::Export::new(self.source, stream).with_delay(
+			Delay::default()
+				.with_min(self.args.max_delay)
+				.with_max(self.args.max_delay),
+		);
 
 		while let Some(chunk) = flv.next().await? {
 			stdout.write_all(&chunk).await?;
@@ -348,295 +609,15 @@ impl Subscribe {
 	}
 }
 
-/// Paced stdout delivery for the TS export: sleeps until each frame's send
-/// instant, with total delivery lag bounded by the latency budget.
-///
-/// The bound is the subtle part. The pacer alone caps how far one frame may be
-/// scheduled past the `now` it paces with, but our own sleeps push that `now`
-/// forward, so a backlog arriving faster than real time (a tune-in group
-/// replaying from its keyframe, a catch-up after a stall) stays within the lead
-/// of every individual call while total delivery lag grows without bound. The
-/// export's group skipping can't shed that lag either: it fires when the
-/// *current group* is blocked with a newer alternative, so it measures producer
-/// stalls, never consumer lag. So lag is measured here instead, against
-/// `arrived`: the last instant the export made us wait, which is when a frame
-/// obtained without waiting could first have been queued. When a frame's
-/// schedule overshoots that epoch by more than the lead, it is delivered
-/// immediately and becomes the live edge
-/// ([`Pacer::hurry`](moq_mux::Pacer::hurry)). The anchor then rides the newest
-/// frame through a backlog, so pacing resumes from the live edge.
-///
-/// A hurry moves the epoch with it, because the frame it delivers *is* the live
-/// edge and the distance it is measured from has to be too. `hurry` returns `now`,
-/// so the credit below can never fire on the frame that hurried; leaving the epoch
-/// behind would put every later frame the same overshoot past it and shed the whole
-/// stream at the arrival cadence, which the buffered export would never correct
-/// since it never makes us wait. A sink that is genuinely slow still sheds on every
-/// stall: each one leaves the next frame far enough past the epoch to overshoot
-/// again.
-///
-/// Reaching a scheduled instant also advances the epoch, and has to. The TS export
-/// holds a mux buffer: it always has the next grid slot ready, so it stops making
-/// us wait, and an epoch that only moved on a wait would freeze for good and take
-/// the budget with it (measured: a hurry roughly every second, each shedding the
-/// pacing it was there to protect). Sleeping to the schedule is the proof that
-/// replaces the wait, since nothing the export queued while we slept could have
-/// gone out any earlier. What that gives up is a producer running faster than real
-/// time indefinitely: the sink keeps pace with it and falls further behind live
-/// without the budget noticing. Bounding *that* is the export's own
-/// `--latency-max`, which sheds media rather than compressing the clock.
-///
-/// The budget is the lead plus whatever standing lag the pacer has absorbed
-/// ([`Pacer::slack`](moq_mux::Pacer::slack)), which is a distance it is holding on
-/// purpose rather than lag to shed.
-struct Delivery {
-	pacer: moq_mux::Pacer,
-	/// The delivery-lag bound, and the pacer's lead: both are the export's
-	/// latency budget.
-	lead: Duration,
-	/// The last instant the export made us wait for a frame: the conservative
-	/// arrival epoch for frames obtained without waiting (see the type docs).
-	arrived: tokio::time::Instant,
-}
-
-impl Delivery {
-	fn new(lead: Duration) -> Self {
-		Self {
-			pacer: moq_mux::Pacer::default().with_lead(lead),
-			lead,
-			// tokio's clock rather than the bare std one so tests can pause it; in
-			// production they are identical.
-			arrived: tokio::time::Instant::now(),
-		}
-	}
-
-	/// Write one export frame to `out` at its paced instant. `waited` is whether
-	/// the export made us wait for this frame rather than having it ready.
-	async fn deliver(
-		&mut self,
-		frame: &moq_mux::container::Frame,
-		waited: bool,
-		out: &mut (impl tokio::io::AsyncWrite + Unpin),
-	) -> anyhow::Result<()> {
-		let now = tokio::time::Instant::now();
-		if waited {
-			self.arrived = now;
-		}
-
-		// The pacer's own slack is not lag: it is the producer's standing delivery
-		// distance, which the pacer discovered and is holding on purpose. Counting
-		// it here would shed the margin on a fixed cadence and put the writes back
-		// on the arrival clock, which is the whole thing this is here to avoid.
-		let budget = self.lead + self.pacer.slack();
-		let mut send_at = self.pacer.pace(frame.timestamp, now.into_std());
-		if send_at.saturating_duration_since(self.arrived.into_std()) > budget {
-			send_at = self.pacer.hurry(frame.timestamp, now.into_std());
-			// A hurry makes this frame the live edge, so the epoch it is measured
-			// against becomes now as well. `hurry` returns `now`, so the credit below
-			// can't do it, and a stale epoch would overshoot the budget on every
-			// later frame, latching the shed on for good.
-			self.arrived = now;
-		}
-
-		let send_at = tokio::time::Instant::from_std(send_at);
-		tokio::time::sleep_until(send_at).await;
-		// Reaching a scheduled instant is proof we are not behind, and it is the only
-		// such proof once the export holds a buffer: it always has the next slot
-		// ready, so it stops making us wait and the arrival epoch would freeze for
-		// good, taking the budget with it. Credit the scheduled instant rather than
-		// `now`, so an overshoot isn't credited as headroom.
-		if send_at > now {
-			self.arrived = send_at;
-		}
-		out.write_all(&frame.payload).await?;
-		out.flush().await?;
-		Ok(())
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use hang::moq_net::{Timescale, Timestamp};
-
-	fn frame(value: u64, scale: Timescale) -> moq_mux::container::Frame {
-		moq_mux::container::Frame {
-			timestamp: Timestamp::new(value, scale).unwrap(),
-			duration: None,
-			payload: bytes::Bytes::from_static(&[0x47; 188]),
-			keyframe: false,
-		}
-	}
-
-	/// Regression for #2984: the TS stdout writer must deliver each frame at the
-	/// instant its timestamp asserts, not as fast as frames arrive. The exporter
-	/// stamps PCR grid frames in microseconds and media frames at the source's own
-	/// timescale, so the spacing must also survive a scale change mid-stream.
-	#[tokio::test(start_paused = true)]
-	async fn ts_frames_are_paced_on_the_media_clock() {
-		let mut delivery = Delivery::new(Duration::from_millis(500));
-		let mut out = Vec::new();
-
-		let start = tokio::time::Instant::now();
-
-		// The first frame anchors the pacer and is written immediately.
-		delivery
-			.deliver(&frame(0, Timescale::MICRO), true, &mut out)
-			.await
-			.unwrap();
-		assert_eq!(start.elapsed(), Duration::ZERO);
-
-		// A PCR slot 25ms later (ready without waiting, like a backfilled grid
-		// slot) waits for its grid boundary.
-		delivery
-			.deliver(&frame(25_000, Timescale::MICRO), false, &mut out)
-			.await
-			.unwrap();
-		assert_eq!(start.elapsed(), Duration::from_millis(25));
-
-		// A media frame at the source's 90 kHz timescale paces on the same clock.
-		delivery
-			.deliver(&frame(3_600, Timescale::new(90_000).unwrap()), true, &mut out)
-			.await
-			.unwrap();
-		assert_eq!(start.elapsed(), Duration::from_millis(40));
-
-		assert_eq!(out.len(), 3 * 188, "every payload was written");
-	}
-
-	/// A sink that cannot reach its schedule still sheds the lag, which is the case
-	/// the budget is left guarding.
-	///
-	/// The epoch advances on a wait, on reaching a scheduled instant, or on a hurry.
-	/// A sink falling behind reaches none of its instants and is never made to wait,
-	/// so only the hurry moves it, and each fresh stall puts the next frame far
-	/// enough past that epoch to overshoot the budget and hurry again.
-	///
-	/// What this no longer covers, deliberately, is a one-off pre-queued backlog
-	/// (a tune-in group replaying from its keyframe). That now paces out at the
-	/// media rate instead of being shed, because it is indistinguishable from the
-	/// TS export's own mux buffer from here: both hand over a frame that is ready
-	/// and ahead of the schedule. The size of such a backlog is bounded by the
-	/// export's `--latency-max`, which is where it belongs.
-	#[tokio::test(start_paused = true)]
-	async fn a_sink_that_cannot_keep_up_sheds_the_lag() {
-		let mut delivery = Delivery::new(Duration::from_millis(500));
-		let mut out = Vec::new();
-
-		let start = tokio::time::Instant::now();
-		delivery
-			.deliver(&frame(0, Timescale::MICRO), true, &mut out)
-			.await
-			.unwrap();
-
-		// The writer stalls for 2s (a blocked pipe): wall clock runs on, the media
-		// clock does not, and every frame after this is overdue on arrival.
-		tokio::time::advance(Duration::from_secs(2)).await;
-
-		delivery
-			.deliver(&frame(400_000, Timescale::MICRO), false, &mut out)
-			.await
-			.unwrap();
-		assert_eq!(
-			start.elapsed(),
-			Duration::from_secs(2),
-			"an overdue frame writes at once: the overshoot hurries and makes it the live edge"
-		);
-
-		// Shedding happens at the re-anchor, once, not on every frame after it. This
-		// one is 200ms of media past the new edge and 200ms past the epoch the hurry
-		// set with it, so it is inside the budget and paces.
-		delivery
-			.deliver(&frame(600_000, Timescale::MICRO), false, &mut out)
-			.await
-			.unwrap();
-		assert_eq!(start.elapsed(), Duration::from_secs(2) + Duration::from_millis(200));
-
-		// A sink that goes on stalling goes on shedding, which is the property this
-		// test is here for: each stall leaves the next frame far enough past the
-		// epoch to overshoot the budget again, however recently the last hurry moved
-		// it. Media steps 25ms per iteration while the wall clock steps 2s.
-		for slot in 1..=3u64 {
-			tokio::time::advance(Duration::from_secs(2)).await;
-			let before = start.elapsed();
-			delivery
-				.deliver(&frame(600_000 + slot * 25_000, Timescale::MICRO), false, &mut out)
-				.await
-				.unwrap();
-			assert_eq!(start.elapsed(), before, "stall {slot} must shed, not pace");
-		}
-	}
-
-	/// A hurry has to move the arrival epoch with it, or it latches.
-	///
-	/// `hurry` returns `now`, so the credit for reaching a scheduled instant can
-	/// never fire on the frame that hurried. Left there, the epoch stays wherever it
-	/// was before the shed while the schedule walks forward from the new edge, so the
-	/// next frame overshoots the budget too, and so does every one after it. The
-	/// buffered export never waits, so nothing else would move the epoch back.
-	#[tokio::test(start_paused = true)]
-	async fn pacing_resumes_after_a_hurry_without_a_wait() {
-		let mut delivery = Delivery::new(Duration::from_millis(500));
-		let mut out = Vec::new();
-
-		let start = tokio::time::Instant::now();
-		delivery
-			.deliver(&frame(0, Timescale::MICRO), true, &mut out)
-			.await
-			.unwrap();
-
-		// Stall long enough that the schedule outruns the budget and sheds.
-		tokio::time::advance(Duration::from_secs(2)).await;
-		delivery
-			.deliver(&frame(400_000, Timescale::MICRO), false, &mut out)
-			.await
-			.unwrap();
-		let hurried = start.elapsed();
-		assert_eq!(hurried, Duration::from_secs(2), "the overshoot sheds");
-
-		// Grid slots from the new edge, every one already queued and none waited on.
-		// Against a stale epoch each is a whole stall past it, so each would hurry and
-		// write at once, pinning `start.elapsed()` at `hurried` for the whole loop.
-		for slot in 1..=8u64 {
-			delivery
-				.deliver(&frame(400_000 + slot * 25_000, Timescale::MICRO), false, &mut out)
-				.await
-				.unwrap();
-			assert_eq!(
-				start.elapsed(),
-				hurried + Duration::from_millis(slot * 25),
-				"slot {slot} must be paced, not shed"
-			);
-		}
-	}
-
-	/// The TS export holds a mux buffer, so it always has the next grid slot ready
-	/// and stops making the sink wait. Reaching a scheduled instant has to advance
-	/// the epoch too, or the budget freezes and hurries on a fixed cadence, shedding
-	/// the pacing it exists to protect.
-	#[tokio::test(start_paused = true)]
-	async fn a_buffered_producer_keeps_pacing() {
-		let mut delivery = Delivery::new(Duration::from_millis(500));
-		let mut out = Vec::new();
-
-		let start = tokio::time::Instant::now();
-		delivery
-			.deliver(&frame(0, Timescale::MICRO), true, &mut out)
-			.await
-			.unwrap();
-
-		// A grid slot every 25ms, each already queued: an epoch that only moved on a
-		// wait would freeze here and hurry once the schedule passed 500ms.
-		for slot in 1..=40u64 {
-			delivery
-				.deliver(&frame(slot * 25_000, Timescale::MICRO), false, &mut out)
-				.await
-				.unwrap();
-			assert_eq!(
-				start.elapsed(),
-				Duration::from_millis(slot * 25),
-				"slot {slot} must be paced, not shed"
-			);
-		}
-	}
+/// Make the writes that turn a recording into a regular MP4: the moov where the media ends,
+/// then the mdat header over the reserved box.
+pub async fn write_finish(file: &mut tokio::fs::File, finish: &moq_mux::container::mp4::Finish) -> std::io::Result<()> {
+	file.set_len(finish.moov_offset).await?;
+	file.seek(std::io::SeekFrom::Start(finish.moov_offset)).await?;
+	file.write_all(&finish.moov).await?;
+	// The header points readers past the media at the moov, so the moov must be on disk first.
+	file.sync_data().await?;
+	file.seek(std::io::SeekFrom::Start(finish.mdat_offset)).await?;
+	file.write_all(&finish.mdat).await?;
+	file.sync_all().await
 }

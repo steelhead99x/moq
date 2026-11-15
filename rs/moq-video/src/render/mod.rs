@@ -12,7 +12,7 @@
 //! dependency.
 //!
 //! ```no_run
-//! # fn example(device: &moq_video::render::wgpu::Device, queue: &moq_video::render::wgpu::Queue) -> Result<(), moq_video::Error> {
+//! # fn example(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<(), moq_video::Error> {
 //! use moq_video::render::{Config, Renderer};
 //!
 //! let mut renderer = Renderer::new(device, queue, Config::new())?;
@@ -26,41 +26,49 @@
 //! ## Zero-copy
 //!
 //! A hardware-decoded frame is imported by aliasing the decoder's surface as a
-//! texture rather than copying it: `CVMetalTextureCache` on macOS for the
+//! texture rather than copying it: `CVMetalTextureCache` on macOS and iOS for the
 //! `PixelBuffer` variant of [`Surface`](crate::Surface), and Vulkan external
-//! memory on Linux for packed PipeWire DMA-BUFs.
-// `PixelBuffer` is deliberately not a doc link: the variant is macOS-only, so a
+//! memory on Linux for DMA-BUFs, packed or planar. A planar one is imported a
+//! memory plane at a time, since Vulkan will not take an NV12 or YU12 buffer as
+//! a single image, and the shader was already sampling planes.
+// `PixelBuffer` is deliberately not a doc link: the variant is Apple-only, so a
 // link to it fails the `-D warnings` rustdoc build on every other platform.
 //!
-//! Linux callers must request
-//! [`wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF`] when creating the device
-//! to enable that import. Every other frame, and any import that fails, goes through
-//! [`Surface::into_i420`](crate::Surface::into_i420) and a plane upload. That
-//! path is always available, so which route a frame takes is a question of cost.
-//! An import path that keeps failing (a driver that cannot do it at all) retires
-//! itself after a few frames rather than paying for the attempt forever.
+//! Linux callers open the device with [`request_device`], which enables
+//! [`wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF`] for that import. A CPU
+//! frame is uploaded as planes. Any other GPU surface, and any import that
+//! fails, is an error rather than a download, so a frame's path is settled
+//! where it is produced: decode or capture with [`output`] of the device to
+//! receive only frames that draw here.
+//!
+//! ## Export
+//!
+//! [`export`] runs the other way, handing a texture you drew to an encoder as a
+//! [`Frame`](crate::Frame): on the GPU when the encoder reads this platform's
+//! GPU surface, read back to the CPU when it does not. [`readback`] is that
+//! read back on its own, for a consumer that wants the picture's RGBA pixels
+//! with no encoder behind it.
 //!
 //! Enabled by the non-default `render` feature, which is what pulls in `wgpu`.
 
 mod color;
+mod device;
+pub mod export;
+pub mod readback;
 mod renderer;
 mod source;
+
+pub(crate) use source::imports;
+pub use source::output;
 
 #[cfg(all(target_os = "linux", feature = "dmabuf"))]
 mod dmabuf;
 
-#[cfg(target_os = "macos")]
+#[cfg(apple)]
 mod metal;
 
+pub use device::request_device;
 pub use renderer::{Config, Renderer};
-
-/// The `wgpu` this renderer was built against, re-exported so you name the exact
-/// version rather than guessing at a compatible one.
-///
-/// [`Renderer::new`] takes this crate's `Device` and `Queue`, and
-/// [`Renderer::render`] hands back its `Texture`, so a major bump here is a
-/// breaking change for this crate.
-pub use wgpu;
 
 #[cfg(test)]
 mod tests {

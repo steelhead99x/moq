@@ -10,14 +10,21 @@ pub enum Error {
 	#[error("moq: {0}")]
 	Moq(#[from] moq_net::Error),
 
+	/// Muxing or demuxing FLV failed.
+	#[error("mux: {0}")]
+	Mux(#[from] moq_mux::Error),
+
 	/// I/O error from the RTMP listener or a connection.
 	#[error("io: {0}")]
 	Io(Arc<std::io::Error>),
 
-	/// Catch-all for ingest logic that reports via `anyhow` (the RTMP session and
-	/// the moq-mux demuxer surface their errors this way).
-	#[error("{0}")]
-	Other(Arc<anyhow::Error>),
+	/// This CPU lacks a feature that rind requires.
+	#[error(transparent)]
+	UnsupportedCpu(#[from] moq_crypto::cpu::UnsupportedCpu),
+
+	/// The RTMP handshake or session state machine failed.
+	#[error("rtmp session: {0}")]
+	Session(String),
 }
 
 impl From<std::io::Error> for Error {
@@ -28,7 +35,7 @@ impl From<std::io::Error> for Error {
 
 impl From<anyhow::Error> for Error {
 	fn from(err: anyhow::Error) -> Self {
-		Error::Other(Arc::new(err))
+		Error::Session(err.to_string())
 	}
 }
 

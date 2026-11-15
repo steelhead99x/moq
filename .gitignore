@@ -7,13 +7,21 @@
 *.local.json
 
 # Claude Code scratch space. These are untracked working directories, and
-# `just _changed` counts untracked files, so leaving them visible pushes the
-# changed-file list past its cap and silently turns every scoped `just check`
-# into `check-all`. The worktrees also carry their own biome.jsonc, which the
+# `just check` counts untracked files, so leaving them visible would put their
+# whole tree in scope. The worktrees also carry their own biome.jsonc, which the
 # unscoped run then rejects as a nested root config.
 /.claude/cache/
 /.claude/tmp/
 /.claude/worktrees/
+# quest's own checkouts (`quest worktree create`, /quest-spawn, and its Claude
+# Code worktree hooks) live under the main checkout's .worktrees/, for the same
+# reason.
+/.worktrees/
+
+# Per-checkout scratch output, such as benchmark logs and agent notes.
+/.tmp/
+# The old name, so a worktree's leftover scratch is never committed by accident.
+/.scratch/
 
 # IDE
 .idea
@@ -41,12 +49,15 @@ node_modules
 
 # Except these test fixtures, which are committed.
 !rs/moq-mux/src/container/fmp4/test_data/*.mp4
+!rs/moq-audio/src/decode/test_data/*.mp4
 
 # Cloudflare Wrangler
 .wrangler/
 
 # VitePress pages generated from drafts/ by doc/.vitepress/drafts.ts
 /doc/draft/
+# The JS API reference generated from TSDoc by doc/.vitepress/api/
+/doc/lib/js/api/
 
 # We're using bun
 package-lock.json
@@ -61,9 +72,6 @@ __pycache__/
 # maturin develop drops uniffi bindings + cdylib here during editable
 # installs of the py/moq-ffi package.
 /py/moq-ffi/moq_ffi/_uniffi/
-
-# Generated JSR manifest (derived from package.json by js/common/package.ts)
-jsr.json
 
 # msys/cygwin crash dumps, from running the shell scripts on Windows.
 *.stackdump

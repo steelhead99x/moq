@@ -9,54 +9,125 @@
 //! [`Shared`] is a role-less sibling: every handle can lock, read, or park on a
 //! predicate, with no liveness of its own.
 //!
+//! [`Watch`] wraps a [`Consumer`] for one predicate that reads only its value, so a
+//! re-poll the channel hasn't changed since skips the predicate and the lock.
+//!
 //! [`Queue`] is a poll-native FIFO queue built in the same style: role-less
 //! clone-able handles, bounded or unbounded, with separate wake lists for the
 //! push and pop sides.
 //!
-//! [`Fan`] hands out a [`Waker`](std::task::Waker) that wakes a whole [`WaiterList`], for
-//! driving a foreign future that keeps a single waker on behalf of everyone parked on it.
-//! It either owns the list or, via [`Fan::project`], wakes one already inside a [`Lock`].
+//! [`log`] is an append-only log whose readers take committed entries by index
+//! without a lock, for fan-out state paired with a channel that parks them.
+//!
+//! [`Bridge`] lets many waiters poll one `Context`-based handle, the inverse of [`Park`].
+//!
+//! [`coop`] bounds the passes a loop makes per poll, so one that always finds
+//! work ready still yields.
+//!
+//! [`clock`] is the time those waits run on: logical instants, wall time,
+//! deadlines, timers, and a deterministic simulator for tests.
+//!
+//! Every wait is a `poll_*` method first. The `async` feature adds the `async fn` that
+//! awaits each one, so a build without it compiles no coroutines (`async` bodies).
+//!
+//! With the `macros` feature, `#[kio::machine]` writes a `poll_*` state machine from
+//! straight-line code with explicit waits, and `#[kio::wrapper]` generates the `async
+//! fn` that awaits a `poll_*` method.
 
-use std::{
-	fmt,
-	ops::{Deref, DerefMut},
-};
+#![warn(missing_docs)]
 
-use crate::sync::AtomicUsize;
+use std::{fmt, sync::atomic::AtomicUsize};
 
+mod channel;
 mod lock;
-mod sync;
 mod waiter;
 
+pub mod clock;
+pub mod coop;
+pub mod log;
+
+mod bridge;
 mod consumer;
-mod pollable;
+mod pending;
 mod producer;
 mod queue;
-mod send;
 mod shared;
+mod task;
+mod watch;
 mod weak;
 
-#[cfg(feature = "time")]
-pub mod time;
-
-#[cfg(feature = "tokio")]
-#[doc(hidden)]
-pub mod tokio;
-
-#[cfg(all(test, loom))]
-mod loom;
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests;
 
+#[cfg(feature = "macros")]
+pub use kio_macros::{machine, wrapper};
+
+pub use bridge::Bridge;
+pub use channel::{Mut, Ref};
 pub use consumer::Consumer;
-pub use lock::{Lock, LockGuard, WeakLock};
-pub use pollable::{Pending, Pollable};
-pub use producer::{Mut, Producer, Ref};
+pub use lock::{Lock, LockGuard};
+pub use pending::Pending;
+pub use producer::{Producer, Unwanted};
 pub use queue::{PushError, Queue};
-pub use send::MaybeSend;
 pub use shared::Shared;
-pub use waiter::{Fan, Hold, Park, Waiter, WaiterList, wait};
+pub use task::{Task, TaskKey, Tasks};
+pub use waiter::{Hold, Park, Waiter, WaiterList, hold, wait};
+pub use watch::Watch;
 pub use weak::{ConsumerWeak, ProducerWeak, Weak};
+
+/// Run an `async fn` test to completion on [`clock::sim::run`].
+#[cfg(feature = "sim")]
+pub use kio_macros::test;
+
+// So `#[kio::test]` resolves inside this crate's own tests, and the wrappers
+// `#[kio::wrapper]` generates here reach `::kio::wait`.
+#[cfg(any(test, feature = "async"))]
+extern crate self as kio;
+
+/// Bytes an `Arc<T>` allocation occupies: `T` behind two reference counts, padded to
+/// `T`'s alignment and rounded up to the whole layout's.
+///
+/// The `const` equivalent of `Layout::extend` followed by `pad_to_align`, neither of
+/// which is `const`. `arc_heap_matches_layout` holds it to those.
+const fn arc_heap<T>() -> usize {
+	let counts = 2 * size_of::<usize>();
+	let align = align_of::<T>();
+	let layout = if align > align_of::<usize>() {
+		align
+	} else {
+		align_of::<usize>()
+	};
+	(counts.next_multiple_of(align) + size_of::<T>()).next_multiple_of(layout)
+}
+
+#[cfg(test)]
+mod heap {
+	use std::alloc::Layout;
+
+	// Not a glob: it would import `test`, kio's attribute, over the built-in one.
+	use super::{arc_heap, channel::Channel};
+
+	/// [`arc_heap`] hand-rolls what `Layout` does, because `Layout` isn't `const`. Hold
+	/// it to the real thing, including a `T` aligned past the reference counts.
+	#[test]
+	fn arc_heap_matches_layout() {
+		#[repr(align(64))]
+		struct Overaligned;
+
+		fn layout<T>() -> usize {
+			Layout::new::<[usize; 2]>()
+				.extend(Layout::new::<T>())
+				.unwrap()
+				.0
+				.pad_to_align()
+				.size()
+		}
+
+		assert_eq!(arc_heap::<u8>(), layout::<u8>());
+		assert_eq!(arc_heap::<Overaligned>(), layout::<Overaligned>());
+		assert_eq!(arc_heap::<Channel<()>>(), layout::<Channel<()>>());
+	}
+}
 
 /// The channel closed before the awaited condition held.
 ///
@@ -76,65 +147,6 @@ impl fmt::Display for Closed {
 }
 
 impl std::error::Error for Closed {}
-
-/// Waiters split by what they're waiting on, so an event only wakes the
-/// waiters that care about it. The big win is per-modification writes (the hot
-/// path) waking only `value`, leaving the long-lived `closed` and `consumer`
-/// waiters untouched.
-#[derive(Debug)]
-pub(crate) struct State<T> {
-	pub value: T,
-	/// Value changes (`poll`/`wait`). Woken on every modification.
-	pub waiters_value: waiter::WaiterList,
-	/// Closure (`closed`). Woken only when the channel closes.
-	pub waiters_closed: waiter::WaiterList,
-	/// Consumer-count changes (`used`/`unused`). `used`/`unused` are used
-	/// sequentially in practice, so they share one list.
-	pub waiters_consumer: waiter::WaiterList,
-	pub closed: bool,
-}
-
-impl<T: Default> Default for State<T> {
-	fn default() -> Self {
-		Self::new(Default::default())
-	}
-}
-
-impl<T> State<T> {
-	pub fn new(value: T) -> Self {
-		Self {
-			value,
-			closed: false,
-			waiters_value: waiter::WaiterList::new(),
-			waiters_closed: waiter::WaiterList::new(),
-			waiters_consumer: waiter::WaiterList::new(),
-		}
-	}
-
-	/// Drain every waiter list. Used on close, which all waiters react to.
-	/// Caller wakes the returned lists after releasing the lock.
-	pub fn take_close_waiters(&mut self) -> [waiter::WaiterList; 3] {
-		[
-			self.waiters_value.take(),
-			self.waiters_closed.take(),
-			self.waiters_consumer.take(),
-		]
-	}
-}
-
-impl<T> Deref for State<T> {
-	type Target = T;
-
-	fn deref(&self) -> &Self::Target {
-		&self.value
-	}
-}
-
-impl<T> DerefMut for State<T> {
-	fn deref_mut(&mut self) -> &mut Self::Target {
-		&mut self.value
-	}
-}
 
 #[derive(Debug)]
 pub(crate) struct Counts {

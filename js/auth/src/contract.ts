@@ -1,0 +1,245 @@
+/**
+ * The JSON a relay POSTs to an auth server per session event, and the grant or refusal it answers with.
+ *
+ * Mirrors `moq_auth::Request`, `moq_auth::Grant`, and `moq_auth::Refusal` in the Rust crate: a server written
+ * in TypeScript validates a request and builds a grant with these schemas.
+ *
+ * @module
+ */
+
+import { Pattern } from "@moq/pattern";
+import * as z from "zod/mini";
+import { decodeRoles, encodeRoles, UnixSecondsSchema, WireRoleSchema } from "./wire.ts";
+
+const PathSchema = z.string().check(
+	z.refine(
+		(path) => {
+			try {
+				Pattern.literal(path);
+				return true;
+			} catch {
+				return false;
+			}
+		},
+		{ message: "invalid path" },
+	),
+);
+
+// A relay renders the tier as a metrics label; empty is the default tier.
+const TierSchema = z.string().check(z.regex(/^([A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*)?$/, "invalid tier"));
+
+/** How a session reached the relay; `http` is a one-shot request on the relay's web listener. */
+export const TransportSchema = z.pipe(
+	z.string(),
+	z.catch(
+		z.enum(["quic", "websocket", "tcp", "unix", "http", "rtmp", "srt", "webrtc", "webtransport", "unknown"]),
+		"unknown",
+	),
+);
+/** A value parsed by {@link TransportSchema}. */
+export type Transport = z.infer<typeof TransportSchema>;
+
+/** The single direction a client declared at SETUP. */
+export const RoleSchema = z.enum(["publisher", "subscriber"]);
+/** A value parsed by {@link RoleSchema}. */
+export type Role = z.infer<typeof RoleSchema>;
+
+/**
+ * The verified client certificate a session presented, as facts for the server to
+ * decide on. Presenting one admits nothing by itself.
+ */
+export const PeerSchema = z.object({
+	/** The first SAN DNS name, else the CN, else the fingerprint, so it is never empty.
+	 * Those three sources fold into one string a server cannot tell apart; match on
+	 * `fingerprint` when identity must be exact. */
+	name: z.string(),
+	/** SHA-256 of the leaf certificate, hex. */
+	fingerprint: z.string(),
+	/** SHA-256 of the leaf, then of each certificate the leaf provably descends from,
+	 * nearest first, hex, ending at the root the relay's listener verified it against.
+	 * Absent from a relay that predates it: read that as the leaf alone. */
+	chain: z.optional(z.array(z.string())),
+	/** The certificate's notAfter, as unix seconds. */
+	expires: z.optional(z.int()),
+	/** The issuer's distinguished name. */
+	issuer: z.string(),
+});
+/** A value parsed by {@link PeerSchema}. */
+export type Peer = z.infer<typeof PeerSchema>;
+
+/** A credential from a moq-transport SETUP's `AUTHORIZATION TOKEN` option, unparsed. */
+export const TokenSchema = z.object({
+	/** The moq-transport Token Type: 0 is negotiated out of band (a JWT to `moq auth serve`), 1 is a Common Access Token. */
+	kind: z.int().check(z.nonnegative()),
+	/** The token bytes, base64url without padding. The final character must leave no stray bits, as Rust decodes it. */
+	value: z
+		.string()
+		.check(z.regex(/^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-][AQgw]|[A-Za-z0-9_-]{2}[AEIMQUYcgkosw048])?$/)),
+});
+/** A value parsed by {@link TokenSchema}. */
+export type Token = z.infer<typeof TokenSchema>;
+
+/** Byte totals for a session, both directions from the relay's point of view. */
+export const BytesSchema = z.object({
+	/** Bytes the relay sent to the peer. */
+	sent: z.int().check(z.nonnegative()),
+	/** Bytes the relay received from the peer. */
+	received: z.int().check(z.nonnegative()),
+});
+/** A value parsed by {@link BytesSchema}. */
+export type Bytes = z.infer<typeof BytesSchema>;
+
+const BaseRequestSchema = z.object({
+	/** The attached credential this event concerns; absent for the connection itself. */
+	auth: z.optional(z.string()),
+	/** Random 128-bit hex, unique per session; the key every event for it shares. */
+	id: z.string(),
+	/** The operator's name for the relay asking. */
+	node: z.string(),
+	/** How the session reached the relay. */
+	transport: TransportSchema,
+	/** The peer's socket address, absent on a transport without one (a unix socket). */
+	remote: z.optional(z.string()),
+	/** The relay's socket address the session arrived on, absent likewise. */
+	local: z.optional(z.string()),
+	/**
+	 * The SNI that selected the relay's certificate, absent without TLS or SNI.
+	 * The client picks it among the names the relay serves, so a hostname-scoped
+	 * server binds the tenant to the credential, not to this alone.
+	 */
+	server_name: z.optional(z.string()),
+	/**
+	 * The host the client dialed, without its port: the `Host` header or URL authority on
+	 * HTTP, WebSocket, and WebTransport, the SNI on raw QUIC and `tls://`. Client-chosen
+	 * even over plaintext, so bind the tenant to the credential, not to this alone.
+	 */
+	host: z.optional(z.string()),
+	/** The negotiated application protocol, including the moq version. */
+	alpn: z.optional(z.string()),
+	/** The path exactly as dialed. */
+	path: z.string(),
+	/** The raw query string, without the leading `?`. */
+	query: z.optional(z.string()),
+	/** The credential a moq-transport client presented in its SETUP. */
+	token: z.optional(TokenSchema),
+	/** The direction the client declared at SETUP; absent means both. */
+	role: z.optional(RoleSchema),
+	/** What the client advertised in its SETUP, such as `moq-net-js/0.4.2`; peer-controlled, so never authorize on it. */
+	implementation: z.optional(z.string()),
+	/** The verified client certificate, when one was presented. */
+	tls: z.optional(PeerSchema),
+});
+
+/**
+ * Everything a relay knows about a session, sent to the auth server on every event.
+ *
+ * Nothing is parsed on the relay's behalf: the server keys policy on the raw `path`,
+ * `query`, and `token`, so no query parameter is special. The same shape carries every event;
+ * an `end` adds what the session did.
+ */
+export const RequestSchema = z.discriminatedUnion("event", [
+	z.extend(BaseRequestSchema, {
+		/** A session was accepted and asks to be admitted. */
+		event: z.literal("connect"),
+	}),
+	z.extend(BaseRequestSchema, {
+		/** Another credential asks to join the connection. */
+		event: z.literal("attach"),
+		/** The credential's own lifecycle identity. */
+		auth: z.string(),
+	}),
+	z.extend(BaseRequestSchema, {
+		/** The grant asked to be re-checked on its cadence. */
+		event: z.literal("revalidate"),
+	}),
+	z.extend(BaseRequestSchema, {
+		/** The session closed. */
+		event: z.literal("end"),
+		/** Why it closed: `dropped`, `expired`, `refused`, `invalid`, `narrowed`, `shutdown`, or the session's own classification. */
+		reason: z.string(),
+		/** How long it was admitted, in seconds. */
+		duration: z.number(),
+		/** What it moved. */
+		bytes: BytesSchema,
+	}),
+]);
+/** A value parsed by {@link RequestSchema}. */
+export type Request = z.infer<typeof RequestSchema>;
+
+/**
+ * What a session may do, as the auth server answered.
+ *
+ * A 2xx carrying one of these admits; anything else refuses. A grant that names
+ * nothing is a refusal too, and one that asks to be revalidated must say when it
+ * expires, so an outage always has a bound the server chose.
+ *
+ * A role may be `{"path": [...], "rate": bps}`, which parses into `publish_rate` or
+ * `subscribe_rate` beside the patterns. Answer with {@link encodeGrant}, which writes a
+ * cap back into its role; a bare `publish_rate` field is ignored by the relay.
+ */
+export const GrantSchema = z
+	.pipe(
+		z.object({
+			/** Patterns the session may publish, relative to the root, optionally with a bitrate cap. */
+			publish: z.optional(WireRoleSchema),
+			/** Patterns the session may subscribe to, relative to the root, optionally with a bitrate cap. */
+			subscribe: z.optional(WireRoleSchema),
+			/** The path the patterns are relative to, replacing the dialed one. Absent means the dialed path. */
+			root: z.optional(z.string()),
+			/** Subtrees read from elsewhere: each path, relative to the root, resolves at the absolute path it maps to. Read-only. */
+			mounts: z.optional(z.record(z.string(), z.string())),
+			/** When the session closes, as whole unix seconds. */
+			expires: z.optional(UnixSecondsSchema),
+			/** How long until the relay asks again, in whole seconds. Zero would be a tight loop. */
+			revalidate: z.optional(z.int().check(z.positive())),
+			/** The stats tier this session's traffic is bucketed under: `/`-joined segments of ASCII letters, digits, `.`, `_`, and `-`. */
+			tier: z.optional(TierSchema),
+			/** The literal path this session's stats record under, independent of its root. Absent records under the empty label. */
+			label: z.optional(PathSchema),
+			/**
+			 * The session is a cluster peer (another relay): what it announces entered the cluster elsewhere,
+			 * and it discovers hidden routes without asking, for peers that predate the opt-in.
+			 * A client certificate alone is not.
+			 */
+			peer: z.optional(z.boolean()),
+			/** The peer is upstream: the relay never offers it a route learned from another upstream. Requires `peer`. */
+			upstream: z.optional(z.boolean()),
+		}),
+		z.transform(decodeRoles),
+	)
+	.check(
+		z.refine((grant) => (grant.publish?.length ?? 0) > 0 || (grant.subscribe?.length ?? 0) > 0, {
+			message: "a grant must name something",
+		}),
+		z.refine((grant) => grant.revalidate === undefined || grant.expires !== undefined, {
+			message: "a grant that asks to be revalidated must expire",
+		}),
+		z.refine((grant) => !grant.upstream || grant.peer === true, {
+			message: "an upstream grant must be a peer",
+		}),
+	);
+/** A value parsed by {@link GrantSchema}. */
+export type Grant = z.infer<typeof GrantSchema>;
+
+/**
+ * The JSON an auth server answers with for `grant`, writing each capped role as
+ * `{"path": [...], "rate": bps}`. Throws on a grant {@link GrantSchema} would refuse.
+ */
+export function encodeGrant(grant: Grant): z.input<typeof GrantSchema> {
+	const { publish, publish_rate, subscribe, subscribe_rate, ...rest } = grant;
+	const wire = { ...encodeRoles({ publish, publish_rate, subscribe, subscribe_rate }), ...rest };
+	GrantSchema.parse(wire);
+	return wire;
+}
+
+/** The reason and verified attribution an auth server returns with HTTP 403. */
+export const RefusalSchema = z.object({
+	/** Unknown reason strings read as `refused`. */
+	reason: z.pipe(z.string(), z.catch(z.enum(["refused", "forbidden", "expired", "malformed"]), "refused")),
+	/** A root named by a verified credential, never an unverified request path. */
+	root: z.optional(PathSchema),
+	/** The tier resolved by the decider, as in a grant; absent uses the default tier. */
+	tier: z.optional(TierSchema),
+});
+/** A typed refusal returned by an admission decider. */
+export type Refusal = z.infer<typeof RefusalSchema>;

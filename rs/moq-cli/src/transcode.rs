@@ -11,118 +11,103 @@ use anyhow::Context;
 
 use crate::Net;
 use crate::args::MoqSide;
-use hang::moq_net;
 
 /// Ladder and codec options for the `transcode` verb.
-#[derive(clap::Args, Clone)]
+#[derive(usage_rs::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 pub struct Args {
 	/// The derivative broadcast path. Defaults to `<broadcast>/transcode.hang`.
-	#[arg(long)]
+	#[usage(long)]
 	pub output: Option<String>,
 
-	/// A ladder rung as `height:bitrate` (pixels : bits per second), repeatable,
-	/// e.g. `--rung 720:2500000 --rung 360:600000`. Rungs at or above the source
-	/// are dropped at runtime. Defaults to a 1080p..240p ladder.
-	#[arg(long = "rung", value_parser = parse_rung)]
-	pub rungs: Vec<moq_transcode::Rung>,
+	/// A ladder rung as `size:bitrate` (short-side pixels : bits per second), repeatable,
+	/// e.g. `--rung 720:2500000 --rung 360:600000`. Short sides and bitrates must
+	/// increase together; input order does not matter. Rungs above the source
+	/// are dropped; a same-size rung needs a lower known bitrate.
+	/// Defaults to a 240p..1080p ladder.
+	#[usage(long = "rung")]
+	rungs: Vec<RungArg>,
 
 	/// The video encoder: `auto` (hardware first), `hardware`, `software`, or a
 	/// backend name like `nvenc`.
-	#[arg(long, default_value = "auto")]
+	#[usage(long, default = "auto")]
 	pub encoder: String,
 
 	/// The video decoder: `auto` (hardware first), `hardware`, `software`, or a
 	/// backend name like `nvdec`.
-	#[arg(long, default_value = "auto")]
+	#[usage(long, default = "auto")]
 	pub decoder: String,
 
-	/// Frame resize acceleration: `auto` (GPU-backed frames stay resident), `cpu`,
-	/// or `gpu`.
-	#[arg(long, default_value = "auto", value_parser = parse_resize_acceleration)]
-	pub resize_acceleration: moq_video::resize::Acceleration,
+	/// Where decoded frames live: `native` (GPU-backed frames stay resident from
+	/// decode through encode) or `cpu` (decode to CPU pixels, resize on the CPU).
+	#[usage(long, default = "native")]
+	frames: OutputArg,
+
+	/// The VA-API render node, such as `/dev/dri/renderD129`. Defaults to the
+	/// first that encodes, decodes, and scales.
+	#[cfg(all(target_os = "linux", feature = "vaapi"))]
+	#[usage(long, env = "MOQ_VAAPI_DEVICE", value_hint = usage_rs::ValueHint::FilePath)]
+	pub vaapi_device: Option<std::path::PathBuf>,
+
+	/// The V4L2 M2M encoder node, such as `/dev/video11`. Defaults to the first
+	/// that encodes H.264.
+	#[cfg(all(target_os = "linux", feature = "v4l2"))]
+	#[usage(long, env = "MOQ_V4L2_ENCODER", value_hint = usage_rs::ValueHint::FilePath)]
+	pub v4l2_encoder: Option<std::path::PathBuf>,
+
+	/// The V4L2 M2M decoder node, such as `/dev/video10`. Defaults to the first
+	/// that decodes H.264.
+	#[cfg(all(target_os = "linux", feature = "v4l2"))]
+	#[usage(long, env = "MOQ_V4L2_DECODER", value_hint = usage_rs::ValueHint::FilePath)]
+	pub v4l2_decoder: Option<std::path::PathBuf>,
 }
 
-/// Parse a `height:bitrate` rung, e.g. `720:2500000`.
-fn parse_rung(arg: &str) -> Result<moq_transcode::Rung, String> {
-	let (height, bitrate) = arg
-		.split_once(':')
-		.ok_or_else(|| format!("expected height:bitrate, got `{arg}`"))?;
-	let height: u32 = height.parse().map_err(|e| format!("invalid height `{height}`: {e}"))?;
-	let bitrate: u64 = bitrate
-		.parse()
-		.map_err(|e| format!("invalid bitrate `{bitrate}`: {e}"))?;
-	Ok(moq_transcode::Rung::new(height, bitrate))
+/// A `size:bitrate` rung, e.g. `720:2500000`.
+///
+/// A newtype because Usage builds a value through `FromStr`, and `Rung` is not ours.
+#[derive(Clone)]
+struct RungArg(moq_transcode::Rung);
+
+impl std::str::FromStr for RungArg {
+	type Err = String;
+
+	fn from_str(arg: &str) -> Result<Self, Self::Err> {
+		let (size, bitrate) = arg
+			.split_once(':')
+			.ok_or_else(|| format!("expected size:bitrate, got `{arg}`"))?;
+		let size: u32 = size.parse().map_err(|e| format!("invalid short side `{size}`: {e}"))?;
+		let bitrate: u64 = bitrate
+			.parse()
+			.map_err(|e| format!("invalid bitrate `{bitrate}`: {e}"))?;
+		Ok(Self(moq_transcode::Rung::new(
+			size,
+			moq_net::bandwidth::Rate::from_bps(bitrate),
+		)))
+	}
 }
 
-/// Parse a frame resize acceleration preference.
-fn parse_resize_acceleration(arg: &str) -> Result<moq_video::resize::Acceleration, String> {
-	match arg {
-		"auto" => Ok(moq_video::resize::Acceleration::Auto),
-		"cpu" => Ok(moq_video::resize::Acceleration::Cpu),
-		"gpu" => Ok(moq_video::resize::Acceleration::Gpu),
-		_ => Err(format!("expected auto, cpu, or gpu, got `{arg}`")),
+#[derive(Clone, Copy)]
+struct OutputArg(moq_video::Output);
+
+impl std::str::FromStr for OutputArg {
+	type Err = String;
+
+	fn from_str(arg: &str) -> Result<Self, Self::Err> {
+		match arg {
+			"native" => Ok(Self(moq_video::Output::Native)),
+			"cpu" => Ok(Self(moq_video::Output::Cpu)),
+			_ => Err(format!("expected native or cpu, got `{arg}`")),
+		}
 	}
 }
 
 /// Run the transcoder: subscribe to the source through the relay, publish the
 /// derivative back through the same session, and serve rungs until either ends.
 pub async fn run(moq: MoqSide, args: Args, net: Net) -> anyhow::Result<()> {
-	let source_path = moq_net::PathOwned::from(
-		moq.broadcast
-			.clone()
-			.context("`transcode` requires the source broadcast: pass --broadcast <name>")?,
-	);
-	if source_path.is_empty() {
-		anyhow::bail!("`transcode` requires the source broadcast: pass --broadcast <name>");
-	}
-	let output_path = moq_net::PathOwned::from(
-		args.output
-			.clone()
-			.unwrap_or_else(|| format!("{source_path}/transcode.hang")),
-	);
-
-	// Publish the derivative through one origin and consume the source through
-	// another, over a single auto-reconnecting session.
-	let url = moq
-		.client
-		.connect
-		.clone()
-		.context("`transcode` requires a relay: pass --client-connect <url>")?;
-	let publish = moq_net::Origin::random().produce();
-	let remote = moq_net::Origin::random().produce();
-	let session = net
-		.client(moq.client.clone())?
-		.with_publisher(&publish)
-		.with_subscriber(remote.clone())
-		.reconnect(url);
-
-	// Wait for the source to be announced rather than for the session to connect:
-	// `request_broadcast` answers on the spot, so asking the moment a session exists
-	// races the announcement that makes the path routable.
-	//
-	// Raced against the session ending, since the wait itself never fails: the origin
-	// outlives the session here, so a rejected token or an exhausted retry budget would
-	// otherwise leave us waiting for an announcement that can never arrive.
-	let consumer = remote.consume();
-	tokio::select! {
-		announced = consumer.announced_broadcast(&source_path) => {
-			announced.context("origin closed before the source broadcast was announced")?;
-		}
-		closed = session.closed() => {
-			closed.context("session failed before the source broadcast was announced")?;
-			anyhow::bail!("session closed before the source broadcast was announced");
-		}
-	}
-
-	// Resolve it for real; the session subscribes upstream on demand.
-	let source = consumer
-		.request_broadcast(&source_path)
-		.await
-		.context("source broadcast unavailable")?;
-
 	let mut config = moq_transcode::Config::default();
 	if !args.rungs.is_empty() {
-		config.rungs = args.rungs.clone();
+		config.ladder =
+			moq_transcode::Ladder::new(args.rungs.iter().map(|rung| rung.0)).context("invalid --rung ladder")?;
 	}
 	config.encoder = match args.encoder.as_str() {
 		"auto" => moq_video::encode::Kind::Auto,
@@ -136,22 +121,251 @@ pub async fn run(moq: MoqSide, args: Args, net: Net) -> anyhow::Result<()> {
 		"software" => moq_video::decode::Kind::Software,
 		name => moq_video::decode::Kind::Named(name.to_string()),
 	};
-	config.resize.acceleration = args.resize_acceleration;
+	config.resize.output = args.frames.0;
+	#[cfg(all(target_os = "linux", feature = "vaapi"))]
+	{
+		config.vaapi = args.vaapi_device.clone();
+	}
+	#[cfg(all(target_os = "linux", feature = "v4l2"))]
+	{
+		config.v4l2_encoder = args.v4l2_encoder.clone();
+		config.v4l2_decoder = args.v4l2_decoder.clone();
+	}
+
+	let source_path = moq_net::Path::try_from(
+		moq.broadcast
+			.clone()
+			.context("`transcode` requires the source broadcast: pass --broadcast <name>")?,
+	)?;
+	if source_path.is_empty() {
+		anyhow::bail!("`transcode` requires the source broadcast: pass --broadcast <name>");
+	}
+	let output_path = moq_net::Path::try_from(
+		args.output
+			.clone()
+			.unwrap_or_else(|| format!("{source_path}/transcode.hang")),
+	)?;
+
+	// Publish the derivative through one origin and consume the source through
+	// another, over a single auto-reconnecting session.
+	let url = moq
+		.client
+		.url
+		.clone()
+		.context("`transcode` requires a relay: pass --connect <url>")?;
+	let publish = moq_tokio::origin::spawn();
+	let remote = moq_tokio::origin::spawn();
+	let session = net
+		.client(moq.client.clone())?
+		.with_publisher(&publish)
+		.with_subscriber(remote.clone())
+		.connect(url);
+
 	// Point the derivative catalog at the source renditions so players fetch them from the
 	// source directly. An empty reference would name the derivative broadcast itself, which
 	// publishes the rungs and nothing else.
-	config.source = source_path.relative(&output_path).filter(|rel| !rel.is_empty());
-	// Persistent across reconnects. `None` while disconnected, so the ladder
-	// stays fixed-rate until the session has an estimate.
-	config.bandwidth = Some(session.send_bandwidth());
+	let source = source_path
+		.relative(&output_path)
+		.with_context(|| format!("`{output_path}` cannot reference the source broadcast `{source_path}`"))?;
+	config.source = Some(source).filter(|rel| !rel.is_empty());
 
-	let output = publish
-		.create_broadcast(&output_path, moq_net::broadcast::Route::new().with_announce(true))
-		.context("failed to create the derivative broadcast")?;
-	tracing::info!(source = %source_path, output = %output_path, "transcoding");
-
+	let following = Following {
+		origin: remote.consume(),
+		publish,
+		source_path,
+		output_path,
+		config,
+	};
 	tokio::select! {
-		res = moq_transcode::run(source, output, config) => Ok(res?),
+		res = following.run() => res,
 		res = session.closed() => Ok(res?),
+	}
+}
+
+/// Each source instance owns a fresh derivative, so its timestamps and track names never
+/// describe another publisher's content on an existing broadcast.
+struct Following {
+	origin: moq_net::origin::Consumer,
+	publish: moq_net::origin::Producer,
+	source_path: moq_net::Path,
+	output_path: moq_net::Path,
+	config: moq_transcode::Config,
+}
+
+impl Following {
+	async fn run(self) -> anyhow::Result<()> {
+		let mut instances = self.origin.follow(&self.source_path, None)?;
+		let mut running = None;
+		loop {
+			tokio::select! {
+				event = instances.available() => match event? {
+					Some(source) => {
+						let output = self.publish.route(&self.output_path, moq_net::origin::RouteOptions::hidden())?;
+						let transcoder = moq_transcode::Transcoder::new(source, output.broadcast().clone(), self.config.clone())?;
+						output.announce()?;
+						// Drop the old ladder, cancelling its pending requests and rung tasks, only
+						// once its successor is announced: the path never goes absent, so followers
+						// see a Restart rather than an End.
+						drop(running.take());
+						tracing::info!(source = %self.source_path, output = %self.output_path, "transcoding");
+						// The ladder holds its route, so the output stays announced while it runs.
+						running = Some(Box::pin(async move {
+							let _output = output;
+							transcoder.run().await
+						}));
+					}
+					None => tracing::info!(source = %self.source_path, "offline, waiting for it to return"),
+				},
+				result = async { running.as_mut().expect("guarded").await }, if running.is_some() => {
+					running = None;
+					match result {
+						Ok(()) => {}
+						// The instance ended cleanly before advertising anything to transcode.
+						Err(moq_transcode::Error::NoSource) => {
+							tracing::info!(source = %self.source_path, "ended before its video was ready, waiting for it to return");
+						}
+						Err(err) => return Err(err).context("transcoding failed"),
+					}
+				}
+			}
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A pending source catalog is a real run even before an encoder is needed. Replacing
+	/// that source must retire the old derivative and announce a fresh instance immediately.
+	#[tokio::test(start_paused = true)]
+	async fn a_source_restart_replaces_the_derivative_while_its_catalog_is_pending() {
+		restart(true).await;
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_source_restart_under_the_handle_instance_also_creates_a_new_derivative() {
+		restart(false).await;
+	}
+
+	/// `named` announces each source under an instance its options name, rather than the one
+	/// its route mints.
+	async fn restart(named: bool) {
+		let origin = moq_tokio::origin::spawn();
+		let publish = moq_tokio::origin::spawn();
+		let options = || {
+			let options = moq_net::origin::RouteOptions::default();
+			if named {
+				options.with_instance(moq_net::Instance::random(), 0)
+			} else {
+				options
+			}
+		};
+		let old = origin.route("source", options()).unwrap();
+		let _old_dynamic = old.broadcast().requests();
+		let mut derivatives = publish.consume().follow("derived", None).unwrap();
+		let mut routes = publish.consume().routes();
+		let following = Following {
+			origin: origin.consume(),
+			publish: publish.clone(),
+			source_path: moq_net::Path::from_static("source"),
+			output_path: moq_net::Path::from_static("derived"),
+			config: Default::default(),
+		};
+		let task = tokio::spawn(following.run());
+		let first = next(&mut derivatives).await;
+		assert_eq!(next_route(&mut routes).await, moq_net::origin::RouteKind::Start);
+		let mut old_catalog = first
+			.track(hang::Catalog::DEFAULT_NAME)
+			.unwrap()
+			.subscribe(None)
+			.await
+			.unwrap();
+		let new = origin.route("source", options()).unwrap();
+		let _new_dynamic = new.broadcast().requests();
+		let second = next(&mut derivatives).await;
+		assert!(!first.is_clone(&second));
+		assert_ne!(first.info().instance, second.info().instance);
+		assert!(first.is_closed(), "the superseded ladder is retired");
+		assert_eq!(
+			next_route(&mut routes).await,
+			moq_net::origin::RouteKind::Restart,
+			"the derivative path never goes absent across a source restart"
+		);
+		loop {
+			match old_catalog.recv_group().await {
+				Ok(Some(_)) => continue,
+				Err(moq_net::Error::Cancel) => break,
+				_ => panic!("the retired catalog must report deliberate cancellation"),
+			}
+		}
+		assert!(!second.is_closed(), "the new ladder serves immediately");
+		assert!(
+			!old.broadcast().consume().is_closed(),
+			"replacement does not close the source publisher"
+		);
+		task.abort();
+		assert!(task.await.unwrap_err().is_cancelled());
+	}
+
+	/// A source that finishes its catalog before advertising any video is a clean end, so the
+	/// command keeps following and the next instance still gets a ladder.
+	#[tokio::test(start_paused = true)]
+	async fn a_source_ending_before_its_video_waits_for_the_next_instance() {
+		let origin = moq_tokio::origin::spawn();
+		let publish = moq_tokio::origin::spawn();
+		let old = origin
+			.route("source", moq_net::origin::RouteOptions::default())
+			.unwrap();
+		let mut catalog = moq_mux::catalog::Producer::new(&mut old.broadcast().clone(), Default::default()).unwrap();
+		let mut derivatives = publish.consume().follow("derived", None).unwrap();
+		let following = Following {
+			origin: origin.consume(),
+			publish: publish.clone(),
+			source_path: moq_net::Path::from_static("source"),
+			output_path: moq_net::Path::from_static("derived"),
+			config: Default::default(),
+		};
+		let task = tokio::spawn(following.run());
+		let first = next(&mut derivatives).await;
+
+		catalog.finish().unwrap();
+		kio::clock::timeout(std::time::Duration::from_secs(1), first.closed())
+			.await
+			.expect("the ladder outlived its source's end");
+		assert!(!task.is_finished(), "a clean end stopped following");
+
+		let new = origin
+			.route("source", moq_net::origin::RouteOptions::default())
+			.unwrap();
+		let _new_dynamic = new.broadcast().requests();
+		let second = next(&mut derivatives).await;
+		assert!(!first.is_clone(&second));
+		task.abort();
+		assert!(task.await.unwrap_err().is_cancelled());
+	}
+
+	/// How the next change to the output path's route is announced.
+	async fn next_route(routes: &mut moq_net::origin::Routes) -> moq_net::origin::RouteKind {
+		let event = kio::clock::timeout(std::time::Duration::from_secs(1), routes.next())
+			.await
+			.expect("no route change was announced")
+			.expect("the route stream ended");
+		assert_eq!(event.announce.prefix.as_str(), "derived");
+		event.kind
+	}
+
+	/// The next derivative instance announced at the output path.
+	async fn next(instances: &mut moq_net::origin::Following) -> moq_net::broadcast::Consumer {
+		let start = async {
+			loop {
+				if let Some(broadcast) = instances.available().await.unwrap() {
+					return broadcast;
+				}
+			}
+		};
+		kio::clock::timeout(std::time::Duration::from_secs(1), start)
+			.await
+			.expect("no derivative instance was announced")
 	}
 }

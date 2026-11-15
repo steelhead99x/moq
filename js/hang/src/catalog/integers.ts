@@ -1,4 +1,4 @@
-import * as z from "@zod/mini";
+import * as z from "zod/mini";
 
 /**
  * Branded type for 8-bit unsigned integers (0-255)
@@ -16,6 +16,11 @@ export const u53Schema = z.number().check(z.int(), z.nonnegative(), z.lte(Number
 
 /** Branded unsigned integer up to JavaScript's MAX_SAFE_INTEGER (2^53 - 1). */
 export type U53 = z.infer<typeof u53Schema>;
+
+/**
+ * Branded type for nonzero 53-bit unsigned integers: a timescale, which zero cannot express.
+ */
+export const nonzeroU53Schema = z.number().check(z.int(), z.positive(), z.lte(Number.MAX_SAFE_INTEGER)).brand("u53");
 
 /**
  * Convenience function to create a u8 value

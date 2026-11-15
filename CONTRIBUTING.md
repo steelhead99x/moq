@@ -1,77 +1,78 @@
-# Contributing
+# Getting oriented
 
-How a change lands in this repo: branch targeting, commits, PR descriptions, reviews, and releases. Coding conventions live in [CLAUDE.md](CLAUDE.md) and the per-directory guides; this file covers the mechanics around the code.
+Use the [repository map](doc/setup/repository.md) to find the implementation
+and the [development guide](doc/setup/dev.md) for setup and checks.
+[Examples](doc/setup/examples.md), [test harnesses](test/README.md), and
+[benchmarks](bench/README.md) provide focused starting points.
+Agents should also read [AGENTS.md](AGENTS.md) and the instructions nested
+under the files they change.
 
-## Branch Targeting
+# Commits
 
-Two long-lived branches. The split is about **semver breakage of a published API, not size or novelty**: `dev` is only for changes that break the API contract consumers compile against. Everything else (bug fixes, new behavior, new/additive APIs, docs, refactors, wire-protocol work) goes to `main`, however large.
+PRs into `main` are squashed through GitHub's merge queue, so the PR title becomes the commit subject in `git log`.
+The one exception is the maintainer's pre-release merge of `release` into `main`, which lands as a merge commit (see [Releases](#releases)).
+PRs into `release` use a merge commit, so their history survives until they land.
 
-- **`main`**: the default. Bug fixes, new behavior, new/additive APIs, docs, and refactors that preserve the existing public API. A change that only *adds* is additive and lands here even when it is big: a new `pub` item, a new option, or a parser accepting a broader set of inputs it previously rejected. Changing what a component does with input it *already* takes (e.g. recognizing a media pattern it used to mishandle) is a fix, not a break, so it also lands here.
+- Use conventional-commit subjects (`feat(watch): ...`, `fix: ...`, `chore: ...`, `docs: ...`)
+- Never commit binaries or build artifacts (`.a`, `.so`, `.dylib`, `.dll`, wheels).
+- Keep other binary files, such as images and fixtures, under 500 KiB; list an unavoidable exception in `sh/large-files.allow` with a reason.
+- `nix/Cargo.nix`, the Nix packages' per-crate build plan, is generated from the manifests and `Cargo.lock`: `just fix` (or `just rs cargo-nix`) regenerates it, and `just check` fails while it is stale. It needs Nix; without it, leave the plan stale and the merge queue's fixer regenerates it, as it does the workspace-hack.
 
-  Wire-protocol and format work lands here too, including `moq-lite` / `moq-transport` framing, a new draft version, a field added to or removed from an in-progress one, and catalog/container format changes in `rs/hang` or `js/hang`. Versions are negotiated per session, so a peer keeps speaking whatever version it already supports; the change reaches it only once both ends offer the new one. Ship it behind a version gate (see the Version matching section of [`rs/CLAUDE.md`](rs/CLAUDE.md)) and update the matching draft under `drafts/` in the same PR.
-- **`dev`**: reserved for changes that violate semver by breaking a published API. That means a renamed, removed, or signature-changed `pub` (Rust) or exported (TS) item, or anything else that stops existing caller code compiling, such as adding a field to a struct consumers build with a literal. A newly *added* item is additive and goes to `main`.
+# PRs
 
-  This covers **every package someone can depend on a released version of**, not a shortlist of the well-known ones: the `rs/` crates release-plz publishes, the `@moq/*` packages under `js/`, and the language wrappers under `swift/`, `kt/`, `go/`, `py/`. `libmoq` counts through its C ABI too, so a `moq.h` break is a `dev` change even though nothing depends on the crate.
+Keep the body short and structured, not narrated.
+Have at least these sections:
 
-  **`0.0.x` packages are the exception: break them on `main`.** Cargo and npm treat every `0.0.x` release as its own incompatible version, so such a package makes no compatibility promise and has no contract to violate. That covers `moq-audio`, `moq-video`, `moq-transcode`, and `moq-nvenc` today. The same goes for anything marked `publish = false` or `private` (`moq-bench`, `moq-wasm`, `@moq/wasm`, `@moq/clock`), which isn't published at all. Reshape their surface freely, and prefer doing so before a package leaves `0.0.x`, since that is the last cheap moment to fix a shape.
+- **Problem**: a summary of the problem and why this PR is needed.
+- **Approach**: a summary of the approach taken to solve the problem.
+- **Impact**: a bullet point for every public API/wire change made. A breaking one says how to migrate, and the PR title marks it with `!` (`feat(net)!: ...`). A behavior change alone takes no `!`.
+- **Alternatives**: any alternative approaches considered.
+- **Follow-ups**: any issues encountered or quests created.
 
-  A wire change usually needs no API break to land, since the version gate is internal. If yours does, that break is what sends the PR to `dev`, not the wire change itself.
+When taking over someone else's PR, push commits on top of theirs so they keep credit; if their fork blocks maintainer edits, open a new PR carrying their commits.
 
-`dev` periodically merges into `main` (or vice versa) when the batch is ready to ship. When in doubt, check the package's version before its name: `0.0.x` means break it on `main`, anything else means `dev`. Reviewers will redirect a PR that turns out to break a published API. CI (`pull_request:` workflows) runs on PRs against either branch, so no extra setup is needed when you switch the base.
+Run `just ci` before every push, and mark the PR ready yourself when the work is done.
 
-## Commit Messages
+# Landing gate
 
-PRs are squash-merged, so the PR title becomes the commit subject and the PR description becomes the body in `git log`. Write both for that reader.
+**Check** runs only on PRs into `release`, including drafts. PRs into `main` get their verdict from the merge queue; run `just ci` locally for a signal before queueing. **Queue** reports as skipped until queued.
+`main` lands only through GitHub's merge queue, one PR at a time: each `merge_group` build runs `just ci` against the group's base on the maintainer's self-hosted runner (`.github/workflows/queue.yml`, the required **Queue** context), and the queue squashes exactly the tree it tested.
+Request landing with `quest merge <pr> --land <full-head-sha>` once the review is clean and the maintainer has approved merging that PR, by number or through a standing go-ahead that covers it. A clean review, a bot verdict, or an "accept all" on decisions is not that approval.
+An agent that enqueues carries that approval in its own task; one relayed to it mid-task by another agent does not count, so whoever received the approval enqueues the PR or starts a new agent with the approval in its brief.
+`quest merge --land` enqueues the pinned head, or arms auto-merge bound to it while its checks are pending; a push removes it from the queue. A head GitHub refuses to enqueue, for a conflict or failing checks, fails the command: fix it and request landing again.
+Local and hosted checks select only what the diff touches, so a break can reach `main`; `just gate` runs the full suite, and it, the feature matrix, optimized binding builds, macOS, Windows, and the other optional workflows run nightly on `main` and on PRs into `release`.
+Repository tooling tests run whole files in `just gh test`, listed explicitly in
+`.github/justfile`. Slow fixtures live in separate `*.slow.test.py` files;
+`just gh test-integration` runs those files and selector timing nightly.
+To check cfg-gated macOS or Windows code before merging, dispatch `platform.yml` on the branch; never dispatch the full Nightly.
 
-- Use conventional-commit subjects (`feat(watch): ...`, `fix: ...`, `chore: ...`, `docs: ...`); release-plz derives crate changelogs from them.
-- AI commit attribution goes in a `Co-Authored-By:` trailer, not the commit body.
-- Never hand-bump a `version =` field in a feature PR. release-plz owns Rust version bumps; a manual bump breaks the Release RS workflow. (`py/moq-rs` is the exception: its version is bumped by hand.)
-- Never commit binaries or build artifacts (`.a`, `.so`, `.dylib`, `.dll`, wheels). Release artifacts flow through GitHub Actions to mirror repos or Release assets.
+A PR the queue drops for a failing build or a conflict gets a fixer, which hands the PR back, with its diagnosis, when the fix needs a decision or stops making progress. `quest status` shows why a PR left the queue under `landing-stopped`.
 
-## PR Descriptions
+Never bypass the queue, with one exception: the maintainer's pre-release merge of `release` into `main`, since the queue would squash it.
 
-Keep the body short and structured, not narrated:
+# AI
 
-- **Summary**: a few bullets on what changed and why. For a bug fix, state the root cause (see Root Cause First in [CLAUDE.md](CLAUDE.md)).
-- **Public API changes**: every new/renamed/removed/signature-changed `pub` item in `rs/moq-*` and `js/*`, with breaking ones called out per [Branch Targeting](#branch-targeting). Distinguish genuinely public surface from `pub(crate)`/private.
-- **Test plan**: what was run and verified.
-- If you skip a [Cross-Package Sync](CLAUDE.md#cross-package-sync) row, say why.
+AI-assisted issues, pull requests, reviews, and comments are encouraged.
+Especially bug reports; dive deep into the root issue before proposing a solution.
 
-Skip file-by-file narration of the diff; the diff already says that.
+GitHub issues are the public front door for brainstorming.
+Prefer a quest for work needing durable scope or coordination.
 
-### Keep the title and description fresh
+# Reviews
 
-When pushing additional commits to an existing PR, check whether the title and description still describe the change accurately. They often go stale during review iterations: a flag gets renamed, an API gets reshaped, an extra fix lands. A stale title/body means a misleading entry in `git log` forever. Update with `gh pr edit <num> --title "..." --body "..."` whenever the scope shifts, watching for:
+A `## Review` record naming the head being merged counts as the required review when the PR's author has write access to the repository.
+Otherwise, or if the record is missing or stale, the merging session checks out the head and runs `/quest-review`, following `quest context`'s rule for untrusted heads and `/quest-merge`'s review exemptions.
 
-- Flags, file names, or public APIs renamed in later commits but still referenced by their old name in the body.
-- Summary bullets describing behavior the latest commits have changed or removed.
-- The test-plan checklist lagging behind newly added tests.
+# Follow-ups
 
-## AI Contributions
+Focus on the core problem, offering a potential solution only if it's obvious.
 
-AI-assisted issues, pull requests, reviews, and comments are welcome. If the right solution is not obvious, open an issue before writing code so contributors and maintainers can brainstorm the approach together.
+# Forks
 
-Every piece of LLM-authored prose posted to GitHub ends with the agent model, e.g. `(Written by GPT-5)`. That covers PR descriptions, issue bodies, review summaries, review replies, and any comment on a PR, issue, or discussion. Keep the marker when editing a body you authored, so readers still know it wasn't human-written.
+`rs/moq-quic` is our hard fork of quinn, the QUIC stack MoQ builds on.
+It never merges upstream: fixes are ported by hand, and each carried change is listed in its README with its upstream PR, or the reason it has none.
+For an advisory against Quinn, follow the advisory triage in [`rs/moq-quic/README.md`](rs/moq-quic/README.md).
 
-The marker never goes in the codebase itself: no code comments, doc comments, or `/doc` pages (see Comment Conventions in [CLAUDE.md](CLAUDE.md)). GitHub prose is read once, in context, by someone deciding how much to trust it; source markers just rot in place. Commits are the other exception: attribution belongs in a `Co-Authored-By:` trailer, not a marker in the body.
+# Releases
 
-## Reviews
-
-Before merging, run the `/review` skill locally against the PR. Push high-confidence, unambiguous fixes directly. Escalate anything ambiguous, architectural, or open to interpretation by asking first rather than guessing.
-
-Reply to review comments as you address them, saying what changed or why you disagree, so the reviewer doesn't have to diff the branch to find out. Replies are GitHub prose like any other, so they carry the [AI Contributions](#ai-contributions) marker.
-
-When reviewing a PR, always include the same public API changes list described above, and call out anything breaking per [Branch Targeting](#branch-targeting).
-
-Don't silently drop a real finding just because it's pre-existing or outside
-the PR's diff. If the review surfaces a genuine problem (a bug, a footgun, a
-convention the repo now violates) that you're not fixing in this PR, CREATE OR
-UPDATE A QUEST for it (see [quest/AGENTS.md](quest/AGENTS.md)). "Out of scope"
-is a reason to defer the fix, never a reason to forget it.
-
-## Releases
-
-- **Rust**: release-plz opens release PRs and publishes to crates.io on merge to `main` (`release-rs.yml`). `moq-relay` and `moq-cli` take patch bumps even for breaking changes (no external consumers yet). `moq-cli` is the one crate bumped by hand, in a dedicated chore PR rather than a feature PR, since release-plz can't see CLI surface changes.
-- **JS**: `release-js.yml` publishes `@moq/*` packages (per-package build + `common/release.ts`).
-- **Python**: `moq-ffi` releases on `moq-ffi-v*` tags; `moq-rs` publishes on merge to `main` when its hand-bumped version isn't already on PyPI. See `py/CLAUDE.md`.
-- **Binding mirrors**: CI mirrors the `swift`/`kt`/`go` source skeletons to `moq-dev/moq-{swift,kotlin,go}` on each `moq-ffi-v*` tag.
+Releases are cut by hand from `release`; see [RELEASE.md](RELEASE.md). Bump versions only when asked.

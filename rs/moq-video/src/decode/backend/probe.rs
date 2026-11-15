@@ -8,15 +8,15 @@
 //! Reachable only through [`Kind::Named`](super::Kind), never through `Auto` /
 //! `Hardware` / `Software`, so it can't be picked by accident.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
-#[cfg(not(target_os = "macos"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::ThreadId;
 
 use bytes::Bytes;
 use moq_net::Timestamp;
 
-use super::{Backend, Codec, Config};
+use super::{Backend, Config, Stream};
 use crate::{Error, Frame, I420, Size, Surface};
 
 pub(crate) const NAME: &str = "probe";
@@ -24,9 +24,40 @@ pub(crate) const NAME: &str = "probe";
 /// A test decoder that holds one picture until the next call or a flush.
 pub(crate) const BUFFERED_NAME: &str = "probe-buffered";
 
+/// A test decoder that reorders like B-frames do: it holds two pictures and
+/// returns the earliest once it has a third. It hands pictures back at
+/// nanosecond scale, as MediaCodec does, whatever scale the access unit came in.
+pub(crate) const REORDER_NAME: &str = "probe-reorder";
+
+/// A test decoder that holds every picture until a flush.
+pub(crate) const HOLDING_NAME: &str = "probe-holding";
+
+/// A test decoder that hands each picture straight back and records nothing,
+/// for tests that run more than one decoder at a time. It refuses [`CORRUPT`].
+pub(crate) const IMMEDIATE_NAME: &str = "probe-immediate";
+
+/// An access unit the immediate probe fails to decode.
+pub(crate) const CORRUPT: &[u8] = b"corrupt";
+
+/// A test decoder standing in for hardware with a single session: opening a
+/// second while one is alive fails.
+pub(crate) const SINGLE_NAME: &str = "probe-single";
+
+static SINGLE_OPEN: AtomicBool = AtomicBool::new(false);
+
 /// A test decoder whose flush waits until the test releases it.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(apple))]
 pub(crate) const BLOCKING_FLUSH_NAME: &str = "probe-blocking-flush";
+
+/// A test decoder standing in for hardware: it records the [`Config`] it opened
+/// with, ignores the scale hint like a backend without a scaler, and hands back
+/// a platform-native surface where one can be built without a device (a
+/// `CVPixelBuffer` on macOS and iOS), CPU pixels elsewhere.
+pub(crate) const NATIVE_NAME: &str = "probe-native";
+
+/// A test decoder standing in for hardware whose device answers that it cannot
+/// decode the stream, so it never opens.
+pub(crate) const REFUSING_NAME: &str = "probe-refusing";
 
 /// What happened to the codec, and where. `open` and `drop` are the pair that
 /// matters: the Windows backend opens a COM apartment in one and closes it in
@@ -35,19 +66,23 @@ pub(crate) type Event = (&'static str, ThreadId);
 
 static LOG: Mutex<Vec<Event>> = Mutex::new(Vec::new());
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(apple))]
 static FLUSH_ENTERED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(target_os = "macos"))]
+/// Wakes [`flush_entered`] once [`FLUSH_ENTERED`] is set.
+#[cfg(not(apple))]
+static FLUSH_ENTERING: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+#[cfg(not(apple))]
 static FLUSH_RELEASED: AtomicBool = AtomicBool::new(false);
 
 /// Serializes the tests that read [`LOG`], which is process-wide. nextest gives
 /// each test its own process, but `cargo test` does not.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(apple))]
 static EXCLUSIVE: Mutex<()> = Mutex::new(());
 
 /// Take the probe for one test, clearing whatever a previous one left behind.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(apple))]
 pub(crate) fn exclusive() -> std::sync::MutexGuard<'static, ()> {
 	let guard = EXCLUSIVE.lock().unwrap_or_else(|err| err.into_inner());
 	let _ = take();
@@ -55,32 +90,57 @@ pub(crate) fn exclusive() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// Empty the log and hand back what was in it.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(apple))]
 pub(crate) fn take() -> Vec<Event> {
 	std::mem::take(&mut LOG.lock().unwrap())
 }
 
 /// Prepare the blocking flush probe for one cancellation test.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(apple))]
 pub(crate) fn prepare_blocking_flush() {
 	FLUSH_ENTERED.store(false, Ordering::SeqCst);
 	FLUSH_RELEASED.store(false, Ordering::SeqCst);
 }
 
-/// Whether the blocking flush has started on the codec thread.
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn flush_entered() -> bool {
-	FLUSH_ENTERED.load(Ordering::SeqCst)
+/// Resolves once the blocking flush has started on the codec thread.
+#[cfg(not(apple))]
+pub(crate) async fn flush_entered() {
+	loop {
+		let mut entering = std::pin::pin!(FLUSH_ENTERING.notified());
+		entering.as_mut().enable();
+		if FLUSH_ENTERED.load(Ordering::SeqCst) {
+			return;
+		}
+		entering.await;
+	}
 }
 
 /// Let the blocking flush finish so the codec thread can be joined.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(apple))]
 pub(crate) fn release_flush() {
 	FLUSH_RELEASED.store(true, Ordering::SeqCst);
 }
 
 fn record(what: &'static str) {
 	LOG.lock().unwrap().push((what, std::thread::current().id()));
+}
+
+/// The config the native probe last opened with. Process-wide like [`LOG`],
+/// so a test that reads it holds [`native_exclusive`] first.
+static NATIVE_OPENED: Mutex<Option<Config>> = Mutex::new(None);
+
+static NATIVE_EXCLUSIVE: Mutex<()> = Mutex::new(());
+
+/// Take the native probe for one test, clearing what a previous one recorded.
+pub(crate) fn native_exclusive() -> std::sync::MutexGuard<'static, ()> {
+	let guard = NATIVE_EXCLUSIVE.lock().unwrap_or_else(|err| err.into_inner());
+	*NATIVE_OPENED.lock().unwrap() = None;
+	guard
+}
+
+/// The config the native probe was opened with, once it has been.
+pub(crate) fn native_opened() -> Option<Config> {
+	NATIVE_OPENED.lock().unwrap().clone()
 }
 
 /// The size the probe claims to decode at, so a test can build frames without a
@@ -90,52 +150,235 @@ pub(crate) const SIZE: Size = Size {
 	height: 240,
 };
 
-pub(crate) struct Probe;
+pub(crate) struct Probe(VecDeque<Frame>);
 
-pub(crate) struct Buffered(Option<Frame>);
+pub(crate) struct Buffered {
+	held: Option<Frame>,
+	ready: VecDeque<Frame>,
+}
 
-#[cfg(not(target_os = "macos"))]
+pub(crate) struct Immediate(VecDeque<Frame>);
+
+pub(crate) struct Reorder {
+	name: &'static str,
+	/// How many pictures it holds back.
+	depth: usize,
+	/// Held pictures, in presentation order.
+	held: Vec<Frame>,
+	ready: VecDeque<Frame>,
+}
+
+pub(crate) struct Single(VecDeque<Frame>);
+
+pub(crate) struct Native(VecDeque<Frame>);
+
+pub(crate) struct Refusing;
+
+#[cfg(not(apple))]
 pub(crate) struct BlockingFlush;
 
 impl Probe {
-	pub(crate) fn open(_codec: Codec, _config: &Config) -> Result<Box<dyn Backend>, Error> {
+	pub(crate) fn open(_stream: &Stream, _config: &Config) -> Result<Box<dyn Backend>, Error> {
 		record("open");
-		Ok(Box::new(Self))
+		Ok(Box::new(Self(VecDeque::new())))
 	}
 }
 
 impl Buffered {
-	pub(crate) fn open(_codec: Codec, _config: &Config) -> Result<Box<dyn Backend>, Error> {
-		Ok(Box::new(Self(None)))
+	pub(crate) fn open(_stream: &Stream, _config: &Config) -> Result<Box<dyn Backend>, Error> {
+		Ok(Box::new(Self {
+			held: None,
+			ready: VecDeque::new(),
+		}))
 	}
 }
 
-#[cfg(not(target_os = "macos"))]
+impl Reorder {
+	pub(crate) fn open(_stream: &Stream, _config: &Config) -> Result<Box<dyn Backend>, Error> {
+		Ok(Box::new(Self {
+			name: REORDER_NAME,
+			depth: 2,
+			held: Vec::new(),
+			ready: VecDeque::new(),
+		}))
+	}
+
+	pub(crate) fn open_holding(_stream: &Stream, _config: &Config) -> Result<Box<dyn Backend>, Error> {
+		Ok(Box::new(Self {
+			name: HOLDING_NAME,
+			depth: usize::MAX,
+			held: Vec::new(),
+			ready: VecDeque::new(),
+		}))
+	}
+}
+
+impl Backend for Reorder {
+	fn decode(&mut self, _access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<(), Error> {
+		let nanos = u64::try_from(timestamp.as_nanos()).map_err(|err| anyhow::anyhow!("probe: {err}"))?;
+		let frame = frame(Timestamp::from_nanos(nanos)?)?;
+		let index = self.held.partition_point(|held| held.timestamp < frame.timestamp);
+		self.held.insert(index, frame);
+		let bumped = self.held.len().saturating_sub(self.depth);
+		self.ready.extend(self.held.drain(..bumped));
+		Ok(())
+	}
+
+	fn receive(&mut self) -> Result<Option<Frame>, Error> {
+		Ok(self.ready.pop_front())
+	}
+
+	fn flush(&mut self) -> Result<(), Error> {
+		self.ready.extend(self.held.drain(..));
+		Ok(())
+	}
+
+	fn name(&self) -> &str {
+		self.name
+	}
+}
+
+impl Immediate {
+	pub(crate) fn open(_stream: &Stream, _config: &Config) -> Result<Box<dyn Backend>, Error> {
+		Ok(Box::new(Self(VecDeque::new())))
+	}
+}
+
+impl Backend for Immediate {
+	fn decode(&mut self, access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<(), Error> {
+		if access_unit == CORRUPT {
+			return Err(anyhow::anyhow!("probe: corrupt access unit").into());
+		}
+		self.0.push_back(frame(timestamp)?);
+		Ok(())
+	}
+
+	fn receive(&mut self) -> Result<Option<Frame>, Error> {
+		Ok(self.0.pop_front())
+	}
+
+	fn flush(&mut self) -> Result<(), Error> {
+		Ok(())
+	}
+
+	fn name(&self) -> &str {
+		IMMEDIATE_NAME
+	}
+}
+
+impl Single {
+	pub(crate) fn open(_stream: &Stream, _config: &Config) -> Result<Box<dyn Backend>, Error> {
+		if SINGLE_OPEN.swap(true, Ordering::SeqCst) {
+			return Err(anyhow::anyhow!("probe: out of decoder sessions").into());
+		}
+		Ok(Box::new(Self(VecDeque::new())))
+	}
+}
+
+impl Backend for Single {
+	fn decode(&mut self, _access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<(), Error> {
+		self.0.push_back(frame(timestamp)?);
+		Ok(())
+	}
+
+	fn receive(&mut self) -> Result<Option<Frame>, Error> {
+		Ok(self.0.pop_front())
+	}
+
+	fn flush(&mut self) -> Result<(), Error> {
+		Ok(())
+	}
+
+	fn name(&self) -> &str {
+		SINGLE_NAME
+	}
+}
+
+impl Drop for Single {
+	fn drop(&mut self) {
+		SINGLE_OPEN.store(false, Ordering::SeqCst);
+	}
+}
+
+impl Native {
+	pub(crate) fn open(_stream: &Stream, config: &Config) -> Result<Box<dyn Backend>, Error> {
+		*NATIVE_OPENED.lock().unwrap() = Some(config.clone());
+		Ok(Box::new(Self(VecDeque::new())))
+	}
+
+	/// A mid-gray picture at [`SIZE`] in the most native representation this
+	/// platform can build without a device.
+	fn frame(timestamp: Timestamp) -> Result<Frame, Error> {
+		let frame = frame(timestamp)?;
+		#[cfg(apple)]
+		let frame = {
+			let Surface::I420(i420) = frame.surface else {
+				unreachable!("the probe builds CPU pictures");
+			};
+			Frame::new(
+				Surface::PixelBuffer(crate::frame::apple::nv12_surface(&i420)),
+				frame.timestamp,
+			)
+		};
+		Ok(frame)
+	}
+}
+
+impl Backend for Native {
+	fn decode(&mut self, _access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<(), Error> {
+		self.0.push_back(Self::frame(timestamp)?);
+		Ok(())
+	}
+
+	fn receive(&mut self) -> Result<Option<Frame>, Error> {
+		Ok(self.0.pop_front())
+	}
+
+	fn flush(&mut self) -> Result<(), Error> {
+		Ok(())
+	}
+
+	fn name(&self) -> &str {
+		NATIVE_NAME
+	}
+}
+
+impl Refusing {
+	pub(crate) fn open(stream: &Stream, _config: &Config) -> Result<Box<dyn Backend>, Error> {
+		Err(Error::UnsupportedCodec(format!(
+			"probe: this device cannot decode {}",
+			stream.codec.label()
+		)))
+	}
+}
+
+#[cfg(not(apple))]
 impl BlockingFlush {
-	pub(crate) fn open(_codec: Codec, _config: &Config) -> Result<Box<dyn Backend>, Error> {
+	pub(crate) fn open(_stream: &Stream, _config: &Config) -> Result<Box<dyn Backend>, Error> {
 		Ok(Box::new(Self))
 	}
 }
 
 fn frame(timestamp: Timestamp) -> Result<Frame, Error> {
-	let i420 = I420::new(
-		SIZE.width,
-		SIZE.height,
-		vec![0x80u8; I420::len(SIZE.width, SIZE.height)],
-	)?;
+	let i420 = I420::new(SIZE, vec![0x80u8; I420::len(SIZE)?])?;
 	Ok(Frame::new(Surface::I420(i420), timestamp))
 }
 
 impl Backend for Probe {
 	/// One mid-gray frame per access unit, carrying the timestamp it came in
 	/// with, so a test can tell which payload a frame came from.
-	fn decode(&mut self, _access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<Vec<Frame>, Error> {
+	fn decode(&mut self, _access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<(), Error> {
 		record("decode");
-		Ok(vec![frame(timestamp)?])
+		self.0.push_back(frame(timestamp)?);
+		Ok(())
 	}
 
-	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
-		Ok(Vec::new())
+	fn receive(&mut self) -> Result<Option<Frame>, Error> {
+		Ok(self.0.pop_front())
+	}
+
+	fn flush(&mut self) -> Result<(), Error> {
+		Ok(())
 	}
 
 	fn name(&self) -> &str {
@@ -143,18 +386,23 @@ impl Backend for Probe {
 	}
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(apple))]
 impl Backend for BlockingFlush {
-	fn decode(&mut self, _access_unit: Bytes, _timestamp: Timestamp, _keyframe: bool) -> Result<Vec<Frame>, Error> {
-		Ok(Vec::new())
+	fn decode(&mut self, _access_unit: Bytes, _timestamp: Timestamp, _keyframe: bool) -> Result<(), Error> {
+		Ok(())
 	}
 
-	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
+	fn receive(&mut self) -> Result<Option<Frame>, Error> {
+		Ok(None)
+	}
+
+	fn flush(&mut self) -> Result<(), Error> {
 		FLUSH_ENTERED.store(true, Ordering::SeqCst);
+		FLUSH_ENTERING.notify_waiters();
 		while !FLUSH_RELEASED.load(Ordering::SeqCst) {
 			std::thread::yield_now();
 		}
-		Ok(Vec::new())
+		Ok(())
 	}
 
 	fn name(&self) -> &str {
@@ -163,12 +411,18 @@ impl Backend for BlockingFlush {
 }
 
 impl Backend for Buffered {
-	fn decode(&mut self, _access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<Vec<Frame>, Error> {
-		Ok(self.0.replace(frame(timestamp)?).into_iter().collect())
+	fn decode(&mut self, _access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<(), Error> {
+		self.ready.extend(self.held.replace(frame(timestamp)?));
+		Ok(())
 	}
 
-	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
-		Ok(self.0.take().into_iter().collect())
+	fn receive(&mut self) -> Result<Option<Frame>, Error> {
+		Ok(self.ready.pop_front())
+	}
+
+	fn flush(&mut self) -> Result<(), Error> {
+		self.ready.extend(self.held.take());
+		Ok(())
 	}
 
 	fn name(&self) -> &str {

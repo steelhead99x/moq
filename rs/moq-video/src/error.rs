@@ -1,20 +1,67 @@
+use std::sync::Arc;
+
 /// Errors returned by `moq-video`.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+	/// A [`decode::Consumer`](crate::decode::Consumer) refused the rendition before
+	/// subscribing: its codec, codec parameters, or description is
+	/// [unsupported](Self::UnsupportedCodec). Backend faults keep their own variants.
+	#[error("unsupported video configuration: {0}")]
+	UnsupportedConfig(String),
+
 	/// No encoder matching the requested codec / hardware preference could be
 	/// opened (none compiled in, or none available on this machine).
 	#[error("no usable video encoder found (tried: {0})")]
 	NoEncoder(String),
 
-	/// No decoder matching the requested codec / hardware preference could be
-	/// opened (none compiled in, or none available on this machine).
+	/// Every decoder this build has for the requested codec and hardware preference
+	/// failed to open on this machine, at least one with a fault: missing drivers,
+	/// no device, or a library error. A codec this build has no decoder for, or a
+	/// stream every decoder's device refused, is [`UnsupportedCodec`](Self::UnsupportedCodec).
 	#[error("no usable video decoder found (tried: {0})")]
 	NoDecoder(String),
 
-	/// A track's codec is not supported by the native decoders.
+	/// `Kind::Named` asked for an encoder this build does not have for that
+	/// codec: a name that is not a backend, one whose feature is off, or one
+	/// that does not encode the codec requested.
+	#[error("no encoder named {name} for {codec:?} (this build has: {available})")]
+	UnknownEncoder {
+		/// The name that was asked for.
+		name: String,
+		/// The codec it was asked for.
+		codec: crate::encode::Codec,
+		/// The encoders this build does have for that codec.
+		available: String,
+	},
+
+	/// `Kind::Named` asked for a decoder this build does not have for that
+	/// codec: a name that is not a backend, one whose feature is off, or one
+	/// that does not decode the codec requested.
+	#[error("no decoder named {name} for {codec:?} (this build has: {available})")]
+	UnknownDecoder {
+		/// The name that was asked for.
+		name: String,
+		/// The codec it was asked for.
+		codec: crate::decode::Codec,
+		/// The decoders this build does have for that codec.
+		available: String,
+	},
+
+	/// A track's codec, codec parameters, or description is not supported by the
+	/// native decoders this build has, or by the devices they run on here.
 	#[error("unsupported codec for native decode: {0}")]
 	UnsupportedCodec(String),
+
+	/// The codec session is over: its worker thread stopped, or a cancelled
+	/// call left it out of step with the stream it was decoding.
+	///
+	/// Distinct from [`Codec`](Self::Codec), which describes the bytes of one
+	/// picture and which a caller can reasonably skip past. Nothing about this
+	/// one improves by reading on: the session that would have decoded the next
+	/// picture no longer exists, and only a new encoder or decoder recovers it.
+	#[error("codec session ended: {0}")]
+	CodecGone(String),
 
 	/// The requested capture source or enumeration has no implementation on this
 	/// platform (the message names what is missing).
@@ -38,14 +85,36 @@ pub enum Error {
 	#[error("encoder {0} cannot change bitrate while running")]
 	BitrateUnsupported(&'static str),
 
+	/// This encoder can't force a group boundary, so a cut was refused rather
+	/// than queued. Groups keep falling where its configured GOP puts them.
+	#[error("encoder {0} cannot cut a group on request")]
+	CutUnsupported(&'static str),
+
+	/// A frame's samples are in a different color space than the one the
+	/// encoder writes into the bitstream, so encoding it would mislabel it.
+	/// Open the encoder with [`encode::Config::color`](crate::encode::Config::color)
+	/// set to the frame's [`Surface::color`](crate::Surface::color).
+	#[error("frame is {frame:?} but the encoder signals {encoder:?}")]
+	ColorMismatch {
+		/// The space the frame's samples are in.
+		frame: crate::Color,
+		/// The space the encoder was opened with.
+		encoder: crate::Color,
+	},
+
+	/// [`encode::Config::join`](crate::encode::Config::join) is zero, which opens
+	/// no group.
+	#[error("a join of zero opens no group")]
+	ZeroJoin,
+
 	/// GPU rendering failure: building the pipeline, importing a frame's surface
 	/// as a texture, or the device itself.
 	#[error("render: {0}")]
-	Render(#[source] anyhow::Error),
+	Render(#[source] Arc<anyhow::Error>),
 
 	/// Capture / encode / codec failure (the message carries the detail).
 	#[error(transparent)]
-	Codec(#[from] anyhow::Error),
+	Codec(Arc<anyhow::Error>),
 
 	/// moq-mux muxer/catalog error.
 	#[error(transparent)]
@@ -58,4 +127,23 @@ pub enum Error {
 	/// Timestamp overflow converting to the moq microsecond timescale.
 	#[error(transparent)]
 	TimeOverflow(#[from] moq_net::TimeOverflow),
+}
+
+impl Error {
+	/// A [`Codec`](Self::Codec) failure.
+	pub(crate) fn codec(err: anyhow::Error) -> Self {
+		Self::Codec(Arc::new(err))
+	}
+
+	/// A [`Render`](Self::Render) failure.
+	#[cfg(feature = "render")]
+	pub(crate) fn render(err: anyhow::Error) -> Self {
+		Self::Render(Arc::new(err))
+	}
+}
+
+impl From<anyhow::Error> for Error {
+	fn from(err: anyhow::Error) -> Self {
+		Self::codec(err)
+	}
 }

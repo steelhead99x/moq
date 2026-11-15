@@ -7,6 +7,7 @@
 //! It also holds each frame back by one, like the Media Foundation MFT, so a
 //! drain that loses the tail shows up as a missing frame rather than passing.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::thread::ThreadId;
 
@@ -16,6 +17,11 @@ use crate::{Error, Frame};
 
 pub(crate) const NAME: &str = "probe";
 
+/// The same probe, refusing cuts: stands in for a backend whose groups fall
+/// only on its own interval, so the sink's refusal can be tested without the
+/// V4L2 driver that actually behaves that way.
+pub(crate) const NO_CUT: &str = "probe-nocut";
+
 /// What happened to the codec, and where. `open` and `drop` are the pair that
 /// matters: the Windows backend opens a COM apartment in one and closes it in
 /// the other, so they have to land on the same thread.
@@ -23,17 +29,23 @@ pub(crate) type Event = (&'static str, ThreadId);
 
 static LOG: Mutex<Vec<Event>> = Mutex::new(Vec::new());
 
+/// Every bitrate the probe accepted, in order.
+static BITRATES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// A bitrate the probe refuses once, standing in for a transient codec failure.
+static REFUSE: Mutex<Option<u64>> = Mutex::new(None);
+
 /// Serializes the tests that read [`LOG`], which is process-wide. nextest gives
 /// each test its own process, but `cargo test` does not, and a shared log that
 /// only holds up under one runner is a trap for whoever adds the next test.
-#[cfg(not(target_os = "macos"))]
 static EXCLUSIVE: Mutex<()> = Mutex::new(());
 
 /// Take the probe for one test, clearing whatever a previous one left behind.
-#[cfg(not(target_os = "macos"))]
 pub(crate) fn exclusive() -> std::sync::MutexGuard<'static, ()> {
 	let guard = EXCLUSIVE.lock().unwrap_or_else(|err| err.into_inner());
 	let _ = take();
+	BITRATES.lock().unwrap().clear();
+	REFUSE.lock().unwrap().take();
 	guard
 }
 
@@ -44,7 +56,7 @@ static GATE: Mutex<()> = Mutex::new(());
 ///
 /// Lets a test pin the codec mid-call, so a cancellation lands while the request
 /// is genuinely in flight rather than racing the encode thread for it.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(apple))]
 pub(crate) fn hold() -> std::sync::MutexGuard<'static, ()> {
 	GATE.lock().unwrap_or_else(|err| err.into_inner())
 }
@@ -54,51 +66,97 @@ fn record(what: &'static str) {
 }
 
 /// Empty the log and hand back what was in it.
-#[cfg(not(target_os = "macos"))]
 pub(crate) fn take() -> Vec<Event> {
 	std::mem::take(&mut LOG.lock().unwrap())
 }
 
+/// Empty the accepted bitrates and hand them back.
+#[cfg(feature = "capture")]
+pub(crate) fn bitrates() -> Vec<u64> {
+	std::mem::take(&mut BITRATES.lock().unwrap())
+}
+
+/// Fail the first `set_bitrate` asking for `bitrate`, then accept it again.
+#[cfg(feature = "capture")]
+pub(crate) fn refuse_once(bitrate: u64) {
+	*REFUSE.lock().unwrap() = Some(bitrate);
+}
+
 pub(crate) struct Probe {
-	pending: Option<Encoded>,
+	/// The frame held back by one.
+	held: Option<Encoded>,
+	ready: VecDeque<Encoded>,
+	cuts: bool,
 }
 
 impl Probe {
 	pub(crate) fn open(_config: &Config) -> Result<Box<dyn Backend>, Error> {
 		record("open");
-		Ok(Box::new(Self { pending: None }))
+		Ok(Box::new(Self {
+			held: None,
+			ready: VecDeque::new(),
+			cuts: true,
+		}))
+	}
+
+	pub(crate) fn open_no_cut(_config: &Config) -> Result<Box<dyn Backend>, Error> {
+		record("open");
+		Ok(Box::new(Self {
+			held: None,
+			ready: VecDeque::new(),
+			cuts: false,
+		}))
 	}
 }
 
 impl Backend for Probe {
-	fn encode(&mut self, frame: &Frame, _keyframe: bool) -> Result<Vec<Encoded>, Error> {
+	fn encode(&mut self, frame: &Frame, cut: bool) -> Result<(), Error> {
 		// Uncontended unless a test is holding the codec here on purpose.
 		drop(GATE.lock().unwrap_or_else(|err| err.into_inner()));
 		record("encode");
+		// Recorded as its own event so a test can see the cut reach the codec on
+		// the frame it was meant for.
+		if cut {
+			record("cut");
+		}
 		// The payload is the frame's timestamp, so a test can tell which frame a
 		// packet came from independently of what it's stamped with.
 		let payload = bytes::Bytes::from(frame.timestamp.as_micros().to_string());
-		let previous = self.pending.replace(Encoded::new(payload, frame.timestamp));
-		Ok(previous.into_iter().collect())
-	}
-
-	fn flush(&mut self) -> Result<Vec<Encoded>, Error> {
-		record("flush");
-		Ok(self.pending.take().into_iter().collect())
-	}
-
-	fn finish(&mut self) -> Result<Vec<Encoded>, Error> {
-		record("finish");
-		Ok(self.pending.take().into_iter().collect())
-	}
-
-	fn set_bitrate(&mut self, _bitrate: u64) -> Result<(), Error> {
-		record("set_bitrate");
+		let previous = self.held.replace(Encoded::new(payload, frame.timestamp, cut));
+		self.ready.extend(previous);
 		Ok(())
 	}
 
-	fn name(&self) -> &str {
-		NAME
+	fn receive(&mut self) -> Result<Option<Encoded>, Error> {
+		Ok(self.ready.pop_front())
+	}
+
+	fn flush(&mut self) -> Result<(), Error> {
+		record("flush");
+		self.ready.extend(self.held.take());
+		Ok(())
+	}
+
+	fn set_bitrate(&mut self, bitrate: u64) -> Result<(), Error> {
+		record("set_bitrate");
+		let mut refuse = REFUSE.lock().unwrap();
+		if *refuse == Some(bitrate) {
+			*refuse = None;
+			return Err(Error::codec(anyhow::anyhow!("probe refused {bitrate} bps")));
+		}
+		BITRATES.lock().unwrap().push(bitrate);
+		Ok(())
+	}
+
+	fn can_cut(&self) -> bool {
+		self.cuts
+	}
+
+	fn name(&self) -> &'static str {
+		match self.cuts {
+			true => NAME,
+			false => NO_CUT,
+		}
 	}
 }
 

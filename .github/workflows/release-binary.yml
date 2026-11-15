@@ -1,0 +1,312 @@
+name: release-binary
+
+# Builds, packages, and (on a tag) attests and releases one workspace binary.
+# moq-cli.yml and moq-relay.yml call it; they keep the tag trigger and the
+# workflow name that alert.yml and release-brew.yml match on, and grant the
+# attest job's `id-token` and `attestations` permissions.
+
+on:
+  workflow_call:
+    inputs:
+      crate:
+        description: "Cargo package to build, e.g. moq-cli"
+        required: true
+        type: string
+      bin:
+        description: "Executable the package ships, e.g. moq"
+        required: true
+        type: string
+      linux-targets:
+        description: "JSON list of the Linux targets to build"
+        required: false
+        type: string
+        default: '["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]'
+      linux-features:
+        description: "Cargo features the Linux builds add, comma-separated"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CRATE: ${{ inputs.crate }}
+  BIN: ${{ inputs.bin }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    # Native runners for x86_64 and aarch64; armv7 cross-compiles on arm64.
+    # zig links every target against glibc 2.34, whatever the runner has.
+    runs-on: ${{ startsWith(matrix.target, 'x86_64') && 'ubuntu-22.04' || 'ubuntu-22.04-arm' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.linux-targets) }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/just
+
+      # Run from the checkout, so rustup installs the toolchain rust-toolchain.toml
+      # pins and adds the target to that one rather than to the image's stable.
+      - name: Add the Rust target
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup target add "$TARGET"
+
+      - name: Parse version
+        id: parse
+        shell: bash
+        run: just gh release parse-version "$CRATE"
+
+      - name: Set up packaging tools
+        uses: ./.github/actions/setup-packaging
+
+      # Debian and RPM name each architecture their own way. AlmaLinux 9 ships
+      # no 32-bit ARM, so armv7 is a .deb and a tarball only.
+      - name: Package architectures
+        id: arch
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          case "$TARGET" in
+            x86_64-unknown-linux-gnu) echo "deb=amd64 rpm=x86_64" ;;
+            aarch64-unknown-linux-gnu) echo "deb=arm64 rpm=aarch64" ;;
+            armv7-unknown-linux-gnueabihf) echo "deb=armhf rpm=" ;;
+            *) echo "no package architecture for $TARGET" >&2; exit 1 ;;
+          esac | tr ' ' '\n' >> "$GITHUB_OUTPUT"
+
+      # cargo-zigbuild writes the arm-features.h glibc lacks into zig's lib
+      # directory (ziglang/zig#3287), which the Nix store keeps read-only.
+      - name: Writable zig for 32-bit ARM
+        if: startsWith(matrix.target, 'armv7')
+        shell: bash
+        run: | # zizmor: ignore[github-env] a copy of the Nix store zig this job already runs.
+          zig=$(readlink -f "$(command -v zig)")
+          cp -rL --no-preserve=mode "$(dirname "$(dirname "$zig")")" "$RUNNER_TEMP/zig"
+          chmod +x "$RUNNER_TEMP/zig/bin/zig"
+          echo "CARGO_ZIGBUILD_ZIG_PATH=$RUNNER_TEMP/zig/bin/zig" >> "$GITHUB_ENV"
+
+      - name: Build (release, glibc 2.34)
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          FEATURES: ${{ inputs.linux-features }}
+        # Pin to glibc 2.34 so one binary covers Ubuntu 22.04+ (.deb)
+        # and AlmaLinux/RHEL/Rocky 9+ (.rpm).
+        run: cargo zigbuild --locked --release --target "$TARGET.2.34" -p "$CRATE" --features "$FEATURES"
+
+      - name: Package release assets
+        shell: bash
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          just rs package-binary \
+            --crate "$CRATE" \
+            --bin "$BIN" \
+            --binary "target/${TARGET}/release/${BIN}" \
+            --bare \
+            --version "$VERSION" \
+            --target "$TARGET" \
+            --output dist
+
+      # A transition.yaml beside nfpm.yaml is a deb-only package that keeps
+      # apt upgrades following a renamed package.
+      - name: Package .deb (Ubuntu 22.04 toolchain)
+        shell: bash
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+          ARCH: ${{ steps.arch.outputs.deb }}
+          BINARY_PATH: target/${{ matrix.target }}/release/${{ inputs.bin }}
+        run: |
+          just rs package-nfpm "packaging/$CRATE/nfpm.yaml" deb dist/
+          if [[ -f "packaging/$CRATE/transition.yaml" ]]; then
+            just rs package-nfpm "packaging/$CRATE/transition.yaml" deb dist/
+          fi
+
+      - name: Package .rpm
+        if: steps.arch.outputs.rpm != ''
+        shell: bash
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+          ARCH: ${{ steps.arch.outputs.rpm }}
+          BINARY_PATH: target/${{ matrix.target }}/release/${{ inputs.bin }}
+        run: just rs package-nfpm "packaging/$CRATE/nfpm.yaml" rpm dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ inputs.crate }}-${{ matrix.target }}
+          path: dist/*
+
+  build-tarball-macos:
+    name: Build macOS tarball (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/just
+
+      - uses: ./.github/actions/nix
+
+      - name: Parse version
+        id: parse
+        shell: bash
+        run: just gh release parse-version "$CRATE"
+
+      - name: Build and package tarball
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          just rs package-binary \
+            --crate "$CRATE" \
+            --bin "$BIN" \
+            --target "$TARGET" \
+            --version "$VERSION" \
+            --output dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ inputs.crate }}-${{ matrix.target }}
+          path: dist/*
+
+  build-windows:
+    name: Build Windows zip (${{ matrix.target }})
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/just
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Parse version
+        id: parse
+        shell: bash
+        run: just gh release parse-version "$CRATE"
+
+      - name: Build and package zip
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          just rs package-windows \
+            --crate "$CRATE" \
+            --bin "$BIN" \
+            --target "$TARGET" \
+            --version "$VERSION" \
+            --output dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ inputs.crate }}-${{ matrix.target }}
+          path: dist/*
+
+  # Signs a build provenance attestation over every built file, so a user
+  # can check one came from this workflow with `gh attestation verify` instead
+  # of trusting the SHA256SUMS uploaded beside it. Its own job keeps the
+  # signing grant off the build jobs, which run on nightly dry runs too, and
+  # off the release job, which holds `contents: write`.
+  attest:
+    name: Attest
+    needs: [build, build-tarball-macos, build-windows]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: artifacts/*
+
+  release:
+    name: Release
+    needs: [attest]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/just
+
+      - name: Parse version
+        id: parse
+        run: just gh release parse-version "$CRATE"
+
+      - name: Find previous tag
+        id: prev_tag
+        run: just gh release prev-tag "$CRATE"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TITLE: "${{ inputs.crate }} v${{ steps.parse.outputs.version }}"
+          RELEASE_PREV_TAG: ${{ steps.prev_tag.outputs.tag }}
+        run: just gh release create artifacts
+
+      - name: Trigger apt/rpm repo publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: just gh trigger-repo-publish

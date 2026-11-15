@@ -1,0 +1,61 @@
+//! A thread-per-core io_uring worker for the native MoQ stack.
+//!
+//! One [`Worker`] per pinned thread. It owns a `SINGLE_ISSUER | DEFER_TASKRUN |
+//! COOP_TASKRUN` ring, a userspace timer queue, a local task set, and the UDP
+//! sockets bound through it. The caller owns the thread loop: drive everything
+//! with [`Worker::block_on`], spawn extra `!Send` tasks through [`Handle`], and
+//! wake the worker from other threads through any [`std::task::Waker`] it hands
+//! out (a futex word, no ring or syscall needed while the worker is awake).
+//!
+//! UDP is the point: [`udp::Socket`] receives through one multishot `recvmsg`
+//! with a registered provided-buffer ring (one whole buffer per completion,
+//! `UDP_GRO` coalesced) and sends with an explicit `UDP_SEGMENT` control
+//! message per `sendmsg` from a growable pool of staging buffers.
+//!
+//! [`quic`] stacks a sans-IO QUIC stack on that path: a [`quic::Endpoint`]
+//! serves many connections on one socket (demuxed by connection id, dials
+//! included), each a [`quic::Connection`] wrapped by [`quic::web::Session`]
+//! and [`transport::Local`], which meets moq-net's `Send` bound by checking the
+//! thread on every use, so `moq_net::Client::connect` and `Server::accept` run
+//! real MoQ sessions on the worker. The socket is the identity: whatever is
+//! built on it runs on the worker that adopted it, and a socket adopted as a
+//! member of a steered reuseport group ([`udp::Bound`]) issues connection ids
+//! that steer back to it. [`Handle::run`] supplies time and schedules driver
+//! wakeups; callers run the returned drivers with [`Handle::spawn`]. The stack
+//! underneath is enabled by the `quic` feature; a build without it leaves the
+//! module out.
+//!
+//! [`metrics::Metrics`] is how the worker's own health leaves its thread:
+//! relaxed counters for the buffer pools, the batching mechanisms, the ring,
+//! and the scheduler, snapshotted from anywhere. Hand one to
+//! [`Config::metrics`] to keep a copy where the worker was spawned, or read the
+//! worker's own through [`Handle::metrics`].
+//!
+//! Requires Linux 6.12; [`Worker::new`] refuses older kernels with a legible
+//! error instead of degrading. The crate compiles to nothing off Linux.
+
+#![warn(missing_docs)]
+#![cfg_attr(
+	not(target_os = "linux"),
+	allow(
+		rustdoc::broken_intra_doc_links,
+		reason = "off Linux the crate compiles to nothing, so these doc links have no target"
+	)
+)]
+#![cfg(target_os = "linux")]
+
+mod clock;
+mod error;
+pub mod metrics;
+mod park;
+#[cfg(feature = "quic")]
+pub mod quic;
+mod shared;
+mod timer;
+pub mod transport;
+pub mod udp;
+mod worker;
+
+pub use error::Error;
+pub use timer::Timer;
+pub use worker::{Config, Handle, Worker};

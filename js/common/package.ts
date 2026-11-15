@@ -2,23 +2,16 @@
 // This creates a dist/ folder with the correct paths and dependencies for publishing
 // Split from release.ts to allow building packages without publishing
 
-import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { copyFileSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { publint } from "publint";
 import { formatMessage } from "publint/utils";
+import { checkPackageConstructors } from "./constructors.ts";
+
+checkPackageConstructors(process.cwd());
 
 console.log("✍️  Rewriting package.json...");
 const pkg = JSON.parse(readFileSync("package.json", "utf8"));
-
-// Capture the source exports before the npm rewrite below mutates them, so the
-// JSR config can map them to the built (.js) entrypoints.
-const srcExports: Record<string, unknown> = structuredClone(pkg.exports ?? {});
-
-// Publish to JSR alongside npm for every package that publishes at all (has a
-// release script), unless it opts out with "jsr": false. The web-component
-// packages opt out: JSR forbids the HTMLElementTagNameMap global augmentation
-// every custom element needs. Captured before pkg.scripts/jsr are cleared below.
-const publishJsr = Boolean(pkg.scripts?.release) && pkg.jsr !== false;
 
 function rewritePath(p: string, ext: string): string {
 	return p.replace(/^\.\/src/, ".").replace(/\.ts(x)?$/, `.${ext}`);
@@ -52,6 +45,11 @@ if (pkg.exports) {
 	}
 }
 
+// Worklets and workers that a page whose CSP refuses blob: hosts itself; see the package's assets().
+if (existsSync("dist/assets")) {
+	pkg.exports["./assets/*"] = "./assets/*";
+}
+
 if (pkg.sideEffects) {
 	pkg.sideEffects = pkg.sideEffects.map((p: string) => rewritePath(p, "js"));
 }
@@ -60,12 +58,17 @@ if (pkg.files) {
 	pkg.files = pkg.files.map((p: string) => rewritePath(p, "js"));
 }
 
+// npm normalizes bin targets to drop the leading "./" and warns when it has to.
+function rewriteBin(p: string): string {
+	return rewritePath(p, "js").replace(/^\.\//, "");
+}
+
 if (pkg.bin) {
 	if (typeof pkg.bin === "string") {
-		pkg.bin = rewritePath(pkg.bin, "js");
+		pkg.bin = rewriteBin(pkg.bin);
 	} else if (typeof pkg.bin === "object") {
 		for (const key in pkg.bin) {
-			pkg.bin[key] = rewritePath(pkg.bin[key], "js");
+			pkg.bin[key] = rewriteBin(pkg.bin[key]);
 		}
 	}
 }
@@ -91,14 +94,32 @@ rewriteWorkspaceDependency(pkg.peerDependencies);
 
 pkg.devDependencies = undefined;
 pkg.scripts = undefined;
-pkg.jsr = undefined; // JSR opt-out flag, not part of the npm package
 
 // Write the rewritten package.json
 writeFileSync("dist/package.json", JSON.stringify(pkg, null, 2));
 
-// Copy static files
+// A package that reports its own version keeps it in src/version.ts as "dev", since the
+// workspace runs src/ unbuilt; the published build gets the real one.
+if (existsSync("src/version.ts")) {
+	console.log(`🏷️  Stamping version ${pkg.version}...`);
+	const file = join("dist", "version.js");
+	const body = readFileSync(file, "utf8");
+	const placeholder = 'VERSION = "dev";';
+	if (body.split(placeholder).length !== 2) {
+		console.error(`${file} must contain exactly one \`${placeholder}\``);
+		process.exit(1);
+	}
+	writeFileSync(file, body.replace(placeholder, `VERSION = ${JSON.stringify(pkg.version)};`));
+}
+
+// Copy static files, including the license and patent notices of any third-party code ported in,
+// named like `<UPSTREAM>-LICENSE` and `<UPSTREAM>-PATENTS`.
 console.log("📄 Copying README.md...");
 copyFileSync("README.md", join("dist", "README.md"));
+for (const notice of readdirSync(".").filter((name) => /^[A-Z0-9]+-(LICENSE|PATENTS)$/.test(name))) {
+	console.log(`📄 Copying ${notice}...`);
+	copyFileSync(notice, join("dist", notice));
+}
 
 // Lint the package to catch publishing issues
 console.log("🔍 Running publint...");
@@ -116,111 +137,3 @@ if (messages.length > 0) {
 }
 
 console.log("📦 Package built successfully in dist/");
-
-// Optionally emit a jsr.json so the package can also publish to JSR (jsr.io).
-// Generated from package.json so version/exports never drift. We publish the
-// built dist (.js + .d.ts) rather than source: tsc emits explicit types into
-// the .d.ts, which sidesteps JSR's "slow types" and ships real declarations,
-// while JSR still builds the API docs from the .d.ts (JSDoc is preserved).
-if (publishJsr) {
-	writeJsrConfig();
-}
-
-function writeJsrConfig() {
-	console.log("✍️  Generating jsr.json...");
-
-	const exports: Record<string, string> = {};
-	for (const [key, val] of Object.entries(srcExports)) {
-		if (typeof val !== "string") continue;
-		// CSS exports are dev-only and not published, same as the npm package.
-		if (val.endsWith(".css")) continue;
-		// rewritePath turns "./src/index.ts" into "./index.js".
-		exports[key] = `./dist/${rewritePath(val, "js").slice(2)}`;
-	}
-
-	// Self-contained import map so we don't rely on JSR's package.json merge
-	// behavior. Deps resolve via npm, so packages can publish to JSR in any
-	// order. Flip @moq/* entries to "jsr:" once the whole graph is on JSR if you
-	// want JSR-native cross-links between the docs.
-	const imports: Record<string, string> = {};
-	const deps = { ...(pkg.dependencies ?? {}), ...(pkg.peerDependencies ?? {}) };
-	for (const [name, range] of Object.entries(deps) as [string, string][]) {
-		if (name.startsWith("@types/")) continue; // type-only, never imported at runtime
-		imports[name] = `npm:${name}@${range}`;
-		// Trailing-slash subpath mapping (e.g. @moq/signals/dom). The leading slash
-		// in "npm:/" is required: jsr.json's imports is a standalone import map, so
-		// the value must parse as a base URL for relative resolution. The
-		// "npm:name@range/" form (no slash) fails to URL-parse the appended subpath.
-		imports[`${name}/`] = `npm:/${name}@${range}/`;
-	}
-
-	injectSelfTypes();
-	rewriteDtsImports();
-
-	// JSR validates the license field as a single recognized SPDX identifier, not
-	// an expression: it rejects "(MIT OR Apache-2.0)". Take the first identifier
-	// from a dual-license expression so the package keeps a valid license field.
-	const license =
-		typeof pkg.license === "string"
-			? pkg.license
-					.replace(/[()]/g, "")
-					.split(/\s+(?:OR|AND)\s+/i)[0]
-					.trim()
-			: undefined;
-
-	const jsr = {
-		name: pkg.name,
-		version: pkg.version,
-		// JSR reads this for the package description and the "has a description"
-		// score check; it isn't pulled from the npm package.json automatically.
-		...(pkg.description ? { description: pkg.description } : {}),
-		...(license ? { license } : {}),
-		exports,
-		...(Object.keys(imports).length ? { imports } : {}),
-		// dist is gitignored, so un-ignore it with a "!" negation; JSR honors
-		// .gitignore otherwise and would drop the whole build from the graph.
-		publish: { include: ["dist", "README.md", "LICENSE*"], exclude: ["!dist"] },
-	};
-
-	writeFileSync("jsr.json", JSON.stringify(jsr, null, 2));
-	console.log("📦 jsr.json written");
-}
-
-function rewriteDtsImports() {
-	// JSR's doc generator resolves the .d.ts import graph and can't handle a
-	// ".ts" extension (the dist ships .js/.d.ts, not .ts) or a bare "." specifier.
-	// Normalize those in the declarations so doc generation resolves. Only the
-	// .d.ts needs this; the .js keeps its own specifiers for npm consumers.
-	const glob = new Bun.Glob("**/*.d.ts");
-	for (const rel of glob.scanSync("dist")) {
-		const file = join("dist", rel);
-		const body = readFileSync(file, "utf8");
-		const next = body
-			.replace(/(from\s+"\.[^"]*?)\.ts"/g, '$1"') // "./x.ts" -> "./x"
-			.replace(/(from\s+")\.(")/g, "$1./index$2"); // "." -> "./index"
-		if (next !== body) writeFileSync(file, next);
-	}
-}
-
-function injectSelfTypes() {
-	// JSR ignores a sibling .d.ts unless the .js references it explicitly;
-	// without this it infers types from the JS and reports "slow type" warnings.
-	const glob = new Bun.Glob("**/*.js");
-	for (const rel of glob.scanSync("dist")) {
-		const js = join("dist", rel);
-		const dts = js.replace(/\.js$/, ".d.ts");
-		if (!existsSync(dts)) continue;
-		const body = readFileSync(js, "utf8");
-		if (body.includes("@ts-self-types")) continue;
-		// Sibling .d.ts (same directory), so just its basename.
-		const directive = `/* @ts-self-types="./${basename(dts)}" */\n`;
-		// A shebang (bin entrypoints) must stay on line 1, so insert after it;
-		// otherwise the directive goes first.
-		if (body.startsWith("#!")) {
-			const nl = body.indexOf("\n") + 1;
-			writeFileSync(js, body.slice(0, nl) + directive + body.slice(nl));
-		} else {
-			writeFileSync(js, directive + body);
-		}
-	}
-}

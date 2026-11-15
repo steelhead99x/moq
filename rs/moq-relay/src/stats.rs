@@ -6,8 +6,8 @@
 
 use std::time::Duration;
 
-use clap::Args;
-use moq_net::PathOwned;
+use anyhow::Context;
+use moq_net::Path;
 use moq_net::origin;
 use serde::{Deserialize, Serialize};
 
@@ -16,42 +16,41 @@ use serde::{Deserialize, Serialize};
 /// Set `enabled = true` to attach a [`moq_stats::Producer`] to every session
 /// the relay accepts (and every cluster dial). The producer publishes a single
 /// `<prefix>/node/<node>` broadcast (or `<prefix>/node` when [`Self::node`] is
-/// unset) on the cluster origin. Each broadcast carries plain `.json` tracks
-/// (a JSON map of broadcast path to a cumulative counter snapshot per frame)
-/// plus compressed `.json.z` siblings; see `moq_stats` for the wire format and
-/// per-field semantics.
-#[derive(Args, Clone, Debug, Default, Deserialize, Serialize)]
+/// unset) on the cluster origin, under a fresh instance each run. The broadcast
+/// carries a `totals.json` track of per-tier totals, one `<bucket>/bucket.<epoch>.json`
+/// track per [`Self::depth`] bucket with its per-path traffic and per-label
+/// sessions, and presence and prefix tracks on request, each a compressed JSON
+/// track; see `moq_stats` for the wire format and per-field semantics.
+#[derive(usage_rs::Args, Clone, Debug, Deserialize, Serialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
-#[group(id = "stats-config")]
-pub struct StatsConfig {
+pub struct Config {
 	/// Master switch for stats publishing. Defaults to false.
-	///
-	/// Typed as `Option<bool>` (not bare `bool`) so a TOML file setting
-	/// `stats.enabled = true` survives `Config::load`'s `update_from` CLI
-	/// re-parse. With a bare `bool`, an absent `--stats-enabled` CLI flag
-	/// writes the `Default::default()` value (`false`) over the TOML value.
-	/// See `tests::cli_does_not_clobber_toml_stats_enabled` and the
-	/// "Config flags + TOML merge" note in `rs/CLAUDE.md`.
-	#[arg(
+	#[usage(
 		long = "stats-enabled",
 		env = "MOQ_STATS_ENABLED",
-		default_missing_value = "true",
-		num_args = 0..=1,
-		require_equals = true,
-		value_parser = clap::value_parser!(bool),
+		setting = "stats.enabled",
+		bool_value
 	)]
-	pub enabled: Option<bool>,
+	pub enabled: bool,
 
 	/// Top-level path under which stats broadcasts are published. Defaults
 	/// to `.stats`. Future stats categories (e.g. host-level node stats)
 	/// will share the same prefix.
-	#[arg(long = "stats-prefix", env = "MOQ_STATS_PREFIX")]
-	pub prefix: Option<String>,
+	#[usage(
+		long = "stats-prefix",
+		env = "MOQ_STATS_PREFIX",
+		default = ".stats",
+		setting = "stats.prefix"
+	)]
+	pub prefix: String,
 
-	/// Interval (in seconds) between snapshot publishes. Defaults to 1.
-	#[arg(long = "stats-interval", env = "MOQ_STATS_INTERVAL")]
-	pub interval: Option<u64>,
+	/// How often a snapshot is published, e.g. "1s" or "500ms". Defaults to 1
+	/// second.
+	#[usage(long = "stats-interval", env = "MOQ_STATS_INTERVAL", setting = "stats.interval")]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub interval: Option<moq_tokio::cli::Duration>,
 
 	/// Node identifier appended to the advertised stats path to disambiguate
 	/// broadcasts when multiple relays share a cluster origin. Without this,
@@ -60,43 +59,134 @@ pub struct StatsConfig {
 	///
 	/// May be multi-segment (e.g. `sjc/1`, `sjc/2`) when a region has multiple
 	/// hosts; the segments nest under a shared region key on the advertised
-	/// path. Single-relay deployments can leave this unset.
-	#[arg(long = "stats-node", env = "MOQ_STATS_NODE")]
+	/// path. Required when stats are enabled on a clustered relay, and on a
+	/// relay that only accepts peer dials, since its dialers see every peer's
+	/// broadcast; otherwise it may be unset.
+	#[usage(long = "stats-node", env = "MOQ_STATS_NODE", setting = "stats.node")]
 	pub node: Option<String>,
 
 	/// Number of leading broadcast-path segments to bucket stats by, one
-	/// broadcast per bucket at `<prefix>/<group>/node/<node>`. Defaults to 0: a
-	/// single `<prefix>/node/<node>` broadcast for the whole node. Set to 1 to
-	/// publish a per-first-segment broadcast (e.g. per tenant), so a consumer can
-	/// announce-scope to just that group rather than slurping every node's full
-	/// stats. See [`moq_stats::ProducerConfig::depth`].
-	#[arg(long = "stats-depth", env = "MOQ_STATS_DEPTH")]
-	pub depth: Option<usize>,
+	/// `<bucket>/bucket.<epoch>.json` track per bucket on the node's broadcast. Defaults
+	/// to 0: a single `bucket.<epoch>.json` track for the whole node. Set to 1 to
+	/// publish a per-first-segment track (e.g. per tenant), so a consumer
+	/// subscribes to just that bucket rather than slurping every node's full
+	/// stats.
+	#[usage(
+		long = "stats-depth",
+		env = "MOQ_STATS_DEPTH",
+		default = "0",
+		setting = "stats.depth"
+	)]
+	pub depth: usize,
+
+	/// How long a bucket's stats track stays listed after the bucket's last
+	/// session and traffic leave, e.g. "5m" or "30s". Defaults to 5 minutes. A
+	/// bucket that returns within it keeps its track and counters; one that
+	/// returns after it is a new track instance counted from zero. Only applies
+	/// at `depth` 1 or more. See [`moq_stats::produce::Config::linger`].
+	#[usage(long = "stats-linger", env = "MOQ_STATS_LINGER", setting = "stats.linger")]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub linger: Option<moq_tokio::cli::Duration>,
 }
 
-impl StatsConfig {
-	/// Build a [`moq_stats::Producer`] from this config, publishing on `origin`.
-	///
-	/// Returns a no-op producer when [`Self::enabled`] is false, so the relay can
-	/// attach the result unconditionally. Hand it to
-	/// [`Cluster::with_stats`](crate::Cluster::with_stats), which takes over both
-	/// the registry and keeping the publish task alive (the task stops when the
-	/// last clone of the producer drops).
-	pub fn build(&self, origin: origin::Producer) -> moq_stats::Producer {
-		if !self.enabled.unwrap_or(false) {
-			return moq_stats::Producer::new(moq_stats::ProducerConfig::new());
+impl Default for Config {
+	fn default() -> Self {
+		Self {
+			enabled: false,
+			prefix: ".stats".into(),
+			interval: None,
+			node: None,
+			depth: 0,
+			linger: None,
 		}
-		let prefix = self.prefix.clone().unwrap_or_else(|| ".stats".to_string());
-		let interval = Duration::from_secs(self.interval.unwrap_or(1).max(1));
-		let node = self.node.clone().map(PathOwned::from);
-		let depth = self.depth.unwrap_or(0);
-		tracing::info!(prefix, interval_secs = interval.as_secs(), node = ?node, depth, "stats publishing enabled");
-		let config = moq_stats::ProducerConfig::new()
+	}
+}
+
+impl Config {
+	/// The publish interval; `None` keeps the producer's default.
+	pub(crate) fn interval(&self) -> Option<Duration> {
+		self.interval.map(Into::into)
+	}
+
+	/// The linger after command-line overrides; `None` keeps the producer's default.
+	pub fn linger(&self) -> Option<Duration> {
+		self.linger.map(Into::into)
+	}
+
+	/// Refuse stats on a clustered relay without a node name: every node would
+	/// publish the same `<prefix>/node` broadcast and the origin keeps only one.
+	/// Run by both `Config::resolve` and [`Cluster::new`](crate::cluster::Cluster::new),
+	/// which embedders call directly.
+	pub(crate) fn check(&self, cluster: &crate::cluster::Config) -> anyhow::Result<()> {
+		if !self.enabled {
+			return Ok(());
+		}
+		// A malformed node was set, so it gets its own error rather than the missing-flag one.
+		let node = self
+			.node
+			.as_deref()
+			.map(Path::new)
+			.transpose()
+			.context("invalid stats.node")?;
+		#[cfg(feature = "cluster-lan")]
+		let lan = cluster.lan.enabled;
+		#[cfg(not(feature = "cluster-lan"))]
+		let lan = false;
+		let clustered = !cluster.connect.is_empty() || cluster.api.url.is_some() || cluster.node.is_some() || lan;
+		// An empty name is the root path, which publishes the shared unnamed broadcast.
+		anyhow::ensure!(
+			!clustered || node.is_some_and(|node| !node.is_empty()),
+			"--stats-enabled on a clustered relay requires --stats-node, so each node publishes its own stats"
+		);
+		Ok(())
+	}
+
+	/// The prefix stats publish under, reserved for the relay's own publisher, or
+	/// `None` when publishing is disabled.
+	pub(crate) fn reserved(&self) -> anyhow::Result<Option<Path>> {
+		if !self.enabled {
+			return Ok(None);
+		}
+		Ok(Some(Path::new(&self.prefix).context("invalid stats.prefix")?))
+	}
+
+	/// Build a [`moq_stats::Producer`] and its [`moq_stats::Publisher`] from this
+	/// config, publishing on `origin`.
+	///
+	/// Returns a no-op producer when [`Self::enabled`] is false, so
+	/// [`Cluster::new`](crate::cluster::Cluster::new) can build one unconditionally,
+	/// keep the producer, and run the publisher on its driver. Fails on a zero
+	/// interval.
+	pub(crate) fn build(
+		&self,
+		origin: origin::Producer,
+	) -> anyhow::Result<(moq_stats::Producer, moq_stats::Publisher)> {
+		if !self.enabled {
+			return Ok(moq_stats::Producer::new(moq_stats::produce::Config::new()));
+		}
+		let prefix = Path::new(&self.prefix).context("invalid stats.prefix")?;
+		let interval = self.interval();
+		anyhow::ensure!(interval != Some(Duration::ZERO), "stats.interval must be non-zero");
+		let node = self
+			.node
+			.as_deref()
+			.map(Path::new)
+			.transpose()
+			.context("invalid stats.node")?;
+		let depth = self.depth;
+		let linger = self.linger();
+		tracing::info!(%prefix, ?interval, node = ?node, depth, ?linger, "stats publishing enabled");
+		let mut config = moq_stats::produce::Config::new()
 			.with_origin(origin)
 			.with_prefix(prefix)
-			.with_interval(interval)
 			.with_node(node)
 			.with_depth(depth);
-		moq_stats::Producer::new(config)
+		if let Some(interval) = interval {
+			config = config.with_interval(interval);
+		}
+		if let Some(linger) = linger {
+			config = config.with_linger(linger);
+		}
+		Ok(moq_stats::Producer::new(config))
 	}
 }

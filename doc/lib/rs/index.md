@@ -5,47 +5,71 @@ description: The reference implementation, as a set of crates on crates.io
 
 # Rust
 
-The reference implementation. Every crate is on
-[crates.io](https://crates.io/search?q=moq) with API docs on docs.rs.
+The reference implementation. Published crates are on
+[crates.io](https://crates.io/search?q=moq) with API docs on docs.rs; source
+links cover crates awaiting their first release.
+
+Start with [moq-net](/lib/rs/moq-net) and `moq-tokio` for a connection,
+then add [hang](/lib/rs/hang) for media. To run a tool without embedding it,
+see [Applications](/bin/). [Examples](/setup/examples) links runnable consumers;
+[Repository map](/setup/repository) locates internal crates and their tests.
+
+Transport cryptography comes from [rind](https://github.com/kixel-ai/rind).
+It supports every x86\_64 CPU, aarch64 with NEON (including Raspberry Pi 4,
+CM4, and Zero 2 W without crypto extensions), and armv7. Setup reports a
+missing required CPU feature before starting transport cryptography.
 
 ## Crates
 
 | Crate | Does |
 | --- | --- |
 | [moq-net](/lib/rs/moq-net) | The pub/sub layer: sessions, origins, broadcasts, tracks, groups, frames. Transport-agnostic. |
-| [moq-native](https://docs.rs/moq-native) | Stands up QUIC (quinn, quiche, or noq), TLS, WebSocket fallback, and iroh, from config or CLI flags. |
+| [moq-pattern](https://docs.rs/moq-pattern) | Path patterns such as `room/**`. Re-exported by moq-net and moq-auth. |
+| [moq-tokio](https://docs.rs/moq-tokio) | Connects and listens over QUIC, WebTransport, WebSocket, TCP, or Unix sockets, from config or CLI flags, and runs MoQ over a qmux session established elsewhere (`qmux` feature). With default features off, `driver` builds a Tokio QUIC stack, with rind cryptography, without MoQ. |
+| [qmux](https://docs.rs/qmux) | QUIC streams, datagrams, and flow control over TCP, TLS, WebSocket, and Unix sockets, on moq-quic's state machine. |
+| [moq-sock](https://docs.rs/moq-sock) | Socket binding and CPU pinning for thread-per-core listeners. |
+| [moq-uring](https://docs.rs/moq-uring) | Experimental Linux io\_uring server for moq-lite. |
 | [hang](/lib/rs/hang) | The media layer: catalog, containers, ordered frame delivery. |
 | [moq-mux](/lib/rs/moq-mux) | Import and export fMP4/CMAF, MPEG-TS, Matroska, FLV, and Annex-B. |
+| [moq-archive](https://docs.rs/moq-archive) | [Record and serve broadcasts](/concept/archives) on any `object_store` backend. |
 | [moq-video](/lib/rs/moq-video) | Native capture, hardware encode/decode (Apple, Windows, NVIDIA, VAAPI, V4L2, Android), and GPU rendering. |
+| [moq-v4l](https://docs.rs/moq-v4l) | Safe Video4Linux 2 bindings. |
+| [moq-vaapi](https://docs.rs/moq-vaapi) | VA-API H.264 and H.265 hardware encode and decode, loading libva at runtime. |
 | [moq-audio](/lib/rs/moq-audio) | Microphone and speaker, Opus/PCM/AAC codecs, echo cancellation. |
 | [moq-transcode](https://docs.rs/moq-transcode) | Just-in-time rendition ladders, GPU-resident on NVIDIA. |
-| [moq-token](/lib/rs/moq-token) | JWT keys, signing, verification, path authorization. |
-| [moq-json](https://docs.rs/moq-json) | JSON over tracks: snapshots with merge-patch deltas, or append logs. |
-| [moq-flate](https://docs.rs/moq-flate) | Group-scoped DEFLATE for any track. |
+| [moq-auth](/lib/rs/moq-auth) | Relay authorization: JWT signing and verification, and the auth server contract. |
+| [moq-json](/lib/rs/moq-json) | JSON over tracks: snapshots with merge-patch deltas, or append logs. |
+| [moq-crypto](https://github.com/moq-dev/moq/tree/main/rs/moq-crypto) | Workspace-only end-to-end encryption of groups, datagrams, and track names, scoped to a publisher run's epoch, and per-frame Ed25519 signatures, so relays forward content they cannot read, forge, retime, or relocate. |
 | [moq-loc](https://docs.rs/moq-loc), [moq-msf](https://docs.rs/moq-msf) | The IETF LOC container and MSF catalog. |
 | [moq-stats](https://docs.rs/moq-stats) | Publish and consume relay traffic counters as tracks. |
-| [moq-hls](https://docs.rs/moq-hls), [moq-rtmp](https://docs.rs/moq-rtmp), [moq-srt](https://docs.rs/moq-srt), [moq-rtc](https://docs.rs/moq-rtc) | The [gateways](/bin/), as libraries you can embed with your own auth. |
-| [moq-ffi](https://docs.rs/moq-ffi), [libmoq](/lib/c/) | The UniFFI core behind the language bindings, and the C ABI. |
+| [kio](/lib/rs/kio) | The async primitives everything polls through, and one clock for time and timers on tokio and a deterministic test simulator. |
+| [moq-hls](https://docs.rs/moq-hls), [moq-rtmp](https://docs.rs/moq-rtmp), [moq-srt](https://docs.rs/moq-srt), [moq-rtsp](https://github.com/moq-dev/moq/tree/main/rs/moq-rtsp), [moq-webrtc](https://github.com/moq-dev/moq/tree/main/rs/moq-webrtc) | The [gateways](/bin/), as libraries you can embed with your own auth. |
+| [moq-ffi](https://docs.rs/moq-ffi), [moq-c](/lib/c/) | The UniFFI core behind the language bindings, and the C ABI. |
 | [moq-relay](/bin/relay/), [moq-cli](/bin/cli) | The binaries, also usable as crates. |
-| [web-transport](https://github.com/moq-dev/web-transport) | The QUIC/WebTransport/qmux transports, in a sibling repository. |
+| [web-transport](https://github.com/moq-dev/web-transport) | The WebTransport traits and the browser transport, in a sibling repository. |
 
 ## Quick start
 
-`moq-native` configures the endpoint; `moq-net` does the protocol.
+`moq-tokio` configures the endpoint; `moq-net` does the protocol.
 
 ```rust
 // The Origin is the local hub: the session fills it with remote broadcasts
 // and serves your local broadcasts out of it.
-let origin = moq_net::Origin::random().produce();
+let origin = moq_tokio::origin::spawn();
 
-let client = moq_native::ClientConfig::default().init()?;
+let client = moq_tokio::connect::Config::default().init(Default::default())?;
 let url = url::Url::parse("https://cdn.moq.dev/anon")?;
-let session = client.with_subscriber(origin.clone()).with_publisher(&origin).connect(url).await?;
+// Reconnects on its own; `closed()` resolves when it gives up.
+let session = client.with_publisher(&origin).with_subscriber(origin.clone()).connect(url);
 
-// Subscribe: wait for a broadcast, read its catalog, then its tracks.
-let mut announced = origin.consume().announced();
-while let Some(update) = announced.next().await {
-    let Some(broadcast) = update.broadcast else { continue };
+// Subscribe: wait for a route, resolve the broadcast at its path, read the catalog.
+let consumer = origin.consume();
+let mut announced = consumer.announced();
+while let Some(event) = announced.next().await {
+    // Skip retractions. A path stays present across publisher restarts: hold
+    // `consumer.follow(path, None)` to be handed each new run.
+    let moq_net::announce::Event::Present(update) = event else { continue };
+    let broadcast = consumer.request(&update.prefix, Some(update.route.instance().clone())).await?;
     let catalog = broadcast
         .track(hang::Catalog::DEFAULT_NAME)?
         .subscribe(hang::Catalog::default_subscription())
@@ -55,35 +79,40 @@ while let Some(update) = announced.next().await {
 ```
 
 ```rust
-// Publish: create a broadcast on the origin and add tracks to it.
-let route = moq_net::broadcast::Route::new().with_announce(true);
-let mut broadcast = origin.create_broadcast("my-stream.hang", route)?;
-// moq-mux (from a container) or moq-video / moq-audio (from a device) fill it.
+// Publish: create a route on the origin; it owns the broadcast to fill.
+let route = origin.route("my-stream.hang", RouteOptions::default())?;
+// moq-mux (from a container) or moq-video / moq-audio (from a device) fill
+// `route.broadcast()`. Keep the route: dropping it, or closing its broadcast,
+// retracts it, and `withdraw()`/`announce()` hide and show the same stream. To
+// serve a whole subtree on demand instead, `origin.claim("room", ..)?` returns
+// a `Claim` that yields each requested path: answer with `request.route(..)`, `serve` a held
+// broadcast, or `reject`.
 ```
 
-The examples run the session and the origin work concurrently (`tokio::select!` or
-`spawn`), since the announcement loop is live. Runnable examples:
+The connection and origin helpers spawn their drivers. Watch
+`session.closed()` alongside the announcement loop to handle a connection
+that gives up. Before exiting, `session.close().await` delivers what was
+already queued, then `Client::close` sends the QUIC close. Runnable examples:
 [`rs/hang/examples/video.rs`](https://github.com/moq-dev/moq/blob/main/rs/hang/examples/video.rs)
 (publish) and
 [`subscribe.rs`](https://github.com/moq-dev/moq/blob/main/rs/hang/examples/subscribe.rs).
-URLs may be `https://` (WebTransport, with raw QUIC preferred for native),
-`moql://`/`moqt://` (raw QUIC), or `iroh://`. A `?jwt=` query carries the
-token. `http://` is for a relay on localhost only: it fetches the certificate
-fingerprint unauthenticated before upgrading, so never send a token over it. Connections race
-QUIC against WebSocket and remember which won.
 
-## WebAssembly
-
-`moq-net` compiles to `wasm32-unknown-unknown` and rides the browser's own
-`WebTransport` through the `web-transport` crate, so Rust logic can be shared
-between native and web. Skip `moq-native` there, build the transport with
-`web_transport::ClientBuilder`, and drive the returned session future with
-`wasm_bindgen_futures::spawn_local` (nothing is `Send` on wasm). If you just
-want MoQ in a page, the [TypeScript libraries](/lib/js/) are the easier path.
+URLs may be `https://` (QUIC or WebTransport, with a WebSocket fallback),
+`moql://`/`moqt://` (raw QUIC), `ws://`/`wss://` (WebSocket), or
+`tcp://`/`tls://`/`unix://` (qmux). Put credentials in
+`connect::Config::tokens` rather than the URL: the first rides SETUP (and
+`?jwt=` while an offered version needs it), each other widens the grant in band,
+and `Connection::tokens().set(...)` replaces them before they expire, with
+`answered().await` reporting the relay's verdict. A `?jwt=`
+already in the URL stays the connection credential, which reaches an older
+relay. `http://` is for a relay on localhost only: it fetches the certificate
+fingerprint unauthenticated, so never send a token over it. QUIC tuning shares
+the relay's settings; see the [relay reference](/bin/relay/config#quic).
 
 ## Conventions
 
 The API is producer/consumer pairs at every level (origin, broadcast, track,
 group). Producers write and consumers read; cloning a consumer shares the
-subscription, and the last clone dropping closes it. Everything is
-`async`, executor-agnostic, and errors are typed enums with `thiserror`.
+subscription, and the last clone dropping closes it. The core exposes
+executor-agnostic `poll_*` methods with optional async helpers; `moq-tokio`
+handles native runtime integration. Errors are typed enums with `thiserror`.

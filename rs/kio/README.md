@@ -17,10 +17,26 @@ The channel auto-closes when all producers are dropped.
 `Shared` is the role-less sibling for state that both sides mutate, and `Queue` is a
 poll-native FIFO queue (bounded or unbounded) built in the same style. `Park` holds a
 waiter for as long as a poll stays pending, bridging a `std::task::Context` to kio's
-waiter-based polls when implementing `Future` or `poll_*` on top of kio channels, and
-`Fan` hands out a waker that wakes a whole waiter list, for driving a foreign future on
-behalf of everyone parked on it. It either owns the list or reaches one already inside a
-`Lock`.
+waiter-based polls when implementing `Future` or `poll_*` on top of kio channels.
+`coop::Budget` bounds the passes a loop makes per poll, so one that always finds
+work ready still yields to the rest of its runtime. `log::Writer` is an append-only
+log whose `log::Reader`s read committed entries by index without a lock, paired with
+a channel that parks them; evicted entries are freed by epoch-based reclamation.
+With the `macros` feature, `#[kio::machine]` writes a `poll_*` state machine from
+straight-line code with explicit waits.
+
+`clock` is the time those waits run on: logical instants, wall time, deadlines, and
+timers on tokio (the `runtime` feature). The `sim` feature adds a
+deterministic executor and `#[kio::test]`, which runs an `async fn` test on it:
+
+```rust
+#[kio::test]
+async fn retries_after_a_second() {
+    let start = kio::clock::now(); // Instant::ZERO
+    kio::clock::sleep(std::time::Duration::from_secs(1)).await; // returns at once
+    assert_eq!(kio::clock::now() - start, std::time::Duration::from_secs(1));
+}
+```
 
 It's used internally by [moq-net](https://github.com/moq-dev/moq/tree/main/rs/moq-net) and friends, but is generic enough to be useful on its own.
 

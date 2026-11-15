@@ -1,0 +1,206 @@
+name: Platform
+
+# The native macOS and Windows gates run nightly on main and on every release
+# PR (nightly.yml and release-gate.yml call this), selecting suites from the diff.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [release]
+    paths:
+      - "rs/**"
+      - "c/**"
+      - "cpp/**"
+      - "swift/**"
+      - "infra/moq-sh/**"
+      - "sh/**"
+      - "doc/lib/**"
+      - ".cargo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "justfile"
+      - "**/justfile"
+      - ".github/**"
+  workflow_call:
+    inputs:
+      benchmarks:
+        description: Smoke-run the Swift binding benchmark runner
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      benchmarks:
+        description: Smoke-run the Swift binding benchmark runner
+        type: boolean
+        default: false
+
+concurrency:
+  group: platform-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+env:
+  # Cargo and the CMake/Swift builds use one artifact tree on each runner.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  NEXTEST_PROFILE: ci
+
+jobs:
+  scope:
+    name: Platform scope
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    outputs:
+      needed: ${{ steps.scope.outputs.needed }}
+      rs: ${{ steps.scope.outputs.rs }}
+      swift: ${{ steps.scope.outputs.swift }}
+      c: ${{ steps.scope.outputs.c }}
+      cpp: ${{ steps.scope.outputs.cpp }}
+      obs: ${{ steps.scope.outputs.obs_compile }}
+      moq_sh: ${{ steps.scope.outputs.moq_sh }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/just
+      - name: Select platform checks
+        id: scope
+        env:
+          CI_BASE: ${{ github.event_name != 'pull_request' && '--all' || '' }}
+        run: just ci-select-platform "$CI_BASE" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows
+    needs: scope
+    if: needs.scope.outputs.rs == 'true' || needs.scope.outputs.c == 'true' || needs.scope.outputs.cpp == 'true' || needs.scope.outputs.obs == 'true'
+    # OBS uses the Visual Studio 17 2022 CMake generator.
+    runs-on: windows-2022
+    # Hosted `main` jobs write the Rust cache; see .github/actions/rust-cache.
+    environment: ${{ github.ref == 'refs/heads/main' && 'cache-write' || '' }}
+    # The suites run serially; the full macOS suite measured 43 min without a Rust cache.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/nasm
+      - uses: ./.github/actions/just
+      - name: Install nextest
+        if: needs.scope.outputs.rs == 'true'
+        uses: ./.github/actions/nextest
+      # Nightly writes these platforms; `release` pull requests read.
+      - name: Rust cache
+        uses: ./.github/actions/rust-cache
+        with:
+          access-key-id: ${{ secrets.MBX_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MBX_R2_SECRET_ACCESS_KEY }}
+      - uses: ./.github/actions/uniffi-bindgen
+        if: needs.scope.outputs.c == 'true' || needs.scope.outputs.cpp == 'true' || needs.scope.outputs.obs == 'true'
+        with:
+          generator: cpp
+      # Later suites are independent once tool and generator setup succeeds.
+      - name: Setup complete
+        id: setup
+        run: echo "Platform tools ready"
+      - name: Rust compile
+        id: compile
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (needs.scope.outputs.rs == 'true') }}
+        shell: bash
+        env:
+          CI_BASE: ${{ github.event_name != 'pull_request' && '--all' || '' }}
+        run: just rs windows "$CI_BASE"
+      # Windows misses most cache lookups that macOS hits; mbx analyze reads the
+      # build mbx just recorded and names why each compilation missed. It only
+      # explains, so its own failure does not fail the job.
+      - name: Explain Rust cache misses
+        if: ${{ !cancelled() && steps.compile.outcome != 'skipped' }}
+        continue-on-error: true
+        shell: bash
+        run: mbx analyze
+      - name: Rust tests
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (needs.scope.outputs.rs == 'true') }}
+        shell: bash
+        run: just rs windows-test
+      - name: C
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (needs.scope.outputs.c == 'true') }}
+        shell: bash
+        run: just c check
+      - name: C++
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (needs.scope.outputs.cpp == 'true') }}
+        shell: bash
+        run: just cpp check
+      - name: OBS
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (needs.scope.outputs.obs == 'true') }}
+        shell: bash
+        run: just obs package --target x86_64-pc-windows-msvc --output "$RUNNER_TEMP/obs"
+
+  macos:
+    name: macOS
+    needs: scope
+    if: needs.scope.outputs.rs == 'true' || needs.scope.outputs.swift == 'true' || needs.scope.outputs.obs == 'true' || needs.scope.outputs.moq_sh == 'true'
+    runs-on: macos-latest
+    # Hosted `main` jobs write the Rust cache; see .github/actions/rust-cache.
+    environment: ${{ github.ref == 'refs/heads/main' && 'cache-write' || '' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/just
+      - name: Install nextest
+        if: needs.scope.outputs.rs == 'true'
+        uses: ./.github/actions/nextest
+      - name: Rust cache
+        uses: ./.github/actions/rust-cache
+        with:
+          access-key-id: ${{ secrets.MBX_R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MBX_R2_SECRET_ACCESS_KEY }}
+      - uses: ./.github/actions/uniffi-bindgen
+        if: needs.scope.outputs.obs == 'true'
+        with:
+          generator: cpp
+      # Later suites are independent once tool and generator setup succeeds.
+      - name: Setup complete
+        id: setup
+        run: echo "Platform tools ready"
+      - name: Rust compile
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (needs.scope.outputs.rs == 'true') }}
+        env:
+          CI_BASE: ${{ github.event_name != 'pull_request' && '--all' || '' }}
+        run: just rs macos "$CI_BASE"
+      - name: Rust tests
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (needs.scope.outputs.rs == 'true') }}
+        run: just rs macos-test
+      - name: Swift simulator check
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (needs.scope.outputs.swift == 'true') }}
+        run: just swift simulator
+      - name: Swift
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (needs.scope.outputs.swift == 'true') }}
+        run: just swift check
+      # At a token budget, so the runner keeps working at this commit; rust2's
+      # `just bench-ffi` measures it at its pinned moq revision.
+      - name: Swift binding benchmark runner
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (inputs.benchmarks) }}
+        env:
+          MOQ_BENCH_SECONDS: "0.05"
+        run: |
+          just swift bench
+          test -s target/bench/ffi/swift.json
+      - name: OBS
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (needs.scope.outputs.obs == 'true') }}
+        run: just obs package --target aarch64-apple-darwin --output "$RUNNER_TEMP/obs"
+      - name: Installer fixtures
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (needs.scope.outputs.moq_sh == 'true') }}
+        run: just infra moq-sh test
+      - name: Installer smoke
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && (needs.scope.outputs.moq_sh == 'true') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: just infra moq-sh smoke

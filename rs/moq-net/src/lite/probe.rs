@@ -12,8 +12,9 @@ pub struct Probe {
 	pub rtt: Option<u64>,
 }
 
-impl Message for Probe {
-	fn decode_msg<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+impl<'a> Message<'a> for Probe {
+	const CONTROL: Option<crate::stats::Message> = Some(crate::stats::Message::Probe);
+	fn decode_msg(r: &mut Decoder<'a>, version: Version) -> Result<Self, DecodeError> {
 		match version {
 			Version::Lite01 | Version::Lite02 => {
 				return Err(DecodeError::Version);
@@ -23,13 +24,13 @@ impl Message for Probe {
 
 		// 0 means unknown, the same as RTT below. A publisher whose transport
 		// exposes no congestion controller reports the RTT half alone.
-		let bitrate = match u64::decode(r, version)? {
+		let bitrate = match r.varint()? {
 			0 => None,
 			v => Some(v),
 		};
 		let rtt = match version.has_probe_rtt() {
 			false => None,
-			true => match u64::decode(r, version)? {
+			true => match r.varint()? {
 				0 => None,
 				v => Some(v),
 			},
@@ -38,7 +39,7 @@ impl Message for Probe {
 		Ok(Self { bitrate, rtt })
 	}
 
-	fn encode_msg<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
+	fn encode_msg(&self, w: &mut Encoder<'_>, version: Version) -> Result<(), EncodeError> {
 		match version {
 			Version::Lite01 | Version::Lite02 => {
 				return Err(EncodeError::Version);
@@ -48,10 +49,10 @@ impl Message for Probe {
 
 		// 0 means unknown; round Some(0) up to 1.
 		let wire = self.bitrate.map(|v| v.max(1)).unwrap_or(0);
-		wire.encode(w, version)?;
+		w.varint(wire)?;
 		if version.has_probe_rtt() {
 			let wire = self.rtt.map(|v| v.max(1)).unwrap_or(0);
-			wire.encode(w, version)?;
+			w.varint(wire)?;
 		}
 		Ok(())
 	}
@@ -62,10 +63,11 @@ mod tests {
 	use super::*;
 
 	fn round_trip(msg: &Probe, version: Version) -> Probe {
-		let mut buf = bytes::BytesMut::new();
-		msg.encode(&mut buf, version).unwrap();
+		let mut buf = Vec::new();
+		msg.encode(&mut Encoder::new(&mut buf, version.into()), version)
+			.unwrap();
 		let mut slice = &buf[..];
-		let got = Probe::decode(&mut slice, version).unwrap();
+		let got = crate::coding::decode_buf(&mut slice, version, |r, v| Probe::decode(r, v)).unwrap();
 		assert!(bytes::Buf::remaining(&slice) == 0, "trailing bytes after decode");
 		got
 	}

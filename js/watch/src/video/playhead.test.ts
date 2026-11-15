@@ -1,30 +1,36 @@
 import { describe, expect, it } from "bun:test";
+import { Duration } from "@moq/clock";
 import type * as Catalog from "@moq/hang/catalog";
-import type { Time } from "@moq/net";
-import { caughtUp, renditionJitter } from "./playhead";
+import { caughtUp, renditionJitter, switchJitter } from "./playhead";
 
 // `jitter` is a branded u53 in the catalog schema, so build the config through a cast.
-function config(props: { jitter?: number; framerate?: number }): Catalog.VideoConfig {
+function config(props: { jitter?: number; delay?: number; framerate?: number }): Catalog.VideoConfig {
 	return { codec: "avc1.640028", container: { kind: "legacy" }, ...props } as Catalog.VideoConfig;
 }
 
-const ms = (value: number) => value as Time.Milli;
+const ms = (value: number) => Duration.millis(value);
 
 describe("renditionJitter", () => {
 	it("prefers the catalog value", () => {
-		expect(renditionJitter(config({ jitter: 2000, framerate: 30 }))).toBe(ms(2000));
+		expect(renditionJitter(config({ jitter: 2000, framerate: 30 }))).toEqual(ms(2000));
 	});
 
 	it("keeps a declared zero rather than falling back", () => {
-		expect(renditionJitter(config({ jitter: 0, framerate: 30 }))).toBe(ms(0));
+		expect(renditionJitter(config({ jitter: 0, framerate: 30 }))).toEqual(ms(0));
 	});
 
 	it("falls back to a frame interval", () => {
-		expect(renditionJitter(config({ framerate: 30 }))).toBe(ms(34));
+		expect(renditionJitter(config({ framerate: 30 }))).toEqual(ms(34));
 	});
 
 	it("is undefined when the catalog declares neither", () => {
 		expect(renditionJitter(config({}))).toBeUndefined();
+	});
+
+	it("adds the delay behind the earliest rendition", () => {
+		expect(renditionJitter(config({ delay: 200, jitter: 60 }))).toEqual(ms(260));
+		expect(renditionJitter(config({ delay: 200, framerate: 30 }))).toEqual(ms(234));
+		expect(renditionJitter(config({ delay: 200 }))).toEqual(ms(200));
 	});
 });
 
@@ -48,5 +54,18 @@ describe("caughtUp", () => {
 		// outgoing playhead. Promoting at the live edge would replay everything in between, so the
 		// bar stays the outgoing playhead however far live falls behind it.
 		expect(caughtUp({ playhead: ms(8000), active: ms(10_000) })).toBe(false);
+	});
+});
+
+describe("switchJitter", () => {
+	it("covers both renditions until promotion", () => {
+		expect(switchJitter({ active: ms(20), pending: ms(100) })).toEqual(ms(100));
+		expect(switchJitter({ active: ms(100), pending: ms(20) })).toEqual(ms(100));
+	});
+
+	it("settles to the remaining rendition", () => {
+		expect(switchJitter({ active: ms(20) })).toEqual(ms(20));
+		expect(switchJitter({ pending: ms(100) })).toEqual(ms(100));
+		expect(switchJitter({})).toBeUndefined();
 	});
 });

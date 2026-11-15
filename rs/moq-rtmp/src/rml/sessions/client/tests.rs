@@ -1,10 +1,10 @@
 use super::*;
+use crate::rml::amf0::Amf0Value;
 use crate::rml::chunk_io::{ChunkDeserializer, ChunkSerializer, Packet};
 use crate::rml::messages::{MessagePayload, RtmpMessage, UserControlEventType};
 use bytes::Bytes;
 use bytes::BytesMut;
 use rand;
-use rml_amf0::Amf0Value;
 use std::collections::HashMap;
 
 #[test]
@@ -190,8 +190,9 @@ fn event_raised_when_connect_request_rejected() {
 
 	assert_eq!(events.len(), 1, "Expected one event returned");
 	match events.remove(0) {
-		ClientSessionEvent::ConnectionRequestRejected { description } => {
-			assert!(description.len() > 0, "Expected a non-empty description");
+		ClientSessionEvent::ConnectionRequestRejected { code, description } => {
+			assert_eq!(code, "NetConnection.Connect.Failed");
+			assert_eq!(description, "hi");
 		}
 
 		x => panic!("Expected connection accepted event, instead received: {:?}", x),

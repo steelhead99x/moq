@@ -1,0 +1,55 @@
+[package]
+name = "moq-sock"
+description = "Socket and thread-per-core listener plumbing shared by the native MoQ runtimes"
+authors = ["Luke Curley <kixelated@gmail.com>"]
+repository = "https://github.com/moq-dev/moq"
+license = "MIT OR Apache-2.0"
+
+version = "0.2.0"
+edition = "2024"
+rust-version.workspace = true
+
+keywords = ["quic", "networking", "reuseport"]
+categories = ["network-programming"]
+
+[features]
+# Exposes the `fuzz/` harness's target body and seeds through the `udp::fuzz` module, on 64-bit
+# Linux. Off by default.
+fuzz = []
+
+[dependencies]
+arc-swap = "1.9"
+core_affinity = "0.8"
+libc = { workspace = true }
+socket2 = { version = "0.6", features = ["all"] }
+thiserror = "2"
+tracing = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_Networking_WinSock"] }
+
+[build-dependencies]
+cfg_aliases = "0.2"
+
+[dev-dependencies]
+criterion = { package = "bench-harness", path = "../bench-harness" }
+rand = "0.10"
+tracing-test = "0.2"
+workspace-hack = { path = "../workspace-hack" }
+
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+nix = { workspace = true }
+
+# Writes the generated fuzzer corpus to disk. Needs the `fuzz` feature, so a default
+# `--all-targets` build skips it rather than failing to find the module.
+[[example]]
+name = "fuzz-seeds"
+path = "examples/fuzz-seeds.rs"
+required-features = ["fuzz"]
+
+[[bench]]
+name = "demux"
+harness = false
+
+[lints]
+workspace = true

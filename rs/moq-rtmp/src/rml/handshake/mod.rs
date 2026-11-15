@@ -28,9 +28,8 @@ mod errors;
 
 pub use self::errors::HandshakeError;
 
-use hmac::{Hmac, KeyInit, Mac};
 use rand::RngExt;
-use sha2::Sha256;
+use rind::hmac;
 
 const RTMP_PACKET_SIZE: usize = 1536;
 const SHA256_DIGEST_LENGTH: usize = 32;
@@ -149,8 +148,8 @@ impl Handshake {
 	/// The Flash Player 9 handshake requires generating a different packet 1 depending if you
 	/// are the client or the server, and thus this must be specified when creating a new
 	/// `Handshake` instance.
-	pub fn new(peer_type: PeerType) -> Handshake {
-		Handshake {
+	pub fn new(peer_type: PeerType) -> Self {
+		Self {
 			current_stage: Stage::NeedToSendP0AndP1,
 			command_byte: 0_u8,
 			input_buffer: Vec::with_capacity(RTMP_PACKET_SIZE),
@@ -465,38 +464,16 @@ fn get_message_parts(handshake: &[u8; RTMP_PACKET_SIZE], digest_offset: u32) -> 
 }
 
 fn calc_hmac_from_parts(part1: &[u8], part2: &[u8], key: &[u8]) -> [u8; SHA256_DIGEST_LENGTH] {
-	let mut inputs = Vec::with_capacity(part1.len() + part2.len());
-	for index in 0..part1.len() {
-		inputs.push(part1[index]);
-	}
-
-	for index in 0..part2.len() {
-		inputs.push(part2[index]);
-	}
-
-	calc_hmac(&inputs, &key)
+	let key = hmac::Key::new(&hmac::HMAC_SHA256, key);
+	let mut mac = hmac::Context::with_key(&key);
+	mac.update(part1);
+	mac.update(part2);
+	mac.sign().as_ref().try_into().unwrap()
 }
 
 fn calc_hmac(input: &[u8], key: &[u8]) -> [u8; SHA256_DIGEST_LENGTH] {
-	let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
-	mac.update(input);
-
-	let result = mac.finalize();
-	let array = result.into_bytes();
-
-	if array.len() != 32 {
-		panic!(
-			"Expected hmac signature to be 32 byte array, instead it was a {} byte array",
-			array.len()
-		);
-	}
-
-	let mut output = [0_u8; 32];
-	for index in 0..32 {
-		output[index] = array[index];
-	}
-
-	output
+	let key = hmac::Key::new(&hmac::HMAC_SHA256, key);
+	hmac::sign(&key, input).as_ref().try_into().unwrap()
 }
 
 fn fill_with_random_data(buffer: &mut [u8]) {
@@ -643,13 +620,6 @@ mod tests {
 		0x58_u8, 0xfc_u8, 0xb3_u8, 0x2b_u8, 0xd0_u8, 0x16_u8, 0x07_u8, 0x47_u8, 0xc1_u8, 0xd1_u8, 0x4b_u8, 0x7d_u8,
 		0x77_u8, 0x17_u8, 0xd9_u8, 0x34_u8, 0x5a_u8, 0x09_u8, 0xd2_u8, 0x8c_u8, 0xfc_u8, 0x6e_u8, 0x39_u8, 0x59_u8,
 	];
-
-	#[test]
-	fn can_start_client_handshake() {
-		let handshake = Handshake::new(PeerType::Server);
-
-		assert_eq!(handshake.current_stage, Stage::NeedToSendP0AndP1);
-	}
 
 	#[test]
 	fn bad_version_if_first_byte_is_not_a_3() {
@@ -827,22 +797,6 @@ mod tests {
 		];
 
 		assert_eq!(&expected[..], &hmac[..]);
-	}
-
-	#[test]
-	fn hmac_test3() {
-		let mut mac = Hmac::<Sha256>::new_from_slice(&[0x0b; 20]).unwrap();
-		mac.update(b"Hi There");
-
-		let expected = [
-			176_u8, 52_u8, 76_u8, 97_u8, 216_u8, 219_u8, 56_u8, 83_u8, 92_u8, 168_u8, 175_u8, 206_u8, 175_u8, 11_u8,
-			241_u8, 43_u8, 136_u8, 29_u8, 194_u8, 0_u8, 201_u8, 131_u8, 61_u8, 167_u8, 38_u8, 233_u8, 55_u8, 108_u8,
-			46_u8, 50_u8, 207_u8, 247_u8,
-		];
-
-		let result = mac.finalize();
-		let code_bytes = result.into_bytes();
-		assert_eq!(&expected[..], &code_bytes[..]);
 	}
 
 	#[test]

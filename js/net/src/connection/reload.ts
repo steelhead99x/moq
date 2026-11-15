@@ -1,59 +1,201 @@
-import { Effect, type Getter, Signal } from "@moq/signals";
-import * as Announce from "../announced.ts";
-import { error } from "../error.ts";
-import type * as Path from "../path.ts";
-import { empty as emptyPath } from "../path.ts";
-import { type ConnectProps, connect, type WebSocketOptions, type WebTransportProps } from "./connect.ts";
-import type { Established } from "./established.ts";
-import type { Probe, Stats } from "./stats.ts";
+import { Duration, type Instant, now, sleep } from "@moq/clock";
+import { Derived, Effect, type GetPromise, type Getter, Once, Signal } from "@moq/signals";
+import type * as Announce from "../announced.ts";
+import { Handle as AuthHandle } from "../auth.ts";
+import { ended } from "../auth_session.ts";
+import { Allocator, reserved, Viewers } from "../bandwidth.ts";
+import { error, reason } from "../error.ts";
+import type { Consumer as OriginConsumer, Producer as OriginProducer } from "../origin.ts";
+import * as Path from "../path.ts";
+import { Follow } from "../util/observed.ts";
+import { wireOf } from "../wire.ts";
+import { isWebTransportSupported } from "./browser.ts";
+import {
+	type ConnectProps,
+	establish,
+	normalizeVersions,
+	Reached,
+	reachable,
+	type WebSocketProps,
+	type WebTransportProps,
+} from "./connect.ts";
+import { parse } from "./endpoint.ts";
+import { DISCOVERY_REMOVED } from "./forward.ts";
+import { DEFAULT_HANDOVER, type Drain, dialed, type GoawayProps, handover, pinnedTransport, target } from "./goaway.ts";
+import type { Session } from "./session.ts";
+import { estimates, type Probe } from "./stats.ts";
+import { tick } from "./ticker.ts";
+import { heldOf } from "./tokens.ts";
 
 /**
- * Exponential backoff settings for {@link Reload}'s reconnect loop.
+ * The wait before a session on the WebSocket fallback first probes WebTransport, before jitter.
+ * Each failed probe doubles it, up to {@link PROBE_MAX}, matching moq-tokio.
+ */
+const PROBE_INITIAL = Duration.secs(10);
+
+/** The longest wait between WebTransport probes, before jitter. */
+const PROBE_MAX = Duration.secs(300);
+
+/**
+ * Exponential backoff settings for the reconnect loop.
  *
  * The delays carry jitter, so a fleet of tabs knocked offline together doesn't reconnect in
- * lockstep. Every failure is retried; {@link ReloadDelay.timeout} is what stops the loop.
+ * lockstep. Nothing retries until a session to the current URL has been established: the
+ * first attempt failing stops that URL with its error. After that, every failure is retried,
+ * including an attempt that outlives {@link ConnectProps.timeout}, until
+ * {@link ReloadDelay.timeout} runs out, whatever the error, an auth rejection included; only a
+ * refused GOAWAY redirect stops the current URL sooner. A new URL or a disable/re-enable starts another sequence.
+ *
+ * A GOAWAY off a session that outlived {@link ReloadDelay.healthy} migrates at once, unless it
+ * sends the connection back to an endpoint that already redirected it elsewhere and the
+ * session lived less than {@link ReloadDelay.max} (or {@link ReloadDelay.healthy} when
+ * uncapped). Two peers redirecting to each other thus
+ * wait out this backoff and count against the timeout.
  */
 export type ReloadDelay = {
-	/** The delay in milliseconds before reconnecting (default: 1000). */
-	initial: DOMHighResTimeStamp;
+	/** The delay before reconnecting (default: 1000ms; zero retries at once). */
+	initial?: Duration;
 
-	/** The multiplier for the delay (default: 2). */
-	multiplier: number;
-
-	/** The maximum delay in milliseconds (default: 5000). */
-	max: DOMHighResTimeStamp;
+	/** The multiplier for the delay after each failure (default: 2; below 1 keeps it constant). */
+	multiplier?: number;
 
 	/**
-	 * Maximum total time in milliseconds to spend retrying before giving up (default:
-	 * 10000). Resets after each successful connection. Set to 0 for unlimited retries.
+	 * The maximum delay (default: 5000ms; `null` leaves it uncapped; zero retries at once). A cap
+	 * below `initial` caps the first delay too.
 	 */
-	timeout?: DOMHighResTimeStamp;
+	max?: Duration | null;
+
+	/**
+	 * How long a session must stay up to count as healthy (default: 1000ms; must be positive).
+	 *
+	 * A healthy session's end resets the delay and the timeout. One that ends sooner is a
+	 * failed attempt, so a peer that accepts and then drops every session still escalates the
+	 * delay and exhausts the timeout.
+	 */
+	healthy?: Duration;
+
+	/**
+	 * Maximum total time to spend retrying the current URL before giving up
+	 * (default: `null`, unlimited; zero gives up at the first failure). Counts from the first dial, and restarts after a healthy session
+	 * outside a redirect loop, a URL change, or a disable/re-enable. It decides whether another
+	 * attempt starts and never cuts one that is running, so giving up can take up to one attempt
+	 * longer than the window; {@link ConnectProps.timeout} bounds each attempt. A peer that
+	 * restarts, draining each session with a GOAWAY naming no URI, restarts it too.
+	 */
+	timeout?: Duration | null;
 };
 
-/** Connection and retry options for {@link Reload}. */
-export type ReloadProps = Omit<ConnectProps, "signal"> & {
+/**
+ * Connection and retry options for {@link Reload}.
+ *
+ * {@link ConnectProps.transport} is excluded: a supplied session is good for exactly one
+ * connection, so the reconnect loop has nothing to reuse once that session drops. Call
+ * {@link connect} directly when you have a session to hand over. Every attempt advertises
+ * the default {@link ConnectProps.implementation} and {@link ConnectProps.extensions}.
+ *
+ * @internal
+ */
+export type ReloadProps = Omit<
+	ConnectProps,
+	"url" | "signal" | "transport" | "implementation" | "extensions" | "tokens" | "viewers"
+> & {
+	/** See {@link ConnectProps.tokens}; pass a `Signal` to replace them before they expire. */
+	tokens?: readonly string[] | Signal<readonly string[]>;
+
+	/** A reload owns the abort signal for each connection attempt. */
+	signal?: never;
+
+	/** A one-shot transport cannot be reused by the reconnect loop. */
+	transport?: never;
+
+	/** A reload owns its {@link Reload.viewers}, fed by its own sessions' estimates. */
+	viewers?: never;
+
 	/** Whether to reload the connection when it disconnects (default: true). */
 	enabled?: boolean | Signal<boolean>;
 
 	/** The URL of the relay server. */
 	url?: URL | Signal<URL | undefined>;
 
-	/** Backoff settings for the reconnect loop. */
+	/** Backoff settings for the reconnect loop; every field falls back to its default. */
 	delay?: ReloadDelay;
+
+	/** How to react to the peer's GOAWAY; every field falls back to its default. */
+	goaway?: GoawayProps;
 };
 
 /**
- * How long to keep retrying before giving up, when {@link ReloadDelay.timeout} is unset.
+ * The backoff applied to whichever {@link ReloadDelay} fields a caller leaves out.
  *
- * Short on purpose: a failure that clears within it was transient, and one that doesn't should
- * surface as an error rather than leave the page silently reconnecting for minutes.
+ * Retries are unlimited by default: a loop that gives up stays offline until something
+ * redials it, and a page usually has nothing that will, so an outage of any length has to
+ * recover on its own. {@link Reload.status} already shows the outage. A caller that can react
+ * sets a timeout to surface a persistent failure on {@link Reload.error}; giving up does not
+ * dispose the loop, and a new URL or a disable/re-enable starts another sequence.
  */
-const DEFAULT_TIMEOUT = 10000;
+const DEFAULT_DELAY: Required<ReloadDelay> = {
+	initial: Duration.millis(1000),
+	multiplier: 2,
+	max: Duration.millis(5000),
+	healthy: Duration.millis(1000),
+	timeout: null,
+};
 
-/** Current state of a {@link Reload} connection. */
+/**
+ * {@link ReloadDelay} resolved against its defaults, with the same meaning as moq-tokio's
+ * backoff. Throws a RangeError for a value that has none.
+ *
+ * Field by field rather than by spread: a caller building `{ initial: maybeInitial }` from an
+ * optional value passes an explicit undefined, which a spread would take as the answer.
+ */
+function pacing(delay: ReloadDelay) {
+	const initial = delay.initial ?? DEFAULT_DELAY.initial;
+	// `null` means no bound, so only `undefined` takes the default.
+	const cap = delay.max === undefined ? DEFAULT_DELAY.max : delay.max;
+	const multiplier = delay.multiplier ?? DEFAULT_DELAY.multiplier;
+	if (!Number.isFinite(multiplier)) throw new RangeError(`invalid delay.multiplier: ${multiplier}`);
+	// Zero would count every session as healthy, resetting the retry window forever under a
+	// peer that drops each one on sight.
+	const healthy = delay.healthy ?? DEFAULT_DELAY.healthy;
+	if (healthy.isZero()) throw new RangeError("delay.healthy must be positive");
+	const timeout = delay.timeout === undefined ? DEFAULT_DELAY.timeout : delay.timeout;
+	// A multiplier below 1 means no growth, not a delay that shrinks to nothing.
+	const growth = Math.max(multiplier, 1);
+
+	return {
+		initial: cap === null ? initial : initial.min(cap),
+		healthy,
+		timeout,
+		// How long a session must last to start a new run of redirects. One that outlived the
+		// capped delay already redials no faster than the backoff would allow. Uncapped, the
+		// healthy bar is the only rate the config names.
+		settled: cap ?? healthy,
+		/** The delay after one that waited `delay`. */
+		next(delay: Duration): Duration {
+			const next = Math.min(delay.asNanos() * growth, cap?.asNanos() ?? Number.POSITIVE_INFINITY);
+			// Saturates, as Rust's Duration does, rather than overflowing the wait.
+			return Number.isFinite(next) ? Duration.nanos(next) : delay;
+		},
+	};
+}
+
+/** How often the send-rate estimate is sampled from the live transport while a reservation reads it. */
+const BANDWIDTH_POLL = Duration.millis(100);
+
+/** Current state of a reconnecting connection. */
 export type ReloadStatus = "connecting" | "connected" | "disconnected";
 
-/** Maintains a MoQ connection, reconnecting with exponential backoff when it drops. */
+/**
+ * The reconnect loop behind a Connection handle: connects, waits for the session to end, then
+ * redials with exponential backoff.
+ *
+ * The first attempt for a URL fails fast instead: until a session to it has been established,
+ * a failed attempt sets {@link Reload.error} rather than retrying, so a setup mistake such as an
+ * untrusted certificate or no version in common surfaces at once. A page opened before its
+ * relay is reachable therefore stays disconnected until a new URL or a disable/re-enable.
+ *
+ * @internal
+ */
 export class Reload {
 	/** Relay URL to connect to; updating it triggers a reconnect. */
 	url: Signal<URL | undefined>;
@@ -61,92 +203,289 @@ export class Reload {
 	/** Whether reconnecting is active. */
 	enabled: Signal<boolean>;
 
+	/**
+	 * Credentials every dial presents; see {@link ConnectProps.tokens}. Replacing them reaches
+	 * the next dial and, on a live session with AUTH, presents the new tokens at once,
+	 * withdrawing the replaced ones once every new one has its answer.
+	 */
+	tokens: Signal<readonly string[]>;
+
 	/** Current connection status. */
 	status = new Signal<ReloadStatus>("disconnected");
 
+	/**
+	 * The failure that stopped retrying the current URL, or undefined while the loop is live.
+	 *
+	 * Set when the first attempt for a URL fails, or when the retry window
+	 * expires. Cleared when a new URL or a
+	 * disable/re-enable starts another sequence, not on a page hide/show. Transient drops
+	 * that are still being retried leave this empty.
+	 */
+	readonly error: Getter<Error | undefined>;
+
 	/** The currently established session, or undefined while disconnected. */
-	established = new Signal<Established | undefined>(undefined);
+	established = new Signal<Session | undefined>(undefined);
 
 	/**
 	 * The current connection's PROBE estimates, spanning reconnects.
 	 *
 	 * Undefined while disconnected: the estimates belong to a single connection.
-	 * See {@link Established.probe}.
+	 * Observation requests updates; `peek()` alone is passive.
+	 * See {@link Session.probe}.
 	 */
 	readonly probe: Getter<Probe | undefined>;
+	#probeSource = new Signal<Getter<Probe> | undefined>(undefined);
+
+	/**
+	 * Divides this connection's send-rate estimate among the tracks sharing it.
+	 *
+	 * The same instance across reconnects, so reservations survive a drop. The
+	 * estimate is `undefined` while disconnected, which tells a sender to hold
+	 * its rate rather than encode at zero. It is sampled from the transport only
+	 * while a reservation reads it, so the first reservation after none waits one
+	 * snapshot for its slice. It stays `undefined` on a transport that cannot
+	 * report one: the WebSocket fallback, WebRTC, WebTransport without
+	 * `getStats()`, or Safari's stub, which reads as none.
+	 */
+	readonly allocator: Allocator;
+
+	/**
+	 * Divides this connection's receive estimate among the broadcasts watched over it.
+	 *
+	 * The same instance across reconnects, so viewers survive a drop, and every session
+	 * the loop dials sends their ceilings summed as its PROBE target. A live viewer
+	 * requests PROBE; viewers report `undefined` while disconnected.
+	 */
+	readonly viewers: Viewers;
+
+	/**
+	 * The auth handle every session of the loop is built on, spanning reconnects.
+	 *
+	 * Each session presents every token it holds, so a route naming one keeps it across a
+	 * reconnect, and its grant follows the live session. It spans URL changes too, so its
+	 * tokens go to whatever URL the loop dials next. It ends once the loop closes and its
+	 * sessions finish draining, and aborting it stops the loop at its next reconnect, with the
+	 * abort's error.
+	 */
+	readonly auth = new AuthHandle();
+
+	/** Protocol versions to offer, most preferred first, kept across retries and redirects. */
+	readonly versions?: readonly string[];
 
 	/** WebTransport options applied to each connection attempt (not reactive). */
 	webtransport?: WebTransportProps;
 
 	/** WebSocket fallback options applied to each connection attempt (not reactive). */
-	websocket: WebSocketOptions | undefined;
+	websocket: WebSocketProps | undefined;
+
+	/** The bound on each connection attempt. See {@link ConnectProps.timeout}. */
+	readonly timeout?: Duration;
 
 	/**
-	 * Whether the relay supports broadcast discovery, applied to each connection attempt (not
-	 * reactive). Undefined defers to the default for the URL. See {@link Established.discovery}.
+	 * The origin whose broadcasts are served, spanning reconnects (not reactive).
+	 *
+	 * Each session announces the origin's table when it attaches, so a broadcast published
+	 * while offline surfaces on the next connection and a reconnect re-announces everything
+	 * still published. See the `publish` connect option.
 	 */
-	discovery?: boolean;
+	publish?: OriginConsumer;
 
-	/** Backoff settings for the reconnect loop. */
+	/**
+	 * The origin fed with the peer's announced broadcasts, spanning reconnects (not
+	 * reactive).
+	 *
+	 * The entries a session fed retract when it dies, and the next session asks again for
+	 * whatever is still watched, so a consumer watching the origin sees offline/online
+	 * transitions across a reconnect. See the `consume` connect option.
+	 */
+	consume?: OriginProducer;
+
+	/** Backoff settings for the reconnect loop; an unset field uses its default. */
 	delay: ReloadDelay;
+
+	/** How to react to the peer's GOAWAY (not reactive). */
+	goaway: GoawayProps;
+
+	/**
+	 * The URL an accepted GOAWAY redirect assigned, or undefined while the loop dials
+	 * {@link Reload.url}. Sticky across reconnects: a redirect is an assignment, not a
+	 * detour. Cleared when a dial to it fails, so the redial returns to {@link Reload.url},
+	 * or when a new URL or a disable/re-enable starts another sequence.
+	 */
+	readonly redirect: Getter<URL | undefined>;
 
 	/** The reactive effect scope driving the connect loop; closed by {@link Reload.close}. */
 	#signals = new Effect();
 
+	// Sampled from the live session; undefined while disconnected or the transport has none.
+	#estimate = new Signal<number | undefined>(undefined);
+
 	/**
-	 * Resolves when the reconnect loop stops via {@link Reload.close}.
-	 *
-	 * Rejects when the loop gives up instead, carrying the failure that was in flight when the
-	 * retry window expired.
+	 * Settles once this loop is disposed via {@link Reload.close}: `null` on a clean close,
+	 * or the abort {@link Error}. Peek it synchronously (`undefined` while open), observe it
+	 * reactively, or `await` it. Attempt failures live on {@link Reload.error} instead.
 	 */
-	closed: Promise<void>;
-	#closedResolve!: () => void;
-	#closedReject!: (err: Error) => void;
+	get closed(): GetPromise<Error | null> {
+		return this.#closed;
+	}
+
+	#closed = new Once<Error | null>();
+	#error = new Signal<Error | undefined>(undefined);
+	#redirect = new Signal<URL | undefined>(undefined);
+	// The configured href the redirect was assigned for.
+	#redirectHref: string | undefined;
+
+	// A session the peer sent GOAWAY on, serving its groups in flight while the replacement
+	// dials. Retired when it closes, at its handover cap, or when the sequence ends.
+	#draining: Draining | undefined;
+	// A redirect from the draining fallback's peer, held while a replacement serves.
+	#pending: { connection: Session; next: URL } | undefined;
+
+	// Sessions this loop ended that are still draining, each until its close settles.
+	#ending = new Map<Session, Promise<void>>();
+
+	// The current run of migrations. A redirect back to an endpoint that already sent us away is
+	// a loop, however healthy each session looked. Reset when a session ends without a GOAWAY,
+	// outlives the capped delay, or a new sequence starts.
+	#redirects = new Redirects();
+
+	// Whether a run is dialing: from its start until each connect attempt settles.
+	#dialing = false;
 
 	// The current wait between attempts, doubling per failure, and when the retry window expires.
 	// Both are undefined between sequences, so a later edit to `delay` applies to the next one.
-	#delay: DOMHighResTimeStamp | undefined;
-	#deadline: DOMHighResTimeStamp | undefined;
+	#delay: Duration | undefined;
+	// When the retry window expires, or null when it never does.
+	#deadline: Instant | null | undefined;
+
+	// The URL the current retry sequence is for. Cleared when disabled, URL-less, or given
+	// up, so the next attempt starts a fresh backoff window.
+	#sequenceHref: string | undefined;
+
+	// The href that exhausted its retry sequence. Survives a page hide/show so resume does
+	// does not restart a sequence that already gave up. Cleared when the URL changes or the
+	// loop is disabled.
+	#givenUpHref: string | undefined;
+
+	// The configured href a session has been established for. Until it matches, a failed attempt
+	// gives up rather than retrying. Kept across a page hide/show and a disable/re-enable, which
+	// resume a URL that worked.
+	#establishedHref: string | undefined;
 
 	// Increased by 1 each time to trigger a reload.
 	#tick = new Signal(0);
 
 	// True after the browser freezes or hides the page until it visibly resumes.
 	#suspended = new Signal(false);
+	// Watches the page for #suspended, outliving the loop until the sessions it ended settle.
+	#suspension = new Effect();
 
 	// Use the serialized URL as the reactive connection key. URL objects use identity
 	// equality, but replacing one with an equivalent instance should not reconnect.
 	#url: Getter<string | undefined>;
 	constructor(props?: ReloadProps) {
+		if (props && "discovery" in props) throw new TypeError(DISCOVERY_REMOVED);
 		this.url = Signal.from(props?.url);
-		this.enabled = Signal.from(props?.enabled ?? false);
-		this.delay = props?.delay ?? { initial: 1000, multiplier: 2, max: 5000 };
+		this.enabled = Signal.from(props?.enabled ?? true);
+		this.tokens = Signal.from(props?.tokens ?? []);
+		this.delay = props?.delay ?? {};
+		// Validated here, like the timeout, rather than by every retry.
+		pacing(this.delay);
+		this.goaway = props?.goaway ?? {};
+		this.redirect = this.#redirect;
+		this.versions = normalizeVersions(props);
 		this.webtransport = props?.webtransport;
 		this.websocket = props?.websocket;
-		this.discovery = props?.discovery;
+		// Validated here, like the versions, rather than by every attempt.
+		this.timeout = props?.timeout;
+		this.publish = props?.publish;
+		this.consume = props?.consume;
 
-		this.closed = new Promise((resolve, reject) => {
-			this.#closedResolve = resolve;
-			this.#closedReject = reject;
-		});
+		// The consume origin's announcement streams are not synced while no session is there to
+		// deliver an initial set, so an empty table before the first connect, or during a
+		// reconnect, never reads as nothing being announced. The next session takes its own
+		// hold before this one is released. Taken now rather than in the effect, which runs
+		// a microtask later, after a watcher created alongside would already have synced.
+		if (this.consume) {
+			const consume = wireOf(this.consume);
+			let hold = this.enabled.peek() ? consume.snapshot(Path.empty()) : undefined;
+			this.#signals.run((effect) => {
+				if (effect.get(this.enabled) && !effect.get(this.established)) {
+					hold ??= consume.snapshot(Path.empty());
+				} else {
+					hold?.();
+					hold = undefined;
+				}
+			});
+			this.#signals.cleanup(() => hold?.());
+		}
 
-		// A caller is free to never await `closed`, and giving up rejects it unprompted. Marking the
-		// rejection handled here keeps that from surfacing as an `unhandledrejection`; a consumer
-		// awaiting the same promise still receives it.
-		this.closed.catch(() => {});
+		this.error = this.#error;
 
-		if (typeof window !== "undefined" && typeof document !== "undefined") {
-			this.#signals.event(window, "pagehide", () => this.#suspended.set(true));
-			this.#signals.event(window, "pageshow", () => this.#suspended.set(false));
-			this.#signals.event(window, "unload", () => this.#suspended.set(true));
-			this.#signals.event(document, "visibilitychange", () => {
-				if (!document.hidden) this.#suspended.set(false);
+		const win = globalThis.window;
+		const doc = globalThis.document;
+		if (typeof win !== "undefined" && typeof doc !== "undefined") {
+			this.#suspension.event(win, "pagehide", () => this.#suspended.set(true));
+			this.#suspension.event(win, "pageshow", () => this.#suspended.set(false));
+			this.#suspension.event(win, "unload", () => this.#suspended.set(true));
+			this.#suspension.event(doc, "visibilitychange", () => {
+				if (!doc.hidden) this.#suspended.set(false);
+			});
+			// Nothing would run to finish a drain begun before the page went away either.
+			this.#suspension.run((effect) => {
+				if (!effect.get(this.#suspended)) return;
+				for (const connection of this.#ending.keys()) connection.abort();
+				this.#ending.clear();
 			});
 		}
 
-		this.probe = this.#signals.computed((effect) => {
+		this.probe = new Follow(this.#probeSource);
+		this.#signals.run((effect) => {
+			effect.set(this.#probeSource, effect.get(this.established)?.probe, undefined);
+		});
+
+		this.allocator = new Allocator(this.#estimate);
+		this.#signals.cleanup(() => this.allocator.close());
+
+		// Lazy: the registry observes the estimate only while a viewer is live, and only
+		// that observation requests PROBE from the current session.
+		this.viewers = new Viewers(new Derived([this.probe], (probe) => probe?.estimatedRecvRate));
+		this.#signals.cleanup(() => this.viewers.close());
+
+		// The transport has no event for the send-rate estimate, so sample on our
+		// own schedule and skip a tick while the previous snapshot is outstanding.
+		// Only while a reservation reads it: a receive-only or lingering connection
+		// would otherwise snapshot the transport ten times a second for nobody. The
+		// estimate clears with the last reservation, so the next one never reads a
+		// stale figure. A transport that can never report one is not sampled at all.
+		this.#signals.run((effect) => {
+			effect.set(this.#estimate, undefined);
+			if (!effect.get(reserved(this.allocator))) return;
 			const connection = effect.get(this.established);
-			return connection && effect.get(connection.probe);
+			if (!connection || !estimates(connection)) return;
+
+			let pending = false;
+			const sample = async () => {
+				if (pending) return;
+				pending = true;
+				try {
+					const stats = await effect.race(connection.stats());
+					if (stats) this.#estimate.set(stats.estimatedSendRate);
+				} finally {
+					pending = false;
+				}
+			};
+
+			void sample();
+			// One page-wide ticker samples every connection in the same wakeup.
+			effect.cleanup(tick(BANDWIDTH_POLL, () => void sample()));
+		});
+
+		// The live session holds the current tokens on AUTH; a dial picks them up itself.
+		this.#signals.run((effect) => {
+			const tokens = effect.get(this.tokens);
+			const connection = effect.get(this.established);
+			if (connection) heldOf(connection)?.update(tokens);
 		});
 
 		this.#url = this.#signals.computed((effect) => effect.get(this.url)?.href);
@@ -158,56 +497,434 @@ export class Reload {
 		// Will retry when the tick changes.
 		effect.get(this.#tick);
 
-		const suspended = effect.get(this.#suspended);
 		const enabled = effect.get(this.enabled);
-		if (!enabled || suspended) return;
+		if (!enabled) {
+			this.#givenUpHref = undefined;
+			this.#resetSequence();
+			this.#redirect.set(undefined);
+			return;
+		}
+
+		// Hide/freeze pauses an in-flight sequence without recovering from give-up.
+		const suspended = effect.get(this.#suspended);
+		if (suspended) {
+			this.#resetSequence();
+			return;
+		}
 
 		const href = effect.get(this.#url);
-		if (!href) return;
+		if (!href) {
+			this.#givenUpHref = undefined;
+			this.#resetSequence();
+			this.#redirect.set(undefined);
+			return;
+		}
 		const url = new URL(href);
 
-		effect.set(this.status, "connecting", "disconnected");
+		if (this.#givenUpHref === href) {
+			return;
+		}
+
+		if (this.#sequenceHref !== href) {
+			this.#resetSequence();
+			// A redirect was assigned for another URL; this one starts from itself. A page
+			// hide/show resumes the same URL, so it keeps the assignment.
+			if (this.#redirectHref !== href) this.#redirect.set(undefined);
+			this.#sequenceHref = href;
+			this.#error.set(undefined);
+			this.#givenUpHref = undefined;
+		}
+
+		this.#setDialing(true);
 
 		// This run's teardown, handed to connect() so a rerun cancels the attempt in flight.
 		const signal = effect.abort;
 
+		// The session this run serves, ended with the run. A drained one leaves this slot
+		// for #draining, which outlives the run.
+		let current: Session | undefined;
+		effect.cleanup(() => {
+			if (current) {
+				this.#end(current);
+				if (this.established.peek() === current) this.#serve(undefined);
+				current = undefined;
+			}
+			this.#setDialing(false);
+		});
+
 		effect.spawn(async () => {
 			// Set once the session is live, so #retry can tell a healthy session that
 			// later dropped from a connect failure or a peer that flaps immediately.
-			let connected: DOMHighResTimeStamp | undefined;
+			let connected: Instant | undefined;
+			// Whether the last failure was a dial to a GOAWAY redirect's target.
+			let redirectFailed = false;
 
 			try {
-				const connection = await connect(url, {
-					websocket: this.websocket,
-					webtransport: this.webtransport,
-					discovery: this.discovery,
-					signal,
-				});
+				// The WebTransport session a probe opened, which the next dial finishes its MoQ
+				// handshake over instead of racing.
+				let reached: Reached | undefined;
+				// Loops only to migrate: a GOAWAY off a healthy session dials its replacement
+				// straight away, with no backoff.
+				for (;;) {
+					const dialing = this.#redirect.peek() ?? url;
+					// The retry window counts from the first dial of a run, so a dial that hangs
+					// spends it too.
+					this.#deadline ??= this.#window(now());
 
-				// Hand the connection to the effect, which closes it now if this run is already over.
-				effect.cleanup(() => connection.close());
-				if (signal.aborted) return;
+					this.#setDialing(true);
+					const tokens = reached?.tokens ?? this.tokens.peek();
+					let connection: Session;
+					const reusing = reached;
+					reached = undefined;
+					try {
+						connection = await establish(
+							{
+								url: dialing,
+								tokens,
+								// A redirect names the relay; a fallback URL pinned for the old one does not follow.
+								websocket: this.#redirect.peek()
+									? { ...this.websocket, url: undefined }
+									: this.websocket,
+								versions: this.versions,
+								webtransport: this.webtransport,
+								timeout: this.timeout,
+								publish: this.publish,
+								consume: this.consume,
+								auth: this.auth,
+								viewers: this.viewers,
+								signal,
+							},
+							reusing,
+						);
+					} catch (err) {
+						this.#setDialing(false);
+						redirectFailed = this.#redirect.peek() !== undefined;
+						throw err;
+					}
 
-				effect.set(this.established, connection);
-				effect.set(this.status, "connected", "disconnected");
+					// Hand the connection to the effect. One that lands after this run is over never
+					// served anything, so there is nothing to drain.
+					if (signal.aborted) {
+						connection.abort();
+						return;
+					}
+					current = connection;
 
-				connected = performance.now();
+					// The replacement serves now; a predecessor keeps draining its groups in flight.
+					this.#serve(connection);
+					this.#setDialing(false);
+					connected = now();
+					this.#establishedHref = href;
 
-				// A cancelled effect resolves undefined, so the sentinel tells the session
-				// closing apart from this run being torn down.
-				const closed = await Promise.race([effect.cancel, connection.closed.then(() => true)]);
-				if (!closed) return;
+					// A cancelled effect resolves undefined, so the sentinel tells the session
+					// closing (null for clean, an Error otherwise) apart from this run being
+					// torn down. Anything else is the peer's GOAWAY, or WebTransport reachable
+					// again under a session on the WebSocket fallback.
+					const probing = new AbortController();
+					const probe = this.#probe(connection, dialing, probing.signal);
+					const first = await effect
+						.race(connection.closed, connection.draining, probe)
+						.finally(() => probing.abort());
+					// The peer's GOAWAY wins over a probe that got through in the same turn, so its
+					// redirect is never lost.
+					const drain = connection.draining.peek();
+					const raced = first instanceof Reached && drain !== undefined ? drain : first;
+					// A probe the race did not take still holds an open WebTransport session.
+					void probe.then((left) => {
+						if (left !== raced) left.transport.close();
+					});
+					if (raced === undefined) return;
+					// Leaving the fallback is a GOAWAY of our own: the session drains as the
+					// predecessor while the replacement finishes its handshake over the probe.
+					if (raced instanceof Reached) {
+						console.info("WebTransport reachable again; leaving the WebSocket fallback");
+						wireOf(connection).leave();
+						reached = raced;
+					}
+					const ended = raced instanceof Reached ? { uri: "" } : raced;
+					if (ended === null || ended instanceof Error) {
+						console.warn(`connection closed, reconnecting: ${ended ? reason(ended) : "no error"}`);
+						this.#redirects.reset();
+						current = undefined;
+						// A predecessor still draining serves again, so this is no outage.
+						if (this.established.peek() === connection) this.#serve(this.#draining?.serving());
+						this.#applyPending();
+						this.#retry(effect, connected, ended ?? undefined);
+						return;
+					}
 
-				console.warn("connection closed, reconnecting");
-				this.#retry(effect, connected);
+					current = undefined;
+					// A pinned WebSocket URL can win the race against the primary. Judge the
+					// redirect against that endpoint, not the primary we never reached.
+					const socket = this.#redirect.peek() ? undefined : this.websocket?.url;
+					const at = dialed(dialing, connection.transport, socket);
+					const before = this.#redirect.peek();
+					if (!this.#migrate(connection, at, ended)) {
+						reached?.transport.close();
+						return;
+					}
+					// Moving off the fallback is no peer's redirect or restart, and the probe
+					// backoff already paces it, so its replacement dials at once. A fallback that
+					// served past the healthy bar still earns the healthy reset.
+					if (reached) {
+						this.#follow(connection, at, pinnedTransport(connection.transport, this.#pinned()));
+						if (now().since(connected).ge(this.#pacing().healthy)) {
+							this.#delay = undefined;
+							this.#deadline = undefined;
+						}
+						continue;
+					}
+					const after = this.#redirect.peek();
+
+					// Two peers that each hold a session past the healthy bar can still bounce us between
+					// them forever. Returning to an endpoint that already sent us elsewhere in this
+					// run of migrations escalates the backoff, which never resets mid-loop, so the
+					// retry window still applies. A one-way rolling restart never revisits one, and
+					// a GOAWAY back to the same place is a restart, not a move, so it never counts.
+					// A session that outlived the capped delay already redials no faster than the
+					// backoff would allow, so it starts a new run: rolling restarts days apart
+					// never add up to a loop.
+					const { settled, healthy } = this.#pacing();
+					const lived = now().since(connected);
+					if (lived.ge(settled)) this.#redirects.reset();
+					// Only a redirect this GOAWAY named is a move. An empty or ignored one reconnects
+					// in place, even when that reruns the race a WebSocket fallback won.
+					const from = destination(at);
+					const to = after && after !== before ? destination(after) : from;
+					if (to !== from && this.#redirects.move(from, to)) {
+						this.#retry(effect, undefined, new Error("redirect loop"));
+						return;
+					}
+
+					// A healthy session's handover is not a failure. One redirected sooner still
+					// migrates, but through the backoff, so two peers bouncing us between them
+					// escalate to the capped delay. An empty URI is a peer restarting, which drains
+					// each new session until it goes; every one serves, so that is no failure either.
+					if (lived.lt(healthy)) {
+						if (ended.uri === "") this.#restart(effect);
+						else this.#retry(effect, connected, new Error("peer redirected immediately"));
+						return;
+					}
+					this.#delay = undefined;
+					this.#deadline = undefined;
+				}
 			} catch (err) {
 				// Treat teardown as cancellation, not a connection failure.
 				if (signal.aborted) return;
 
+				// An ended auth handle refuses every later session, so no retry can recover.
+				const closed = ended(this.auth);
+				if (closed) {
+					this.#giveUp(closed);
+					return;
+				}
+
+				// The first attempt fails fast: a URL that never yielded a session is more likely
+				// misconfigured than restarting, and only the app can fix that.
+				if (this.#establishedHref !== href) {
+					console.warn("connection failed, not retrying:", err);
+					this.#giveUp(error(err));
+					return;
+				}
+
 				console.warn("connection error:", err);
+				// A redirect target that no longer answers is dropped: the redial returns to the
+				// configured URL, which may still answer. Rust's Reconnect follows the same rule.
+				if (redirectFailed) this.#redirect.set(undefined);
 				this.#retry(effect, connected, err);
 			}
 		});
+	}
+
+	/**
+	 * Resolve with the WebTransport session that reaches `dialing` while `connection` runs on the
+	 * WebSocket fallback, probing on a jittered backoff from {@link PROBE_INITIAL} up to {@link PROBE_MAX}.
+	 * Never resolves for a session on another transport, where WebTransport is unsupported, or
+	 * once `signal` aborts.
+	 */
+	async #probe(connection: Session, dialing: URL, signal: AbortSignal): Promise<Reached> {
+		const never = new Promise<never>(() => {});
+		if (connection.transport !== "websocket" || !isWebTransportSupported()) return never;
+		try {
+			for (let delay = PROBE_INITIAL; ; delay = delay.mul(2).min(PROBE_MAX)) {
+				await sleep(delay.mul(0.5 + Math.random() / 2), { signal });
+				const props = {
+					tokens: this.tokens.peek(),
+					versions: this.versions,
+					webtransport: this.webtransport,
+					websocket: this.#redirect.peek() ? undefined : this.websocket,
+					timeout: this.timeout,
+				};
+				const reached = await reachable(dialing, props, signal);
+				if (reached) return reached;
+			}
+		} catch {
+			// The sleep rejects once the session ends.
+			return never;
+		}
+	}
+
+	/**
+	 * Act on the peer's GOAWAY for `connection`, which was dialed at `dialing`: resolve where
+	 * to go next and leave the old session serving until it drains. Returns false when the
+	 * redirect is refused, which ends the sequence rather than redialing.
+	 */
+	#migrate(connection: Session, dialing: URL, drain: Drain): boolean {
+		// The pin is a WebTransport option. A WebSocket that won the race never used it.
+		const pinned = pinnedTransport(connection.transport, this.#pinned());
+
+		let next: URL | undefined;
+		try {
+			next = target(this.goaway.redirect ?? "same-host", drain.uri, dialing, pinned);
+		} catch (err) {
+			// The peer is leaving and named somewhere we won't go: redialing the old address
+			// would ignore it, so stop here.
+			console.warn("GOAWAY redirect refused:", err);
+			this.#end(connection);
+			this.#serve(undefined);
+			this.#giveUp(error(err));
+			return false;
+		}
+
+		// Only an accepted redirect replaces the URL; an empty one keeps it.
+		if (next) {
+			this.#redirect.set(next);
+			this.#redirectHref = this.#sequenceHref;
+		}
+
+		console.info("GOAWAY received; migrating");
+		// A newer GOAWAY retires an older predecessor rather than serving from two.
+		this.#retire();
+		const cap = handover(this.goaway.handover ?? DEFAULT_HANDOVER, drain.timeout);
+		const draining = new Draining(connection, cap, () => {
+			if (this.#draining === draining) this.#draining = undefined;
+			// If nothing replaced it yet, nothing is serving.
+			if (this.established.peek() === connection) this.#serve(undefined);
+		});
+		this.#draining = draining;
+		return true;
+	}
+
+	/** Whether a certificate pin is configured for WebTransport. */
+	#pinned(): boolean {
+		const hashes = this.webtransport?.serverCertificateHashes?.length ?? 0;
+		return hashes > 0 || this.webtransport?.serverCertificate !== undefined;
+	}
+
+	/**
+	 * Follow a redirect the peer of `connection`, a fallback session we left for a probe that
+	 * got through, sends while it drains: whenever nothing else serves, the next dial goes where
+	 * the peer named, and a dial still headed for the leaving peer starts over. A restart in
+	 * place or a refused redirect is ignored, since we are already leaving. No loop scoring:
+	 * only a probe that got through leads here, and the probe's backoff paces those.
+	 */
+	#follow(connection: Session, dialing: URL, pinned: boolean): void {
+		void connection.draining.then((drain) => {
+			let next: URL | undefined;
+			try {
+				next = target(this.goaway.redirect ?? "same-host", drain.uri, dialing, pinned);
+			} catch {
+				return;
+			}
+			if (!next) return;
+			this.#pending = { connection, next };
+			this.#applyPending();
+		});
+	}
+
+	/**
+	 * Apply the pending redirect once its session is the one serving, which a replacement that
+	 * closes hands back to; drop it once that session retires.
+	 */
+	#applyPending(): void {
+		const pending = this.#pending;
+		if (!pending) return;
+		if (this.#draining?.serving() !== pending.connection) {
+			this.#pending = undefined;
+			return;
+		}
+		if (this.established.peek() !== pending.connection) return;
+		this.#pending = undefined;
+		console.info("draining fallback peer redirected; following");
+		this.#redirect.set(pending.next);
+		this.#redirectHref = this.#sequenceHref;
+		// A backoff still paces the next dial, which now goes to the new target.
+		if (this.#dialing) this.#tick.update((prev) => prev + 1);
+	}
+
+	/**
+	 * End a session this loop is done with. Its groups in flight finish within the close
+	 * deadline, unless the page is going away: nothing would run to finish them, and an abort
+	 * closes the transport now rather than leaving the browser to sever it.
+	 */
+	#end(connection: Session): void {
+		if (this.#suspended.peek()) {
+			connection.abort();
+			return;
+		}
+		// A served live track never finishes, so the deadline aborting the rest is the usual end.
+		const ending = connection.close().catch(() => {});
+		this.#ending.set(connection, ending);
+		void ending.then(() => this.#ending.delete(connection));
+	}
+
+	/** Serve `connection`, or nothing. */
+	#serve(connection: Session | undefined): void {
+		this.established.set(connection);
+		this.#report();
+	}
+
+	#setDialing(dialing: boolean): void {
+		this.#dialing = dialing;
+		this.#report();
+	}
+
+	// The one derivation of status: serving, else dialing, else neither. A drained predecessor
+	// serves until it retires, so its replacement's dial reads as connected.
+	#report(): void {
+		this.status.set(this.established.peek() ? "connected" : this.#dialing ? "connecting" : "disconnected");
+	}
+
+	/** Stop serving from a drained predecessor, ending it if still open. */
+	#retire(): void {
+		const draining = this.#draining?.retire();
+		if (draining) this.#end(draining);
+	}
+
+	// Resolved per use rather than at construction, so an edit to `delay` (including one that
+	// drops a field back to its default) applies to the next retry.
+	#pacing() {
+		return pacing(this.delay ?? {});
+	}
+
+	// When a retry window starting `at` expires.
+	#window(at: Instant): Instant | null {
+		const { timeout } = this.#pacing();
+		return timeout === null ? null : at.saturatingAdd(timeout);
+	}
+
+	/**
+	 * Wait out the backoff after a restarting peer drained a session short of the healthy bar.
+	 * The delay escalates, so the redials cannot hammer it, but the wait never spends the retry
+	 * window: the window restarts once the wait is over.
+	 */
+	#restart(effect: Effect): void {
+		const wait = this.#backoff();
+		const tick = this.#tick.peek() + 1;
+		effect.timer(() => {
+			this.#deadline = undefined;
+			this.#tick.update((prev) => Math.max(prev, tick));
+		}, wait);
+	}
+
+	// The jittered wait before the next attempt, escalating the delay for the one after.
+	// Equal jitter, so a fleet of tabs knocked offline together doesn't reconnect on the same tick.
+	#backoff(): Duration {
+		const pacing = this.#pacing();
+		this.#delay ??= pacing.initial;
+		const wait = this.#delay.mul(0.5 + Math.random() / 2);
+		this.#delay = pacing.next(this.#delay);
+		return wait;
 	}
 
 	/**
@@ -215,131 +932,215 @@ export class Reload {
 	 * has expired. `connected` is when the dead session was established, if it ever was, and
 	 * `cause` the error that killed it, if it died with one.
 	 */
-	#retry(effect: Effect, connected: DOMHighResTimeStamp | undefined, cause?: unknown): void {
-		// Any session is dead now: report disconnected during the backoff rather than
-		// when the retry reruns the effect.
-		this.established.set(undefined);
-		this.status.set("disconnected");
-
-		// A session that outlived the initial delay was healthy, so clear the backoff and
-		// start a fresh retry window: a one-off drop should reconnect promptly. Anything
-		// shorter is a peer that accepts and immediately severs, which has to keep
-		// escalating or we hammer it forever at the initial delay.
-		if (connected !== undefined && performance.now() - connected >= this.delay.initial) {
+	#retry(effect: Effect, connected: Instant | undefined, cause?: unknown): void {
+		// A healthy session's end clears the backoff and starts a fresh retry window: a one-off
+		// drop should reconnect promptly. Anything shorter is a peer that accepts and soon
+		// severs, which has to keep escalating or we hammer it forever at the initial delay.
+		if (connected !== undefined && now().since(connected).ge(this.#pacing().healthy)) {
 			this.#delay = undefined;
 			this.#deadline = undefined;
 		}
 
-		const now = performance.now();
-		const timeout = this.delay.timeout ?? DEFAULT_TIMEOUT;
-		this.#delay ??= this.delay.initial;
-		this.#deadline ??= timeout > 0 ? now + timeout : Number.POSITIVE_INFINITY;
+		const at = now();
+		// A healthy session's end starts the window here.
+		this.#deadline ??= this.#window(at);
+		const wait = this.#backoff();
 
-		if (now >= this.#deadline) {
+		// No attempt starts once the window has passed: a wait that reaches the deadline gives up
+		// there instead of dialing.
+		const deadline = this.#deadline;
+		// A graceful close has no error, so report the timeout itself.
+		const failure = cause === undefined ? new Error("reconnect timed out") : error(cause);
+		const giveUp = () => {
 			console.warn("reconnect timed out");
-			// A graceful close has no error, so report the timeout itself.
-			this.#closedReject(cause === undefined ? new Error("reconnect timed out") : error(cause));
+			this.#giveUp(failure);
+		};
+		const left = deadline === null ? undefined : deadline.since(at);
+		if (left !== undefined && wait.ge(left)) {
+			if (!left.isZero()) effect.timer(giveUp, left);
+			else giveUp();
 			return;
 		}
 
-		// Equal jitter, so a fleet of tabs knocked offline together doesn't reconnect on the same
-		// tick, and never past the deadline the retry window promised.
-		const wait = Math.min(this.#delay * (0.5 + Math.random() / 2), this.#deadline - now);
-		this.#delay = Math.min(this.#delay * this.delay.multiplier, this.delay.max);
-
 		const tick = this.#tick.peek() + 1;
-		effect.timer(() => this.#tick.update((prev) => Math.max(prev, tick)), wait);
+		effect.timer(() => {
+			// Checked again when the wait ends: a timer that fires late, as after the device
+			// slept, must not dial past the window.
+			if (deadline !== null && now().ge(deadline)) return giveUp();
+			this.#tick.update((prev) => Math.max(prev, tick));
+		}, wait);
 	}
 
-	/**
-	 * Subscribe to broadcast announcements under an optional prefix, spanning reconnects.
-	 *
-	 * The same {@link Announce.Consumer} stream as {@link Established.announced}, but everything active
-	 * is retracted (an `active: false` update) whenever the connection drops and re-announced on
-	 * reconnect, so a consumer draining `next()` never clings to a dead route across a reconnect.
-	 *
-	 * Stays empty while the relay lacks {@link Established.discovery}.
-	 */
-	announced(prefix: Path.Valid = emptyPath()): Announce.Consumer {
-		const producer = new Announce.Producer(prefix);
-		const consumer = producer.consume();
-
-		// Closing the consumer closes the shared state, so stop appending after that.
-		let closed = false;
-		void consumer.closed.then(() => {
-			closed = true;
-		});
-
-		const pump = new Effect();
-		pump.run((effect) => {
-			const conn = effect.get(this.established);
-			if (!conn) return;
-
-			// Without discovery the upstream announce stream never yields, so leave the
-			// consumer empty rather than opening a subscription that can't be answered.
-			if (!conn.discovery) return;
-
-			const upstream = conn.announced(prefix);
-			effect.cleanup(() => upstream.close());
-
-			// Track what this connection announced so we can retract it if the connection drops.
-			const active = new Set<Path.Valid>();
-
-			effect.spawn(async () => {
-				try {
-					for (;;) {
-						const entry = await Promise.race([effect.cancel, upstream.next()]);
-						if (!entry) break;
-						if (entry.active) active.add(entry.path);
-						else active.delete(entry.path);
-						producer.append(entry);
-					}
-				} catch {
-					// A dropped connection resets the announce stream; the retractions below cover it.
-				} finally {
-					// Retract everything from the connection that just went away, so a per-broadcast
-					// watcher tears down instead of clinging to the dead route.
-					if (!closed) {
-						for (const path of active) {
-							producer.append({ path, active: false });
-						}
-					}
-				}
-			});
-		});
-
-		this.#signals.cleanup(() => pump.close());
-		void consumer.closed.then(() => pump.close());
-
-		return consumer;
+	#giveUp(cause: Error): void {
+		this.#error.set(cause);
+		this.#givenUpHref = this.#sequenceHref;
+		this.#resetSequence();
 	}
 
-	/**
-	 * A reactive handle to one broadcast, spanning reconnects.
-	 *
-	 * The same {@link Announce.Broadcast} as {@link Established.announcedBroadcast}, but it
-	 * follows the reconnect loop: the broadcast drops to `undefined` when the connection dies
-	 * and resolves again once the new connection announces the path. Use it instead of
-	 * consuming off {@link Reload.established} whenever the broadcast may come online after you
-	 * do, which is exactly the case a blind `consume` loses.
-	 *
-	 * Close the handle when done; {@link Reload.close} only drops it to `undefined`.
-	 */
-	announcedBroadcast(path: Path.Valid): Announce.Broadcast {
-		return new Announce.Broadcast({ connection: this.established, path });
+	#resetSequence(): void {
+		this.#delay = undefined;
+		this.#deadline = undefined;
+		this.#sequenceHref = undefined;
+		this.#redirects.reset();
+		this.#retire();
 	}
 
-	/**
-	 * Snapshot the live connection's transport counters, or undefined while disconnected.
-	 * See {@link Established.stats}.
-	 */
-	async stats(): Promise<Stats | undefined> {
-		return this.established.peek()?.stats();
-	}
-
-	/** Stop reconnecting, close the current connection, and resolve {@link Reload.closed}. */
-	close() {
+	/** Stop reconnecting, drain and close the current connection, and settle {@link Reload.closed}. Idempotent. */
+	close(abort?: Error) {
 		this.#signals.close();
-		this.#closedResolve();
+		this.#retire();
+		// No session will present the tokens again, so they end with the loop, once the sessions
+		// still draining no longer need their grants or a page hide to cut them short.
+		const err = abort ?? new Error("connection closed");
+		const done = () => {
+			this.auth.abort(err);
+			this.#suspension.close();
+		};
+		if (this.#ending.size === 0) done();
+		else void Promise.all(this.#ending.values()).then(done);
+		if (this.#closed.peek() === undefined) this.#closed.set(abort ?? null);
+	}
+}
+
+/**
+ * Pump `upstream` into `producer` for the rest of `effect`'s run: its events, then an `offline`
+ * for each route still active once it closes or the run ends, so nothing clings to a source
+ * that went away. Synced follows the upstream's, and owes those retractions too.
+ *
+ * @internal
+ */
+export function pumpAnnounced(effect: Effect, upstream: Announce.Routes, producer: Announce.Producer) {
+	// The last event per active route rides along for its retraction.
+	const active = new Map<Path.Valid, Announce.Routed>();
+	let live = true;
+	const retract = () => {
+		live = false;
+		if (producer.closed.peek() !== undefined || active.size === 0) return;
+		// Behind first, so a reader parked on the stream takes these as owed, not as news.
+		producer.behind();
+		// The source went away, which says nothing of whether the origin ended them.
+		for (const entry of active.values()) producer.append({ ...entry, kind: "offline" });
+		active.clear();
+	};
+
+	// Torn down in reverse: the mirror stops, the retractions land, then the upstream closes,
+	// so its closing never reads as synced.
+	effect.cleanup(() => upstream.close());
+	effect.cleanup(retract);
+	// A new upstream owes its own initial set, and the retractions of the one before.
+	producer.behind();
+	effect.subscribe(upstream.synced, (synced) => {
+		if (!synced) producer.behind();
+		else if (upstream.closed.peek() === undefined) producer.synced();
+	});
+
+	effect.spawn(async () => {
+		try {
+			for (;;) {
+				const entry = await effect.race(upstream.next());
+				if (!entry || !live || producer.closed.peek() !== undefined) break;
+				if (entry.kind === "end" || entry.kind === "offline") active.delete(entry.prefix);
+				else active.set(entry.prefix, entry);
+				producer.append(entry);
+			}
+		} catch {
+			// A dropped connection resets the announce stream; the retractions below cover it.
+		} finally {
+			if (live) {
+				// The upstream ended on its own: nothing more comes from it, so once its
+				// retractions are read there is nothing left to wait for.
+				retract();
+				producer.behind();
+				producer.synced();
+			}
+		}
+	});
+}
+
+/**
+ * A session the peer sent GOAWAY on, left serving so its groups in flight finish. It retires
+ * when it closes on its own, overstays its handover window, or is retired by the loop, and
+ * `onRetire` runs once either way. The window still caps a retired session's close: it is
+ * aborted at the window's end if still open.
+ */
+class Draining {
+	#connection: Session;
+	#timer = new AbortController();
+	#onRetire: () => void;
+	#retired = false;
+
+	constructor(connection: Session, handover: Duration, onRetire: () => void) {
+		this.#connection = connection;
+		this.#onRetire = onRetire;
+		void sleep(handover, { signal: this.#timer.signal }).then(
+			() => {
+				if (this.retire()) console.warn("old session did not drain in time; closing");
+				connection.abort();
+			},
+			() => {},
+		);
+		void connection.closed.then(() => {
+			this.#timer.abort();
+			this.retire();
+		});
+	}
+
+	/** The old session while it still serves, before it retires. */
+	serving(): Session | undefined {
+		return this.#retired ? undefined : this.#connection;
+	}
+
+	/** Stop serving from the old session, returning it the first time for the caller to end. */
+	retire(): Session | undefined {
+		if (this.#retired) return undefined;
+		this.#retired = true;
+		this.#onRetire();
+		return this.#connection;
+	}
+}
+
+/**
+ * Where `url` dials, without its userinfo, query, or fragment, where a peer may mint fresh
+ * credentials on every redirect, and with its host as the dial reads it. Two URLs that differ
+ * only there reach the same place.
+ */
+function destination(url: URL): string {
+	const bare = new URL(parse(url).url);
+	bare.username = "";
+	bare.password = "";
+	bare.search = "";
+	bare.hash = "";
+	return bare.href;
+}
+
+/**
+ * A run of GOAWAY redirects, and whether it has revisited an endpoint. The peer picks every
+ * hop, so remembering them all would grow without bound. Brent's cycle detection instead keeps
+ * one departed endpoint, replaced at doubling intervals, and catches a cycle of any length
+ * within a few laps of it. Once caught, the run stays a loop until reset.
+ */
+export class Redirects {
+	#mark: string | undefined;
+	#span = 1;
+	#hops = 0;
+	#loop = false;
+
+	/** Record leaving `from` for a different endpoint `to`, and return whether this run loops. */
+	move(from: string, to: string): boolean {
+		if (to === this.#mark) this.#loop = true;
+		if (++this.#hops === this.#span) {
+			this.#mark = from;
+			this.#span *= 2;
+			this.#hops = 0;
+		}
+		return this.#loop;
+	}
+
+	/** Start a new run. */
+	reset(): void {
+		this.#mark = undefined;
+		this.#span = 1;
+		this.#hops = 0;
+		this.#loop = false;
 	}
 }

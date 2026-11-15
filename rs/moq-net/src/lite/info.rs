@@ -7,8 +7,9 @@ pub struct SessionInfo {
 	pub bitrate: Option<u64>,
 }
 
-impl Message for SessionInfo {
-	fn decode_msg<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
+impl<'a> Message<'a> for SessionInfo {
+	const CONTROL: Option<crate::stats::Message> = Some(crate::stats::Message::Session);
+	fn decode_msg(r: &mut Decoder<'a>, version: Version) -> Result<Self, DecodeError> {
 		match version {
 			Version::Lite01 | Version::Lite02 => {}
 			_ => {
@@ -16,7 +17,7 @@ impl Message for SessionInfo {
 			}
 		}
 
-		let bitrate = match u64::decode(r, version)? {
+		let bitrate = match r.varint()? {
 			0 => None,
 			bitrate => Some(bitrate),
 		};
@@ -24,7 +25,7 @@ impl Message for SessionInfo {
 		Ok(Self { bitrate })
 	}
 
-	fn encode_msg<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
+	fn encode_msg(&self, w: &mut Encoder<'_>, version: Version) -> Result<(), EncodeError> {
 		match version {
 			Version::Lite01 | Version::Lite02 => {}
 			_ => {
@@ -32,7 +33,7 @@ impl Message for SessionInfo {
 			}
 		}
 
-		self.bitrate.unwrap_or(0).encode(w, version)?;
+		w.varint(self.bitrate.unwrap_or(0))?;
 		Ok(())
 	}
 }

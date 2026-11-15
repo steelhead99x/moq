@@ -3,39 +3,43 @@
 //! Counterpart to [`moq-video`](https://crates.io/crates/moq-video) for audio
 //! tracks, and shaped the same way. Sits on top of [`moq_mux`] and [`hang`] and
 //! adds the missing piece for native callers: Rust-native Opus and uncompressed
-//! PCM codecs that turn raw samples into HANG audio tracks and back, plus AAC-LC
-//! on the way in, which is what the gateways (RTMP, SRT, HLS, gstreamer) publish.
+//! PCM codecs that turn raw samples into HANG audio tracks and back, plus AAC-LC,
+//! which is what the gateways (RTMP, SRT, HLS, gstreamer) publish. AAC decodes in
+//! software and encodes only through a platform encoder.
 //!
 //! - `capture` describes an audio source (`capture::Config`) and grabs buffers
 //!   per platform: a microphone via cpal (CoreAudio / WASAPI / ALSA) everywhere,
 //!   or macOS system audio via ScreenCaptureKit. `capture::Source` picks between
 //!   them and `capture::devices` lists the inputs and hands back the ids it
-//!   takes. Requires the `capture` feature, so these names are unlinked here:
+//!   takes. Open `capture::Producer` once, give each bus or encoder a consumer,
+//!   and drive its `run` alongside them. Requires the `capture` feature:
 //!   they don't exist in a default build.
 //! - [`encode`] encodes PCM and publishes it through `moq_mux::container`,
 //!   registering the rendition in the `hang` catalog. Two entry points:
-//!   - `encode::Publication` and `encode::Driver` capture a controllable
-//!     microphone publication. The retained publication starts, stops, and
-//!     replaces the input while preserving one track identity, and reports the
-//!     active device, failures, and post-processing level.
-//!   - `encode::publish_capture` is the turnkey shorthand. It encodes strictly
-//!     on demand: the track and catalog are advertised up front, but the device
-//!     opens only while a subscriber is listening and is released when the last
-//!     one leaves.
+//!   - `encode::publish_capture` publishes an already-open capture consumer,
+//!     returning a `Publication` that reports its state and level, and the
+//!     `Driver` that encodes. Its rendition is registered before processing
+//!     samples. Capture keeps running while raw audio waits for a subscriber,
+//!     then encodes that history and continues live. Set
+//!     `encode::Capture::retain` to false to encode continuously instead.
 //!   - [`encode::Producer`] publishes PCM you hand it.
 //! - [`decode`] subscribes to an encoded track and decodes it back to PCM.
 //!   [`decode::Consumer`] is the mirror of [`encode::Producer`]. It reads AAC-LC
 //!   too, behind the default-on `aac` feature, since a broadcast that came in
-//!   through a gateway is AAC rather than one of the two codecs we encode.
+//!   through a gateway is AAC rather than one of the codecs we encode in software.
 //! - `playback` plays decoded PCM out a speaker. `playback::Engine` owns the
 //!   output device and mixes the `playback::Sink`s registered with it, so one
 //!   device serves every track in a call. Requires the `playback` feature, so
 //!   these names are unlinked here too.
+//! - `bus` mixes any number of PCM sources, each with its own gain, mute, pan,
+//!   sync delay, and meter, into several mixes advanced on the caller's own
+//!   clock: a studio's program audio and its return feeds. Behind the
+//!   default-on `bus` feature.
 //! - `aec` keeps the speaker out of the microphone, which is what a conference
-//!   on a laptop needs to not send itself back. `playback::Engine::canceller`
-//!   builds an `aec::Canceller` from the mix it is playing and
-//!   `capture::Config::aec` hands it to the microphone. Requires the `aec`
-//!   feature, which implies both of the above.
+//!   on a laptop needs to not send itself back. [`aec::Processor`] processes PCM
+//!   supplied by any audio stack without enabling device features. The `aec`
+//!   feature wires `playback::Engine::canceller` to
+//!   `capture::Config::aec` and implies both device features.
 //!
 //! [`Format`] mirrors WebCodecs `AudioData.format`; the helpers convert between
 //! any supported layout and the interleaved `f32` representation libopus
@@ -43,20 +47,40 @@
 //! [`Activity`] it was decoded from, which is how a caller tells coded audio
 //! from the frames an Opus sender withholds while its input is silent. PCM
 //! layout lives on the producer / consumer via [`encode::Input`] /
-//! [`decode::Config`], not on each frame, so callers can't drift between calls.
+//! [`decode::Output`], not on each frame, so callers can't drift between calls.
+
+#[cfg(test)]
+mod allocation;
+
+/// The one output a codec that holds nothing returns for each call.
+#[cfg(test)]
+pub(crate) fn single<T: std::fmt::Debug>(outputs: Vec<T>) -> T {
+	let [output] = <[T; 1]>::try_from(outputs).expect("exactly one output");
+	output
+}
 
 #[cfg(feature = "aac")]
 mod aac;
 mod activity;
+#[cfg(any(feature = "bus", feature = "playback"))]
+mod comfort;
 mod error;
 mod format;
 mod frame;
+mod jitter;
+mod layout;
+mod level;
 mod opus;
 mod pcm;
 mod resample;
+#[cfg(any(feature = "bus", feature = "playback"))]
+mod ring;
+#[cfg(any(feature = "bus", feature = "playback"))]
+mod stretch;
 
-#[cfg(feature = "aec")]
 pub mod aec;
+#[cfg(feature = "bus")]
+pub mod bus;
 #[cfg(feature = "capture")]
 pub mod capture;
 pub mod decode;
@@ -69,4 +93,5 @@ pub use activity::Activity;
 pub use error::Error;
 pub use format::Format;
 pub use frame::Frame;
-pub use resample::Resampler;
+pub use layout::Layout;
+pub use level::Level;

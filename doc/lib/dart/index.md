@@ -11,40 +11,180 @@ The [`moq`](https://pub.dev/packages/moq) package on pub.dev wraps the
 generated [`moq_ffi`](https://pub.dev/packages/moq_ffi) bindings in Dart
 futures and streams. A Native Assets hook supplies the Rust core for Android
 (API 24+), iOS (16+), Linux, macOS, and Windows. Flutter web is not supported,
-since it can't load a native library.
+since it can't load a native library. The iOS library ships but has not yet
+been run in an iOS app, so treat iOS as untested.
+
+Import `package:moq/media.dart` with a prefix for catalogs, encoded-media imports, and
+container consumers. `TrackProducer.audio` / `.video` take a broadcast, an init record,
+and a `Named` or `Requested` target. `CatalogProducer(broadcast: ...)` owns catalog properties
+and sections; it holds the broadcast weakly and fails after the broadcast closes.
+Publish JSON tracks with `MoqTrackInfo(compression: MoqCompression.deflate)`; a `package:moq/json.dart` consumer reads one with no option of its own.
+A raw frame without a timestamp stays untimed, which only an untimed track accepts; JSON writes always take one. The library never substitutes zero or now.
+`SnapshotProducer.update`, `StreamProducer.append`, and `WindowProducer.push` and `pop` require a timestamp on the broadcast clock (`CatalogProducer.now()`), the epoch every track in the broadcast shares, so their track needs a timescale.
+`package:moq/json.dart` consumers return `Value` (`value`, `timestamp`) from `next()`; a snapshot consumer
+yields each state in order, and `latest()` skips to the newest.
+Media times are exact `Timestamp` records, `value` units at `scale` units per second, so a 90 kHz tick survives a
+read and republish. `Duration.toTimestamp()` converts exactly; `Timestamp.toDuration()` rounds down to a whole microsecond.
+Raw tracks with a `null` timescale are untimed on both publish and receive.
+`MoqTrackInfo.compression` set to `MoqCompression.deflate` on a raw track sends each group DEFLATE-compressed to opt-in `moq-lite-07-wip` peers; other peers, and every reader here, get the original frames.
+Whole-frame media writes require caller time; container imports keep their own timeline handling.
+Timed raw/data tracks require caller-supplied timestamps. Use `CatalogProducer.now()` to stamp a locally
+created event on the broadcast clock; reading it fixes that clock for later media producers.
+Share `media.Timebase(broadcast: ...)` through `ContainerInit` when several imports use
+one source timeline; omitting it keeps an independent offset. A timebase belongs to its
+broadcast and does not keep it open. `ContainerProducer` takes chunks split anywhere,
+so a raw byte stream needs no other importer.
+`ContainerFormat.fmp4` splits each fragment into one frame per sample.
+`media.CatalogConsumer.subscribe`, `media.TrackConsumer.subscribe`, and `media.GroupConsumer.fetch`
+construct the read side from a broadcast; the last two take a catalog `media.Rendition` and
+follow its broadcast and track themselves. For arrival-order reads, decode each group from
+`TrackConsumer.recvGroup()` with `media.GroupConsumer(group: ..., container: ...)`; frames
+carry container media time as they land.
+`package:moq/video.dart` and `package:moq/audio.dart` encode raw pixels and PCM inside the
+binding: `video.Producer` / `audio.Producer` take a `CatalogProducer`, and
+`video.Consumer.subscribe` / `audio.Consumer.subscribe` decode a catalog rendition.
 
 ```bash
 dart pub add moq        # or: flutter pub add moq
 ```
 
 ```dart
+import 'package:moq/media.dart' as media;
 import 'package:moq/moq.dart';
 
 final moq = await Moq.connect('https://relay.example.com');
 
 // Subscribe. The stream is live, so listen to it rather than awaiting its end.
-moq.announcements(prefix: 'live/').listen((announcement) {
-  print(announcement.path());
+moq
+    .announced(
+      options: const AnnounceOptions(prefix: 'live/', filter: '*/camera'),
+    )
+    .updates()
+    .listen((event) {
+  // A path stays present across publisher restarts: hold moq.follow(path) to be handed
+  // each new run, or null once it goes offline.
+  switch (event) {
+    case AnnounceEventPresent(:final announce):
+      print(announce.prefix);
+      // Captures are a list of wildcard matches, empty without wildcards.
+      print(announce.captures);
+    case AnnounceEventAbsent():
+  }
 });
-final broadcast = await moq.requestBroadcast('live/camera');
+// Wait for a publisher at one path. The first call never returns null; call available()
+// again for the next one, or null once the path goes offline.
+final broadcast = (await moq.follow('live/camera').available())!;
+final catalog = await media.CatalogConsumer.subscribe(broadcast: broadcast);
+print(await catalog.next());
 ```
 
 ```dart
-// Publish. bytes comes from your encoder or application source.
-final mine = moq.createBroadcast('live/camera');
-final track = mine.publishTrack(name: 'video', info: null);
-track.appendGroup().writeFrame(frame: MoqFrame(payload: bytes));
+// Publish raw pixels; the binding encodes them. rgba and pts come from your capture source.
+import 'package:moq/video.dart' as video;
 
-moq.close();
+// Hidden until announced, so the catalog is filled before anyone finds it.
+final camera = moq.route('live/camera', options: RouteOptions(hidden: true));
+final encoder = video.Producer(
+  catalog: media.CatalogProducer(broadcast: camera.broadcast()),
+  options: video.ProducerOptions(
+    input: video.EncoderInput(
+      format: video.PixelFormat.rgba,
+      width: 1280,
+      height: 720,
+      framerate: video.FrameRate(numerator: 30000, denominator: 1001),
+    ),
+    output: video.EncoderOutput(
+      codec: video.Codec.h264,
+      kind: video.AutoEncoder(),
+    ),
+    track: 'camera',
+  ),
+);
+encoder.write(frame: video.Frame(timestamp: pts, data: rgba));
+camera.announce();
+encoder.finish();
 ```
 
-Cancelling a stream releases the native cursor. The package re-exports
-`moq_ffi`, so the full generated API is available without a second import.
+```dart
+// Decode a subscribed rendition. Dispose each frame promptly.
+import 'package:moq/video.dart' as video;
 
-Unlike the other bindings, the published Dart binaries carry **no codecs**:
-catalog and container types are there, so already-encoded frames flow through
-`MoqMediaProducer`/`MoqMediaConsumer`, but encoding is up to
-`package:camera`, platform channels, or another codec package.
+final remote = (await moq.follow('live/camera').available())!;
+final renditions = await media.CatalogConsumer.subscribe(broadcast: remote);
+final decoder = await video.Consumer.subscribe(
+  broadcast: remote,
+  id: 'camera',
+  catalogVideo: (await renditions.next())!.video['camera']!,
+  // A live player joins at the newest group; a recorder keeps the default oldest.
+  output: video.DecoderOutput(start: media.DecodeStart.latest),
+);
+// A read is a frame, a gap where media was lost, or an end where the publisher stopped its encoder.
+final read = await decoder.next();
+if (read is video.ReadFrame) {
+  print(read.frame.pixels(format: video.PixelFormat.rgba).length);
+  read.frame.dispose();
+}
+```
 
+```dart
+// Publish already-encoded frames. bytes comes from your encoder or application source.
+final route = moq.route('live/camera'); // visible at once, under a fresh instance
+print(route.instance());
+final mine = route.broadcast();
+final track = mine.publishTrack(name: 'video', info: null);
+final group = track.appendGroup();
+group.writeFrame(frame: Frame(payload: bytes, timestamp: null));
+group.finish();
+track.finish();
+mine.close(); // ends the route too
+
+await moq.close();
+```
+
+Raw video encoders take an exact numerator/denominator frame rate, such as 30000/1001. Producer options hold input, codec settings, track naming, and optional session bandwidth ownership; standalone encoders take only codec settings. For simulcast, give each rendition the next one down as `lower`: it stops encoding, advertised as disabled, while its bandwidth grant cannot fund it, and resumes once the grant recovers. A rung only disables while the session probes for bandwidth, which on native transports takes moq-quic with BBR3. A pre-encoded video track takes `lower` in its `VideoInit` too, as a `TrackMoqMediaProducer` or `StreamMoqMediaProducer`, which only places it one priority below; follow its reservation with `RateControl`, and while it reports disabled, drop the frames, call `setEnabled(false)` after a `discontinuity()`, and `setEnabled(true)` on the keyframe that resumes it. A `TrackStreamProducer` finds its own frames: `setEnabled(false)` drops what is written to it, and after `setEnabled(true)` it resumes at the stream's next keyframe.
+
+## Things to know
+
+The rest of the [shared feature list](/lib/#what-every-binding-can-do) maps
+one to one; the API reference has the names, and [Layers](/lib/layers)
+shows which module holds each.
+
+- **Names.** Types drop the `Moq` prefix (`Session`, `BroadcastProducer`, `RouteOptions`) as aliases, so the generated names still work. `MoqContainer`, `MoqRoute`, and the exceptions keep it, since Flutter owns those names.
+- **Routes.** `route(path)` publishes a broadcast, returning a `MoqRoute` whose `broadcast()` you fill, and `claim(prefix)` answers requests beneath a prefix, returning a `Claim` whose `requested()` yields each one. Hold either: cancelling or disposing it retracts it, while a broadcast handle alone does not keep a route announced. A `route(path)` keeps its instance across `withdraw()` and `announce()`, so a new run is a new route. Unless one is named, a request's own route (`request.route(options: ...)`) takes its claim's instance (on moq-lite 07; older wires mint another, restarting readers resolved through the claim), and the claim moves to a fresh one each time such a route holding its current one ends.
+- **Audio needs cuts.** Video groups at its keyframes, but audio forms a group only where you call `cut()`: after every frame, or less often to batch frames into fewer groups.
+- **Timeline breaks.** On a seek or pause, call `discontinuity()`, then keep timestamps moving forward and resume video on a keyframe.
+- **Media reads.** `media.TrackConsumer`, `audio.Consumer`, and `video.Consumer` return a `Read` in order: a `ReadFrame`, a `ReadGap` where media was lost, or a `ReadEnd` where the publisher stopped its encoder. A gap breaks continuity. An encoder end is not stream EOF: following frames before its endpoint are the old encoder's drain; the first at or past it starts fresh. A decoder reads everything the track still holds unless a live player sets `start: media.DecodeStart.latest` in its decoder output, which joins at the newest group and skips the cached backlog.
+- **Decoded frames hold decoder buffers.** `dispose()` each frame from a `video.Consumer` promptly rather than waiting for the garbage collector, or the decoder stalls. `resize` is best effort, so read each frame's `width()` and `height()`.
+- **Closing.** `await moq.close()` drains for up to one second and reports its result. `session.shutdown()` requests the drain synchronously; `await session.closed()` waits for its result. `session.cancel(code: 0)` closes at once. Finish or abort live tracks first. Awaiting cancellation of an announcement, grant, or request subscription releases its pending native read. Announcements and grants also release their consumer; server listeners leave their shared server usable. moq-lite-05 and newer wait for the peer to receive finished tails; older Lite versions and IETF wait only for transport ACKs.
+- **Ending cleanly.** When the input ends, finish every track, then call `finish()` on its `CatalogProducer` to finish the catalog, which ends the content. The broadcast stays announced and keeps serving the finished tracks, so a subscriber still catching up can drain them, until `broadcast.close()` or disposing its `MoqRoute` takes it offline. How long to keep it up is yours to decide. A track still open at the close, or released without a finish, ends with `Unroutable` (`Internal` over moq-transport, which has no such code). Readers follow a publisher's runs by announcement, not by that error: see [identity and recovery](/concept/identity).
+- **Stats.** `session.stats()` reports `rtt`, `estimatedSendRateBps`, and the byte and packet counters (`bytesSent`, `bytesReceived`, `bytesLost`, `packetsSent`, `packetsReceived`, `packetsLost`), and `datagramsUnrouted`, the datagrams received for a subscription with no datagram track, reported only on moq-lite 05 and later, which carry datagrams. A field is `null` when the transport does not report it, which is not the same as zero. `version` names the negotiated protocol. Connect returns a connecting session; read its coherent `state()` snapshot and wait with that snapshot's revision to observe reconnects. A first dial that reaches no session ends the session with that error rather than retrying. Each watcher keeps its own revision. Hold the owned `BandwidthConsumer` returned by `session.recvBandwidth()` to receive bandwidth estimates. `rate()` reads the current estimate in bits per second and `rateChanged()` waits for a new one. Release the consumer or call `cancel()` when finished; releasing the last consumer stops PROBE; the session and stats snapshots do not request it. Client consumers survive reconnects and report no estimate while disconnected.
+- **Viewers.** `client.viewers()` divides the connection's receive estimate among the broadcasts you watch, max-min fair by each one's ceiling. `watch(maxBps: ...)` returns a `Viewer` claiming up to what the largest rendition the player would switch to needs; `rate()` reads its slice in bits per second, `null` while there is no estimate, so hold the current selection. `update(maxBps: ...)` changes the ceiling, such as when the catalog enables or disables a rendition. Holding a viewer requests PROBE, and the session sends the viewers' summed ceilings as the PROBE target; `dispose()` it once the broadcast stops being watched. `setTarget(targetBps: ...)` sends another target, `0` sends none, and `null` follows the viewers again. Ceilings or a target past 2^53 - 1 bps, the most a PROBE target carries, throw `OutOfRangeMoqException`. Client viewers survive reconnects and read `null` while disconnected.
+- **Authorization.** On `moq-lite-07-wip` (opt in with `ConnectOptions(versions: ...)`), listen to `moq.grants().updates()` for the `Grant` the relay sent back and each change, `null` until it answers and while a client session reconnects.
+- **Tokens.** Pass `ConnectOptions(tokens: [...])` instead of putting the credential in the URL. The first is the connection credential, sent in SETUP and, while an offered version can't carry it there (lite before 07), as the URL's `?jwt=`; each other token widens the grant over AUTH. `moq.tokens().set_(tokens: [...])` replaces them before they expire: the next dial presents them, a live AUTH session at once, and after an authorization refusal the session redials only if they changed. `await tokens().answered()` returns once the relay accepts them and throws its refusal with the relay's code. A `?jwt=` already in the URL stays the connection credential, which is how to reach a relay older than this release. For a per-request token, `moq.credential(token)` returns a `Credential` that `route.setAuth(credential: credential)` or `claim.setAuth(credential: credential)` names (`null` for none); setting a new one renews the announcement in place. Only the session that minted it carries it, a client session across its reconnects; another session announcing the same route uses its own scope. On moq-transport `answered` resolves at once, since only the request carries the token; on moq-lite the token rides AUTH instead (07 only, unsupported before), so `answered` is the peer's verdict and the grant joins the whole session's, not only the named route's. `await credential.answered()` throws the peer's refusal, and `credential.cancel()` withdraws it unless a route or claim still names it.
+- **Errors.** Read diagnostic payloads from `reason` and structured protocol failures from `details`.
+- **Disabled renditions.** Audio and video convenience decoders reject a catalog configuration with `enabled: false`. Select an enabled rendition from the latest catalog before opening a decoder. Among the video renditions you can decode, prefer the highest `preference`; `0` is the default and `-1` marks a compatibility transcode. Audio and video subscribe setup returns `UnsupportedConfigMoqException` when the decoder refuses the codec, layout, or description; a player can then try its next ranked rendition. Decoder faults and later peer or decode failures do not report that setup refusal.
+- **Subscription defaults.** A bare `Subscription()`, passing no subscription, and `defaultSubscription()` all mean moq-net's defaults, whose zero `delay` starts at the newest group and skips a superseded one at once. `Delay` defaults both bounds to zero: pass `max: null` for no subscriber limit, or `min: null` to leave the target latency unstated. Decoders take the same `Delay`.
+- **Track demand.** Obtain a dynamic track request’s `demand()` before accepting it to watch subscribers through the handoff to its producer. The watch does not keep the track alive and ends when the track closes or the request is rejected. A producer publishes everything you write, subscribed or not, so a late subscriber can fetch the recent past. Capturing only while a producer's `demand()` reports a subscriber is an opt-in that saves the encode but leaves nothing from before the first one.
+
+## Runtime
+
+Native I/O and background tasks run on a Tokio worker pool. Calls awaited by the
+host still poll in place; independent native wake callbacks can run concurrently.
+The generated bindings deliver native wakeups to the Dart isolate. Keep UI work
+on its owning isolate.
+A panic in a native background task reaches the pending and later fallible calls
+of every object that depends on it as a task error; other objects keep running.
+
+A session closed for exceeding the relay's request caps reports the protocol
+kind `ProtocolKind.tooManyRequests`. Reduce
+the simultaneous announcements or subscriptions, or ask the relay operator
+to adjust the [session limits](/bin/relay/config#session-and-peer), before
+reconnecting with the same workload.
+A session closed because its credential expired reports `ProtocolKind.expired`, and a request refused for an expired token raises `ExpiredMoqException`; refresh the token before retrying. Malformed credentials report `ProtocolKind.malformedAuthToken`; correct the token before reconnecting with it.
+A catalog that needs a newer moq-hang draft than this build reads raises `UnsupportedCatalogMoqException`; upgrade the library to read it.
+
+## Reference
+
+- API reference: [pub.dev/documentation/moq](https://pub.dev/documentation/moq/latest/)
 - Source: [`dart/`](https://github.com/moq-dev/moq/tree/main/dart)
 - Packages: [moq](https://pub.dev/packages/moq), [moq\_ffi](https://pub.dev/packages/moq_ffi)

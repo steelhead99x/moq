@@ -1,22 +1,186 @@
 name: Rust cache
-description: Restore the Cargo build cache cache.yml warms on the default branch.
+description: Install mbx and its Cargo shim, using local storage on self-hosted runners and R2 on hosted runners.
 
 inputs:
-  save-on-dispatch:
-    description: Let a trusted workflow_dispatch seed the cache (cache.yml only).
-    default: "false"
+  access-key-id:
+    description: R2 access key id. Empty, as for a fork pull request, builds cold.
+    default: ""
+  secret-access-key:
+    description: R2 secret access key matching `access-key-id`.
+    default: ""
+  write:
+    description: Whether a run on `main` publishes its compilations. A job whose builds nothing reuses, such as one per mutant, passes false and reads with the repository's key.
+    default: "true"
 
 runs:
   using: composite
   steps:
-    # One shared key lets differently named jobs restore the cache warmed by
-    # cache.yml. Pull requests stay read-only, while a trusted manual run can
-    # explicitly seed a cold cache.
-    - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+    # Only main's merge queue builds on the self-hosted runner: a maintainer
+    # picked each group's PR, so nothing unreviewed writes its persistent caches.
+    - name: Require main's merge queue on self-hosted runners
+      if: runner.environment == 'self-hosted' && !(github.workflow == 'Queue' && github.event_name == 'merge_group' && startsWith(github.ref, 'refs/heads/gh-readonly-queue/main/'))
+      shell: bash
+      run: |
+        echo "::error::Persistent self-hosted caches require Queue on main's merge queue." >&2
+        exit 1
+
+    # Hosted runs on `main` write, unless the job passes `write: false`;
+    # everything else reads. The merge queue
+    # uses only its local store and receives no remote credentials.
+    #
+    # The write key is the boundary. It lives in the `cache-write`
+    # Environment, whose branch policy admits exactly the refs `WRITE` names,
+    # and its secrets shadow the repository's read key under the same names.
+    # So every job that can run on those refs names the Environment there, and
+    # a pull request's code never sees the write key, even from this
+    # repository. Fork pull requests get no secrets at all and build cold.
+    #
+    # A writer without a key means the Environment is misconfigured, and
+    # building on would leave every reader cold with nothing to say why. Half
+    # a pair is a broken secret on any job, never a fork's empty one.
+    - name: Cache credentials
+      if: runner.environment != 'self-hosted'
+      shell: bash
+      env:
+        KEY_ID: ${{ inputs.access-key-id }}
+        SECRET: ${{ inputs.secret-access-key }}
+        WRITE: ${{ github.ref == 'refs/heads/main' && inputs.write == 'true' }}
+      run: |
+        if [ -z "$KEY_ID" ] && [ -z "$SECRET" ]; then
+          if [ "$WRITE" = "true" ]; then
+            echo "::error::$GITHUB_REF writes the cache but the cache-write Environment supplied no R2 key"
+            exit 1
+          fi
+          echo "::warning::No R2 cache credentials, as for a fork pull request; building cold"
+          exit 0
+        fi
+        if [ -z "$KEY_ID" ] || [ -z "$SECRET" ]; then
+          echo "::error::only one of the R2 access key id and secret is set; check the MBX_R2_* secrets"
+          exit 1
+        fi
+        {
+          echo "AWS_ACCESS_KEY_ID=$KEY_ID"
+          echo "AWS_SECRET_ACCESS_KEY=$SECRET"
+          echo "MBX_REMOTE_S3_ENDPOINT=https://dd618f5dbd5da77b8296f1613c301f5c.r2.cloudflarestorage.com"
+          echo "MBX_REMOTE_S3_REGION=auto"
+          # The action store's size budget also caps what one build downloads,
+          # and a hosted disk scales it to 5 GiB on Linux and 10 on Windows.
+          # Prefetching predictions every job shares spends that early, so the
+          # job's own results then fail to restore, compile again, and re-upload
+          # objects the bucket already holds, each a refused but billed put.
+          # 20 GiB covers the most any job downloaded with the cap lifted.
+          echo "MBX_GC_MAX_SIZE=20GiB"
+          if [ "$WRITE" = "true" ]; then
+            echo "MBX_REMOTE_MODE=read-write"
+            # mbx trusts only a push to a protected branch, which leaves out
+            # Nightly's schedule. Its guess is bypassed on
+            # purpose: the Environment already decided who holds the write key.
+            echo "MBX_REMOTE_TRUST_WRITES=true"
+          else
+            echo "MBX_REMOTE_MODE=read-only"
+          fi
+        } >> "$GITHUB_ENV"
+
+    # mbx keys every compilation on the compiler, target, and inputs, so one
+    # bucket serves every toolchain and workflow without a cache key of ours.
+    # The namespace splits it per runner platform anyway, so a platform's
+    # usage and misses can be read off its own prefix. The remote mode comes
+    # from MBX_REMOTE_MODE above.
+    #
+    # Task manifests must fit the remote reader's bound; 1.28 caps new
+    # manifests below it. Already oversized remote manifests age out under
+    # the bucket lifecycle, so they may still miss until they expire.
+    - uses: jdx/mr-boxington-action@88acf2bb50552c7c508cbac13e5f8c576b95b1de # v1.7.3
+      id: mbx
       with:
-        # Build scripts link against Nix store paths from the dev shell. Roll
-        # the cache when that shell changes so Cargo never restores executables
-        # whose dynamic linker has disappeared.
-        shared-key: rust-${{ hashFiles('flake.nix', 'flake.lock') }}
-        cache-on-failure: true
-        save-if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.save-on-dispatch == 'true') }}
+        version: 1.30.0
+        backend: ${{ runner.environment != 'self-hosted' && inputs.access-key-id != '' && inputs.secret-access-key != '' && 'remote' || 'local' }}
+        remote-url: s3://mbx-moq-dev
+        namespace: ${{ runner.os }}-${{ runner.arch }}
+
+    # A self-hosted runner keeps managed targets and learned incremental state
+    # across jobs, and Cargo trusts whatever outputs it finds there. State
+    # another mbx version left is not trusted, since 1.26's was corrupt, so it
+    # goes before the first build on a new version. The shared store stays, so
+    # that build restores what it needs rather than compiling it. Runners on one
+    # host may share the home but never a workspace, so each workspace has its
+    # own stamp.
+    - name: Drop another mbx version's private state
+      if: runner.environment == 'self-hosted'
+      shell: bash
+      env:
+        VERSION: ${{ steps.mbx.outputs.mbx-version }}
+      run: |
+        : "${VERSION:?the mbx action reported no version}"
+        stamp="$HOME/.cache/moq-mbx-versions$RUNNER_WORKSPACE"
+        if [ "$(cat "$stamp" 2>/dev/null)" != "$VERSION" ]; then
+          mbx clean --under "$RUNNER_WORKSPACE"
+          mkdir -p "${stamp%/*}"
+          printf '%s\n' "$VERSION" > "$stamp"
+        fi
+
+    # After a build, mbx sweeps in the background, and on a disk short of
+    # gc.min_free_size it removes whatever no compiler has open at that moment,
+    # including generated source trees the job's next build reads. That build
+    # then recompiles, which sh/dart/check.sh refuses. Most of this runner's
+    # disk holds data mbx does not own, so those sweeps empty the cache without
+    # closing the gap. Sweep once here, before anything builds, and never during
+    # the job. The runner's global mbx config carries the setting, since
+    # generate.sh and Dart's build hooks drop MBX_* variables. The runner
+    # provides it, read-only (dotfiles' nixos/modules/ci-runners.nix), so a job
+    # cannot write it: check it instead, with the variables stripped as a hook
+    # strips them, so a runner without it fails here and not mid-build.
+    - name: Sweep the cache before building
+      if: runner.environment == 'self-hosted'
+      shell: bash
+      run: |
+        auto=$(env -i HOME="$HOME" PATH="$PATH" mbx settings get gc.auto)
+        if [ "$auto" != "false" ]; then
+          echo "::error::the runner's global mbx config must set gc.auto = false, but it reads '$auto' without MBX_* variables"
+          exit 1
+        fi
+        mbx gc
+
+    # The action only warns when it cannot reach the remote, which is how a
+    # revoked or mistyped key would look. A cache that silently never hits
+    # costs every job its full build, so refuse instead. A writer also has to
+    # come out read-write, or nothing would publish and every reader would
+    # drift cold unnoticed.
+    - name: Check the cache
+      if: runner.environment != 'self-hosted' && inputs.access-key-id != '' && inputs.secret-access-key != ''
+      shell: bash
+      run: |
+        report=$(mbx doctor --json || true)
+        remote=$(jq -r '.checks[] | select(.name == "remote") | "\(.severity): \(.detail)"' <<< "$report")
+        policy=$(jq -r '.checks[] | select(.name == "policy") | .detail' <<< "$report")
+        echo "remote: $remote"
+        echo "policy: $policy"
+        case "$remote" in
+          pass:*) ;;
+          *) echo "::error::R2 cache unusable: $remote"; exit 1 ;;
+        esac
+        if [ "$MBX_REMOTE_MODE" = "read-write" ] && [[ "$policy" != *"effective read-write" ]]; then
+          echo "::error::the cache writer cannot publish: $policy"
+          exit 1
+        fi
+
+    # The shim is how mbx reaches Cargo. The action above only puts `mbx` itself
+    # on PATH, which reaches a build that spells the wrapper out; nothing here
+    # does, and release-plz spawns Cargo where no environment variable could.
+    # `mbx setup` installs a `cargo` launcher instead. Its directory goes on
+    # PATH for jobs that use the runner's rustup toolchain, and flake.nix puts
+    # it back in front of the dev shell's pinned toolchain.
+    #
+    # The shim existing is the assertion: it is the only thing routing Cargo
+    # through mbx, so a setup that quietly did nothing would build every job
+    # uncached and still report success.
+    - name: Cargo shim
+      shell: bash
+      run: | # zizmor: ignore[github-env] mbx installed the shim; nothing from the event names it.
+        mbx setup --yes
+        shim=$(mbx setup --status 2>/dev/null | sed -n '1s/.*: //p' || true)
+        if [ ! -e "$shim" ]; then
+          echo "::error::mbx setup installed no Cargo shim: $(mbx setup --status 2>&1)"
+          exit 1
+        fi
+        echo "${shim%[/\\]*}" >> "$GITHUB_PATH"

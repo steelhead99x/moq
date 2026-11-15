@@ -9,143 +9,403 @@ package dev.moq
 
 // Session + connection handles. `Server` is not aliased: `dev.moq.Server` is the
 // listen facade (see Server.kt), which exposes the raw handle as `server`.
-/** A MoQ client: configure the TLS/bind knobs, then connect to a relay. */
+/** A MoQ client built from a [ClientConfig]: connect it to a relay. */
 typealias Client = uniffi.moq.MoqClient
-/** A live pub/sub session with a relay, exposing a publisher and a consumer. */
+
+/**
+ * Client configuration: bind address, versions, tokens, TLS, QUIC, WebSocket, reconnect pacing, and
+ * origins.
+ */
+typealias ClientConfig = uniffi.moq.MoqClientConfig
+
+/** The credentials a [Client] presents, replaceable while it runs. */
+typealias Tokens = uniffi.moq.MoqTokens
+
+/**
+ * A request token a session presents, which a [Route] or [Claim] names with `setAuth`. Suspend on
+ * `answered()` for the peer's verdict; `cancel()` withdraws it unless a route or claim still names
+ * it.
+ */
+typealias Credential = uniffi.moq.MoqCredential
+
+/** Certificate trust and the mTLS identity for a [ClientConfig]. */
+typealias ClientTls = uniffi.moq.MoqClientTls
+
+/** Server configuration: bind address, versions, TLS identity, QUIC, and origins. */
+typealias ServerConfig = uniffi.moq.MoqServerConfig
+
+/** The served TLS identity for a [ServerConfig]: PEM files or generated hostnames. */
+typealias ServerTls = uniffi.moq.MoqServerTls
+
+/** QUIC transport tuning, such as the peer's inbound stream cap. */
+typealias QuicConfig = uniffi.moq.MoqQuicConfig
+
+/** The congestion control family for a QUIC connection. */
+typealias CongestionControl = uniffi.moq.MoqCongestionControl
+
+/** The WebSocket fallback raced against QUIC: whether it runs and QUIC's head start. */
+typealias WebSocketConfig = uniffi.moq.MoqWebSocketConfig
+
+/** A live pub/sub session with a relay, exposing publish and consume origins. */
 typealias Session = uniffi.moq.MoqSession
+
 /** An incoming session awaiting a decision: accept it to handshake, or reject it. */
 typealias Request = uniffi.moq.MoqRequest
 
+/** The network transport carrying an incoming session. */
+typealias Transport = uniffi.moq.MoqTransport
+
 // Origin (broadcast discovery / announcement).
-/** The publish side of an origin: create broadcasts so subscribers can discover them. */
+/** The publish side of an origin: create routes and claims so subscribers can discover them. */
 typealias OriginProducer = uniffi.moq.MoqOriginProducer
-/** Options for creating an origin, such as its total cache budget. */
-typealias OriginOptions = uniffi.moq.MoqOriginOptions
+
+/**
+ * An exact route on an origin, owning one broadcast (`broadcast()` to fill it). `announce`,
+ * `withdraw`, `setCost`, and `setAuth` advertise it. Closing or cancelling it retracts it, as does
+ * ending its broadcast; a broadcast handle alone does not keep it announced.
+ */
+typealias Route = uniffi.moq.MoqRoute
+
+/**
+ * A prefix route on an origin, from `OriginProducer.claim`: a claim that every path beneath a
+ * prefix can be served, yielding each request (`requested()`). `announce`, `withdraw`, `setCost`,
+ * and `setAuth` advertise it. Closing or cancelling it retracts it and rejects the requests still
+ * waiting.
+ */
+typealias Claim = uniffi.moq.MoqClaim
+
+/** Config for creating an origin, such as its total cache budget. */
+typealias OriginConfig = uniffi.moq.MoqOriginConfig
+
 /** The subscribe side of an origin: discover and request published broadcasts. */
 typealias OriginConsumer = uniffi.moq.MoqOriginConsumer
-/** A stream of broadcasts requested by subscribers, for serving unannounced paths on demand. */
-typealias OriginDynamic = uniffi.moq.MoqOriginDynamic
-/** A requested broadcast not yet accepted: fulfill it with a producer or abort it. */
+
+/** A requested broadcast not yet answered: serve it, route it, or reject it. */
 typealias BroadcastRequest = uniffi.moq.MoqBroadcastRequest
-/** A stream of broadcast announcements under a prefix. */
-typealias Announced = uniffi.moq.MoqAnnounced
-/** A pending wait for a specific broadcast path to be announced. */
-typealias AnnouncedBroadcast = uniffi.moq.MoqAnnouncedBroadcast
-/** A single broadcast announcement: its path plus a consumer. */
-typealias Announcement = uniffi.moq.MoqAnnouncement
+
+/** A stream of announce events under a prefix. */
+typealias AnnounceConsumer = uniffi.moq.MoqAnnounceConsumer
+
+/**
+ * A literal prefix, an optional relative pattern, and the hidden-path opt-in for announcement
+ * discovery.
+ */
+typealias AnnounceConfig = uniffi.moq.MoqAnnounceConfig
+
+/** Follows a specific broadcast path across the publisher instances that serve it. */
+typealias Following = uniffi.moq.MoqFollowing
+
+/**
+ * A route over a prefix: its origin-relative path, required wildcard captures (empty without
+ * wildcards), and route metadata.
+ */
+typealias Announce = uniffi.moq.MoqAnnounce
+
+/**
+ * What an [AnnounceConsumer] yields: [AnnounceEventPresent], [AnnounceEventUnavailable],
+ * [AnnounceEventAvailable], [AnnounceEventAbsent], or [AnnounceEventOffline].
+ *
+ * Another publisher instance taking a path over keeps it present: hold a [Following] to see the
+ * broadcast change.
+ */
+typealias AnnounceEvent = uniffi.moq.MoqAnnounceEvent
+
+// Kotlin cannot reach a sealed class's subtypes through its typealias, so each
+// variant gets its own.
+/** A route now covers the path, which was absent; it may arrive unavailable. */
+typealias AnnounceEventPresent = uniffi.moq.MoqAnnounceEvent.Present
+
+/**
+ * The present path lost every usable path to its origin but may recover one: it stays present while
+ * requests for it may fail.
+ */
+typealias AnnounceEventUnavailable = uniffi.moq.MoqAnnounceEvent.Unavailable
+
+/** The present path recovered a usable path: request it again. */
+typealias AnnounceEventAvailable = uniffi.moq.MoqAnnounceEvent.Available
+
+/** The origin withdrew the path; carries its last route. */
+typealias AnnounceEventAbsent = uniffi.moq.MoqAnnounceEvent.Absent
+
+/**
+ * This side let go of the path, which its origin may still serve: the session it arrived on closed,
+ * or the network lost every path to it. Carries its last route.
+ */
+typealias AnnounceEventOffline = uniffi.moq.MoqAnnounceEvent.Offline
 
 // Broadcast / track / group producers and consumers.
 /** The write side of a broadcast: publish tracks into it. */
 typealias BroadcastProducer = uniffi.moq.MoqBroadcastProducer
+
 /** The read side of a broadcast: subscribe to its catalog and tracks. */
 typealias BroadcastConsumer = uniffi.moq.MoqBroadcastConsumer
-/** Watches a broadcast's route: yields the current route first, then every change. */
-typealias RouteWatch = uniffi.moq.MoqRouteWatch
+
 /** Receives tracks requested from a dynamically served broadcast. */
-typealias BroadcastDynamic = uniffi.moq.MoqBroadcastDynamic
+typealias BroadcastRequests = uniffi.moq.MoqBroadcastRequests
+
 /** The write side of a raw track: append groups of frames. */
 typealias TrackProducer = uniffi.moq.MoqTrackProducer
-/** A subscriber-requested track not yet accepted: accept it for a [TrackProducer] or abort it. */
+
+/** A subscriber-requested track not yet accepted: accept it for a [TrackProducer] or reject it. */
 typealias TrackRequest = uniffi.moq.MoqTrackRequest
-/** A stream of uncached group requests for one track, for serving fetches on demand. */
-typealias TrackDynamic = uniffi.moq.MoqTrackDynamic
-/** The read side of a raw track: yields groups in sequence order, skipping ahead if it falls behind. */
+
+/** A stream of the fills readers of one track need: runs of groups the cache lacks. */
+typealias TrackRequests = uniffi.moq.MoqTrackRequests
+
+/**
+ * A watch-only handle to whether a published track has subscribers; holding it keeps nothing open.
+ */
+typealias TrackDemand = uniffi.moq.MoqTrackDemand
+
+/**
+ * The read side of a raw track: yields groups in sequence order, skipping ahead if it falls behind.
+ */
 typealias TrackConsumer = uniffi.moq.MoqTrackConsumer
-/** A request to produce one uncached group for a fetch consumer. */
-typealias GroupRequest = uniffi.moq.MoqGroupRequest
+
+/** A run of groups readers miss: accept each group you have and drop the rest. */
+typealias Fill = uniffi.moq.MoqFill
+
 /** The write side of a single group: append frames to it. */
 typealias GroupProducer = uniffi.moq.MoqGroupProducer
+
 /** The read side of a single group: yields timestamped raw frames. */
 typealias GroupConsumer = uniffi.moq.MoqGroupConsumer
 
-// Media (codec-aware) producers and consumers.
-/** The write side of a media track fed pre-framed payloads. */
-typealias MediaProducer = uniffi.moq.MoqMediaProducer
-/** The write side of a media track fed a raw byte stream, with frame boundaries inferred. */
-typealias MediaStreamProducer = uniffi.moq.MoqMediaStreamProducer
-/** The read side of a media track: yields frames with codec metadata in decode order. */
-typealias MediaConsumer = uniffi.moq.MoqMediaConsumer
-/** A finite fetched media group: yields container-decoded frames until the group ends. */
-typealias MediaGroupConsumer = uniffi.moq.MoqMediaGroupConsumer
-/** A demand-observable raw-audio track producer with explicit timeline re-anchoring after idle gaps. */
-typealias AudioProducer = uniffi.moq.MoqAudioProducer
-/** The read side of a raw-audio track: yields decoded PCM frames. */
-typealias AudioConsumer = uniffi.moq.MoqAudioConsumer
-/** The write side of a raw-video track; pixels written here are encoded inside the FFI boundary. */
-typealias VideoProducer = uniffi.moq.MoqVideoProducer
-/** The read side of a broadcast's catalog: yields updates as the set of tracks changes. */
-typealias CatalogConsumer = uniffi.moq.MoqCatalogConsumer
-/** Publishes lossy latest-value JSON snapshots. */
-typealias JsonSnapshotProducer = uniffi.moq.MoqJsonSnapshotProducer
-/** Consumes reconstructed latest-value JSON snapshots. */
-typealias JsonSnapshotConsumer = uniffi.moq.MoqJsonSnapshotConsumer
-/** Publishes a lossless stream of JSON records. */
-typealias JsonStreamProducer = uniffi.moq.MoqJsonStreamProducer
-/** Consumes a lossless stream of JSON records. */
-typealias JsonStreamConsumer = uniffi.moq.MoqJsonStreamConsumer
-
 // Data types.
-/** A broadcast's catalog: its tracks and their properties, plus any application sections. */
-typealias Catalog = uniffi.moq.MoqCatalog
-/** A datagram-delivered frame, tagged with a per-track sequence number. */
+/** A datagram payload with its own sequence and optional timestamp. */
 typealias Datagram = uniffi.moq.MoqDatagram
+
 /** A payload plus the timestamp it should be presented at. */
 typealias Frame = uniffi.moq.MoqFrame
-/** A [Frame] plus the codec metadata a media track carries. */
-typealias MediaFrame = uniffi.moq.MoqMediaFrame
-/** The catalog description of a video track, including whether the publisher recommends temporarily avoiding it. */
-typealias Video = uniffi.moq.MoqVideo
-/** Caller-provided catalog fields for a video track. */
-typealias VideoHint = uniffi.moq.MoqVideoHint
-/** Catalog properties shared by every video rendition; absent fields clear those properties. */
-typealias VideoProperties = uniffi.moq.MoqVideoProperties
-/** Media format, initialization bytes, and optional video hints. */
-typealias Init = uniffi.moq.MoqInit
-/** The catalog description of an audio track: codec, sample rate, channels, and container. */
-typealias Audio = uniffi.moq.MoqAudio
-/** A width and height pair, in pixels. */
-typealias Dimensions = uniffi.moq.MoqDimensions
-/** The route a broadcast takes to reach this origin: relay hop ids (oldest first), advertised cost (lower wins), and whether it's announced. */
-typealias Route = uniffi.moq.MoqRoute
-/** Tunes how a track subscription is delivered: priority, group ordering, and range. */
+
+/** An exact media timestamp: `value` units at `scale` units per second. */
+typealias Timestamp = uniffi.moq.MoqTimestamp
+
+/**
+ * Names one continuous stream at a path: `Instance.parse` names one, only a session mints one, and
+ * equality also compares `isMinted()`, so pin a reported stream with the instance, not its text.
+ */
+typealias Instance = uniffi.moq.MoqInstance
+
+/**
+ * How a [Route] advertises itself: `hidden` until `announce`, its static production cost (lower
+ * wins), an optional stable [Instance] (null mints a fresh one the route keeps for its lifetime),
+ * and the epoch, which only matters with a stable instance.
+ */
+typealias RouteOptions = uniffi.moq.MoqRouteOptions
+
+/**
+ * The read-only facts on a received route: the [Instance] of the stream it serves, relay hop ids
+ * (oldest first), static production and link cost (lower wins), and its informational `rtt` to the
+ * origin node.
+ */
+typealias RouteInfo = uniffi.moq.MoqRouteInfo
+
+/** Tunes how a track subscription is delivered: priority, delay, ranges, and group ordering. */
 typealias Subscription = uniffi.moq.MoqSubscription
+
+/**
+ * How far behind the live edge a subscriber or decoder plays: `min` is the target latency and where
+ * a cold join starts, null to leave it unstated (a decoder plays it as zero), and `max`, null for
+ * no subscriber limit, is how far a non-latest group may fall behind before it is skipped. A `min`
+ * past `max` starts at `max`.
+ */
+typealias Delay = uniffi.moq.MoqDelay
+
+/**
+ * moq-net's defaults, whose zero `delay` starts at the newest group and skips a superseded one at
+ * once. A null subscription means the same; `copy` this one to change a field. A
+ * `Subscription(...)` must name `delay`.
+ */
+fun uniffi.moq.MoqSubscription.Companion.default(): Subscription =
+    uniffi.moq.moqSubscriptionDefaults()
+
+/** A span of a track to deliver: from `start` up to `end`, or onward when `end` is null. */
+typealias Range = uniffi.moq.MoqRange
+
+/**
+ * Where one end of a [Range] falls: [AnchorOldest], [AnchorAbsolute], [AnchorRelative], or
+ * [AnchorTime].
+ */
+typealias Anchor = uniffi.moq.MoqAnchor
+
+/** The oldest group still around, as far back as the max delay allows. A start only. */
+typealias AnchorOldest = uniffi.moq.MoqAnchor.Oldest
+
+/** A group, delivered from its first frame. */
+typealias AnchorAbsolute = uniffi.moq.MoqAnchor.Absolute
+
+/** The group `groups` before the latest one, clamped to group 0: 0 is the latest. */
+typealias AnchorRelative = uniffi.moq.MoqAnchor.Relative
+
+/** The group containing `timestamp`, a presentation time. */
+typealias AnchorTime = uniffi.moq.MoqAnchor.Time
+
+/** Which pending group the publisher sends first: `ASCENDING` or `DESCENDING`. */
+typealias Order = uniffi.moq.MoqOrder
+
+/** A location within a track: a group sequence and a frame index in it. */
+typealias Position = uniffi.moq.MoqPosition
+
 /** Options for fetching one past group by sequence. */
 typealias FetchGroupOptions = uniffi.moq.MoqFetchGroupOptions
+
 /** Delivery settings for a raw track: priority, ordering, latency budget, and timescale. */
 typealias TrackInfo = uniffi.moq.MoqTrackInfo
+
+/**
+ * How a track's frames are compressed on the wire: `DEFLATE`, or `null` in [TrackInfo] for none.
+ */
+typealias Compression = uniffi.moq.MoqCompression
+
 /** One audio frame: PCM payload bytes plus a presentation timestamp. */
 typealias AudioFrame = uniffi.moq.MoqAudioFrame
-/** An audio codec identifier. */
+
+/** Selects the audio encoder codec. Build one with `AudioCodec.opus()` or `AudioCodec.aac()`. */
 typealias AudioCodec = uniffi.moq.MoqAudioCodec
+
 /** A raw PCM sample format, mirroring WebCodecs `AudioData.format`. */
-typealias AudioFormat = uniffi.moq.MoqAudioFormat
-/** The PCM layout an [AudioConsumer] should decode to. */
+typealias AudioSampleFormat = uniffi.moq.MoqAudioSampleFormat
+
+/** The PCM layout an audio decoder should decode to. */
 typealias AudioDecoderOutput = uniffi.moq.MoqAudioDecoderOutput
-/** The PCM layout the caller feeds an [AudioProducer]. */
+
+/**
+ * What a video decoder decodes to: an optional resize, a latency budget, and whether frames keep
+ * the decoder's surface (macOS only; refused elsewhere).
+ */
+typealias VideoDecoderOutput = uniffi.moq.MoqVideoDecoderOutput
+
+/**
+ * One decoded video frame, owning the decoder's surface until closed; `pixels(format)` converts it
+ * to packed CPU pixels.
+ */
+typealias VideoDecodedFrame = dev.moq.video.DecodedFrame
+
+/** The PCM layout the caller feeds an audio producer. */
 typealias AudioEncoderInput = uniffi.moq.MoqAudioEncoderInput
-/** The codec-side encoder configuration: codec, output rate/channels, bitrate, and frame duration. */
+
+/**
+ * The codec-side encoder configuration: codec, output rate/channels, bitrate, and frame duration.
+ */
 typealias AudioEncoderOutput = uniffi.moq.MoqAudioEncoderOutput
+
 /** One video frame: pixels in the configured layout plus a presentation timestamp. */
 typealias VideoFrame = uniffi.moq.MoqVideoFrame
+
 /** A video codec identifier (H.264 or H.265). */
 typealias VideoCodec = uniffi.moq.MoqVideoCodec
-/** A raw pixel layout (I420 or RGBA) fed to a [VideoProducer]. */
+
+/**
+ * A CPU pixel layout (I420 or RGBA): fed to a video producer, or read from a [VideoDecodedFrame].
+ */
 typealias VideoPixelFormat = uniffi.moq.MoqVideoPixelFormat
-/** The pixel layout, resolution, and framerate the caller feeds a [VideoProducer]. */
+
+/** The pixel layout, resolution, and framerate the caller feeds a video producer. */
 typealias VideoEncoderInput = uniffi.moq.MoqVideoEncoderInput
-/** The video track name, codec, bitrate, keyframe interval, and backend preference. */
+
+/** The video codec, bitrate, keyframe interval, and backend preference. */
 typealias VideoEncoderOutput = uniffi.moq.MoqVideoEncoderOutput
+
 /** Which encoder implementation to use: automatic, hardware, software, or one named backend. */
 typealias VideoEncoderKind = uniffi.moq.MoqVideoEncoderKind
+
+/** Divides one connection's send estimate among the tracks sharing it. */
+typealias Allocator = uniffi.moq.MoqAllocator
+
+/** An owned bandwidth estimate; release it to stop receive PROBE demand. */
+typealias BandwidthConsumer = uniffi.moq.MoqBandwidthConsumer
+
+/** One track's standing claim on an [Allocator]. */
+typealias Reservation = uniffi.moq.MoqReservation
+
+/** Divides one connection's receive estimate among the broadcasts watched over it. */
+typealias Viewers = uniffi.moq.MoqViewers
+
+/**
+ * One watched broadcast's standing claim on [Viewers]; holding it requests PROBE, closing it
+ * releases the claim.
+ */
+typealias Viewer = uniffi.moq.MoqViewer
+
+/** Turns a [Reservation]'s grant into a sender's [RateTarget]; call `update` on every frame. */
+typealias RateControl = uniffi.moq.MoqRateControl
+
+/** How a [RateControl] maps a grant onto a bitrate, and the lower rendition that disables it. */
+typealias RatePolicy = uniffi.moq.MoqRatePolicy
+
+/** What a sender following a [RateControl] should be doing: an enabled bitrate, or disabled. */
+typealias RateTarget = uniffi.moq.MoqRateTarget
+
 /** A snapshot of transport connection statistics. */
 typealias ConnectionStats = uniffi.moq.MoqConnectionStats
-/** Configures a lossy latest-value JSON track. */
-typealias JsonSnapshotConfig = uniffi.moq.MoqJsonSnapshotConfig
-/** Configures a lossless JSON stream track. */
-typealias JsonStreamConfig = uniffi.moq.MoqJsonStreamConfig
 
-// NOTE: a few types are intentionally NOT aliased. `MoqContainer` (sealed) and
-// `MoqException` (sealed) need subtype access (`MoqContainer.Loc`,
-// `MoqException.Closed`), which Kotlin 2.0.21 can't resolve through a typealias.
-// Reference those as `uniffi.moq.MoqContainer` / `uniffi.moq.MoqException`. Enums
-// (AudioCodec/AudioFormat) are fine: entry access through the alias works.
+/** Follows the grant a session's peer gave it; cancel it to release a pending wait. */
+typealias GrantConsumer = uniffi.moq.MoqGrantConsumer
+
+/** What the peer lets this side do: publish and subscribe patterns, and an expiry. */
+typealias Grant = uniffi.moq.MoqGrant
+
+/** Where a connection is in its lifecycle, carrying that phase's failure or version. */
+typealias ConnectionPhase = uniffi.moq.MoqConnectionPhase
+
+// Kotlin cannot reach a sealed class's subtypes through its typealias, so each
+// variant gets its own.
+/** No session has connected yet; carries the latest failed dial. */
+typealias ConnectionPhaseConnecting = uniffi.moq.MoqConnectionPhase.Connecting
+
+/** A session is serving; carries its negotiated version. */
+typealias ConnectionPhaseConnected = uniffi.moq.MoqConnectionPhase.Connected
+
+/** No session is serving while the connection redials; carries why. */
+typealias ConnectionPhaseDisconnected = uniffi.moq.MoqConnectionPhase.Disconnected
+
+/**
+ * The old session serves while its replacement dials; carries its version and the replacement's
+ * failure.
+ */
+typealias ConnectionPhaseMigrating = uniffi.moq.MoqConnectionPhase.Migrating
+
+/** The connection has stopped for good; carries the terminal error, if any. */
+typealias ConnectionPhaseClosed = uniffi.moq.MoqConnectionPhase.Closed
+
+/** One coherent connection lifecycle snapshot. */
+typealias ConnectionState = uniffi.moq.MoqConnectionState
+
+/**
+ * Retry pacing for the automatic reconnect: initial delay, multiplier, ceiling, and give-up window.
+ * It applies only once a session has been established: a first dial that reaches no session ends
+ * the connection with its error rather than retrying.
+ */
+typealias Backoff = uniffi.moq.MoqBackoff
+
+/** Whether a protocol code is from the session or stream registry. */
+typealias ErrorScope = uniffi.moq.MoqErrorScope
+
+/** A recognized protocol kind, or APP / UNKNOWN when the code is not named. */
+typealias ProtocolKind = uniffi.moq.MoqProtocolKind
+
+/** A protocol failure: scope, verbatim wire code, kind, and a diagnostic message. */
+typealias ProtocolError = uniffi.moq.MoqProtocolError
+
+// NOTE: Kotlin 2.0.21 can't resolve a sealed type's subtypes through a typealias.
+// `MoqException` is intentionally NOT aliased, so reference `uniffi.moq.MoqException.Closed`
+// directly. `dev.moq.media.Container` aliases `MoqContainer` for signatures, but its
+// variants still need the full name (`uniffi.moq.MoqContainer.Loc`). Enums
+// (AudioFormat) are fine: entry access through the alias works. Objects
+// (AudioCodec) expose constructors through the alias (`AudioCodec.opus()`).
+
+/** Writes live datagrams with an independent sequence counter and no cache. */
+typealias DatagramProducer = uniffi.moq.MoqDatagramProducer
+
+/** Reads a live datagram track in arrival order from its own cursor. */
+typealias DatagramConsumer = uniffi.moq.MoqDatagramConsumer
+
+/** A requested datagram track awaiting acceptance or rejection. */
+typealias DatagramRequest = uniffi.moq.MoqDatagramRequest
+
+/** Serves on-demand datagram tracks through their own request queue. */
+typealias DatagramRequests = uniffi.moq.MoqDatagramRequests
+
+/** Publisher priority and optional timestamp scale fixed for a datagram track. */
+typealias DatagramInfo = uniffi.moq.MoqDatagramInfo

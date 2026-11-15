@@ -1,6 +1,6 @@
 # moq-nvenc
 
-Safe-ish Rust bindings for the NVIDIA Video Codec SDK (NVENC + NVDEC), vendored
+Rust bindings for the NVIDIA Video Codec SDK (NVENC + NVDEC), vendored
 for the MoQ workspace. `moq-video` uses the encoder path to hardware-encode
 H.264/H.265 on Linux, and the `cuvid` table to hardware-decode via NVDEC.
 
@@ -12,14 +12,69 @@ the NVIDIA driver still links on a GPU-less builder and starts on machines that
 lack the driver (falling back to another encoder); the build needs no CUDA
 toolkit or driver libs present.
 
-The crate compiles on any platform, macOS included: the `sys` bindings are plain
-C-ABI definitions and nothing links at build time. It only actually loads NVENC
-on Linux (that is the only place `moq-video` calls it); elsewhere it is a
-compile-only stub.
+Call `Encoder::load` to validate NVENC before creating a CUDA context. Missing
+libraries and entry points, rejected loader calls, and drivers older than the
+vendored SDK are reported as `LoadError` values. The safe encoder facade never
+panics while loading its driver function table.
+
+The crate compiles on any platform: the `sys` bindings are Linux's plain C-ABI
+definitions and nothing links at build time. It only loads NVENC and NVDEC on
+Linux, the only place `moq-video` depends on it; elsewhere it is a compile-only
+stub.
+
+The public encoder facade owns configuration and registered allocations, seals
+driver handles, and returns a submission that keeps input and output resources
+alive until synchronous completion. Raw SDK structs remain available under
+`sys`; APIs that accept their pointers are explicitly unsafe.
+
+An external input is registered once and mapped for each encode, as NVENC
+expects: registration is the expensive call, and the allocation may be written
+only while unmapped. A registration marks itself mapped before handing out a
+mapping and clears the mark only once that mapping unmaps, so when an unmap or
+unregister fails, or a submission is abandoned or forgotten, the allocation
+stays owned because the driver may still refer to it, and no later mapping is
+allowed.
 
 The `sys` bindings are generated with bindgen from the vendored headers
 (`src/sys/headers/`); see the [upstream repo](https://github.com/ViliamVadocz/nvidia-video-codec-sdk)
 for the generation scripts.
+
+## Upstream
+
+Last checked on 2026-10-31: upstream `master` at
+[`88c2ca67406a5087ac117758d0f375d73441c040`](https://github.com/ViliamVadocz/nvidia-video-codec-sdk/commit/88c2ca67406a5087ac117758d0f375d73441c040)
+(2026-03-31), the base of the vendored `dynamic-loading` branch. Upstream
+has no commits since that baseline and no
+[published security advisories](https://github.com/ViliamVadocz/nvidia-video-codec-sdk/security/advisories),
+so there are no wrapper fixes to port this run.
+
+The vendored encoder header targets NVENC API 12.1. NVIDIA's current
+[Video Codec SDK 13.1 release notes](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/read-me/index.html)
+and [13.0 release notes](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/read-me/index.html)
+were checked against `moq-video`'s consumers:
+
+- AV1 hierarchical B-frames, UHQ iterative encoding, additional profiles and
+  multiview support do not serve the current low-latency H.264/H.265 NV12
+  encoder. It disables B-frames and keeps the low-latency tuning's default of
+  no lookahead. AV1 encode and Main10 are tracked as separate work.
+- Decode statistics, multiview metadata and sample-app seeking have no current
+  consumer in the live H.264/H.265/AV1 decoder.
+- Application-owned CUDA arrays could remove the decoder's device-to-device
+  copy before NVENC. This is a candidate for a measured optimization, requiring
+  new bindings, surface ownership and synchronization, rather than a small fix.
+  See NVIDIA's
+  [opaque decode output guide](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/nvdec-video-decoder-api-prog-guide/index.html).
+- The [removed legacy presets and rate-control modes](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/deprecation-notices/index.html)
+  do not affect the encoder's P1/P4/P7 presets with CBR. It does not request
+  byte-based slices or use the deprecated video-source APIs.
+
+No SDK header update is needed for those current consumers. An API 13.1
+upgrade would raise the minimum driver requirement; NVIDIA documents driver
+610 or newer for that SDK. The
+[NVIDIA security bulletins](https://github.com/NVIDIA/product-security/tree/main/2026)
+were also checked: GPU driver fixes belong in the installed driver, which this
+crate loads but does not vendor. No applicable vendored-source security fix
+was identified; updating headers does not update the driver.
 
 ## License
 

@@ -1,0 +1,251 @@
+[
+	{
+		"name": "an active announce with no hops",
+		"version": "moq-lite-05",
+		"message": "announce",
+		"hex": "0d010a726f6f6d2f616c69636500",
+		"expect": "decoded"
+	},
+	{
+		"name": "an ANNOUNCE_START carries its cost and the retired second field at the ceiling",
+		"version": "moq-lite-06",
+		"message": "announce",
+		"hex": "00150a726f6f6d2f616c6963650000ffffffffffffffff",
+		"expect": "decoded"
+	},
+	{
+		"name": "an ANNOUNCE_END retracts by id",
+		"version": "moq-lite-06",
+		"message": "announce",
+		"hex": "010103",
+		"expect": "decoded"
+	},
+	{
+		"name": "a body too short for its fields is malformed, not a wait for more (fuzz regression)",
+		"version": "moq-lite-05",
+		"message": "announce",
+		"hex": "0101",
+		"expect": "refused"
+	},
+	{
+		"name": "a lite-06 body too short for its path is malformed, not a wait for more (fuzz regression)",
+		"version": "moq-lite-06",
+		"message": "announce",
+		"hex": "000105",
+		"expect": "refused"
+	},
+	{
+		"name": "a lite-07 body too short for its path base is malformed, not a wait for more (fuzz regression)",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "000105",
+		"expect": "refused"
+	},
+	{
+		"name": "a ROUTE_START names its origin node, seqno, metric, flags, and hops",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "06089234030501020709",
+		"expect": "decoded"
+	},
+	{
+		"name": "a ROUTE_START's 0x2 flag carries an RTT in milliseconds",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "060792340305031900",
+		"expect": "decoded"
+	},
+	{
+		"name": "a ROUTE_START's RTT flag without its RTT is refused",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "06059234030502",
+		"expect": "refused"
+	},
+	{
+		"name": "a ROUTE_START flag no version defines is withdrawn",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "06059234030504",
+		"expect": "withdrawn"
+	},
+	{
+		"name": "a ROUTE_START with more than 32 hops is withdrawn",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "0606923403050121",
+		"expect": "withdrawn"
+	},
+	{
+		"name": "a ROUTE_START missing a hop it counts is refused",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "060792340305010207",
+		"expect": "refused"
+	},
+	{
+		"name": "a ROUTE_START naming Node ID 0 is withdrawn",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "06050003050100",
+		"expect": "withdrawn"
+	},
+	{
+		"name": "a ROUTE_START advertising the last seqno is withdrawn",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "060d01ffffffffffffffffff000000",
+		"expect": "withdrawn"
+	},
+	{
+		"name": "a ROUTE_UPDATE references its Route ID",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "07050103050100",
+		"expect": "decoded"
+	},
+	{
+		"name": "a ROUTE_HOLD references its Route ID",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "0b0101",
+		"expect": "decoded"
+	},
+	{
+		"name": "a ROUTE_END references its Route ID",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "080101",
+		"expect": "decoded"
+	},
+	{
+		"name": "an ANNOUNCE_FLOOR carries its Revision plus one",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "09020105",
+		"expect": "decoded"
+	},
+	{
+		"name": "an ANNOUNCE_FLOOR of 0 certifies nothing",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "09020100",
+		"expect": "decoded"
+	},
+	{
+		"name": "a lite-07 ANNOUNCE_START names its Route ID in place of a hop chain",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "000a00000178020161000100",
+		"expect": "decoded"
+	},
+	{
+		"name": "a ROUTE_UPDATE flag no version defines is withdrawn",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "0705010305802a",
+		"expect": "withdrawn"
+	},
+	{
+		"name": "a lite-07 ANNOUNCE_START with an invalid path is withdrawn",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "000c0000032f2f78020161000100",
+		"expect": "withdrawn"
+	},
+	{
+		"name": "a lite-07 ANNOUNCE_START with an invalid instance is withdrawn",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "0009000001780200000100",
+		"expect": "withdrawn"
+	},
+	{
+		"name": "a lite-07 ANNOUNCE_START cut short is refused",
+		"version": "moq-lite-07-wip",
+		"message": "announce",
+		"hex": "0003000003",
+		"expect": "refused"
+	},
+	{
+		"name": "a ROUTE_REQUEST names an origin node and seqno",
+		"version": "moq-lite-07-wip",
+		"message": "announce_reply",
+		"hex": "0a020702",
+		"expect": "decoded"
+	},
+	{
+		"name": "a ROUTE_REQUEST naming Node ID 0 is refused",
+		"version": "moq-lite-07-wip",
+		"message": "announce_reply",
+		"hex": "0a020002",
+		"expect": "refused"
+	},
+	{
+		"name": "a ROUTE_END echo names the Route ID it retired",
+		"version": "moq-lite-07-wip",
+		"message": "announce_reply",
+		"hex": "080103",
+		"expect": "decoded"
+	},
+	{
+		"name": "an announce reply other than ROUTE_REQUEST or ROUTE_END is refused",
+		"version": "moq-lite-07-wip",
+		"message": "announce_reply",
+		"hex": "0000",
+		"expect": "refused"
+	},
+	{
+		"name": "an ANNOUNCE_INIT within the announce budget",
+		"version": "moq-lite-02",
+		"message": "announce_init",
+		"budget": 2,
+		"hex": "050201610162",
+		"expect": "decoded"
+	},
+	{
+		"name": "an ANNOUNCE_INIT listing more broadcasts than the budget is refused before its paths decode",
+		"version": "moq-lite-02",
+		"message": "announce_init",
+		"budget": 1,
+		"hex": "050201610162",
+		"expect": "refused"
+	},
+	{
+		"name": "an ANNOUNCE_INIT one byte past one storage segment is refused at its length prefix",
+		"version": "moq-lite-02",
+		"message": "announce_init",
+		"hex": "800ffff1",
+		"expect": "refused"
+	},
+	{
+		"name": "a group sequence at 2^62-1, the largest a QUIC varint holds",
+		"version": "moq-lite-06",
+		"message": "group",
+		"hex": "0a00ffffffffffffffff00",
+		"expect": "decoded"
+	},
+	{
+		"name": "a group sequence at 2^64-1, the largest a u64 holds",
+		"version": "moq-lite-07-wip",
+		"message": "group",
+		"hex": "0b00ffffffffffffffffff00",
+		"expect": "decoded"
+	},
+	{
+		"name": "a server pinned to a version the client offered selects it",
+		"version": "moq-lite-02",
+		"message": "client_setup",
+		"server": "moq-lite-05",
+		"hex": "20001202c0000000ff0dad06c0000000ff0dad0500",
+		"expect": "decoded"
+	},
+	{
+		"name": "a server pinned to a version the client did not offer refuses",
+		"version": "moq-lite-02",
+		"message": "client_setup",
+		"server": "moq-lite-05",
+		"hex": "20001202c0000000ff0dad07c0000000ff0dad0600",
+		"expect": "refused"
+	}
+]

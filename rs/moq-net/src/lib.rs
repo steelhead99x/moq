@@ -5,9 +5,16 @@
 //! At session setup it negotiates one of two wire protocols: the simplified `moq-lite`
 //! protocol (the default) or the full IETF `moq-transport` protocol.
 //!
+//! ## Features
+//! The `async` feature, off by default, enables the generated async wrappers for the `poll_*`
+//! methods, the announcement `Stream` adapter, `time::run`, and the Lite/IETF sessions
+//! (`Client`, `Server`, `Session`, and the session `Driver`). Without it, use the model's
+//! `poll_*` methods and [`origin::Driver`] with explicit time. Origin serving stays available
+//! without a native runtime; no executor or clock is chosen by the model.
+//!
 //! ## API
 //! The API is built around Producer/Consumer pairs, with the hierarchy:
-//! - [origin::Consumer]: A collection of [broadcast::Consumer]s, produced by one or more [Session]s.
+//! - [origin::Consumer]: A collection of [broadcast::Consumer]s, produced by one or more sessions.
 //! - [broadcast::Consumer]: A collection of [track::Consumer]s, produced by a single publisher.
 //! - [track::Consumer]: A collection of [group::Info]s, delivered out-of-order until expired.
 //! - [group::Info]: A collection of [frame::Info]s, delivered in order until cancelled.
@@ -17,8 +24,8 @@
 //! `announce`) that owns the short `Producer` / `Consumer` / `Info` names.
 //!
 //! Traffic counters for the levels above live in [`stats`]: build a [`stats::Registry`]
-//! and hand each session a [`stats::Handle`] via [`Client::with_stats`] /
-//! [`Server::with_stats`]. Publishing the counters as MoQ broadcasts lives in the
+//! and hand each session a [`stats::Session`] via `Client::with_stats` /
+//! `Server::with_stats`. Publishing the counters as MoQ broadcasts lives in the
 //! `moq-stats` crate.
 //!
 //! ## Compatibility
@@ -26,7 +33,7 @@
 //! keeping it small rather than polluting it with half-baked features.
 //!
 //! The library is forwards-compatible with the full IETF specification and supports
-//! moq-transport drafts 14+ via version negotiation. Everything will work perfectly,
+//! moq-transport drafts 18+ via version negotiation. Everything will work perfectly,
 //! so long as your application uses the API as defined above.
 //!
 //! For example, there's no concept of "sub-group". When connecting to a moq-transport
@@ -46,71 +53,111 @@
 //! gives another writer that contributes to the same shared state. Closing the
 //! last producer signals consumers that no more updates are coming.
 //!
-//! ## Async
-//! This library is async-first. [`Client::connect`] and [`Server::accept`] return a
-//! `(Session, Driver)` pair: the [`Session`] is the handle, and the [`Driver`] is
-//! the future that runs all of its protocol work. Nothing is spawned behind your
-//! back: spawn the driver on your executor, await it in place, or step
-//! [`Driver::poll`] with a [`kio::Waiter`] from your own `poll_*` function. The
-//! driver holds no session handle, so the transport still closes when the last
-//! [`Session`] clone drops (or on [`Session::abort`]), which in turn finishes the
-//! driver.
+//! ## Driving and time
+//! Session and origin drivers never spawn tasks or read the clock.
+//! Minting an [`Instance`] uses secure randomness. `Client::connect` and
+//! `Server::accept` take an initial [`time::Instant`] and return
+//! `(Session, Driver)`. Poll the `Driver` with the current instant and a
+//! [`kio::Waiter`], then wake on external activity or at the deadline it
+//! returns; `time::run` does exactly that on tokio or the browser. The last
+//! `Session` drop requests closure; dropping the driver cancels it.
 //!
-//! The crate has no direct tokio dependency: every future is built on [`kio`]
-//! (plain [`std::task::Waker`] plumbing) and `futures`, so any executor can poll
-//! them, and the `poll_xxx` counterparts can be stepped synchronously with a
-//! [`kio::Waiter`].
+//! [`origin::Producer::new`] also returns a producer and driver. Its driver runs
+//! route changes, serving, linger, teardown, and the origin's cache expiration.
+//! Standalone caches expose [`cache::Pool::poll`]. Frame read/write methods
+//! clear their expiration timestamp for the next cleanup pass. Datagram tracks keep a
+//! short buffer and no cache; model read/write APIs take no time argument, though a frame write stamps
+//! its arrival from the ambient clock ([`frame::Frame::arrived`]).
 //!
-//! The one remaining runtime tie is time. Timers go through `web_async::time`,
-//! which is backed by tokio's time driver on native (and `wasmtimer` in the
-//! browser), and those timers panic when polled outside a tokio runtime. So on
-//! native you still need a tokio runtime to poll a [`Driver`] (bandwidth sampling,
-//! the control stream timeout, and subscription linger all sleep); purely
-//! model-layer methods (tracks, groups, frames, origins) never touch a timer and
-//! run on any executor.
+//! Both drivers implement [`time::Driver`]. `moq-uring` drives thread-local
+//! transports on its own timer heap. Tests advance time by supplying a later
+//! instant.
 
 #![warn(missing_docs)]
-// The browser transport is `!Send`, so on wasm the shared state behind these `Arc`s is
-// too and clippy suggests `Rc`. The same code is genuinely cross-thread on native, so
-// `Arc` stays and the lint is unactionable here.
-#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+#![cfg_attr(
+	test,
+	allow(
+		clippy::redundant_closure,
+		reason = "`Decode`'s buffer lifetime is a trait parameter, so `T::decode` names one lifetime, and only a closure passes where a test helper takes any"
+	)
+)]
 
+// Sessions hand out the auth, GOAWAY, and SETUP handles, so without `async` they are
+// unobtainable and stay private to the model and wire code that still uses them.
+#[cfg(feature = "async")]
+pub mod auth;
+#[cfg(not(feature = "async"))]
+#[allow(dead_code, unused_imports, reason = "async-only")]
+mod auth;
+#[cfg(feature = "async")]
 mod client;
 mod coding;
+#[cfg(feature = "async")]
+mod discovery;
+#[cfg(feature = "async")]
+mod driver;
 mod error;
-// Not part of the public API: compiled only for the crate's own tests and for the
-// `fuzz/` harness.
-#[cfg(any(test, feature = "fuzz"))]
-#[doc(hidden)]
+#[cfg(all(feature = "async", any(test, feature = "fuzz")))]
 pub mod fuzz;
+#[cfg(feature = "async")]
+pub mod goaway;
+#[cfg(not(feature = "async"))]
+#[allow(dead_code, unused_imports, reason = "async-only")]
+mod goaway;
 mod ietf;
+mod instance;
+mod ledger;
 mod lite;
 mod model;
-mod path;
-mod server;
-mod session;
+pub mod path;
+#[cfg(feature = "async")]
+mod priority;
+#[cfg(feature = "async")]
+mod recv;
+mod route;
+#[cfg(feature = "async")]
+pub mod setup;
+#[cfg(not(feature = "async"))]
+#[allow(dead_code, unused_imports, reason = "async-only")]
 mod setup;
+#[cfg(feature = "async")]
+mod tail;
+#[cfg(all(test, feature = "async"))]
+mod test_interop;
+#[cfg(test)]
+mod test_tracing;
 mod util;
 mod version;
 
+#[cfg(feature = "async")]
+pub mod reconnect;
+#[cfg(feature = "async")]
+pub mod server;
+#[cfg(feature = "async")]
+pub mod session;
 pub mod stats;
+pub mod time;
+pub mod transport;
 
+#[cfg(feature = "async")]
 pub use client::*;
-pub use coding::{BoundsExceeded, DecodeError, EncodeError, VarInt};
+pub use coding::{BoundsExceeded, DecodeError, EncodeError, varint};
+#[cfg(feature = "async")]
+pub use driver::Driver;
 pub use error::*;
-/// The session direction a client advertises in its SETUP (moq-lite-05+).
-pub use lite::Role;
+pub use instance::{Instance, InvalidInstance};
 pub use model::*;
-pub use path::*;
-pub use server::*;
-pub use session::*;
+pub use path::{InvalidPattern, Path, Pattern, Patterns};
+#[cfg(feature = "async")]
+pub use reconnect::Reconnect;
+#[cfg(feature = "async")]
+pub use server::Server;
+#[cfg(feature = "async")]
+pub use session::Session;
 pub use version::*;
 
-// Re-export the bytes crate
-pub use bytes;
-
-// Re-export the transport trait, since it bounds the Client/Server entry points.
-pub use web_transport_trait;
-
-// Re-export the kio crate, since it appears in the public API (e.g. poll_* waiters).
-pub use kio;
+/// This crate's product token, `moq-net-rs/<version>`, which SETUP advertises by default.
+///
+/// A wrapper prepends its own token, space-separated, outermost first:
+/// `format!("moq-ffi/{v} {}", moq_net::IMPLEMENTATION)`.
+pub const IMPLEMENTATION: &str = concat!("moq-net-rs/", env!("CARGO_PKG_VERSION"));

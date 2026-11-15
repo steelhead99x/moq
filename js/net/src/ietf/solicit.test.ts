@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
-import { SetupOption, SetupOptions } from "./parameters.ts";
+import { SetupOption, SetupOptions } from "./setup_options.ts";
 import { solicitFromSetup, solicitIntoSetup } from "./solicit.ts";
 
 /**
- * We declare it on every session, so a peer honoring it never sends us an unsolicited
+ * We declare it by default, so a peer honoring it never sends us an unsolicited
  * PUBLISH_NAMESPACE. The literal 1 is the wire contract, not an implementation detail.
  */
 test("we declare that advertisements must be solicited", () => {
