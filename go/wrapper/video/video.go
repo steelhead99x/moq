@@ -161,6 +161,9 @@ func (e *Encoder) Close() { e.inner.Destroy() }
 // Consumer subscribes to a video rendition and yields decoded frames.
 type Consumer struct{ inner *ffi.MoqVideoConsumer }
 
+// Name is the decoder backend, for example "openh264" or "videotoolbox".
+func (c *Consumer) Name() string { return c.inner.Name() }
+
 // Subscribe subscribes to the catalog rendition id, following its broadcast and track.
 func Subscribe(ctx context.Context, broadcast *moq.BroadcastConsumer, id string, rendition media.Video, output DecoderOutput) (*Consumer, error) {
 	if err := bridge.Video(rendition); err != nil {

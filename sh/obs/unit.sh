@@ -18,19 +18,9 @@ if ! command -v "$cxx" >/dev/null; then
     echo "no C++ compiler at '$cxx'" >&2
     exit 1
 fi
-# moq-source.cpp decodes with ffmpeg, so its test needs the headers even
-# though it stubs every function out of them.
-if ! pkg-config --exists libavcodec libavutil libswscale; then
-    echo "missing ffmpeg headers" >&2
-    echo "run inside 'nix develop', which supplies ffmpeg on every platform" >&2
-    exit 1
-fi
-
 includes_raw=$("$here/includes.sh")
 includes=()
 while IFS= read -r flag; do includes+=("$flag"); done <<<"$includes_raw"
-
-ffmpeg=$(pkg-config --cflags libavcodec libavutil libswscale)
 
 # The output and source tests run against the real moq-ffi, over a server in
 # the same process. The bindings compile here, with the tests' flags.
@@ -53,18 +43,18 @@ trap 'rm -rf "$out"' EXIT
 # stubs, so two of them can't share a link. Header-only helpers (quality
 # defaults) build as separate binaries with no plugin source.
 for name in moq-audio-encoder moq-output moq-settings moq-source obs-moq; do
-    # $ffmpeg and $moq_libs stay unquoted on purpose: pkg-config hands back
+    # $moq_libs stays unquoted on purpose: pkg-config hands back
     # one space-separated string, and splitting it is the intended reading.
     sources=("test/$name-test.cpp")
     # The source test includes its implementation to exercise catalog shapes the
     # public publishing wrapper cannot author, without adding production hooks.
     if [ "$name" != moq-source ]; then sources+=("src/$name.cpp"); fi
     # shellcheck disable=SC2086
-    "$cxx" "${flags[@]}" "${includes[@]}" $ffmpeg \
+    "$cxx" "${flags[@]}" "${includes[@]}" \
         -o "$out/$name-test" "${sources[@]}" "$out/moq.o" $moq_libs
     TSAN_OPTIONS="halt_on_error=1 suppressions=$PWD/test/tsan.supp" "$out/$name-test"
 done
-for name in moq-quality-defaults moq-dock-stop moq-error moq-encoder-latency moq-dial moq-spark; do
+for name in moq-quality-defaults moq-dock-stop moq-error moq-encoder-latency moq-dial moq-spark moq-source-present; do
     "$cxx" "${flags[@]}" "${includes[@]}" \
         -o "$out/$name-test" "test/$name-test.cpp"
     TSAN_OPTIONS="halt_on_error=1 suppressions=$PWD/test/tsan.supp" "$out/$name-test"

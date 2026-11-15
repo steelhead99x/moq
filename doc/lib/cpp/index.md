@@ -152,6 +152,24 @@ ok(route->announce()); // each route mints a fresh instance, route->instance_id(
 ok(broadcast->close()); // keep the producer alive while publishing, then close explicitly
 ```
 
+A subscriber decodes inside the binding too. `VideoConsumer::subscribe` follows one rendition. `pixels` is tightly packed I420 or RGBA. `color` is the space the stream named, or empty when it named none (guess BT.601 limited at or below 576 lines, BT.709 limited above that). `surface` borrows the decoder's buffer on the platforms that have one. `name` is the decoder backend.
+
+```cpp
+moq::VideoDecoderOutput decoded{};
+auto consumer = ok(moq::VideoConsumer::subscribe(broadcast, "video", video_rendition, decoded).get());
+auto read = ok(consumer->next().get());
+if (read) {
+    if (auto *frame = std::get_if<moq::VideoRead::kFrame>(&read->get_variant())) {
+        auto pixels = ok(frame->frame->pixels(moq::VideoPixelFormat::kI420));
+        auto color = frame->frame->color();
+        auto backend = consumer->name();
+        (void)pixels;
+        (void)color;
+        (void)backend;
+    }
+}
+```
+
 Raw video encoders take an exact numerator/denominator frame rate, such as 30000/1001. Producer options hold input, codec settings, track naming, and optional session bandwidth ownership; standalone encoders take only codec settings. For simulcast, give each rendition the next one down as `lower`: it stops encoding, advertised as disabled, while its bandwidth grant cannot fund it, and resumes once the grant recovers. A rung only disables while the session probes for bandwidth, which on native transports takes moq-quic with BBR3. A pre-encoded video track takes `lower` in its `VideoInit` too, as a `moq::MediaProducer::kTrack` or `kStream`, which only places it one priority below; follow its reservation with `RateControl`, and while it reports disabled, drop the frames, call `set_enabled(false)` after a `discontinuity()`, and `set_enabled(true)` on the keyframe that resumes it. A `MediaTrackStreamProducer` finds its own frames: `set_enabled(false)` drops what is written to it, and after `set_enabled(true)` it resumes at the stream's next keyframe.
 
 ## Futures

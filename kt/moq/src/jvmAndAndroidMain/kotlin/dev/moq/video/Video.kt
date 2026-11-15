@@ -68,6 +68,9 @@ class Consumer private constructor(private val inner: uniffi.moq.MoqVideoConsume
     /** Cancel all current and future reads, which then throw [MoqException.Cancelled]. */
     fun cancel() = inner.cancel()
 
+    /** The decoder backend, for example `"openh264"` or `"videotoolbox"`. */
+    fun name(): String = inner.name()
+
     /** Release the native consumer. */
     override fun close() = inner.close()
 
@@ -123,6 +126,12 @@ class DecodedFrame internal constructor(private val inner: uniffi.moq.MoqVideoDe
 
     /** The decoder's platform surface, or null when the frame is in CPU memory. */
     fun surface(): Surface? = inner.surface()?.let(Surface::from)
+
+    /**
+     * The color space of these samples, or null when the stream left it unspecified.
+     * Guess BT.601 limited at or below 576 lines, and BT.709 limited above that.
+     */
+    fun color(): uniffi.moq.MoqVideoColor? = inner.color()
 
     /** Release the frame's surface back to the decoder. */
     override fun close() = inner.close()

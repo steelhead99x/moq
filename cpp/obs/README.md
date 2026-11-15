@@ -10,7 +10,7 @@ Build instructions for each platform live in [`doc/bin/obs.md`](../../doc/bin/ob
 In short, from the repo root:
 
 ```bash
-# Linux: the dev shell provides libobs/Qt6/ffmpeg
+# Linux: the dev shell provides libobs/Qt6
 nix develop
 just obs build
 

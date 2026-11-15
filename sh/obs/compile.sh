@@ -5,7 +5,7 @@
 # This is the gate to run in a worktree. `just obs build` needs the
 # multi-hundred-MB obs-deps bundle (macOS/Windows); this doesn't, because the dev
 # shell carries the OBS-side header sets: libobs pinned to the same OBS release
-# buildspec.json downloads (see `obs-headers` in flake.nix), Qt6, and ffmpeg. The
+# buildspec.json downloads (see `obs-headers` in flake.nix), and Qt6. The
 # moq headers are generated, so it builds rs/moq-ffi to render them. CI links the
 # real thing on Linux (.github/workflows/obs.yml).
 #
@@ -33,11 +33,11 @@ if ! command -v "$cxx" >/dev/null; then
     echo "no C++ compiler at '$cxx'" >&2
     exit 1
 fi
-for pkgs in "Qt6Widgets Qt6Gui Qt6Core" "libavcodec libavutil libswscale libswresample"; do
+for pkgs in "Qt6Widgets Qt6Gui Qt6Core"; do
     # shellcheck disable=SC2086
     if ! pkg-config --exists $pkgs; then
         echo "missing headers for: $pkgs" >&2
-        echo "run inside 'nix develop', which supplies Qt6 and ffmpeg on every platform" >&2
+        echo "run inside 'nix develop', which supplies Qt6 on every platform" >&2
         exit 1
     fi
 done
@@ -57,7 +57,6 @@ includes=()
 while IFS= read -r flag; do includes+=("$flag"); done <<<"$includes_raw"
 
 qt=$(pkg-config --cflags Qt6Widgets Qt6Gui Qt6Core)
-ffmpeg=$(pkg-config --cflags libavcodec libavutil libswscale libswresample)
 
 logs=$(mktemp -d)
 declare -A running=()
@@ -82,7 +81,7 @@ while true; do
         # -Werror: a warning that only prints is never fixed.
         # -Wno-unused-command-line-argument: the nix compiler wrapper injects
         # link flags, which a syntax-only run reports as unused, once per file.
-        # $qt and $ffmpeg stay unquoted on purpose: pkg-config hands back one
+        # $qt stays unquoted on purpose: pkg-config hands back one
         # space-separated string, and splitting it is the intended reading.
         # The job is a subshell around the compiler, so it exits even when the
         # compiler is killed: bash 5.2 drops a job that a signal ends before
@@ -90,7 +89,7 @@ while true; do
         # compiler in the subshell's place.
         (
             "$cxx" -std=c++17 -fsyntax-only -Werror -Wno-unused-command-line-argument \
-                "${includes[@]}" $qt $ffmpeg \
+                "${includes[@]}" $qt \
                 -DMOQ_FRONTEND_ENABLED -DMOQ_VERSION_STRING='"0.0.0"' "${sources[next]}"
             exit
         ) </dev/null >"$logs/$next" 2>&1 &

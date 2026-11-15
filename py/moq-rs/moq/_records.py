@@ -31,6 +31,10 @@ from moq_ffi import (
     MoqSubscription,
     MoqTimestamp,
     MoqTrackInfo,
+    MoqVideoColorMatrix,
+    MoqVideoColorPrimaries,
+    MoqVideoColorRange,
+    MoqVideoColorTransfer,
     MoqVideoDecodedFrame,
     MoqVideoPixelFormat,
     MoqVideoSurface,
@@ -531,6 +535,37 @@ class VideoDecodedFrame:
     def surface(self) -> VideoSurface | None:
         """The decoder's platform surface, when the decoder output asked for one."""
         return _surface(self._inner.surface())
+
+    def color(self) -> VideoColor | None:
+        """The color space of these samples, or ``None`` when the stream left it unspecified."""
+        value = self._inner.color()
+        if value is None:
+            return None
+        return VideoColor(
+            matrix=value.matrix,
+            range=value.range,
+            primaries=value.primaries,
+            transfer=value.transfer,
+        )
+
+
+@dataclass(frozen=True)
+class VideoColor:
+    """The color space a decoded picture named.
+
+    ``None`` from :meth:`VideoDecodedFrame.color` means the bitstream left it
+    unspecified. Guess BT.601 limited at or below 576 lines, and BT.709 limited
+    above that.
+    """
+
+    matrix: MoqVideoColorMatrix
+    """The matrix between RGB and Y'CbCr."""
+    range: MoqVideoColorRange
+    """The numeric range of the samples."""
+    primaries: MoqVideoColorPrimaries
+    """The chromaticities of the RGB primaries."""
+    transfer: MoqVideoColorTransfer
+    """The curve between linear light and the coded values."""
 
 
 class VideoSurface:

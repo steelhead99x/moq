@@ -96,6 +96,9 @@ final class Consumer {
   /// Cancel all current and future reads.
   void cancel() => _inner.cancel();
 
+  /// The decoder backend, for example `openh264` or `videotoolbox`.
+  String name() => _inner.name();
+
   /// Release the native consumer.
   void dispose() => _inner.dispose();
 }
@@ -163,6 +166,10 @@ final class DecodedFrame {
 
   /// The decoder's platform surface, or null when the frame is in CPU memory.
   Surface? surface() => surfaceFrom(_inner.surface());
+
+  /// The color space of these samples, or null when the stream left it unspecified.
+  /// Guess BT.601 limited at or below 576 lines, and BT.709 limited above that.
+  MoqVideoColor? color() => _inner.color();
 
   /// Release the frame's surface back to the decoder.
   void dispose() => _inner.dispose();

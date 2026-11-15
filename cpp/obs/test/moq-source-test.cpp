@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // Drives the real moq_source, reached through the obs_source_info it registers,
-// against stubbed libobs and FFmpeg video and the real moq-ffi, which decodes the
+// against stubbed libobs and the real moq-ffi, which decodes the video and the
 // audio, over a relay in the same process. What the consume path can get wrong is mostly an ordering: an
 // announcement that arrives after the session connects, a result belonging to a
 // connection that settings or teardown have already replaced, a destroy while a
@@ -21,7 +21,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <mutex>
@@ -31,13 +32,6 @@
 
 #include <obs.h>
 #include <obs-module.h>
-
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/pixdesc.h>
-#include <libswscale/swscale.h>
-}
 
 // Include the implementation so catalog-shape tests need no production test hooks.
 #include "../src/moq-source.cpp"
@@ -81,6 +75,26 @@ std::atomic<uint64_t> g_last_timestamp{0};
 // Every video timestamp OBS was handed, in output order.
 std::mutex g_video_mutex;
 std::vector<uint64_t> g_video_timestamps;
+
+// The last picture OBS was handed. The bytes are copied only far enough to tell a
+// real decode from an empty buffer.
+struct VideoOut {
+	uint32_t width = 0;
+	uint32_t height = 0;
+	uint32_t linesize[3] = {};
+	enum video_format format = VIDEO_FORMAT_NONE;
+	bool full_range = false;
+	uint8_t trc = 0;
+	float matrix0 = 0;
+	uint8_t luma = 0;
+};
+VideoOut g_last_video;
+
+VideoOut lastVideo()
+{
+	std::lock_guard<std::mutex> lock(g_video_mutex);
+	return g_last_video;
+}
 // PCM buffers the audio decode path handed to OBS.
 std::atomic<int> g_output_audio{0};
 std::atomic<uint64_t> g_last_audio_timestamp{0};
@@ -231,10 +245,46 @@ void obs_source_output_video(obs_source_t *, const struct obs_source_frame *fram
 	}
 	g_last_timestamp = frame->timestamp;
 	{
+		VideoOut out;
+		out.width = frame->width;
+		out.height = frame->height;
+		out.linesize[0] = frame->linesize[0];
+		out.linesize[1] = frame->linesize[1];
+		out.linesize[2] = frame->linesize[2];
+		out.format = frame->format;
+		out.full_range = frame->full_range;
+		out.trc = frame->trc;
+		out.matrix0 = frame->color_matrix[0];
+		if (frame->data[0] && frame->linesize[0] && frame->width && frame->height) {
+			for (uint32_t y = 0; y < frame->height; y++) {
+				const auto *row = frame->data[0] + static_cast<size_t>(y) * frame->linesize[0];
+				for (uint32_t x = 0; x < frame->width; x++)
+					out.luma = std::max(out.luma, row[x]);
+			}
+		}
 		std::lock_guard<std::mutex> lock(g_video_mutex);
 		g_video_timestamps.push_back(frame->timestamp);
+		g_last_video = out;
 	}
 	g_output_frames++;
+}
+
+// The source asks libobs for the matrix. Record the space it asked for in matrix[0],
+// which the picture checks read back.
+void video_format_get_parameters(enum video_colorspace space, enum video_range_type, float matrix[16], float min[3],
+				 float max[3])
+{
+	if (matrix) {
+		matrix[0] = static_cast<float>(space);
+		for (int i = 1; i < 16; i++)
+			matrix[i] = 0;
+	}
+	if (min) {
+		min[0] = min[1] = min[2] = 0;
+	}
+	if (max) {
+		max[0] = max[1] = max[2] = 1;
+	}
 }
 
 void obs_source_output_audio(obs_source_t *, const struct obs_source_audio *audio)
@@ -278,216 +328,6 @@ void obs_register_source_s(const struct obs_source_info *info, size_t size)
 
 } // extern "C"
 
-// ----------------------------------------------------------------- FFmpeg stubs
-
-// Stubbed rather than linked, so the decode path is deterministic and spawns no
-// threads of its own. This test is about the subscription bookkeeping wrapped
-// around the decoder, and a real decoder's worker pool would only add noise
-// under ThreadSanitizer.
-
-namespace {
-std::atomic<long> g_av_allocs{0};
-
-// Decode knobs. Only the failure and reordering scenarios move them.
-std::atomic<bool> g_find_decoder_ok{true};
-// How many pictures the decoder holds back to reorder, as H.264 does for B-frames.
-std::atomic<size_t> g_reorder_delay{0};
-// How many decoded pictures the decoder buffers before refusing input with EAGAIN.
-std::atomic<size_t> g_decoder_capacity{SIZE_MAX};
-// The one picture, by packet pts, whose first receive fails and leaves it in the decoder.
-std::atomic<int64_t> g_unconverted_pts{-1};
-int g_decoded_width = 320;
-int g_decoded_height = 240;
-std::atomic<int> g_last_decoder_extradata{-1};
-std::atomic<int> g_decoder_opens{0};
-// Only packets from the replacement use this timestamp, in the nanoseconds packets carry; the
-// old stream keeps decoding.
-std::atomic<int> g_candidate_decode{0}; // 2: receive error, 3: needs more input
-std::atomic<int> g_candidate_attempts{0};
-// Holds packets' timestamps for reordering: each packet past the delay releases the
-// earliest held one, and a flush releases the rest in order, then reports EOF.
-struct DecodeState {
-	int64_t last_pts = 0;
-	std::vector<int64_t> held;
-	std::deque<int64_t> ready;
-	bool draining = false;
-};
-
-std::atomic<int> g_sws_scales{0};
-
-AVCodec g_fake_codec{};
-uint8_t g_fake_plane[320 * 240] = {};
-} // namespace
-
-extern "C" {
-
-const AVCodec *avcodec_find_decoder(enum AVCodecID id)
-{
-	g_fake_codec.id = id;
-	return (g_find_decoder_ok && id != AV_CODEC_ID_NONE) ? &g_fake_codec : nullptr;
-}
-
-AVCodecContext *avcodec_alloc_context3(const AVCodec *codec)
-{
-	g_av_allocs++;
-	auto *ctx = static_cast<AVCodecContext *>(calloc(1, sizeof(AVCodecContext)));
-	ctx->codec_id = codec ? codec->id : AV_CODEC_ID_NONE;
-	ctx->opaque = new DecodeState{};
-	return ctx;
-}
-
-void avcodec_free_context(AVCodecContext **avctx)
-{
-	if (!avctx || !*avctx)
-		return;
-	if ((*avctx)->extradata) {
-		g_av_allocs--;
-		free((*avctx)->extradata);
-	}
-	delete static_cast<DecodeState *>((*avctx)->opaque);
-	g_av_allocs--;
-	free(*avctx);
-	*avctx = nullptr;
-}
-
-int avcodec_open2(AVCodecContext *, const AVCodec *, AVDictionary **)
-{
-	g_decoder_opens++;
-	return 0;
-}
-
-void avcodec_flush_buffers(AVCodecContext *ctx)
-{
-	*static_cast<DecodeState *>(ctx->opaque) = DecodeState{};
-}
-
-int avcodec_send_packet(AVCodecContext *ctx, const AVPacket *packet)
-{
-	g_last_decoder_extradata = ctx->extradata_size > 0 ? ctx->extradata[0] : -1;
-	auto &state = *static_cast<DecodeState *>(ctx->opaque);
-	if (state.draining)
-		return AVERROR_EOF;
-	if (!packet) {
-		state.draining = true;
-		std::sort(state.held.begin(), state.held.end());
-		state.ready.insert(state.ready.end(), state.held.begin(), state.held.end());
-		state.held.clear();
-		return 0;
-	}
-	if (state.ready.size() >= g_decoder_capacity)
-		return AVERROR(EAGAIN);
-	state.last_pts = packet->pts;
-	if (state.last_pts == 1'000'000'000'000)
-		g_candidate_attempts++;
-	state.held.push_back(packet->pts);
-	if (state.held.size() > g_reorder_delay) {
-		const auto earliest = std::min_element(state.held.begin(), state.held.end());
-		state.ready.push_back(*earliest);
-		state.held.erase(earliest);
-	}
-	return 0;
-}
-
-int avcodec_receive_frame(AVCodecContext *ctx, AVFrame *frame)
-{
-	auto &state = *static_cast<DecodeState *>(ctx->opaque);
-	if (state.last_pts == 1'000'000'000'000) {
-		if (g_candidate_decode == 2)
-			return AVERROR_INVALIDDATA;
-		if (g_candidate_decode == 3)
-			return AVERROR(EAGAIN);
-	}
-	if (state.ready.empty())
-		return state.draining ? AVERROR_EOF : AVERROR(EAGAIN);
-	int64_t unconverted = state.ready.front();
-	if (g_unconverted_pts.compare_exchange_strong(unconverted, -1))
-		return AVERROR_INVALIDDATA;
-
-	frame->pts = state.ready.front();
-	frame->best_effort_timestamp = frame->pts;
-	state.ready.pop_front();
-	frame->format = AV_PIX_FMT_YUV420P;
-	frame->width = g_decoded_width;
-	frame->height = g_decoded_height;
-	for (int i = 0; i < 3; i++) {
-		frame->data[i] = g_fake_plane;
-		frame->linesize[i] = g_decoded_width;
-	}
-	return 0;
-}
-
-AVPacket *av_packet_alloc(void)
-{
-	g_av_allocs++;
-	return static_cast<AVPacket *>(calloc(1, sizeof(AVPacket)));
-}
-
-void av_packet_free(AVPacket **pkt)
-{
-	if (!pkt || !*pkt)
-		return;
-	g_av_allocs--;
-	free(*pkt);
-	*pkt = nullptr;
-}
-
-AVFrame *av_frame_alloc(void)
-{
-	g_av_allocs++;
-	return static_cast<AVFrame *>(calloc(1, sizeof(AVFrame)));
-}
-
-void av_frame_free(AVFrame **frame)
-{
-	if (!frame || !*frame)
-		return;
-	g_av_allocs--;
-	free(*frame);
-	*frame = nullptr;
-}
-
-void *av_mallocz(size_t size)
-{
-	g_av_allocs++;
-	return calloc(1, size ? size : 1);
-}
-
-int av_strerror(int, char *errbuf, size_t errbuf_size)
-{
-	if (errbuf && errbuf_size)
-		snprintf(errbuf, errbuf_size, "stub error");
-	return 0;
-}
-
-const char *av_get_pix_fmt_name(enum AVPixelFormat)
-{
-	return "yuv420p";
-}
-
-struct SwsContext *sws_getContext(int, int, enum AVPixelFormat, int, int, enum AVPixelFormat, int, SwsFilter *,
-				  SwsFilter *, const double *)
-{
-	g_av_allocs++;
-	return static_cast<struct SwsContext *>(calloc(1, 64));
-}
-
-void sws_freeContext(struct SwsContext *ctx)
-{
-	if (!ctx)
-		return;
-	g_av_allocs--;
-	free(ctx);
-}
-
-int sws_scale(struct SwsContext *, const uint8_t *const[], const int[], int, int srcSliceH, uint8_t *const[],
-	      const int[])
-{
-	g_sws_scales++;
-	return srcSliceH;
-}
-
-} // extern "C"
-
 // ---------------------------------------------------------------- test harness
 
 namespace {
@@ -521,19 +361,11 @@ void reset(std::string url, std::string broadcast = "obs/test")
 	}
 	g_obs_sample_rate = 48000;
 	g_blank_calls = 0;
-	g_sws_scales = 0;
-	g_find_decoder_ok = true;
-	g_reorder_delay = 0;
-	g_decoder_capacity = SIZE_MAX;
-	g_unconverted_pts = -1;
-	g_decoded_width = 320;
-	g_decoded_height = 240;
-	g_last_decoder_extradata = -1;
-	g_decoder_opens = 0;
-	g_candidate_decode = 0;
-	g_candidate_attempts = 0;
 	g_live_allocs = 0;
-	g_av_allocs = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_video_mutex);
+		g_last_video = VideoOut{};
+	}
 }
 
 void *createSource()
@@ -557,7 +389,6 @@ void destroySource(void *source)
 	CHECK(connection.expired());
 	CHECK(!executor([] { std::abort(); }));
 	CHECK(g_live_allocs == 0);
-	CHECK(g_av_allocs == 0);
 }
 
 // Close out a scenario, naming it and saying whether any of its assertions
@@ -577,6 +408,57 @@ moq::Timestamp Micros(uint64_t us)
 	return moq::Timestamp{us, 1'000'000};
 }
 
+// Annex-B parameter sets (SPS and PPS, start code included) from one access unit.
+std::vector<uint8_t> ParameterSets(const std::vector<uint8_t> &access_unit)
+{
+	std::vector<uint8_t> sets;
+	size_t i = 0;
+	while (i + 3 < access_unit.size()) {
+		size_t start = 0;
+		size_t header = 0;
+		if (access_unit[i] == 0 && access_unit[i + 1] == 0 && access_unit[i + 2] == 1) {
+			start = i;
+			header = i + 3;
+			i += 3;
+		} else if (i + 4 < access_unit.size() && access_unit[i] == 0 && access_unit[i + 1] == 0 &&
+			   access_unit[i + 2] == 0 && access_unit[i + 3] == 1) {
+			start = i;
+			header = i + 4;
+			i += 4;
+		} else {
+			i++;
+			continue;
+		}
+		if (header >= access_unit.size())
+			break;
+		size_t next = header + 1;
+		while (next + 3 < access_unit.size() &&
+		       !(access_unit[next] == 0 && access_unit[next + 1] == 0 &&
+			 (access_unit[next + 2] == 1 ||
+			  (next + 4 < access_unit.size() && access_unit[next + 2] == 0 && access_unit[next + 3] == 1))))
+			next++;
+		if (next + 3 >= access_unit.size())
+			next = access_unit.size();
+		const uint8_t kind = access_unit[header] & 0x1f;
+		if (kind == 7 || kind == 8)
+			sets.insert(sets.end(), access_unit.begin() + static_cast<std::ptrdiff_t>(start),
+				    access_unit.begin() + static_cast<std::ptrdiff_t>(next));
+		i = next;
+	}
+	return sets;
+}
+
+// A 64x64 I420 picture. Luma ramps so a decoded frame is not a flat buffer.
+std::vector<uint8_t> TestPicture(uint64_t stamp)
+{
+	std::vector<uint8_t> picture(64 * 64 * 3 / 2, 128);
+	for (uint32_t y = 0; y < 64; y++) {
+		for (uint32_t x = 0; x < 64; x++)
+			picture[y * 64 + x] = static_cast<uint8_t>(16 + ((x + y + stamp) & 0x7f));
+	}
+	return picture;
+}
+
 // A broadcast published on the relay, the way the MoQ output would publish it.
 class Publisher {
 public:
@@ -590,9 +472,22 @@ public:
 		route = TestOk(relay.origin->route(path, hidden), "route");
 		broadcast = route->broadcast();
 		if (video) {
+			moq::VideoEncoderInput input{};
+			input.format = moq::VideoPixelFormat::kI420;
+			input.width = 64;
+			input.height = 64;
+			input.framerate = moq::VideoFrameRate{50, 1};
+			moq::VideoEncoderOutput output{};
+			output.codec = moq::VideoCodec::kH264;
+			output.kind = moq::VideoEncoderKind::kSoftware;
+			output.bitrate = 400000;
+			encoder = TestOk(moq::VideoEncoder::init(input, output), "video encoder");
+			// One throwaway keyframe teaches the parameter sets. It is not published:
+			// a subscriber only receives what is written after it subscribes.
+			parameter_sets = ParameterSets(Encode(1));
 			moq::VideoInit init{};
 			init.format = moq::VideoFormat::kAvc3;
-			init.data = TestH264Init();
+			init.data = parameter_sets;
 			this->video =
 				TestOk(moq::MediaTrackProducer::video(broadcast, moq::MediaTarget::kNamed{}, init),
 				       "video producer");
@@ -610,12 +505,19 @@ public:
 
 	~Publisher() { (void)broadcast->close(); }
 
+	// The SPS and PPS the video track was opened with.
+	const std::vector<uint8_t> &ParameterSets() const { return parameter_sets; }
+
+	// One keyframe at `timestamp_us`, Annex-B, with its parameter sets inline.
+	std::vector<uint8_t> Keyframe(uint64_t timestamp_us) { return Encode(timestamp_us); }
+
 	// Write one keyframe and one audio frame, each a group of its own.
 	void Write()
 	{
 		timestamp_us += 20'000;
 		if (video)
-			TestOk(video->write_frame(moq::Frame{TestH264Keyframe(), Micros(timestamp_us)}), "write video");
+			TestOk(video->write_frame(moq::Frame{Encode(timestamp_us), Micros(timestamp_us)}),
+			       "write video");
 		if (audio) {
 			TestOk(audio->write_frame(moq::Frame{{0xfc, 0xff, 0xfe}, Micros(timestamp_us)}), "write audio");
 			TestOk(audio->cut(), "cut audio");
@@ -641,8 +543,105 @@ public:
 	std::shared_ptr<moq::MediaTrackProducer> audio;
 
 private:
+	// Encode one keyframe. openh264 returns it from receive, flushing if it held it.
+	std::vector<uint8_t> Encode(uint64_t timestamp_us)
+	{
+		moq::VideoFrame frame{};
+		frame.timestamp = Micros(timestamp_us);
+		frame.data = TestPicture(timestamp_us);
+		TestOk(encoder->cut(), "cut");
+		TestOk(encoder->encode(std::move(frame)), "encode");
+		auto packet = TestOk(encoder->receive(), "receive");
+		if (!packet) {
+			TestOk(encoder->flush(), "flush");
+			packet = TestOk(encoder->receive(), "receive");
+		}
+		if (!packet || !packet->keyframe || packet->data.empty()) {
+			std::fprintf(stderr, "FAIL: encoder produced no keyframe\n");
+			std::abort();
+		}
+		return std::move(packet->data);
+	}
+
+	std::shared_ptr<moq::VideoEncoder> encoder;
+	std::vector<uint8_t> parameter_sets;
 	uint64_t timestamp_us;
 };
+
+// One access unit of the B-frame fixture, in the file's decode order.
+struct FixtureUnit {
+	std::vector<uint8_t> data;
+	int display = 0;
+};
+
+// libx264 High, 3 B-frames, 64x64, 30 pictures. `display` is the picture's presentation
+// index (POC/2, restarting after the second IDR), which is not the file order.
+std::vector<FixtureUnit> FixtureUnits()
+{
+	const auto path = std::filesystem::path(__FILE__).parent_path() /
+			  "../../../rs/moq-video/src/decode/test_data/bframes_64x64_pattern_30f.h264";
+	std::ifstream in(path, std::ios::binary);
+	std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+	if (file.empty()) {
+		std::fprintf(stderr, "FAIL: missing %s\n", path.c_str());
+		std::abort();
+	}
+	static const int kDisplay[] = {0,  4,  2,  1,  3,  6,  5,  9,  7,  8,  12, 10, 11, 14, 13,
+				       15, 19, 17, 16, 18, 23, 21, 20, 22, 24, 26, 25, 28, 27, 29};
+	std::vector<std::vector<uint8_t>> units;
+	std::vector<uint8_t> current;
+	bool slice = false;
+	auto nal_type = [](const std::vector<uint8_t> &nal) {
+		return nal.empty() ? 0 : (nal[0] & 0x1f);
+	};
+	auto flush = [&] {
+		if (!slice)
+			return;
+		units.push_back(std::move(current));
+		current.clear();
+		slice = false;
+	};
+	size_t i = 0;
+	while (i + 3 < file.size()) {
+		size_t header = 0;
+		if (file[i] == 0 && file[i + 1] == 0 && file[i + 2] == 1) {
+			header = i + 3;
+		} else if (i + 4 < file.size() && file[i] == 0 && file[i + 1] == 0 && file[i + 2] == 0 &&
+			   file[i + 3] == 1) {
+			header = i + 4;
+		} else {
+			i++;
+			continue;
+		}
+		size_t next = header + 1;
+		while (next + 3 < file.size() &&
+		       !(file[next] == 0 && file[next + 1] == 0 &&
+			 (file[next + 2] == 1 ||
+			  (next + 4 < file.size() && file[next + 2] == 0 && file[next + 3] == 1))))
+			next++;
+		if (next + 3 >= file.size())
+			next = file.size();
+		const uint8_t kind = file[header] & 0x1f;
+		if (slice && (kind == 1 || kind == 5 || kind == 6 || kind == 7 || kind == 8 || kind == 9))
+			flush();
+		current.insert(current.end(), file.begin() + static_cast<std::ptrdiff_t>(i),
+			       file.begin() + static_cast<std::ptrdiff_t>(next));
+		if (kind == 1 || kind == 5)
+			slice = true;
+		(void)nal_type;
+		i = next;
+	}
+	flush();
+	if (units.size() != 30) {
+		std::fprintf(stderr, "FAIL: fixture split into %zu access units\n", units.size());
+		std::abort();
+	}
+	std::vector<FixtureUnit> out;
+	out.reserve(30);
+	for (int index = 0; index < 30; index++)
+		out.push_back(FixtureUnit{std::move(units[static_cast<size_t>(index)]), kDisplay[index]});
+	return out;
+}
 
 // Whether OBS has been handed video and audio from a publisher that started at `start_us`.
 bool PlaysFrom(uint64_t start_us)
@@ -778,7 +777,20 @@ int main()
 		Publisher publisher(relay, "obs/test");
 		void *source = createSource();
 		CHECK(publisher.WriteUntil([] { return g_output_frames > 0 && g_output_audio > 0; }));
-		CHECK(g_sws_scales > 0);
+		const auto picture = lastVideo();
+		CHECK(picture.format == VIDEO_FORMAT_I420);
+		CHECK(picture.width == 64 && picture.height == 64);
+		CHECK(picture.linesize[0] == 64 && picture.linesize[1] == 32 && picture.linesize[2] == 32);
+		CHECK(!picture.full_range);
+		CHECK(picture.luma != 0);
+		auto *ctx = static_cast<moq_source *>(source);
+		{
+			std::lock_guard<std::mutex> present(ctx->present_mutex);
+			CHECK(ctx->video_decoder_name == "openh264" || ctx->video_decoder_name == "vaapi" ||
+			      ctx->video_decoder_name == "nvdec" || ctx->video_decoder_name == "v4l2");
+			CHECK(ctx->video_path == "CPU I420");
+			CHECK(ctx->video_delay.size() > 0);
+		}
 		const auto audio = lastAudio();
 		CHECK(audio.format == AUDIO_FORMAT_FLOAT_PLANAR);
 		CHECK(audio.speakers == SPEAKERS_STEREO);
@@ -796,14 +808,12 @@ int main()
 	}
 	report("plays video and audio");
 
-	// Gaps reset references immediately. An encoder end keeps old non-key tail packets
-	// decodable until a fresh frame reaches its endpoint, or until EOF drains the tail.
-	for (int boundary : {0, 1, 2}) {
-		const bool gap = boundary == 0;
-		const bool eof = boundary == 2;
+	// A gap or an encoder end is not a picture, and it does not drop the track that is
+	// playing. moq-video already flushed the pictures it was holding before either one.
+	// Closing a candidate that never showed a picture leaves that track playing.
+	{
 		TestRelay relay;
 		reset(relay.Url());
-		g_reorder_delay = 2;
 		Publisher publisher(relay, "obs/test", true, false);
 		void *source = createSource();
 		CHECK(publisher.WriteUntil([] { return g_output_frames > 0; }));
@@ -815,51 +825,26 @@ int main()
 			held = conn->video;
 			CHECK(held != nullptr);
 			const int frames = g_output_frames;
-			const auto *state = static_cast<DecodeState *>(held->video_decoder->codec_ctx->opaque);
-			const auto pending = state->held.size();
-			CHECK(pending > 0);
-			// The end and tail sit on a 90 kHz grid, which packets carry floored to nanoseconds.
-			const uint64_t end = static_cast<uint64_t>(state->last_pts) * 9 / 100'000 + 90'000;
-			const auto ticks = [](uint64_t value) {
-				return moq::Timestamp{value, 90'000};
-			};
-			const auto nanos = [](uint64_t value) {
-				return value * 100'000 / 9;
-			};
-			auto inject = [&](moq::MediaRead read) {
-				moq_source_on_frame(ctx, conn, held, std::optional<moq::MediaRead>{std::move(read)});
-			};
-			if (gap) {
-				inject(moq::MediaRead{
-					moq::MediaRead::kGap{Micros(123456), std::chrono::microseconds(78901)}});
-				CHECK(g_output_frames == frames + static_cast<int>(pending));
-				CHECK(!held->video_decoder->got_keyframe);
-			} else {
-				inject(moq::MediaRead{moq::MediaRead::kEnd{ticks(end)}});
-				CHECK(held->video_decoder->got_keyframe);
-				// Non-key tail packets below the endpoint still depend on the old references.
-				inject(moq::MediaRead{moq::MediaRead::kFrame{
-					moq::MediaFrame{TestH264Keyframe(), ticks(end - 1), false}}});
-				CHECK(state->last_pts == static_cast<int64_t>(nanos(end - 1)));
-				if (eof) {
-					moq_source_on_frame(ctx, conn, held, std::optional<moq::MediaRead>{});
-				} else {
-					inject(moq::MediaRead{moq::MediaRead::kFrame{
-						moq::MediaFrame{TestH264Keyframe(), ticks(end), true}}});
-					CHECK(state->last_pts == static_cast<int64_t>(nanos(end)));
-					CHECK(state->held.size() == 1);
-				}
-				CHECK(g_output_frames == frames + static_cast<int>(pending) + 1);
-				std::lock_guard<std::mutex> output_lock(g_video_mutex);
-				CHECK(std::count(g_video_timestamps.begin(), g_video_timestamps.end(),
-						 nanos(end - 1)) == 1);
-			}
+			const int blanks = g_blank_calls;
+			moq_source_on_video(ctx, conn, held,
+					    std::optional<moq::VideoRead>{moq::VideoRead{
+						    moq::VideoRead::kGap{Micros(1), std::chrono::microseconds(1)}}});
+			moq_source_on_video(
+				ctx, conn, held,
+				std::optional<moq::VideoRead>{moq::VideoRead{moq::VideoRead::kEnd{Micros(2)}}});
 			CHECK(conn->video == held);
+			CHECK(g_output_frames == frames);
+			CHECK(g_blank_calls == blanks);
+			auto pending = std::make_shared<Track>("Video", "ended");
+			conn->pending_video = pending;
+			moq_source_on_video(ctx, conn, pending, std::optional<moq::VideoRead>{});
+			CHECK(!conn->pending_video);
+			CHECK(conn->video == held);
+			CHECK(g_output_frames == frames);
+			CHECK(g_blank_calls == blanks);
 		}
-		if (gap) {
-			const int frames = g_output_frames;
-			CHECK(publisher.WriteUntil([&] { return g_output_frames > frames; }));
-		}
+		const int frames = g_output_frames;
+		CHECK(publisher.WriteUntil([&] { return g_output_frames > frames; }));
 		held.reset();
 		destroySource(source);
 	}
@@ -871,73 +856,88 @@ int main()
 	{
 		TestRelay relay;
 		reset(relay.Url());
-		g_reorder_delay = 2;
-		Publisher publisher(relay, "obs/test", true, false);
+		Publisher publisher(relay, "obs/test", false, false);
+		const auto units = FixtureUnits();
+		moq::VideoInit init{};
+		init.format = moq::VideoFormat::kAvc3;
+		init.data = ParameterSets(units.front().data);
+		publisher.video =
+			TestOk(moq::MediaTrackProducer::video(publisher.broadcast, moq::MediaTarget::kNamed{}, init),
+			       "fixture video");
 		void *source = createSource();
 		auto *ctx = static_cast<moq_source *>(source);
-		// Write only once the source reads the track, so it sees the whole group.
 		CHECK(WaitFor([&] {
 			std::lock_guard lock(ctx->mutex);
 			const auto &conn = ctx->connection;
-			return conn && conn->pending_video && conn->pending_video->consumer;
+			return conn && conn->pending_video && conn->pending_video->video_consumer;
 		}));
-
-		// IPBB order: each P-frame is sent before the two B-frames it presents after.
-		const int decode_order[] = {0, 3, 1, 2, 6, 4, 5, 9, 7, 8, 11, 10};
-		const std::vector<uint8_t> delta = {0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x00, 0x33, 0xff};
-		const auto timestamp_us = [](int picture) {
-			return 2'000'000 + uint64_t(picture) * 20'000;
+		const auto stamp = [](int display) {
+			return uint64_t(display) * 33333;
 		};
-		for (int picture : decode_order) {
-			const auto payload = picture == 0 ? TestH264Keyframe() : delta;
-			TestOk(publisher.video->write_frame(moq::Frame{payload, Micros(timestamp_us(picture))}),
-			       "write video");
+		bool fed_sorted = true;
+		int previous = -1;
+		for (const auto &unit : units) {
+			fed_sorted = fed_sorted && unit.display > previous;
+			previous = unit.display;
+			TestOk(publisher.video->write_frame(moq::Frame{unit.data, Micros(stamp(unit.display))}),
+			       "write fixture");
 		}
-		TestOk(publisher.video->finish(), "finish video");
-
-		std::vector<uint64_t> expected;
-		for (int picture = 0; picture < 12; picture++)
-			expected.push_back(timestamp_us(picture) * 1000);
-		CHECK(WaitFor([] { return g_output_frames >= 12; }));
+		CHECK(!fed_sorted);
+		CHECK(WaitFor([] { return g_output_frames > 0 && g_output_frames < 30; }));
+		TestOk(publisher.video->finish(), "finish fixture");
+		CHECK(WaitFor([] { return g_output_frames >= 30; }));
 		destroySource(source);
+		std::vector<uint64_t> expected;
+		for (int display = 0; display < 30; display++)
+			expected.push_back(stamp(display) * 1000);
 		std::lock_guard<std::mutex> lock(g_video_mutex);
 		CHECK(g_video_timestamps == expected);
 	}
 	report("reordered video keeps decoded timestamps and drains at eof");
 
-	// A picture that fails to decode stays in the decoder, which then refuses the next
-	// packet until that picture is taken. The refused packet is sent again, not skipped.
+	// A truncated access unit costs pictures, not the rest of the stream. What does come
+	// out keeps a presentation timestamp from the fixture, including one from the second GOP.
 	{
 		TestRelay relay;
 		reset(relay.Url());
-		g_decoder_capacity = 1;
-		const auto timestamp_us = [](int picture) {
-			return 2'000'000 + uint64_t(picture) * 20'000;
-		};
-		g_unconverted_pts = int64_t(timestamp_us(2) * 1000);
-		Publisher publisher(relay, "obs/test", true, false);
+		Publisher publisher(relay, "obs/test", false, false);
+		auto units = FixtureUnits();
+		moq::VideoInit init{};
+		init.format = moq::VideoFormat::kAvc3;
+		init.data = ParameterSets(units.front().data);
+		publisher.video =
+			TestOk(moq::MediaTrackProducer::video(publisher.broadcast, moq::MediaTarget::kNamed{}, init),
+			       "fixture video");
 		void *source = createSource();
 		auto *ctx = static_cast<moq_source *>(source);
 		CHECK(WaitFor([&] {
 			std::lock_guard lock(ctx->mutex);
 			const auto &conn = ctx->connection;
-			return conn && conn->pending_video && conn->pending_video->consumer;
+			return conn && conn->pending_video && conn->pending_video->video_consumer;
 		}));
-
-		const std::vector<uint8_t> delta = {0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x00, 0x33, 0xff};
-		std::vector<uint64_t> expected;
-		for (int picture = 0; picture < 6; picture++) {
-			const auto payload = picture == 0 ? TestH264Keyframe() : delta;
-			TestOk(publisher.video->write_frame(moq::Frame{payload, Micros(timestamp_us(picture))}),
-			       "write video");
-			expected.push_back(timestamp_us(picture) * 1000);
+		const auto stamp = [](int display) {
+			return uint64_t(display) * 33333;
+		};
+		units[5].data.resize(std::max<size_t>(1, units[5].data.size() / 3));
+		for (const auto &unit : units) {
+			TestOk(publisher.video->write_frame(moq::Frame{unit.data, Micros(stamp(unit.display))}),
+			       "write fixture");
 		}
-		// Left unfinished: nothing is held back, and a finish appends an empty end-of-group frame.
-
-		CHECK(WaitFor([] { return g_output_frames >= 6; }));
+		TestOk(publisher.video->finish(), "finish fixture");
+		CHECK(WaitFor([] { return g_output_frames > 0; }));
 		destroySource(source);
 		std::lock_guard<std::mutex> lock(g_video_mutex);
-		CHECK(g_video_timestamps == expected);
+		CHECK(!g_video_timestamps.empty());
+		uint64_t previous = 0;
+		bool second_gop = false;
+		for (uint64_t ns : g_video_timestamps) {
+			CHECK(ns >= previous);
+			CHECK(ns % 33333000 == 0);
+			CHECK(ns / 33333000 < 30);
+			second_gop = second_gop || ns >= 15ull * 33333000;
+			previous = ns;
+		}
+		CHECK(second_gop);
 	}
 	report("a refused packet is resent once the decoder drains");
 
@@ -946,7 +946,6 @@ int main()
 	{
 		TestRelay relay;
 		reset(relay.Url());
-		g_reorder_delay = 2;
 		Publisher publisher(relay, "obs/test", true, false);
 		void *source = createSource();
 		auto *ctx = static_cast<moq_source *>(source);
@@ -954,7 +953,7 @@ int main()
 		FreezeCatalog(ctx, publisher);
 		moq::VideoInit init{};
 		init.format = moq::VideoFormat::kAvc3;
-		init.data = TestH264Init();
+		init.data = publisher.ParameterSets();
 		auto replacement = TestOk(
 			moq::MediaTrackProducer::video(publisher.broadcast,
 						       moq::MediaTarget::kNamed{std::string("!replacement")}, init),
@@ -963,12 +962,13 @@ int main()
 		const auto pending = [&] {
 			std::lock_guard lock(ctx->mutex);
 			const auto &candidate = ctx->connection->pending_video;
-			return candidate && candidate->consumer;
+			return candidate && candidate->video_consumer;
 		};
 		CHECK(publisher.WriteUntil(pending));
 		// One picture, which the decoder holds until a drain.
 		TestOk(replacement->write_frame(moq::Frame{TestH264Keyframe(), Micros(1'000'000'000)}),
 		       "replacement frame");
+		// The bytes are not a decodable picture, so the candidate ends without one.
 		TestOk(replacement->finish(), "finish replacement");
 		CHECK(publisher.WriteUntil([&] { return !pending(); }));
 		const int frames = g_output_frames;
@@ -1073,14 +1073,15 @@ int main()
 		Publisher publisher(relay, "obs/test");
 		void *source = createSource();
 		CHECK(publisher.WriteUntil([] { return g_output_frames > 0 && g_output_audio > 0; }));
-		const int opens = g_decoder_opens;
+		auto *ctx = static_cast<moq_source *>(source);
+		const int opens = ctx->video_subscriptions.load();
 		const int frames = g_output_frames;
 		auto catalog = TestOk(moq::MediaCatalogProducer::init(publisher.broadcast), "catalog");
 		moq::VideoProperties properties{};
 		properties.rotation = 90;
 		TestOk(catalog->set_video_properties(properties), "catalog properties");
 		CHECK(publisher.WriteUntil([&] { return g_output_frames >= frames + 10; }));
-		CHECK(g_decoder_opens == opens);
+		CHECK(ctx->video_subscriptions.load() == opens);
 		destroySource(source);
 	}
 	report("unchanged rendition keeps decoder");
@@ -1375,7 +1376,7 @@ int main()
 		FreezeCatalog(ctx, publisher);
 		moq::VideoInit init{};
 		init.format = moq::VideoFormat::kAvc3;
-		init.data = TestH264Init();
+		init.data = publisher.ParameterSets();
 		auto replacement = TestOk(
 			moq::MediaTrackProducer::video(publisher.broadcast,
 						       moq::MediaTarget::kNamed{std::string("!replacement")}, init),
@@ -1384,7 +1385,7 @@ int main()
 		const int frames = g_output_frames;
 		CHECK(publisher.WriteUntil([&] { return g_output_frames >= frames + 10; }));
 		CHECK(publisher.WriteUntil([&] {
-			TestOk(replacement->write_frame(moq::Frame{TestH264Keyframe(), Micros(2'000'000)}),
+			TestOk(replacement->write_frame(moq::Frame{publisher.Keyframe(2'000'000), Micros(2'000'000)}),
 			       "replacement frame");
 			return g_last_timestamp == 2'000'000'000;
 		}));
@@ -1392,7 +1393,8 @@ int main()
 	}
 	report("replacement waits for first frame");
 
-	// A keyframe flag or accepted packet is not proof that the replacement decodes.
+	// Bytes that never decode are not a rendition change, and a rendition that has not
+	// delivered a picture stays the same object across a metadata-only catalog update.
 	for (int failure : {2, 3}) {
 		TestRelay relay;
 		reset(relay.Url());
@@ -1401,28 +1403,27 @@ int main()
 		auto *ctx = static_cast<moq_source *>(source);
 		CHECK(publisher.WriteUntil([] { return g_output_frames > 0 && g_output_audio > 0; }));
 		FreezeCatalog(ctx, publisher);
-		g_candidate_decode = failure;
 		moq::VideoInit init{};
 		init.format = moq::VideoFormat::kAvc3;
-		init.data = TestH264Init();
+		init.data = publisher.ParameterSets();
 		auto replacement = TestOk(
 			moq::MediaTrackProducer::video(publisher.broadcast,
 						       moq::MediaTarget::kNamed{std::string("!replacement")}, init),
 			"replacement video");
 		const auto preferring = CatalogPreferring(publisher, "!replacement");
 		DeliverCatalog(ctx, preferring);
-		auto write = [&] {
-			TestOk(replacement->write_frame(moq::Frame{TestH264Keyframe(), Micros(1'000'000'000)}),
-			       "replacement frame");
-		};
-		CHECK(publisher.WriteUntil([&] {
-			write();
-			return g_candidate_attempts > 0;
-		}));
 		const int frames = g_output_frames;
-		CHECK(publisher.WriteUntil([&] { return g_output_frames >= frames + 3; }));
-		if (failure == 3) {
-			// Metadata-only updates must preserve the candidate's accumulated decode state.
+		if (failure == 2) {
+			CHECK(publisher.WriteUntil([&] {
+				TestOk(replacement->write_frame(moq::Frame{TestH264Keyframe(), Micros(1'000'000'000)}),
+				       "garbage frame");
+				return g_output_frames >= frames + 3;
+			}));
+			destroySource(source);
+			std::lock_guard<std::mutex> lock(g_video_mutex);
+			CHECK(std::none_of(g_video_timestamps.begin(), g_video_timestamps.end(),
+					   [](uint64_t ns) { return ns >= 1'000'000'000'000; }));
+		} else {
 			auto snapshot = preferring;
 			snapshot.video.at("!replacement").label = "relabeled";
 			{
@@ -1432,13 +1433,14 @@ int main()
 				moq_source_subscribe_video(ctx, ctx->connection, snapshot);
 				CHECK(ctx->connection->pending_video == pending);
 			}
-			g_candidate_decode = 0;
 			CHECK(publisher.WriteUntil([&] {
-				write();
+				TestOk(replacement->write_frame(
+					       moq::Frame{publisher.Keyframe(1'000'000'000), Micros(1'000'000'000)}),
+				       "replacement frame");
 				return g_last_timestamp == 1'000'000'000'000;
 			}));
+			destroySource(source);
 		}
-		destroySource(source);
 		report(failure == 2 ? "failed video candidate preserves playback" : "video waits for decoded output");
 	}
 
@@ -1634,15 +1636,20 @@ int main()
 		reset(relay.Url());
 		Publisher publisher(relay, "obs/test");
 		void *source = createSource();
+		auto *ctx = static_cast<moq_source *>(source);
 		CHECK(publisher.WriteUntil([] { return g_output_frames > 0; }));
-		g_find_decoder_ok = false;
+		FreezeCatalog(ctx, publisher);
 		moq::VideoInit init{};
-		init.format = moq::VideoFormat::kAvc3;
-		init.data = TestH264Init();
+		init.format = moq::VideoFormat::kVp9;
 		auto replacement = TestOk(
 			moq::MediaTrackProducer::video(publisher.broadcast,
 						       moq::MediaTarget::kNamed{std::string("!replacement")}, init),
 			"failed replacement");
+		auto catalog = CatalogPreferring(publisher, "!replacement");
+		catalog.video.at("!replacement").codec = "vp9";
+		catalog.video.at("!replacement").preference = 10;
+		DeliverCatalog(ctx, catalog);
+		(void)replacement;
 		const int frames = g_output_frames;
 		CHECK(publisher.WriteUntil([&] { return g_output_frames >= frames + 10; }));
 		destroySource(source);
@@ -1663,13 +1670,16 @@ int main()
 	}
 	report("audio only");
 
-	// A catalog naming a video codec FFmpeg can't open leaves the video blank, not half
-	// installed, and the audio still plays.
+	// VP9 is not decoded by moq-video yet, so the rendition is refused and the audio still plays.
 	{
 		TestRelay relay;
 		reset(relay.Url());
-		Publisher publisher(relay, "obs/test");
-		g_find_decoder_ok = false;
+		Publisher publisher(relay, "obs/test", false, true);
+		moq::VideoInit init{};
+		init.format = moq::VideoFormat::kVp9;
+		auto vp9 = TestOk(moq::MediaTrackProducer::video(publisher.broadcast, moq::MediaTarget::kNamed{}, init),
+				  "vp9");
+		(void)vp9;
 		void *source = createSource();
 		CHECK(publisher.WriteUntil([] { return g_output_audio > 0; }));
 		CHECK(g_output_frames == 0);
@@ -1686,11 +1696,12 @@ int main()
 		auto first = std::make_unique<Publisher>(relay, "obs/test");
 		void *source = createSource();
 		CHECK(first->WriteUntil([] { return g_output_frames > 0 && g_output_audio > 0; }));
+		auto *ctx = static_cast<moq_source *>(source);
 		const int blanks = g_blank_calls;
-		const int opens = g_decoder_opens;
+		const int opens = ctx->video_subscriptions.load();
 		Publisher second(relay, "obs/test", true, true, 1'000'000'000);
 		// The new instance's video candidate opens its own decoder while the old one still plays.
-		CHECK(first->WriteUntil([&] { return g_decoder_opens == opens + 1; }));
+		CHECK(first->WriteUntil([&] { return ctx->video_subscriptions.load() == opens + 1; }));
 		int frames = g_output_frames;
 		int audio = g_output_audio;
 		CHECK(first->WriteUntil(
@@ -1703,7 +1714,7 @@ int main()
 		CHECK(second.WriteUntil(
 			[&] { return g_output_frames >= frames + 10 && g_output_audio >= audio + 10; }));
 		CHECK(g_blank_calls == blanks);
-		CHECK(g_decoder_opens == opens + 1);
+		CHECK(ctx->video_subscriptions.load() == opens + 1);
 		destroySource(source);
 	}
 	report("follows a replacement instance");
