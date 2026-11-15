@@ -1042,7 +1042,9 @@ void main() {
 
     final fixedOutput = moq_audio.DecoderOutput(
       format: moq_audio.SampleFormat.f32,
-      delay: Delay(min: Duration(milliseconds: 80)),
+      // A null max sets no subscriber limit. The default of zero skips a group by the
+      // native wall clock, so a late read can miss the frames this test wrote.
+      delay: Delay(min: const Duration(milliseconds: 80), max: null),
       estimate: false,
     );
     final fixed = await moq_audio.Consumer.subscribe(
@@ -1055,7 +1057,10 @@ void main() {
       broadcast: consumer,
       id: 'mic',
       catalogAudio: rendition,
-      output: moq_audio.DecoderOutput(format: moq_audio.SampleFormat.f32),
+      output: moq_audio.DecoderOutput(
+        format: moq_audio.SampleFormat.f32,
+        delay: Delay(max: null),
+      ),
     ).timeout(timeout);
     expect(fixed.delay(), const Duration(milliseconds: 80));
     final initial = estimated.delay();

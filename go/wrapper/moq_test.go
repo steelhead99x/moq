@@ -308,15 +308,20 @@ func TestAudioConsumerDelay(t *testing.T) {
 	fixedDelay := 80 * time.Millisecond
 	estimate := false
 	fixed, err := moqaudio.Subscribe(ctx, bc, track, rendition, moqaudio.DecoderOutput{
-		Format:   moq.AudioSampleFormatF32,
-		Delay:    moq.Delay{Min: fixedDelay},
+		Format: moq.AudioSampleFormatF32,
+		// Max left unlimited. A zero max skips a group by the native wall clock, so a
+		// read that starts after the warmup can miss the frames this test wrote.
+		Delay:    moq.Delay{Min: fixedDelay, MaxUnlimited: true},
 		Estimate: &estimate,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer fixed.Cancel()
-	estimated, err := moqaudio.Subscribe(ctx, bc, track, rendition, moqaudio.DecoderOutput{Format: moq.AudioSampleFormatF32})
+	estimated, err := moqaudio.Subscribe(ctx, bc, track, rendition, moqaudio.DecoderOutput{
+		Format: moq.AudioSampleFormatF32,
+		Delay:  moq.Delay{MaxUnlimited: true},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

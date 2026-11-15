@@ -5,6 +5,10 @@ The UniFFI core every non-Rust binding is generated from (proc macros, no `.udl`
 - The wrappers give each layer its own namespace, following `json`: `moq.json` (Python), `moq.dev/moq/json` (Go), `dev.moq.json` (Kotlin), `package:moq/json.dart` (Dart), and the `Json` enum (Swift).
 - Keep wrappers thin and named like the Rust API. Swift and Python extend through labeled/keyword args with defaults; Go, Kotlin, and Dart take an options struct.
 
+# Tests
+
+Assert native timing and decoding once, in moq-ffi's Rust tests. Wrapper tests cover only the code each wrapper owns: record mapping, cancellation, async adapters, and lifetimes.
+
 # Gotchas
 
 - UniFFI ignores `#[cfg]` inside an export impl; gate at the module.
