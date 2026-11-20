@@ -6,9 +6,10 @@
  *
  * - `graph()` is a rolling sparkline (used for bitrate / frame rate).
  * - `bufferBars()` is an editable view of the video/audio jitter buffer; drag it
- *   to change the latency target.
+ *   to change the delay.
  */
 
+import { Duration } from "@moq/clock";
 import type { BufferedRanges, Signals } from "@moq/watch";
 import type MoqWatch from "@moq/watch/element";
 
@@ -69,7 +70,7 @@ export function graph(parent: Signals.Effect, title: string, opts?: GraphOptions
 	const value = document.createElement("span");
 	value.className = "font-mono";
 	value.style.color = color;
-	value.textContent = "—";
+	value.textContent = "-";
 	header.append(label, value);
 
 	const canvas = document.createElement("canvas");
@@ -134,7 +135,7 @@ export function graph(parent: Signals.Effect, title: string, opts?: GraphOptions
 	const push = (v: number | undefined) => {
 		samples.push(v !== undefined && Number.isFinite(v) ? Math.max(0, v) : 0);
 		while (samples.length > capacity) samples.shift();
-		value.textContent = v !== undefined && Number.isFinite(v) ? (opts?.format?.(v) ?? v.toFixed(0)) : "—";
+		value.textContent = v !== undefined && Number.isFinite(v) ? (opts?.format?.(v) ?? v.toFixed(0)) : "-";
 		draw();
 	};
 
@@ -153,7 +154,7 @@ const BUFFER_MAX = 4000; // window shown, in milliseconds
 function drawRanges(
 	canvas: HTMLCanvasElement,
 	ranges: BufferedRanges,
-	timestamp: number | undefined,
+	timestamp: Duration | undefined,
 	stalled: boolean,
 ) {
 	const ctx = canvas.getContext("2d");
@@ -173,11 +174,12 @@ function drawRanges(
 	ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 	ctx.clearRect(0, 0, width, height);
 	if (timestamp === undefined) return;
+	const playhead = timestamp.asMillis();
 
 	for (let i = 0; i < ranges.length; i++) {
 		const range = ranges[i];
-		const startMs = range.start - timestamp;
-		const endMs = range.end - timestamp;
+		const startMs = range.start.asMillis() - playhead;
+		const endMs = range.end.asMillis() - playhead;
 		const visibleStart = Math.max(0, startMs);
 		const visibleEnd = Math.min(endMs, BUFFER_MAX);
 		if (visibleEnd <= visibleStart) continue;
@@ -198,11 +200,11 @@ function drawRanges(
 	}
 }
 
-const STEP = 10; // latency drag/keyboard granularity, in milliseconds
+const STEP = 10; // delay drag/keyboard granularity, in milliseconds
 
 /**
- * Editable latency visualization: video + audio jitter buffers drawn as bars
- * from the playhead (left edge) out to ~4s, with the current latency target
+ * Editable delay visualization: video + audio jitter buffers drawn as bars
+ * from the playhead (left edge) out to ~4s, with the current delay
  * marked. Drag (or focus + arrow keys) to set the buffer, like `<moq-watch-ui>`.
  * Each call binds to one `watch`; close the parent effect to stop it.
  */
@@ -213,7 +215,7 @@ export function bufferBars(parent: Signals.Effect, watch: MoqWatch): HTMLElement
 	viz.style.cssText = "position: relative; cursor: ew-resize;";
 	viz.tabIndex = 0;
 	viz.setAttribute("role", "slider");
-	viz.setAttribute("aria-label", "Latency target");
+	viz.setAttribute("aria-label", "Playback delay");
 	viz.setAttribute("aria-valuemin", "0");
 	viz.setAttribute("aria-valuemax", String(BUFFER_MAX));
 
@@ -252,14 +254,13 @@ export function bufferBars(parent: Signals.Effect, watch: MoqWatch): HTMLElement
 
 	const legend = document.createElement("div");
 	legend.className = "mt-2 text-[10px] text-neutral-500";
-	legend.textContent = "buffered ahead of the playhead; drag to change the latency target";
+	legend.textContent = "buffered ahead of the playhead; drag to change the delay";
 
 	root.append(viz, legend);
 
-	// Set the latency floor, leaving the ceiling. Cast bypasses the branded ms type.
-	const setLatency = (ms: number) => {
-		const clamped = Math.max(0, Math.min(BUFFER_MAX, ms));
-		watch.latencyMin = clamped as unknown as typeof watch.latencyMin;
+	// Set the playback delay, in milliseconds.
+	const setDelay = (ms: number) => {
+		watch.delay = Duration.millis(Math.max(0, Math.min(BUFFER_MAX, ms)));
 	};
 
 	const setFromX = (clientX: number) => {
@@ -267,7 +268,7 @@ export function bufferBars(parent: Signals.Effect, watch: MoqWatch): HTMLElement
 		if (rect.width <= 0) return;
 		const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
 		const ms = (x / rect.width) * BUFFER_MAX;
-		setLatency(Math.round(ms / STEP) * STEP);
+		setDelay(Math.round(ms / STEP) * STEP);
 	};
 
 	let dragging = false;
@@ -290,24 +291,24 @@ export function bufferBars(parent: Signals.Effect, watch: MoqWatch): HTMLElement
 					: 0;
 		if (delta === 0) return;
 		e.preventDefault();
-		setLatency((watch.sync.out.jitter.peek() as unknown as number) + delta);
+		setDelay(watch.sync.out.delay.peek().asMillis() + delta);
 	});
 
-	// Position the target line from the live jitter (actual measured buffer in ms).
+	// Position the target line from the resolved delay (the live buffer in ms).
 	parent.run((effect) => {
-		const jitter = effect.get(watch.sync.out.jitter) as unknown as number;
-		const pct = Math.max(0, Math.min(1, jitter / BUFFER_MAX)) * 100;
+		const delay = effect.get(watch.sync.out.delay).asMillis();
+		const pct = Math.max(0, Math.min(1, delay / BUFFER_MAX)) * 100;
 		target.style.left = `${pct}%`;
-		targetLabel.textContent = `${Math.round(jitter)}ms`;
-		viz.setAttribute("aria-valuenow", String(Math.round(jitter)));
+		targetLabel.textContent = `${Math.round(delay)}ms`;
+		viz.setAttribute("aria-valuenow", String(Math.round(delay)));
 	});
 
 	// Repaint the bars every animation frame; cleaned up when the effect closes.
 	const draw = () => {
-		const timestamp = watch.sync.now() as number | undefined;
+		const timestamp = watch.sync.now();
 		const stalled = watch.video.out.stalled.peek();
 		drawRanges(video.canvas, watch.video.out.buffered.peek(), timestamp, stalled);
-		drawRanges(audio.canvas, watch.audio.out.buffered.peek(), timestamp, false);
+		drawRanges(audio.canvas, watch.audio.out.buffered.peek(), timestamp, watch.audio.out.stalled.peek());
 		parent.animate(draw);
 	};
 	parent.animate(draw);

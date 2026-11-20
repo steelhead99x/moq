@@ -1,43 +1,64 @@
 //! [`Sink`]: one stream of PCM on its way to the speaker.
 
-use std::borrow::Cow;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use fixed_resample::{PushStatus, ResamplingChannelConfig, ResamplingCons, ResamplingProd, resampling_channel};
+use kio::clock::Instant;
 
 use super::driver::Shared;
-use super::mixer::{self, BUS_CHANNELS, Gain};
-use crate::resample::remix;
-use crate::{Error, Format};
+use super::mixer::{self, Gain};
+use crate::resample::Remix;
+use crate::ring::{self, Push};
+use crate::{Error, Format, Layout};
 
-/// Audio buffered between [`Sink::write`] and the speaker.
+/// Default for [`Input::latency`]: audio buffered between [`Sink::write`] and
+/// the speaker.
 ///
 /// This is the price of surviving jitter: the device pulls on a fixed clock, so
 /// a late write is a dropout. 50 ms rides out a stalled network read without
 /// being audible as delay.
-const LATENCY: f64 = 0.05;
+const LATENCY: Duration = Duration::from_millis(50);
 
-/// Ceiling on that buffer. A writer that runs ahead (a decoder catching up after
-/// a pause) parks samples here instead of losing them.
-const CAPACITY: f64 = 3.0;
+/// Headroom above [`Input::latency`]. A writer that runs ahead (a decoder
+/// catching up after a pause) parks samples here instead of losing them.
+const HEADROOM: Duration = Duration::from_secs(3);
 
 /// The PCM layout a [`Sink`] accepts.
 ///
 /// The playback counterpart to [`encode::Input`](crate::encode::Input): it
 /// describes the buffers you hand in, not the device, which is free to run at
-/// its own rate and channel count.
+/// its own rate and layout.
+///
+/// `#[non_exhaustive]`: construct via [`Input::default`] and set fields, so new
+/// options can be added without breaking callers.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Input {
 	/// How samples are packed in each buffer.
 	pub format: Format,
 	/// Samples per second per channel. Resampled to the device rate if they
 	/// differ.
 	pub sample_rate: u32,
-	/// Channels per frame. Mono is duplicated and stereo passed through; more
-	/// than two is rejected, since downmixing is not implemented.
-	pub channels: u32,
+	/// Speaker meaning and channel order. Remixed to the device's layout, so it
+	/// must name speaker positions rather than be [`Layout::Discrete`].
+	pub layout: Layout,
+
+	/// How much audio to hold between [`Sink::write`] and the speaker (default:
+	/// 50 ms).
+	///
+	/// The device pulls on its own clock, so this is the jitter a late write may
+	/// absorb without a dropout, and it is also delay: the sample handed over now
+	/// sounds this much later. A player that presents video against a playout
+	/// delay sets this to match, so the sink is where that delay lives rather
+	/// than something the picture has to be held back for separately. Once a
+	/// clock is [`due`](Sink::due), the device's own delay counts toward it and
+	/// the sink holds the rest. Must be non-zero: a ring with no depth can never
+	/// be read from.
+	pub latency: Duration,
 }
 
 impl Default for Input {
@@ -45,7 +66,8 @@ impl Default for Input {
 		Self {
 			format: Format::F32,
 			sample_rate: 48_000,
-			channels: 2,
+			layout: Layout::Stereo,
+			latency: LATENCY,
 		}
 	}
 }
@@ -55,26 +77,59 @@ impl Input {
 		if self.sample_rate == 0 {
 			return Err(Error::Unsupported("sample rate must be > 0".into()));
 		}
-		if self.channels == 0 || self.channels > BUS_CHANNELS as u32 {
+		if self.layout.speakers().is_none() {
 			return Err(Error::Unsupported(format!(
-				"playback accepts mono or stereo input (got {} channels)",
-				self.channels
+				"playback needs speaker positions to remix (got {:?})",
+				self.layout
+			)));
+		}
+		if self.latency.is_zero() || self.latency > moq_mux::container::DELAY_MAX {
+			return Err(Error::Unsupported(format!(
+				"playback latency must be non-zero and at most {:?} (got {:?})",
+				moq_mux::container::DELAY_MAX,
+				self.latency
 			)));
 		}
 		Ok(())
 	}
 }
 
+/// The sample frames accepted and dropped by one [`Sink::write`].
+///
+/// A sample frame is one instant across all input channels, so one stereo
+/// frame counts once rather than twice.
+#[must_use = "inspect dropped_sample_frames; retrying dropped live audio adds latency"]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Write {
+	/// Input sample frames accepted for playback.
+	pub accepted_sample_frames: usize,
+	/// Input sample frames dropped to keep playback live.
+	pub dropped_sample_frames: usize,
+}
+
+impl Write {
+	fn from_accepted(requested_sample_frames: usize, accepted_sample_frames: usize) -> Self {
+		Self {
+			accepted_sample_frames,
+			dropped_sample_frames: requested_sample_frames - accepted_sample_frames,
+		}
+	}
+}
+
 /// One stream of PCM being played, mixed with every other sink on the device.
 ///
-/// Write decoded samples with [`write`](Self::write) and drop the sink to stop.
-/// Writes are cheap and never block on the device: they hand samples to a ring
-/// buffer that the audio thread drains on its own clock, resampling to the
-/// device rate on the way.
+/// Write decoded samples with [`write`](Self::write), then [`finish`](Self::finish)
+/// to play the tail or drop the sink to stop immediately.
+/// Writes are cheap and never block on the device: they remix to the device's
+/// layout and hand samples to a ring buffer that the audio thread drains on its
+/// own clock, resampling to the device rate on the way.
 pub struct Sink {
+	completion: Arc<Completion>,
+	drained: tokio::sync::oneshot::Receiver<()>,
 	id: u64,
 	input: Input,
-	prod: Arc<Mutex<ResamplingProd<f32>>>,
+	channel: Arc<Mutex<Channel>>,
 	control: Control,
 	/// Whether the last write overflowed, so a writer that stays ahead of the
 	/// device logs once rather than on every write.
@@ -86,6 +141,22 @@ pub struct Sink {
 }
 
 impl Sink {
+	/// Play every queued sample before leaving the mix.
+	///
+	/// Await the returned handle to wait for the device; dropping it stops
+	/// immediately. A device that is unavailable keeps the drain pending.
+	/// The wait includes staged stretch output and up to one resampler block
+	/// of trailing silence. A finished sink bypasses emergency refilling.
+	pub fn finish(self) -> Drain {
+		// Nothing follows the last write, so push the resampler's tail through
+		// and let the mixer play the silence behind it.
+		if !self.channel.lock().unwrap().prod.flush() {
+			tracing::warn!("audio playback overflow, cutting the final samples short");
+		}
+		self.completion.state.store(1, Ordering::Release);
+		Drain { sink: Some(self) }
+	}
+
 	/// Play `samples`, in the layout this sink was built with.
 	///
 	/// Samples play back to back in write order. Nothing is scheduled against a
@@ -93,47 +164,149 @@ impl Sink {
 	/// how far ahead of the speaker you are, which is the anchor an A/V sync
 	/// clock steers video by.
 	///
-	/// Writing faster than the device consumes eventually overflows and drops
-	/// the excess; writing slower underruns and plays silence. Both are logged
-	/// and neither is an error, since a live stream recovers on the next write.
-	pub fn write(&mut self, samples: &[u8]) -> Result<(), Error> {
-		let pcm = self.input.format.as_interleaved_f32(samples, self.input.channels)?;
-		let pcm = match self.input.channels as usize {
-			BUS_CHANNELS => pcm,
-			channels => Cow::Owned(remix(&pcm, channels as u32, BUS_CHANNELS as u32)?),
+	/// Received audio is time-stretched toward the current latency, or toward
+	/// the clock [`due`](Self::due) anchors it to. A writer that outruns that
+	/// correction eventually overflows and drops the excess; one that leaves no
+	/// received audio underruns and plays silence. Both are logged and neither
+	/// is an error, since the next write can recover.
+	/// The returned [`Write`] counts input sample frames accepted and dropped;
+	/// dropped live audio should be observed for telemetry, not retried.
+	pub fn write(&mut self, samples: &[u8]) -> Result<Write, Error> {
+		let channels = self.input.layout.channels();
+		let pcm = self.input.format.as_interleaved_f32(samples, channels)?;
+		let requested_sample_frames = pcm.len() / channels as usize;
+
+		let mut channel = self.channel.lock().unwrap();
+		let mixed;
+		let pcm = match &channel.remix {
+			Some(remix) => {
+				mixed = remix.process(&pcm);
+				&mixed
+			}
+			None => pcm.as_ref(),
 		};
 
-		match self.prod.lock().unwrap().push_interleaved(&pcm) {
-			// OutputNotReady means the device has not read yet, so these samples
-			// are dropped rather than queued to play late.
-			PushStatus::Ok | PushStatus::OutputNotReady => self.overflowing = false,
-			PushStatus::OverflowOccurred { num_frames_pushed } => {
+		let accepted_sample_frames = match channel.prod.push(pcm) {
+			// NotReady means the device has not read yet, so these samples are
+			// dropped rather than queued to play late.
+			Push::Ok => {
+				self.overflowing = false;
+				requested_sample_frames
+			}
+			Push::NotReady => {
+				self.overflowing = false;
+				0
+			}
+			Push::Overflow { accepted } => {
 				// Once per spell, not once per write: a writer that stays ahead
 				// of the device would otherwise warn every frame for as long as
 				// it lasts.
 				if !self.overflowing {
-					tracing::warn!(num_frames_pushed, "audio playback overflow, dropping samples");
+					tracing::warn!(accepted, "audio playback overflow, dropping samples");
 					self.overflowing = true;
 				}
+				accepted
 			}
-			PushStatus::UnderflowCorrected { num_zero_frames_pushed } => {
+			Push::Padded { frames } => {
 				self.overflowing = false;
-				tracing::debug!(num_zero_frames_pushed, "audio playback underflow, padded with silence");
+				tracing::debug!(frames, "audio playback underflow, padded with silence");
+				requested_sample_frames
 			}
-		}
+		};
 
-		Ok(())
+		Ok(Write::from_accepted(requested_sample_frames, accepted_sample_frames))
+	}
+
+	/// Declare that the audio written so far is followed by a silence its
+	/// publisher announced, such as a push-to-talk mute.
+	///
+	/// Once that audio has played, the sink plays comfort noise at the level of
+	/// the quietest 20 ms it played, at most -60 dBFS, rather than running dry,
+	/// and the [`Observer`](super::Observer) counts no gap. That lasts until the
+	/// utterance [`next`](Self::next) starts plays. Writes before then, such as a
+	/// codec's final frames, continue the audio before the silence.
+	pub fn end(&mut self) {
+		self.channel.lock().unwrap().prod.end();
+	}
+
+	/// Start the next utterance after a declared silence with the next
+	/// [`write`](Self::write).
+	///
+	/// It plays one [`latency`](Input::latency) after that write, behind
+	/// whatever is still queued, with comfort noise filling the wait, the way a
+	/// new sink's first write plays behind its opening silence.
+	pub fn next(&mut self) {
+		self.channel.lock().unwrap().prod.next();
 	}
 
 	/// How much audio is queued between the last [`write`](Self::write) and the
-	/// speaker.
+	/// speaker, the device's own delay included.
 	///
-	/// The pacing signal for A/V sync: the sample playing right now was written
+	/// The pacing signal for A/V sync: the sample sounding right now was written
 	/// at roughly `last_timestamp - buffered()`, so a video clock can steer
-	/// against it. It settles near 50 ms once playback is running, climbs when
-	/// the writer runs ahead, and falls toward zero when it falls behind.
+	/// against it. It settles near [`Input::latency`] once playback is running,
+	/// climbs when the writer runs ahead, and falls toward the device's delay
+	/// when it falls behind.
 	pub fn buffered(&self) -> Duration {
-		Duration::from_secs_f64(self.prod.lock().unwrap().occupied_seconds().max(0.0))
+		self.channel.lock().unwrap().prod.heard_in(crate::ring::host())
+	}
+
+	/// How long the device takes to sound what it reads: the delay its host
+	/// reports plus one device period. `None` until the device has called back.
+	///
+	/// A player holding a playout delay counts this in it, since the sink places
+	/// audio on [`due`](Self::due)'s clock where it is heard.
+	pub fn output_latency(&self) -> Option<Duration> {
+		self.shared.observe.output()
+	}
+
+	/// Set the playout target, converging by stretching received PCM.
+	///
+	/// This is the buffer the sink keeps against jitter, counting the device's
+	/// own delay: it slows down while what it holds runs short of it, and speeds up past it only to catch up
+	/// with the clock [`due`](Self::due) anchors it to.
+	///
+	/// Must be non-zero, at most [`moq_mux::container::DELAY_MAX`], and fit in the current
+	/// ring. Each device open or rebuild allocates the then-current target plus
+	/// three seconds, less a 30 ms processing window reserved as headroom.
+	/// Does not resize or reset the device.
+	pub fn set_latency(&mut self, latency: Duration) -> Result<(), Error> {
+		let mut input = self.input.clone();
+		input.latency = latency;
+		input.validate()?;
+		let mut channel = self.channel.lock().unwrap();
+		if !channel.prod.set_latency(latency) {
+			return Err(Error::Unsupported(
+				"playback latency exceeds the current ring capacity".into(),
+			));
+		}
+		self.input = input;
+		Ok(())
+	}
+
+	/// Anchor the audio written so far to the caller's clock: its end is due to
+	/// sound at `at`, as heard after the device's own delay.
+	///
+	/// The sink then plays onto that clock rather than at its latency alone:
+	/// behind it, it speeds up, and ahead of it, it slows down, at a rate
+	/// proportional to how far it is off, up to 10%. Audio about to run out
+	/// slows down too, falling behind the clock by at most `stretch`. Audio
+	/// trailing the clock by more than `stretch` skips onto it, and audio
+	/// leading it by as much waits in silence for it, however the clock moved.
+	/// A zero `stretch` turns the time stretch off: written audio plays
+	/// unaltered, and a sink more than a window off the clock skips onto it or
+	/// pads silence until the clock reaches it. Call it after each write and
+	/// whenever the clock moves; until the first call, or after the device
+	/// changes, the latency alone is the clock.
+	pub fn due(&mut self, at: Instant, stretch: Duration) {
+		// The device thread reads std's clock, so carry the distance from now
+		// over to it rather than the instant.
+		let (now, host) = (Instant::now(), crate::ring::host());
+		let at = match at.checked_duration_since(now) {
+			Some(ahead) => host + ahead,
+			None => host.checked_sub(now.duration_since(at)).unwrap_or(host),
+		};
+		self.channel.lock().unwrap().prod.due(at, stretch);
 	}
 
 	/// The PCM layout this sink was built with.
@@ -141,26 +314,10 @@ impl Sink {
 		&self.input
 	}
 
-	/// A handle for adjusting this sink from another thread, e.g. a volume
-	/// slider on a UI thread while a decode task does the writing.
+	/// This sink's volume and level, as a handle a UI thread can hold while a
+	/// decode task does the writing.
 	pub fn control(&self) -> Control {
 		self.control.clone()
-	}
-
-	/// Set the playback volume, `0.0` to `1.0`. See [`Control::set_volume`].
-	pub fn set_volume(&self, volume: f32) {
-		self.control.set_volume(volume);
-	}
-
-	/// The volume last set. Defaults to `1.0`.
-	pub fn volume(&self) -> f32 {
-		self.control.volume()
-	}
-
-	/// The loudest sample this sink contributed since the last call. See
-	/// [`Control::peak`].
-	pub fn peak(&self) -> f32 {
-		self.control.peak()
 	}
 }
 
@@ -170,6 +327,57 @@ impl Drop for Sink {
 		// The mixer hands the retired sink back rather than dropping it on the
 		// audio thread, so somebody has to come collect it.
 		self.engine.wake();
+	}
+}
+
+/// A finished sink that stays in the mix until its queued samples have played.
+///
+/// Await it to release the sink after playback; dropping it stops immediately.
+#[must_use = "await the drain to play the sink's final samples"]
+pub struct Drain {
+	sink: Option<Sink>,
+}
+
+impl Future for Drain {
+	type Output = ();
+
+	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+		let Some(sink) = self.sink.as_mut() else {
+			return Poll::Ready(());
+		};
+		if Pin::new(&mut sink.drained).poll(cx).is_pending() {
+			return Poll::Pending;
+		}
+		self.sink.take();
+		Poll::Ready(())
+	}
+}
+
+/// Callback state is atomic; the driver delivers the async wake off the audio thread.
+pub(super) struct Completion {
+	// 0: writing, 1: finished, 2: played by the device.
+	state: AtomicU8,
+	commands: super::driver::Commands,
+}
+
+impl Completion {
+	pub(super) fn new(commands: super::driver::Commands) -> Self {
+		Self {
+			state: AtomicU8::new(0),
+			commands,
+		}
+	}
+
+	/// Whether the caller is still writing, rather than having finished.
+	pub(super) fn writing(&self) -> bool {
+		self.state.load(Ordering::Acquire) == 0
+	}
+
+	pub(super) fn played(&self, cons: &ring::Consumer) {
+		if self.state.load(Ordering::Acquire) == 1 && cons.available() == 0 {
+			self.state.store(2, Ordering::Release);
+			self.commands.sync();
+		}
 	}
 }
 
@@ -210,20 +418,39 @@ impl Control {
 	}
 }
 
+/// The ring into the mixer and the remix that fills it, swapped together when
+/// the device changes rate or layout.
+struct Channel {
+	prod: ring::Producer,
+	/// Converts the sink's layout to the device's, when they differ.
+	remix: Option<Remix>,
+}
+
 /// A sink as the driver sees it: enough to rebuild its channel when the device
 /// changes underneath it.
 pub(super) struct Registration {
+	completion: Arc<Completion>,
+	drained: Option<tokio::sync::oneshot::Sender<()>>,
 	pub(super) id: u64,
-	/// The caller's rate, which is the input side of the channel.
-	rate: u32,
-	prod: Arc<Mutex<ResamplingProd<f32>>>,
+	/// The caller's rate, layout, and latency: the input side of the channel.
+	input: Input,
+	channel: Arc<Mutex<Channel>>,
 	gain: Arc<Gain>,
 	/// The consumer waiting to be handed to a mixer. Taken once it is attached,
-	/// and refilled by [`rebuild`](Self::rebuild).
-	pending: Option<ResamplingCons<f32>>,
+	/// and refilled by [`rebuild`](Self::rebuild). Boxed, since it moves
+	/// through the mixer's command channel by value.
+	pending: Option<Box<ring::Consumer>>,
 }
 
 impl Registration {
+	pub(super) fn complete(&mut self) {
+		if self.completion.state.load(Ordering::Acquire) == 2
+			&& let Some(reply) = self.drained.take()
+		{
+			let _ = reply.send(());
+		}
+	}
+
 	/// Whether the mixer has taken this sink's consumer.
 	pub(super) fn attached(&self) -> bool {
 		self.pending.is_none()
@@ -237,6 +464,7 @@ impl Registration {
 			id: self.id,
 			cons,
 			gain: self.gain.clone(),
+			completion: self.completion.clone(),
 		};
 
 		if let Err(err) = mixer.try_send(command) {
@@ -249,34 +477,44 @@ impl Registration {
 		}
 	}
 
-	/// Re-create the channel for a device now running at `rate`, swapping the
-	/// producer the caller's [`Sink`] writes into.
-	pub(super) fn rebuild(&mut self, rate: u32) {
-		let (prod, cons) = channel(self.rate, rate);
-		*self.prod.lock().unwrap() = prod;
-		self.pending = Some(cons);
+	/// Re-create the channel for a device now running at `rate` in `bus`,
+	/// swapping the producer the caller's [`Sink`] writes into.
+	pub(super) fn rebuild(&mut self, rate: u32, bus: Layout) {
+		let mut current = self.channel.lock().unwrap();
+		let mut input = self.input.clone();
+		input.latency = current.prod.latency();
+		let (mut channel, cons) = channel(&input, rate, bus);
+		channel.prod.carry(&current.prod);
+		*current = channel;
+		self.pending = Some(Box::new(cons));
 	}
 }
 
 /// Build a sink and its registration. The device may not be open yet, in which
-/// case `rate` is a placeholder the driver replaces on the next rebuild.
+/// case `rate` and `bus` are placeholders the driver replaces on the next
+/// rebuild.
 pub(super) fn new(
 	id: u64,
 	rate: u32,
+	bus: Layout,
 	input: Input,
 	shared: Arc<Shared>,
 	engine: Arc<super::Handle>,
 ) -> Result<(Sink, Registration), Error> {
 	input.validate()?;
 
-	let (prod, cons) = channel(input.sample_rate, rate);
-	let prod = Arc::new(Mutex::new(prod));
+	let (channel, cons) = self::channel(&input, rate, bus);
+	let channel = Arc::new(Mutex::new(channel));
 	let gain = Arc::new(Gain::new());
 
+	let completion = Arc::new(Completion::new(engine.commands.clone()));
+	let (reply, drained) = tokio::sync::oneshot::channel();
 	let sink = Sink {
+		completion: completion.clone(),
+		drained,
 		id,
 		input,
-		prod: prod.clone(),
+		channel: channel.clone(),
 		control: Control { gain: gain.clone() },
 		overflowing: false,
 		shared,
@@ -284,36 +522,36 @@ pub(super) fn new(
 	};
 
 	let registration = Registration {
+		completion,
+		drained: Some(reply),
 		id,
-		rate: sink.input.sample_rate,
-		prod,
+		input: sink.input.clone(),
+		channel,
 		gain,
-		pending: Some(cons),
+		pending: Some(Box::new(cons)),
 	};
 
 	Ok((sink, registration))
 }
 
-/// The ring buffer between a writer and the audio thread, resampling the
-/// caller's rate to the device's.
-fn channel(from: u32, to: u32) -> (ResamplingProd<f32>, ResamplingCons<f32>) {
-	resampling_channel::<f32>(
-		BUS_CHANNELS,
-		from,
-		to,
-		// We only ever push interleaved, which lets the channel skip its planar
-		// staging buffer.
-		true,
-		ResamplingChannelConfig {
-			latency_seconds: LATENCY,
-			capacity_seconds: CAPACITY,
-			// Correct drift by resampling rather than by jumping, so a clock
-			// that is slightly off doesn't tick audibly.
-			underflow_autocorrect_percent_threshold: Some(25.0),
-			overflow_autocorrect_percent_threshold: Some(75.0),
-			..Default::default()
+/// The ring buffer between a writer and the audio thread, remixing the caller's
+/// layout to the device's and resampling its rate to the device's.
+fn channel(input: &Input, rate: u32, bus: Layout) -> (Channel, ring::Consumer) {
+	let remix =
+		(input.layout != bus).then(|| Remix::new(input.layout, bus).expect("sink and bus layouts name their speakers"));
+
+	let (prod, cons) = ring::channel(
+		bus.channels() as usize,
+		input.sample_rate,
+		rate,
+		ring::Config {
+			latency: input.latency,
+			capacity: input.latency + HEADROOM,
+			correction: ring::Correction::Stretch,
+			comfort: true,
 		},
-	)
+	);
+	(Channel { prod, remix }, cons)
 }
 
 #[cfg(test)]
@@ -321,16 +559,397 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn rejects_layouts_it_cannot_mix() {
-		for channels in [0, 6] {
+	fn ring_allocation_follows_the_device_rate() {
+		let mut baseline = None;
+		for sample_rate in [44_100, 96_000, 4_000_000_000] {
 			let input = Input {
-				channels,
+				sample_rate,
+				layout: Layout::SevenPointOne,
 				..Default::default()
 			};
+			let (_, stats) = crate::allocation::measure(|| channel(&input, 48_000, Layout::Stereo));
+			let baseline = *baseline.get_or_insert(stats.bytes);
 			assert!(
-				matches!(input.validate(), Err(Error::Unsupported(_))),
-				"{channels} channels"
+				stats.bytes <= baseline,
+				"{sample_rate} Hz allocated {} bytes, baseline {baseline}",
+				stats.bytes
 			);
+		}
+	}
+
+	fn sink(input: Input, output_rate: u32) -> (Sink, ring::Consumer) {
+		sink_into(input, output_rate, Layout::Stereo)
+	}
+
+	fn sink_into(input: Input, output_rate: u32, bus: Layout) -> (Sink, ring::Consumer) {
+		let shared = Arc::new(Shared::default());
+		let engine = Arc::new(super::super::Handle {
+			commands: super::super::driver::Commands::default(),
+		});
+		let (sink, mut registration) = new(0, output_rate, bus, input, shared, engine).unwrap();
+		(sink, *registration.pending.take().unwrap())
+	}
+
+	#[test]
+	fn finish_plays_the_partial_final_period_before_completing() {
+		let shared = Arc::new(Shared::default());
+		let engine = Arc::new(super::super::Handle {
+			commands: super::super::driver::Commands::default(),
+		});
+		let (mut sink, mut registration) = new(0, 48_000, Layout::Stereo, Input::default(), shared, engine).unwrap();
+		let (commands, rx) = std::sync::mpsc::sync_channel(8);
+		let (retired, _rx) = std::sync::mpsc::sync_channel(8);
+		let mut mixer = mixer::Mixer::new(rx, retired, 48_000, Layout::Stereo, Default::default()).unwrap();
+		registration.attach(&commands);
+		let mut out = [0.0f32; 960];
+		mixer.fill(&mut out, Duration::from_millis(100), crate::ring::host());
+		let samples = [0.25f32; 123 * 2];
+		let bytes: Vec<_> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+		assert_eq!(sink.write(&bytes).unwrap().accepted_sample_frames, 123);
+		let mut drain = sink.finish();
+		let mut cx = Context::from_waker(std::task::Waker::noop());
+		assert!(Pin::new(&mut drain).poll(&mut cx).is_pending());
+		let mut heard = 0;
+		while heard < 123 * 2 {
+			mixer.fill(&mut out, Duration::from_millis(100), crate::ring::host());
+			heard += out.iter().filter(|s| **s == 0.25).count();
+			registration.complete();
+			assert!(Pin::new(&mut drain).poll(&mut cx).is_pending());
+		}
+		assert_eq!(heard, 123 * 2);
+		// Another staging chunk in the same callback does not finish the drain.
+		mixer.fill(&mut out, Duration::from_millis(100), crate::ring::host());
+		registration.complete();
+		assert!(Pin::new(&mut drain).poll(&mut cx).is_pending());
+		// Later callbacks can still run before the device plays its queued tail.
+		mixer.complete(Duration::from_millis(99));
+		registration.complete();
+		assert!(Pin::new(&mut drain).poll(&mut cx).is_pending());
+		mixer.complete(Duration::from_millis(100));
+		registration.complete();
+		assert!(Pin::new(&mut drain).poll(&mut cx).is_ready());
+	}
+
+	#[test]
+	fn a_writing_sink_running_dry_is_a_gap_and_a_finished_tail_plays_out() {
+		let shared = Arc::new(Shared::default());
+		let mut observer = super::super::Observer::new(shared.observe.clone()).unwrap();
+		let engine = Arc::new(super::super::Handle {
+			commands: super::super::driver::Commands::default(),
+		});
+		let input = Input {
+			latency: Duration::from_millis(1),
+			..Default::default()
+		};
+		let (mut sink, mut registration) = new(0, 48_000, Layout::Stereo, input, shared.clone(), engine).unwrap();
+		let (commands, rx) = std::sync::mpsc::sync_channel(8);
+		let (retired, _rx) = std::sync::mpsc::sync_channel(8);
+		let mut mixer = mixer::Mixer::new(rx, retired, 48_000, Layout::Stereo, shared.observe.clone()).unwrap();
+		registration.attach(&commands);
+		let mut out = [0.0; 1024];
+		mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+		assert!(observer.read().unwrap().stalled, "nothing written yet");
+
+		let tone: Vec<_> = [0.25f32; 2048].iter().flat_map(|s| s.to_le_bytes()).collect();
+		let _ = sink.write(&tone).unwrap();
+		for _ in 0..4 {
+			mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+		}
+		// Running dry waits for a 30 ms window and the device period to resume.
+		let refill: Vec<_> = [0.25f32; 2 * (1440 + 512)]
+			.iter()
+			.flat_map(|s| s.to_le_bytes())
+			.collect();
+		let _ = sink.write(&refill).unwrap();
+		mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+		let observation = observer.read().unwrap();
+		assert!(!observation.stalled);
+		assert_eq!(observation.gaps.len(), 1, "the sink ran dry once: {observation:?}");
+
+		// A finished sink still plays its tail: no stall while it lasts.
+		let _drain = sink.finish();
+		mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+		let observation = observer.read().unwrap();
+		assert!(!observation.stalled && observation.stalls.is_empty(), "{observation:?}");
+		let tail = observation.clock;
+
+		for _ in 0..4 {
+			mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+		}
+		{
+			let mut cx = Context::from_waker(std::task::Waker::noop());
+			let mut finish = std::pin::pin!(observer.finish());
+			assert!(finish.as_mut().poll(&mut cx).is_pending());
+			mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+			assert!(finish.as_mut().poll(&mut cx).is_ready());
+		}
+		// Once the tail runs out nothing plays. The gap where it ran out lands in
+		// the buffer before the stall, which the analyzer attributes to the stall.
+		let observation = observer.read().unwrap();
+		assert!(observation.stalled, "{observation:?}");
+		let ([gap], [stall]) = (&observation.gaps[..], &observation.stalls[..]) else {
+			panic!("one gap and one stall: {observation:?}");
+		};
+		let buffer = Duration::from_secs_f64(512.0 / 48_000.0);
+		assert!(stall.at >= tail, "{observation:?}");
+		assert!(gap.at <= stall.at && stall.at - gap.at < buffer, "{observation:?}");
+	}
+
+	/// A declared silence plays comfort noise at the level heard before it, through
+	/// the wait before the next utterance, which then plays one latency after its
+	/// first write. None of it is a gap or a stall.
+	#[test]
+	fn a_declared_silence_plays_comfort_noise_until_the_next_utterance() {
+		let shared = Arc::new(Shared::default());
+		let mut observer = super::super::Observer::new(shared.observe.clone()).unwrap();
+		let engine = Arc::new(super::super::Handle {
+			commands: super::super::driver::Commands::default(),
+		});
+		let latency = Duration::from_millis(40);
+		let input = Input {
+			latency,
+			..Default::default()
+		};
+		let (mut sink, mut registration) = new(0, 48_000, Layout::Stereo, input, shared.clone(), engine).unwrap();
+		let (commands, rx) = std::sync::mpsc::sync_channel(8);
+		let (retired, _rx) = std::sync::mpsc::sync_channel(8);
+		let mut mixer = mixer::Mixer::new(rx, retired, 48_000, Layout::Stereo, shared.observe.clone()).unwrap();
+		registration.attach(&commands);
+		let pcm = |sample: f32, frames: usize| -> Vec<u8> {
+			std::iter::repeat_n(sample.to_le_bytes(), frames * 2)
+				.flatten()
+				.collect()
+		};
+		let rms =
+			|samples: &[f32]| (samples.iter().map(|&s| s as f64 * s as f64).sum::<f64>() / samples.len() as f64).sqrt();
+		let mut out = [0.0f32; 960];
+		mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+
+		// 100 ms of a quiet background, then a declared end.
+		let quiet = 0.0002;
+		let _ = sink.write(&pcm(quiet, 4_800)).unwrap();
+		sink.end();
+		let mut heard = Vec::new();
+		for _ in 0..150 {
+			mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+			heard.extend_from_slice(&out);
+		}
+		// The primed silence, the background, then a second of noise at its level.
+		let noise = &heard[heard.len() - 48_000 * 2..];
+		assert!(noise.iter().all(|s| s.abs() <= quiet * 3f32.sqrt() * 1.0001));
+		assert!((rms(noise) - quiet as f64).abs() < 0.00001, "rms {}", rms(noise));
+
+		// The next utterance plays one latency after its first write, with noise until then.
+		sink.next();
+		let _ = sink.write(&pcm(0.5, 960)).unwrap();
+		let mut until = 0;
+		loop {
+			mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+			if let Some(at) = out.iter().position(|s| *s == 0.5) {
+				until += at / 2;
+				break;
+			}
+			assert!(out.iter().all(|s| s.abs() <= quiet * 3f32.sqrt() * 1.0001 && *s != 0.0));
+			until += out.len() / 2;
+		}
+		assert_eq!(until, 48_000 * 40 / 1000);
+		for _ in 0..10 {
+			let _ = sink.write(&pcm(0.5, 480)).unwrap();
+			mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+		}
+
+		let observation = observer.read().unwrap();
+		assert!(observation.gaps.is_empty(), "{observation:?}");
+		assert!(!observation.stalled && observation.stalls.len() == 1, "{observation:?}");
+
+		// Once the next utterance plays, running dry is a gap again.
+		for _ in 0..20 {
+			mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+		}
+		let _ = sink.write(&pcm(0.5, 2_400)).unwrap();
+		mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+		assert_eq!(observer.read().unwrap().gaps.len(), 1);
+	}
+
+	/// The resampler only converts whole blocks and its filter lags the input, so
+	/// a track whose rate differs from the device's must have its tail pushed
+	/// through on finish: both a partial final block and one that ends exactly on
+	/// a block boundary, where only the filter delay is owed.
+	#[test]
+	fn finish_plays_the_resampled_tail_before_completing() {
+		for frames in [1000, 2 * ring::CHUNK] {
+			let want = frames * 48_000 / 44_100;
+			let heard = play_resampled(frames);
+			assert!(heard.abs_diff(want) <= 1, "{frames} frames: heard {heard}, want {want}");
+		}
+	}
+
+	/// Write `frames` of a 44.1 kHz tone into a 48 kHz mixer, finish, and count
+	/// the frames heard before the drain completes.
+	fn play_resampled(frames: usize) -> usize {
+		let shared = Arc::new(Shared::default());
+		let engine = Arc::new(super::super::Handle {
+			commands: super::super::driver::Commands::default(),
+		});
+		let input = Input {
+			sample_rate: 44_100,
+			..Default::default()
+		};
+		let (mut sink, mut registration) = new(0, 48_000, Layout::Stereo, input, shared, engine).unwrap();
+		let (commands, rx) = std::sync::mpsc::sync_channel(8);
+		let (retired, _rx) = std::sync::mpsc::sync_channel(8);
+		let mut mixer = mixer::Mixer::new(rx, retired, 48_000, Layout::Stereo, Default::default()).unwrap();
+		registration.attach(&commands);
+		let mut out = [0.0f32; 960];
+		mixer.fill(&mut out, Duration::ZERO, crate::ring::host());
+
+		let bytes: Vec<_> = [0.25f32]
+			.repeat(frames * 2)
+			.iter()
+			.flat_map(|s| s.to_le_bytes())
+			.collect();
+		assert_eq!(sink.write(&bytes).unwrap().accepted_sample_frames, frames);
+		let mut drain = sink.finish();
+		let mut cx = Context::from_waker(std::task::Waker::noop());
+
+		// Count frames past half amplitude, where the resampled edges cross, so
+		// the count is the tone's duration at the device rate.
+		let mut heard = 0;
+		for period in 1..100 {
+			let now = Duration::from_millis(10 * period);
+			mixer.fill(&mut out, now, crate::ring::host());
+			mixer.complete(now);
+			registration.complete();
+			heard += out.iter().step_by(2).filter(|left| **left > 0.125).count();
+			if Pin::new(&mut drain).poll(&mut cx).is_ready() {
+				return heard;
+			}
+		}
+		panic!("the drain never completed, after {heard} frames");
+	}
+
+	/// Write `frame` repeated as `input` and read back what the bus got.
+	fn mix(input: Layout, bus: Layout, frame: &[f32]) -> Vec<f32> {
+		let input = Input {
+			layout: input,
+			..Default::default()
+		};
+		let (mut sink, mut cons) = sink_into(input, 48_000, bus);
+		let channels = bus.channels() as usize;
+		cons.read(&mut vec![0.0; channels]);
+
+		let pcm: Vec<u8> = frame.repeat(4800).iter().flat_map(|s| s.to_le_bytes()).collect();
+		assert_eq!(sink.write(&pcm).unwrap().dropped_sample_frames, 0);
+
+		let mut out = vec![0.0; 4800 * channels];
+		cons.read(&mut out);
+		out[out.len() - channels..].to_vec()
+	}
+
+	fn close(got: &[f32], want: &[f32]) {
+		assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+		for (g, w) in got.iter().zip(want) {
+			assert!((g - w).abs() < 1e-4, "{got:?} vs {want:?}");
+		}
+	}
+
+	/// A 5.1 track on a stereo device plays its downmix, center and surrounds
+	/// folded into the front pair at -3 dB.
+	#[test]
+	fn a_surround_sink_downmixes_into_a_stereo_bus() {
+		let h = std::f32::consts::FRAC_1_SQRT_2;
+		let got = mix(Layout::FivePointOne, Layout::Stereo, &[0.1, 0.2, 0.3, 0.4, 0.05, 0.06]);
+		close(&got, &[0.1 + h * 0.3 + h * 0.05, 0.2 + h * 0.3 + h * 0.06]);
+	}
+
+	/// A stereo track on a 5.1 device plays from the front pair alone.
+	#[test]
+	fn a_stereo_sink_fills_the_front_of_a_surround_bus() {
+		let got = mix(Layout::Stereo, Layout::FivePointOne, &[0.25, 0.75]);
+		close(&got, &[0.25, 0.75, 0.0, 0.0, 0.0, 0.0]);
+	}
+
+	fn s16(frames: usize, channels: usize) -> Vec<u8> {
+		vec![0; frames * channels * 2]
+	}
+
+	fn ready(cons: &mut ring::Consumer) {
+		cons.read(&mut [0.0; 2]);
+	}
+
+	#[test]
+	fn reports_output_not_ready_as_dropped() {
+		let input = Input {
+			format: Format::S16,
+			..Default::default()
+		};
+		let (mut sink, _cons) = sink(input, 48_000);
+
+		assert_eq!(
+			sink.write(&s16(10, 2)).unwrap(),
+			Write {
+				accepted_sample_frames: 0,
+				dropped_sample_frames: 10,
+			}
+		);
+	}
+
+	#[test]
+	fn reports_input_frame_units_through_conversion_and_resampling() {
+		let input = Input {
+			format: Format::S16,
+			sample_rate: 44_100,
+			layout: Layout::Mono,
+			..Default::default()
+		};
+		let (mut sink, mut cons) = sink(input, 48_000);
+		ready(&mut cons);
+
+		assert_eq!(
+			sink.write(&s16(441, 1)).unwrap(),
+			Write {
+				accepted_sample_frames: 441,
+				dropped_sample_frames: 0,
+			}
+		);
+	}
+
+	#[test]
+	fn reports_partial_acceptance_on_overflow() {
+		let input = Input {
+			format: Format::S16,
+			latency: Duration::from_millis(1),
+			..Default::default()
+		};
+		let (mut sink, mut cons) = sink(input, 48_000);
+		ready(&mut cons);
+		let requested = 4 * 48_000;
+
+		let write = sink.write(&s16(requested, 2)).unwrap();
+		assert!(write.accepted_sample_frames > 0);
+		assert!(write.dropped_sample_frames > 0);
+		assert_eq!(write.accepted_sample_frames + write.dropped_sample_frames, requested);
+	}
+
+	#[test]
+	fn keeps_invalid_input_distinct_from_dropping() {
+		let input = Input {
+			format: Format::S16,
+			..Default::default()
+		};
+		let (mut sink, _cons) = sink(input, 48_000);
+
+		assert!(matches!(sink.write(&[0]), Err(Error::Misaligned { .. })));
+	}
+
+	#[test]
+	fn rejects_layouts_it_cannot_mix() {
+		for layout in [Layout::Discrete(0), Layout::Discrete(2), Layout::Discrete(6)] {
+			let input = Input {
+				layout,
+				..Default::default()
+			};
+			assert!(matches!(input.validate(), Err(Error::Unsupported(_))), "{layout:?}");
 		}
 
 		let input = Input {
@@ -341,13 +960,61 @@ mod tests {
 	}
 
 	#[test]
-	fn accepts_mono_and_stereo() {
-		for channels in [1, 2] {
+	fn accepts_named_layouts() {
+		for layout in [
+			Layout::Mono,
+			Layout::Stereo,
+			Layout::FivePointOne,
+			Layout::SevenPointOne,
+		] {
 			let input = Input {
-				channels,
+				layout,
 				..Default::default()
 			};
 			input.validate().unwrap();
 		}
+	}
+
+	/// A ring with no depth can never be read from, and one deeper than the
+	/// device could ever drain is a delay nobody asked for.
+	#[test]
+	fn rejects_a_latency_it_cannot_buffer() {
+		for latency in [Duration::ZERO, moq_mux::container::DELAY_MAX + Duration::from_secs(1)] {
+			let input = Input {
+				latency,
+				..Default::default()
+			};
+			assert!(matches!(input.validate(), Err(Error::Unsupported(_))), "{latency:?}");
+		}
+
+		Input {
+			latency: moq_mux::container::DELAY_MAX,
+			..Default::default()
+		}
+		.validate()
+		.unwrap();
+	}
+
+	#[test]
+	fn changing_target_is_bounded_and_survives_device_rebuild() {
+		let shared = Arc::new(Shared::default());
+		let engine = Arc::new(super::super::Handle {
+			commands: super::super::driver::Commands::default(),
+		});
+		let (mut sink, mut registration) = new(0, 48_000, Layout::Stereo, Input::default(), shared, engine).unwrap();
+		for latency in [
+			Duration::ZERO,
+			Duration::from_secs(4),
+			moq_mux::container::DELAY_MAX + Duration::from_secs(1),
+		] {
+			assert!(sink.set_latency(latency).is_err());
+			assert_eq!(sink.input().latency, LATENCY);
+		}
+		let latency = Duration::from_millis(120);
+		sink.set_latency(latency).unwrap();
+		assert_eq!(sink.input().latency, latency);
+		registration.rebuild(44_100, Layout::Mono);
+		assert_eq!(sink.channel.lock().unwrap().prod.latency(), latency);
+		assert!(registration.pending.as_ref().unwrap().available() == 0);
 	}
 }

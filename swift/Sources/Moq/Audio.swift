@@ -1,71 +1,153 @@
+import Foundation
 import MoqFFI
 
-/// Read side of a raw-audio track. Iterating yields decoded PCM frames in the
-/// layout declared by the `AudioDecoderOutput` passed at subscribe time.
-public final class AudioConsumer: AsyncSequence, Sendable {
-    /// The decoded PCM audio frame emitted by this sequence.
-    public typealias Element = AudioFrame
+/// Native audio encoding, publication, and decoding.
+public enum Audio {
+    /// The PCM layout (format, sample rate, channels) written to a `Producer`.
+    public typealias EncoderInput = AudioEncoderInput
+    /// The codec side: codec, rate, channels, bitrate, and frame duration.
+    public typealias EncoderOutput = AudioEncoderOutput
+    /// The PCM layout a `Consumer` delivers, how stale a group may get, and its playout delay.
+    public typealias DecoderOutput = AudioDecoderOutput
+    /// Interleaved PCM with its presentation timestamp.
+    public typealias Frame = AudioFrame
+    /// One item a `Consumer` reads, in delivery order: `.frame`, a `.gap` where media
+    /// was lost, or an `.end` where the publisher stopped its encoder.
+    public typealias Read = MoqAudioRead
+    /// One encoded payload from an `Encoder`.
+    public typealias Packet = MoqAudioPacket
+    /// The packets an `Encoder` drains on finish and the padded samples to discard.
+    public typealias EncoderFinish = MoqAudioEncoderFinished
+    /// Selects the audio encoder codec. Build one with `Codec.opus()` or `Codec.aac()`.
+    public typealias Codec = AudioCodec
+    /// The PCM sample layout written to a `Producer` or delivered by a `Consumer`.
+    public typealias SampleFormat = AudioSampleFormat
 
-    let ffi: MoqAudioConsumer
+    /// Write side of a raw-audio track. PCM written here is encoded (e.g. to Opus)
+    /// inside the FFI boundary per the `EncoderInput`/`EncoderOutput` given at construction.
+    public final class Producer: Sendable {
+        let ffi: MoqAudioProducer
 
-    init(_ ffi: MoqAudioConsumer) {
-        self.ffi = ffi
+        /// Open an audio track on the catalog's broadcast and register its rendition.
+        public init(
+            catalog: Media.CatalogProducer,
+            input: EncoderInput,
+            output: EncoderOutput,
+            track: String? = nil,
+            bandwidth: Allocator? = nil
+        ) throws {
+            ffi = try MoqAudioProducer(
+                catalog: catalog.ffi,
+                options: MoqAudioProducerOptions(
+                    input: input, output: output, track: track, bandwidth: bandwidth?.ffi))
+        }
+
+        /// A watch-only handle to whether the audio track has subscribers.
+        public func demand() throws -> TrackDemand {
+            TrackDemand(try ffi.demand())
+        }
+
+        /// Re-anchor the timeline to the next frame after an idle gap.
+        public func reanchor() throws {
+            try ffi.reanchor()
+        }
+
+        /// Encode and write one PCM frame.
+        public func write(_ frame: Frame) throws {
+            try ffi.write(frame: frame)
+        }
+
+        /// This encoder's bandwidth reservation, if published against a session allocator.
+        public func reservation() -> Reservation? {
+            ffi.reservation().map(Reservation.init)
+        }
+
+        /// Finish the track and finalize encoding.
+        public func finish() throws {
+            try ffi.finish()
+        }
     }
 
-    /// The next frame, or `nil` once the track ends or is closed.
-    public func next() async throws -> AudioFrame? {
-        try await ffi.next()
-    }
+    /// Read side of a raw-audio track. Iterating yields decoded PCM frames in the
+    /// layout declared by the `DecoderOutput` passed to `subscribe`, and the gaps
+    /// and encoder ends between them.
+    public final class Consumer: AsyncSequence, Sendable {
+        /// The frame, gap, or end emitted by this sequence.
+        public typealias Element = Read
 
-    /// Cancel all current and future reads.
-    public func cancel() {
-        ffi.cancel()
-    }
+        let ffi: MoqAudioConsumer
 
-    /// Create an iterator that cancels native reads when iteration ends.
-    public func makeAsyncIterator() -> AsyncThrowingStream<AudioFrame, Swift.Error>.Iterator {
-        moqStream(cancel: { [ffi] in ffi.cancel() }) { [ffi] in
+        init(_ ffi: MoqAudioConsumer) {
+            self.ffi = ffi
+        }
+
+        /// Subscribe to the catalog audio rendition `id` and decode it.
+        public static func subscribe(
+            broadcast: BroadcastConsumer,
+            id: String,
+            rendition: Media.Audio,
+            output: DecoderOutput
+        ) async throws -> Consumer {
+            Consumer(
+                try await MoqAudioConsumer.subscribe(
+                    broadcast: broadcast.ffi,
+                    id: id,
+                    catalogAudio: rendition,
+                    output: output
+                ))
+        }
+
+        /// The next frame, gap, or end, or `nil` once the track ends or is closed.
+        public func next() async throws -> Read? {
             try await ffi.next()
-        }.makeAsyncIterator()
-    }
-}
+        }
 
-/// Write side of a raw-audio track. PCM written here is encoded (e.g. to Opus)
-/// inside the FFI boundary per the `AudioEncoderInput`/`Output` from publish time.
-public final class AudioProducer: Sendable {
-    let ffi: MoqAudioProducer
+        /// The playout delay to hold ahead of the playhead: the fixed `DecoderOutput.delay.min`,
+        /// or with `DecoderOutput.estimate` the estimate from every frame read so far.
+        public var delay: TimeInterval { ffi.delay() }
 
-    init(_ ffi: MoqAudioProducer) {
-        self.ffi = ffi
-    }
+        /// Cancel all current and future reads.
+        public func cancel() {
+            ffi.cancel()
+        }
 
-    /// The audio track's name.
-    public var name: String {
-        get throws { try ffi.name() }
-    }
+        /// Create an iterator that cancels native reads when iteration ends.
+        public func makeAsyncIterator() -> AsyncThrowingStream<Read, Swift.Error>.Iterator {
 
-    /// Suspend until the audio track has at least one active consumer.
-    public func used() async throws {
-        try await ffi.used()
+            moqStream(cancel: { [ffi] in ffi.cancel() }) { [ffi] in
+                try await ffi.next()
+            }.makeAsyncIterator()
+        }
     }
 
-    /// Suspend until the audio track has no active consumers.
-    public func unused() async throws {
-        try await ffi.unused()
-    }
+    /// Encodes PCM without publishing it.
+    public final class Encoder: Sendable {
+        let ffi: MoqAudioEncoder
 
-    /// Re-anchor the timeline to the next frame after an idle gap.
-    public func resetEpoch() throws {
-        try ffi.resetEpoch()
-    }
+        /// Open a codec-only encoder.
+        public init(output: EncoderOutput) throws { ffi = try MoqAudioEncoder(output: output) }
 
-    /// Encode and write one PCM frame.
-    public func write(_ frame: AudioFrame) throws {
-        try ffi.write(frame: frame)
-    }
+        /// Samples per channel each `encode` call takes.
+        public var frameSize: UInt64 {
+            get throws { try ffi.frameSize() }
+        }
 
-    /// Finish the track and finalize encoding.
-    public func finish() throws {
-        try ffi.finish()
+        /// The OpusHead or AudioSpecificConfig that publishes these packets via `Media.TrackProducer.audio`.
+        public func trackInit() throws -> Media.AudioInit { try ffi.trackInit() }
+
+        /// Retune the live encoder in bits per second.
+        public func setBitrate(_ bitrate: UInt64) throws { try ffi.setBitrate(bitrate: bitrate) }
+
+        /// Submit one codec-sized interleaved f32 frame, whose packet `receive` returns.
+        public func encode(_ pcm: [Float]) throws { try ffi.encode(pcm: pcm) }
+
+        /// Pop the oldest ready packet, or nil while the codec holds the rest; call until nil.
+        public func receive() throws -> Packet? { try ffi.receive() }
+
+        /// Mark the end of input, so `receive` returns every packet the codec still holds, without closing the encoder.
+        public func flush() throws { try ffi.flush() }
+
+        /// Pad an optional partial frame, drain the codec, and close the encoder.
+        public func finish(_ pcm: [Float] = []) throws -> EncoderFinish { try ffi.finish(pcm: pcm) }
     }
 }

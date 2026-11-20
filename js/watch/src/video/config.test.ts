@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
+import { yieldNow } from "@moq/clock";
 import * as Catalog from "@moq/hang/catalog";
 import { Effect, Signal } from "@moq/signals";
 import { playbackIdentity } from "./config";
 
-const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+const flush = () => yieldNow();
 
 function config(fields: Record<string, unknown> = {}): Catalog.VideoConfig {
 	return Catalog.VideoConfigSchema.parse({
@@ -31,7 +32,7 @@ test("metadata changes do not change the playback identity", async () => {
 	rendition.set(
 		config({
 			bitrate: 2_000_000,
-			stalled: true,
+			enabled: false,
 			codedWidth: 1280,
 			codedHeight: 720,
 			framerate: 30,
@@ -56,4 +57,5 @@ test("routing and decoder inputs change the playback identity", () => {
 	expect(playbackIdentity(config({ container: { kind: "loc" } }))).not.toEqual(base);
 	expect(playbackIdentity(config({ displayAspectWidth: 16, displayAspectHeight: 9 }))).not.toEqual(base);
 	expect(playbackIdentity(config({ optimizeForLatency: false }))).not.toEqual(base);
+	expect(playbackIdentity(config({ interlaced: true }))).not.toEqual(base);
 });

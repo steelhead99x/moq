@@ -12,6 +12,8 @@ use crate::Result;
 use crate::catalog::Stream;
 use crate::container::ExportSource;
 use crate::container::Frame;
+use crate::container::consumer::Event;
+use crate::container::decode::{DecodeClock, Settle};
 use crate::container::mkv::Error;
 
 /// Matroska TimestampScale: 1 ms (in nanoseconds).
@@ -24,7 +26,7 @@ const TIMESTAMP_SCALE_NS: u64 = 1_000_000;
 /// re-encodes everything as EBML + Segment + Tracks + Cluster/SimpleBlock tags ready
 /// for any Matroska-aware consumer (ffplay, libwebm, browser MSE for WebM).
 ///
-/// Use [`next`](Self::next) to pull byte chunks. The first chunk is the file
+/// Use [`poll_next`](Self::poll_next) to pull byte chunks. The first chunk is the file
 /// header (EBML + unknown-size Segment + Info + Tracks); subsequent chunks are
 /// complete Cluster elements. By default a Cluster contains one GOP (rolled
 /// over on each video keyframe, or on i16 timestamp overflow);
@@ -44,10 +46,18 @@ const TIMESTAMP_SCALE_NS: u64 = 1_000_000;
 ///
 /// Only Legacy-container tracks (raw codec payloads) are supported. CMAF tracks
 /// (moof+mdat passthrough) are rejected with a clear error.
+///
+/// A rendition the catalog moves to another track (a new `track` or `broadcast`) goes on
+/// under its track number from the new track's first sync frame past what was read, when
+/// the header's TrackEntry still describes it; otherwise, or when it goes back in time, the
+/// export fails.
 pub struct Export<S: Stream> {
 	source: crate::Source,
 	catalog: Option<S>,
-	latency: Duration,
+	delay: moq_net::track::Delay,
+	jitter: crate::jitter::Buffer<String, Frame>,
+	/// An already released frame waiting for the previous cluster to be returned.
+	held: Option<(String, Frame)>,
 	fragment_duration: Option<Duration>,
 
 	tracks: HashMap<String, MkvTrack>,
@@ -63,11 +73,182 @@ pub struct Export<S: Stream> {
 }
 
 struct MkvTrack {
+	/// The inferred decode clock of a rendition that declares no `reorder`.
+	clock: DecodeClock<crate::jitter::Arrival<Frame>>,
+	/// The current group's clock, when its rendition declared `reorder` at the group's start.
+	declared: Option<crate::container::declared::DeclaredClock<crate::jitter::Arrival<Frame>>>,
+	config: Option<VideoConfig>,
+	restart: u64,
+	reorder: Option<(u64, u64)>,
 	source: ExportSource,
-	pending: Option<Frame>,
+	pending: Option<crate::jitter::Arrival<Frame>>,
+	// When the source was subscribed: nothing it delivers reached the export before then.
+	subscribed: kio::clock::Instant,
+	// The latest arrival read from the source, which settles the frames held for their DTS.
+	latest: kio::clock::Instant,
 	finished: bool,
 	track_number: u64,
 	kind: TrackKind,
+	/// The TrackEntry the header declared.
+	entry: Option<MatroskaSpec>,
+	/// The source replaced the one the header was built from, so its frames wait until it
+	/// can be checked against `entry`.
+	moved: bool,
+}
+
+impl MkvTrack {
+	/// A track numbered `track_number` reading `source`, with the video `config` it was added under.
+	fn new(source: ExportSource, kind: TrackKind, config: Option<VideoConfig>, track_number: u64) -> Self {
+		Self {
+			clock: Default::default(),
+			declared: None,
+			config,
+			restart: 0,
+			reorder: None,
+			source,
+			pending: None,
+			subscribed: kio::clock::now(),
+			latest: kio::clock::Instant::ZERO,
+			finished: false,
+			track_number,
+			kind,
+			entry: None,
+			moved: false,
+		}
+	}
+
+	/// Read `source`, the track the catalog moved this rendition to, after releasing the
+	/// frames the old one left held for their DTS.
+	fn rebind(
+		&mut self,
+		name: &str,
+		source: ExportSource,
+		jitter: &mut crate::jitter::Buffer<String, Frame>,
+	) -> Result<()> {
+		self.release(name, jitter, true)?;
+		self.clock = Default::default();
+		self.declared = None;
+		self.reorder = None;
+		self.source = source.continuing(&self.source);
+		self.finished = false;
+		self.subscribed = kio::clock::now();
+		self.moved = true;
+		Ok(())
+	}
+
+	/// The TrackEntry declaring this track under its catalog entry in `catalog`.
+	fn track_entry(&self, catalog: &Catalog, name: &str) -> Result<MatroskaSpec> {
+		match self.kind {
+			TrackKind::Video => {
+				let config = catalog
+					.video
+					.renditions
+					.get(name)
+					.ok_or_else(|| Error::MissingVideoTrack(name.to_string()))?;
+				let config = self.source.video_config(config).unwrap_or_else(|| config.clone());
+				build_video_track_entry(self.track_number, &config, self.source.description())
+			}
+			TrackKind::Audio => {
+				let config = catalog
+					.audio
+					.renditions
+					.get(name)
+					.ok_or_else(|| Error::MissingAudioTrack(name.to_string()))?;
+				build_audio_track_entry(self.track_number, config)
+			}
+		}
+	}
+
+	/// Start a group: release the last one's frames, then clock this one at the depth its
+	/// rendition declares now, or on the inferred clock when it declares none.
+	fn start_group(&mut self, name: &str, jitter: &mut crate::jitter::Buffer<String, Frame>) -> Result<()> {
+		let depth = match &self.config {
+			Some(config) => crate::container::declared::depth(config)?,
+			None => None,
+		};
+		// The inferred clock spans groups, so it is only flushed when a declaration replaces it.
+		if self.declared.is_some() || depth.is_some() {
+			self.release(name, jitter, true)?;
+		}
+		self.declared = depth.map(crate::container::declared::DeclaredClock::new);
+		Ok(())
+	}
+
+	/// Hold a video frame on its clock, then release what it settles.
+	fn push(
+		&mut self,
+		name: &str,
+		arrival: crate::jitter::Arrival<Frame>,
+		jitter: &mut crate::jitter::Buffer<String, Frame>,
+	) -> Result<()> {
+		let pts = (arrival.item.timestamp.as_nanos() * 90_000 / 1_000_000_000) as u64;
+		match &mut self.declared {
+			Some(clock) => {
+				let source = arrival.item.timestamp;
+				clock.push(arrival, pts, source)?
+			}
+			None => {
+				let (arrived, bytes) = (arrival.arrived, arrival.bytes);
+				self.clock.push(arrival, pts, arrived, bytes)
+			}
+		}
+		self.release(name, jitter, false)
+	}
+
+	fn release(&mut self, name: &str, jitter: &mut crate::jitter::Buffer<String, Frame>, flush: bool) -> Result<()> {
+		if let Some(clock) = &mut self.declared {
+			while let Some((mut arrival, dts, pts)) = clock.pop(flush)? {
+				// A tie the clock moved presents on the tick it moved to.
+				if (arrival.item.timestamp.as_nanos() * 90_000 / 1_000_000_000) as u64 != pts {
+					arrival.item.timestamp = moq_net::Timestamp::from_scale(pts, 90_000)?;
+				}
+				if !self.finished && !flush {
+					arrival.arrived = arrival.arrived.max(self.latest);
+				}
+				arrival.decode = crate::jitter::Decode::from_ticks(dts);
+				jitter.push(name.to_owned(), arrival)?;
+			}
+		}
+		let Some(config) = &self.config else { return Ok(()) };
+		let (floor, lookahead) = *self.reorder.get_or_insert_with(|| {
+			let declared = self.source.description().and_then(|description| match config.codec {
+				VideoCodec::H264(_) => {
+					crate::codec::h264::sps_reorder(crate::codec::h264::Avcc::parse(description).ok()?.sps.first()?)
+				}
+				VideoCodec::H265(_) => crate::codec::h265::sps_reorder(
+					crate::codec::h265::base_sps(&crate::codec::h265::Hvcc::parse(description).ok()?.sps).ok()??,
+				),
+				_ => None,
+			});
+			let (floor, lookahead) = declared.map_or((0, 0), |reorder| reorder.timing(config.framerate));
+			let limit = crate::container::decode::MAX_REORDER;
+			let lookahead = lookahead
+				.max(
+					config
+						.jitter
+						.map_or(0, |jitter| (jitter.as_nanos() * 90_000 / 1_000_000_000) as u64),
+				)
+				.min(limit);
+			(floor.min(limit), lookahead)
+		});
+		loop {
+			let settle = match flush {
+				true => Settle::All,
+				false => self
+					.clock
+					.settle(lookahead, self.latest, jitter.delay(), crate::jitter::MAX_BYTES),
+			};
+			let Some((mut arrival, dts)) = self.clock.pop(lookahead, floor, settle) else {
+				break;
+			};
+			if !self.finished && !flush {
+				arrival.arrived = arrival.arrived.max(self.latest);
+			}
+			arrival.decode = moq_net::Timestamp::from_scale(dts, 90_000)?.into();
+			jitter.push(name.to_owned(), arrival)?;
+		}
+		Ok(())
+	}
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -162,7 +343,9 @@ impl<S: Stream> Export<S> {
 		Self {
 			source,
 			catalog: Some(catalog),
-			latency: Duration::ZERO,
+			delay: moq_net::track::Delay::default(),
+			jitter: crate::jitter::Buffer::new(Duration::ZERO),
+			held: None,
 			fragment_duration: None,
 			tracks: HashMap::new(),
 			catalog_snapshot: None,
@@ -171,9 +354,17 @@ impl<S: Stream> Export<S> {
 		}
 	}
 
-	/// Set the maximum buffering latency for each per-track source.
-	pub fn with_latency(mut self, latency: Duration) -> Self {
-		self.latency = latency;
+	/// Set how far behind the live edge the export plays.
+	///
+	/// [`Delay::min`](moq_net::track::Delay::min) releases each frame that long after its decode
+	/// time, dropping frames that arrive later, and is where each per-track source starts. A source
+	/// whose clock runs further off ours than the output's may follow fails the export once it has
+	/// used half of it. [`Delay::max`](moq_net::track::Delay::max) is how late a source's group may
+	/// fall before it is skipped. Zero for both (the default) releases each frame as soon as it is
+	/// read and drops none as late, but a stalled group is still skipped once a newer one is ready.
+	pub fn with_delay(mut self, delay: moq_net::track::Delay) -> Self {
+		self.delay = delay;
+		self.jitter = crate::jitter::Buffer::new(delay.min.unwrap_or_default());
 		self
 	}
 
@@ -192,16 +383,13 @@ impl<S: Stream> Export<S> {
 		self
 	}
 
-	/// Get the next byte chunk.
-	pub async fn next(&mut self) -> Result<Option<Bytes>> {
-		kio::wait(|waiter| self.poll_next(waiter)).await
-	}
-
+	/// Get the next MKV byte chunk, or `None` once the export ends.
+	#[cfg_attr(feature = "async", kio::wrapper)]
 	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Bytes>>> {
 		// 1. Drain catalog updates.
 		while let Some(catalog) = self.catalog.as_mut() {
 			match catalog.poll_next(waiter)? {
-				Poll::Ready(Some(snapshot)) => self.update_catalog(snapshot.media())?,
+				Poll::Ready(Some(snapshot)) => self.update_catalog(snapshot.without_ext())?,
 				Poll::Ready(None) => {
 					self.catalog = None;
 					break;
@@ -210,43 +398,7 @@ impl<S: Stream> Export<S> {
 			}
 		}
 
-		// 2. Pull frames from each track into `pending`. ExportSource has
-		// already transformed Annex-B payloads (Avc3/Hev1) into length-prefixed
-		// form and absorbed any parameter-only frames before returning.
-		//
-		// Pre-header: drop slices that arrived before this track's codec config
-		// is ready. A receiver who subscribed mid-GOP can't render those bytes
-		// without the header anyway, and parking them would stop us from
-		// polling for the next SPS/PPS-bearing frame.
-		let waiting_for_header = !self.header_emitted;
-		for (name, track) in &mut self.tracks {
-			if track.pending.is_some() || track.finished {
-				continue;
-			}
-			loop {
-				match track.source.poll_read(waiter)? {
-					Poll::Ready(Some(frame)) => {
-						let geometry_ready = track.kind == TrackKind::Audio
-							|| self
-								.catalog_snapshot
-								.as_ref()
-								.and_then(|catalog| catalog.video.renditions.get(name))
-								.is_some_and(|config| track.source.video_geometry_ready(config));
-						if waiting_for_header && (!track.source.header_ready() || !geometry_ready) {
-							// Drop this slice and keep polling for codec configuration or geometry.
-							continue;
-						}
-						track.pending = Some(frame);
-						break;
-					}
-					Poll::Ready(None) => {
-						track.finished = true;
-						break;
-					}
-					Poll::Pending => break,
-				}
-			}
-		}
+		self.fill(waiter)?;
 
 		// 3. Before the header is emitted: keep pulling until every video
 		// transform has produced its codec config. Frames arriving in this
@@ -269,19 +421,24 @@ impl<S: Stream> Export<S> {
 			return Poll::Pending;
 		}
 
-		// 5. Pick the smallest-timestamp pending frame across tracks and route it
-		// through the cluster builder.
-		if let Some(name) = self.pick_next_track() {
-			let frame = self.tracks.get_mut(&name).unwrap().pending.take().unwrap();
+		loop {
+			let (name, frame) = match self.held.take() {
+				Some(held) => held,
+				None => match self.jitter.poll_next(waiter) {
+					Poll::Ready(ready) => (ready.track, ready.item),
+					Poll::Pending => break,
+				},
+			};
 			if let Some(chunk) = self.feed_frame(&name, frame)? {
 				return Poll::Ready(Ok(Some(chunk)));
 			}
-			// Frame consumed into the open cluster; loop and see if there's more to do.
-			return self.poll_next(waiter);
+		}
+		if !self.jitter.is_empty() {
+			return Poll::Pending;
 		}
 
 		// 6. End-of-stream: flush any open cluster when every subscribed track
-		// has finished. We don't require catalog EOS here — a long-lived
+		// has finished. We don't require catalog EOS here - a long-lived
 		// producer may keep the catalog open even after every active track has
 		// ended, and we'd rather flush the cluster than hold the last frames.
 		if !self.tracks.is_empty() && self.tracks.values().all(|t| t.finished) {
@@ -295,60 +452,206 @@ impl<S: Stream> Export<S> {
 			return Poll::Ready(Ok(None));
 		}
 
-		// 7. Drop finished, drained tracks so the next catalog update can re-add them.
-		self.tracks.retain(|_, t| !(t.finished && t.pending.is_none()));
-
+		// A finished track keeps its place: the header declared it, and the catalog may still
+		// list it or move it to another track.
 		Poll::Pending
 	}
 
+	#[cfg(test)]
+	pub(super) fn next_deadline(&self) -> Option<kio::clock::Instant> {
+		self.jitter.next_deadline()
+	}
+
+	/// How many frames the export holds between its sources and the output.
+	#[cfg(test)]
+	pub(super) fn buffered(&self) -> usize {
+		self.jitter.len() + self.tracks.values().map(|track| track.clock.len()).sum::<usize>()
+	}
+
+	/// How many video frames wait on a declared clock for their DTS.
+	#[cfg(test)]
+	pub(super) fn held(&self) -> usize {
+		self.tracks
+			.values()
+			.filter_map(|track| track.declared.as_ref())
+			.map(|clock| clock.len())
+			.sum()
+	}
+
+	#[cfg(test)]
+	pub(super) fn with_replay(mut self) -> Self {
+		self.jitter = self.jitter.replay();
+		self
+	}
+
+	/// Read each track within its jitter window, preserving ingress timing before buffering.
+	fn fill(&mut self, waiter: &kio::Waiter) -> Result<()> {
+		for (name, track) in &mut self.tracks {
+			loop {
+				if self.header_emitted && self.jitter.full(name, waiter) {
+					let _ = track.source.poll_received(waiter);
+					break;
+				}
+				if !self.header_emitted && track.pending.is_some() {
+					break;
+				}
+				let arrival = if let Some(pending) = track.pending.take() {
+					pending
+				} else {
+					if track.finished {
+						break;
+					}
+					let (frame, arrived) = match track.source.poll_event(waiter)? {
+						Poll::Ready(Some(Event::Frame { frame, arrived })) => (frame, arrived.max(track.subscribed)),
+						// A group that ended or was cut short holds frames no later one can precede.
+						Poll::Ready(Some(Event::GroupEnd | Event::Cut { .. })) => {
+							if track.declared.is_some() {
+								track.release(name, &mut self.jitter, true)?;
+							}
+							continue;
+						}
+						Poll::Ready(Some(Event::FrameEnd { .. })) => continue,
+						Poll::Ready(None) => {
+							track.finished = true;
+							break;
+						}
+						Poll::Pending => break,
+					};
+					track.latest = track.latest.max(arrived);
+					let geometry_ready = track.kind == TrackKind::Audio
+						|| self
+							.catalog_snapshot
+							.as_ref()
+							.and_then(|catalog| catalog.video.renditions.get(name))
+							.is_some_and(|config| track.source.video_geometry_ready(config));
+					let declaring = !self.header_emitted || track.moved;
+					if declaring && (!track.source.header_ready() || !geometry_ready) {
+						continue;
+					}
+					// A moved rendition's track must be the one the header declared, before any of
+					// its frames go out.
+					if track.moved
+						&& let Some(catalog) = self.catalog_snapshot.as_ref()
+					{
+						if Some(track.track_entry(catalog, name)?) != track.entry {
+							return Err(Error::TrackChanged(name.clone()).into());
+						}
+						track.moved = false;
+					}
+					crate::jitter::Arrival {
+						arrived,
+						read: kio::clock::now(),
+						decode: frame.timestamp.into(),
+						restart: track.source.markers(),
+						sync: track.kind == TrackKind::Audio || frame.keyframe,
+						leading: false,
+						bytes: frame.payload.len() + name.len(),
+						item: frame,
+					}
+				};
+				if !self.header_emitted {
+					track.pending = Some(arrival);
+					break;
+				}
+				let video = track.kind == TrackKind::Video;
+				if video && arrival.restart != track.restart {
+					track.release(name, &mut self.jitter, true)?;
+					track.clock = Default::default();
+					track.declared = None;
+					track.restart = arrival.restart;
+				}
+				if video && arrival.item.keyframe {
+					track.start_group(name, &mut self.jitter)?;
+				}
+				// A declared depth is checked even when nothing is scheduled by decode time.
+				if video && (track.declared.is_some() || !self.delay.min.unwrap_or_default().is_zero()) {
+					track.push(name, arrival, &mut self.jitter)?;
+				} else {
+					self.jitter.push(name.clone(), arrival)?;
+				}
+			}
+			if track.finished {
+				track.release(name, &mut self.jitter, true)?;
+			}
+		}
+		Ok(())
+	}
+
 	fn update_catalog(&mut self, mut catalog: Catalog) -> Result<()> {
-		self.source.retain_valid_media(&mut catalog);
+		self.source.retain_selectable(&mut catalog);
 
+		// Checked on every listing, so a rendition moved to a CMAF track is refused too.
 		let mut active: HashMap<String, ()> = HashMap::new();
-		for name in catalog.video.renditions.keys() {
+		for (name, config) in &catalog.video.renditions {
+			ensure_legacy(&config.container, "video", name)?;
 			active.insert(name.clone(), ());
 		}
-		for name in catalog.audio.renditions.keys() {
+		for (name, config) in &catalog.audio.renditions {
+			ensure_legacy(&config.container, "audio", name)?;
 			active.insert(name.clone(), ());
 		}
 
-		// The MKV `Tracks` element is written once and can't be amended, so
-		// reject any rendition add/remove once the header has been emitted.
+		// The MKV `Tracks` element is written once and can't be amended, so reject a
+		// rendition added once the header has been emitted.
+		//
+		// A declared rendition that leaves the catalog (disabled, or retired) keeps its
+		// track and is read to its own end: a disabled rendition idles until it re-enables,
+		// and a retired one finishes on its own.
 		if self.header_emitted {
 			for name in active.keys() {
 				if !self.tracks.contains_key(name) {
 					return Err(Error::HeaderAddedTrack(name.clone()).into());
 				}
 			}
-			for name in self.tracks.keys() {
-				if !active.contains_key(name) {
-					return Err(Error::HeaderRemovedTrack(name.clone()).into());
+			for (name, config) in &catalog.audio.renditions {
+				if let Some(track) = self.tracks.get_mut(name)
+					&& !track.source.reads(&self.source, name, config)
+					&& let Some(source) = ExportSource::for_audio(&self.source, name, config, self.delay)?
+				{
+					track.rebind(name, source, &mut self.jitter)?;
+				}
+			}
+			for (name, config) in &catalog.video.renditions {
+				if let Some(track) = self.tracks.get_mut(name) {
+					if !track.source.reads(&self.source, name, config)
+						&& let Some(source) = ExportSource::for_video(&self.source, name, config, self.delay)?
+					{
+						track.rebind(name, source, &mut self.jitter)?;
+					}
+					if track
+						.config
+						.as_ref()
+						.is_some_and(|old| old.jitter != config.jitter || old.framerate != config.framerate)
+					{
+						track.reorder = None;
+					}
+					track.config = Some(config.clone());
 				}
 			}
 			self.catalog_snapshot = Some(catalog);
 			return Ok(());
 		}
 
+		// Nothing went out yet, so a rendition that left the catalog is dropped, and one the
+		// catalog moved to another track starts over.
+		self.tracks.retain(|name, track| {
+			match (catalog.video.renditions.get(name), catalog.audio.renditions.get(name)) {
+				(Some(config), _) => track.source.reads(&self.source, name, config),
+				(None, Some(config)) => track.source.reads(&self.source, name, config),
+				(None, None) => false,
+			}
+		});
 		let mut next_track_number: u64 = self.tracks.values().map(|t| t.track_number).max().unwrap_or(0) + 1;
 
 		for (name, config) in catalog.video.renditions.iter() {
 			if self.tracks.contains_key(name) {
 				continue;
 			}
-			ensure_legacy(&config.container, "video", name)?;
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.latency)? else {
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.delay)? else {
 				continue;
 			};
-			self.tracks.insert(
-				name.clone(),
-				MkvTrack {
-					source,
-					pending: None,
-					finished: false,
-					track_number: next_track_number,
-					kind: TrackKind::Video,
-				},
-			);
+			let track = MkvTrack::new(source, TrackKind::Video, Some(config.clone()), next_track_number);
+			self.tracks.insert(name.clone(), track);
 			next_track_number += 1;
 		}
 
@@ -356,24 +659,16 @@ impl<S: Stream> Export<S> {
 			if self.tracks.contains_key(name) {
 				continue;
 			}
-			ensure_legacy(&config.container, "audio", name)?;
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.latency)? else {
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.delay)? else {
 				continue;
 			};
-			self.tracks.insert(
-				name.clone(),
-				MkvTrack {
-					source,
-					pending: None,
-					finished: false,
-					track_number: next_track_number,
-					kind: TrackKind::Audio,
-				},
-			);
+			let track = MkvTrack::new(source, TrackKind::Audio, None, next_track_number);
+			self.tracks.insert(name.clone(), track);
 			next_track_number += 1;
 		}
 
-		self.tracks.retain(|name, _| active.contains_key(name));
+		// Tracks change only before the header, so the clock waits on this set from here on.
+		self.jitter.expect(self.tracks.keys().cloned());
 		self.catalog_snapshot = Some(catalog);
 		Ok(())
 	}
@@ -398,7 +693,7 @@ impl<S: Stream> Export<S> {
 			})
 	}
 
-	fn build_header(&self) -> Result<Bytes> {
+	fn build_header(&mut self) -> Result<Bytes> {
 		let catalog = self.catalog_snapshot.as_ref().ok_or(Error::NoCatalogSnapshot)?;
 
 		// Decide DocType: webm only if every codec is WebM-allowed.
@@ -415,24 +710,16 @@ impl<S: Stream> Export<S> {
 		let doc_type = if webm_only { "webm" } else { "matroska" };
 
 		let mut entries: Vec<MatroskaSpec> = Vec::new();
-		for (name, config) in catalog.video.renditions.iter() {
-			let track = self
-				.tracks
-				.get(name)
-				.ok_or_else(|| Error::MissingVideoTrack(name.clone()))?;
-			let config = track.source.video_config(config).unwrap_or_else(|| config.clone());
-			entries.push(build_video_track_entry(
-				track.track_number,
-				&config,
-				track.source.description(),
-			)?);
-		}
-		for (name, config) in catalog.audio.renditions.iter() {
-			let track = self
-				.tracks
-				.get(name)
-				.ok_or_else(|| Error::MissingAudioTrack(name.clone()))?;
-			entries.push(build_audio_track_entry(track.track_number, config)?);
+		let video = catalog.video.renditions.keys().map(|name| (name, TrackKind::Video));
+		let audio = catalog.audio.renditions.keys().map(|name| (name, TrackKind::Audio));
+		for (name, kind) in video.chain(audio) {
+			let track = self.tracks.get_mut(name).ok_or_else(|| match kind {
+				TrackKind::Video => Error::MissingVideoTrack(name.clone()),
+				TrackKind::Audio => Error::MissingAudioTrack(name.clone()),
+			})?;
+			let entry = track.track_entry(catalog, name)?;
+			track.entry = Some(entry.clone());
+			entries.push(entry);
 		}
 
 		let mut dest = Cursor::new(Vec::new());
@@ -467,14 +754,6 @@ impl<S: Stream> Export<S> {
 		Ok(Bytes::from(dest.into_inner()))
 	}
 
-	fn pick_next_track(&self) -> Option<String> {
-		self.tracks
-			.iter()
-			.filter_map(|(n, t)| t.pending.as_ref().map(|f| (n.clone(), f.timestamp)))
-			.min_by_key(|(_, ts)| *ts)
-			.map(|(n, _)| n)
-	}
-
 	/// Route an already-transformed frame through the cluster builder. Returns
 	/// a chunk if the cluster rolled over (the returned chunk is the
 	/// *previous* cluster; the new frame becomes the first block of a new
@@ -499,7 +778,7 @@ impl<S: Stream> Export<S> {
 			// A reconfiguration can leave a cluster open. Roll it out first and
 			// retry this frame on the next poll.
 			if let Some(open) = self.cluster.take() {
-				track.pending = Some(frame);
+				self.held = Some((name.to_string(), frame));
 				return Ok(Some(open.finish()));
 			}
 			let mut cluster = ClusterBuilder::new(frame_ticks);
@@ -513,7 +792,7 @@ impl<S: Stream> Export<S> {
 			Some(cluster) => {
 				let overflow = !cluster.fits(frame_ticks);
 				// Roll on a video keyframe only once the cluster already has video
-				// frames in it — otherwise audio that arrived before the first
+				// frames in it - otherwise audio that arrived before the first
 				// keyframe would split into its own (un-renderable) cluster.
 				let gop_boundary = is_video && keyframe && cluster.has_video;
 				let too_long = self
@@ -585,6 +864,9 @@ fn build_video_track_entry(
 	if let Some(h) = config.coded_height {
 		video_children.push(MatroskaSpec::PixelHeight(h as u64));
 	}
+	if let Some(colour) = config.color.as_ref().and_then(matroska_colour) {
+		video_children.push(colour);
+	}
 
 	let mut entry: Vec<MatroskaSpec> = vec![
 		MatroskaSpec::TrackNumber(track_number),
@@ -600,6 +882,45 @@ fn build_video_track_entry(
 	}
 
 	Ok(MatroskaSpec::TrackEntry(Master::Full(entry)))
+}
+
+/// The Matroska `Colour` element for a catalog colour, carrying only the fields it sets.
+pub(super) fn matroska_colour(color: &hang::catalog::Color) -> Option<MatroskaSpec> {
+	let mut children = Vec::new();
+	if let Some(v) = color.matrix {
+		children.push(MatroskaSpec::MatrixCoefficients(v.into()));
+	}
+	if let Some(range) = color.range {
+		children.push(MatroskaSpec::Range(match range {
+			hang::catalog::ColorRange::Limited => 1,
+			hang::catalog::ColorRange::Full => 2,
+		}));
+	}
+	if let Some(v) = color.transfer {
+		children.push(MatroskaSpec::TransferCharacteristics(v.into()));
+	}
+	if let Some(v) = color.primaries {
+		children.push(MatroskaSpec::Primaries(v.into()));
+	}
+	if let Some(light) = color.content_light {
+		children.push(MatroskaSpec::MaxCLL(light.max_cll.into()));
+		children.push(MatroskaSpec::MaxFALL(light.max_fall.into()));
+	}
+	if let Some(m) = color.mastering {
+		children.push(MatroskaSpec::MasteringMetadata(Master::Full(vec![
+			MatroskaSpec::PrimaryRChromaticityX(m.red.x),
+			MatroskaSpec::PrimaryRChromaticityY(m.red.y),
+			MatroskaSpec::PrimaryGChromaticityX(m.green.x),
+			MatroskaSpec::PrimaryGChromaticityY(m.green.y),
+			MatroskaSpec::PrimaryBChromaticityX(m.blue.x),
+			MatroskaSpec::PrimaryBChromaticityY(m.blue.y),
+			MatroskaSpec::WhitePointChromaticityX(m.white.x),
+			MatroskaSpec::WhitePointChromaticityY(m.white.y),
+			MatroskaSpec::LuminanceMax(m.max_luminance),
+			MatroskaSpec::LuminanceMin(m.min_luminance),
+		])));
+	}
+	(!children.is_empty()).then_some(MatroskaSpec::Colour(Master::Full(children)))
 }
 
 pub(super) fn build_audio_track_entry(track_number: u64, config: &AudioConfig) -> Result<MatroskaSpec> {
@@ -646,13 +967,25 @@ pub(super) fn build_audio_track_entry(track_number: u64, config: &AudioConfig) -
 		MatroskaSpec::TrackType(2),
 		MatroskaSpec::CodecID(codec_id.to_string()),
 	];
+	// The catalog names the output rate. Under explicit SBR, Matroska puts the core's rate first
+	// and the output after it, as a separate field.
+	let core_rate = match (&config.codec, &codec_private) {
+		(AudioCodec::AAC(aac), Some(asc)) if matches!(aac.profile, 5 | 29) => {
+			Some(crate::codec::aac::in_band(asc)?.sample_rate)
+		}
+		_ => None,
+	};
 	if let Some(cp) = codec_private {
 		entry.push(MatroskaSpec::CodecPrivate(cp));
 	}
-	entry.push(MatroskaSpec::Audio(Master::Full(vec![
-		MatroskaSpec::SamplingFrequency(config.sample_rate as f64),
+	let mut audio = vec![
+		MatroskaSpec::SamplingFrequency(core_rate.unwrap_or(config.sample_rate) as f64),
 		MatroskaSpec::Channels(config.channel_count as u64),
-	])));
+	];
+	if core_rate.is_some_and(|core| core != config.sample_rate) {
+		audio.push(MatroskaSpec::OutputSamplingFrequency(config.sample_rate as f64));
+	}
+	entry.push(MatroskaSpec::Audio(Master::Full(audio)));
 
 	Ok(MatroskaSpec::TrackEntry(Master::Full(entry)))
 }

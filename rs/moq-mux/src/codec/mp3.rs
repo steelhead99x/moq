@@ -35,6 +35,7 @@ pub enum Error {
 	ReservedSampleRate,
 }
 
+/// A result using this module's error type.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Typed MP3 configuration parsed from an MPEG audio frame header.
@@ -97,44 +98,35 @@ impl Config {
 /// passing the track producer and the [`catalog::Reserved`](crate::catalog::Reserved)
 /// it reserves its rendition from.
 ///
-/// Every MP3 frame is independently decodable, so [`decode`](Self::decode) marks only the first frame
-/// of each group a keyframe (the rest extend it): frames accumulate into the current group until the
-/// caller [`cut`](Self::cut)s or [`seek`](Self::seek)s. The [`import::Track`](crate::import::Track)
-/// facade cuts after every frame by default (one group per frame); a caller driving its own
-/// boundaries cuts less often. MP3 carries its config in band, so the rendition has no out-of-band
-/// description.
-pub struct Import<E: CatalogExt = ()> {
-	track: crate::container::Producer<crate::catalog::hang::Container>,
-	rendition: crate::catalog::AudioTrack<E>,
+/// Every MP3 frame is independently decodable, so [`decode`](Self::decode) marks only the first
+/// frame of each group a keyframe (the rest extend it): frames accumulate into the current group
+/// until the caller [`cut`](Self::cut)s or [`seek`](Self::seek)s. The
+/// [`import::Track`](crate::import::Track) facade passes that through, so boundaries are the
+/// caller's either way: cut per frame for one group per frame, or less often to batch frames into
+/// fewer groups. MP3 carries its config in band, so the rendition has no out-of-band description.
+pub struct Import {
+	track: crate::container::Producer<crate::catalog::hang::Container, hang::catalog::AudioConfig>,
 }
 
-impl<E: CatalogExt> Import<E> {
+impl Import {
 	/// Publish on an existing track producer with a resolved catalog config.
 	///
 	/// Build one from a frame header with [`config`], or from an out-of-band [`Config`] via `into()`.
 	/// The rendition publishes immediately.
-	pub fn new(
+	pub fn new<E: CatalogExt>(
 		track: moq_net::track::Producer,
 		reserved: crate::catalog::Reserved<E>,
-		mut config: hang::catalog::AudioConfig,
+		config: hang::catalog::AudioConfig,
 	) -> crate::Result<Self> {
 		tracing::debug!(name = ?track.name(), ?config, "starting track");
-		// Advertise this rendition's timeline before publishing (the generic set() no longer does).
-		config.timeline = Some(reserved.producer().timeline(track.name())?.section());
 		// The caller's config names the container; the writer is built from that same value so the
 		// wire cannot disagree with what the rendition advertises.
-		let wire = crate::catalog::hang::Container::try_from(&config.container)?;
-		let name = track.name().to_string();
-		// Build the writer before advertising the rendition: it is fallible (its timeline track can
-		// collide), and a rendition published for a track we then fail to produce would be
-		// advertised to consumers but never served.
-		let media = reserved.producer().media_producer(track, wire)?;
-		let mut rendition = reserved.audio(name);
-		rendition.set(config);
-		Ok(Self {
-			track: media,
-			rendition,
-		})
+		let wire = crate::catalog::hang::Container::try_from(&config)?;
+		// Build the writer before advertising the rendition: it is fallible (enrolling the track in
+		// the broadcast timeline can collide), and a rendition published for a track we then fail to
+		// produce would be advertised to consumers but never served.
+		let track = reserved.audio(track, wire, config)?;
+		Ok(Self { track })
 	}
 
 	/// A watch-only handle to this track's subscriber demand.
@@ -144,8 +136,7 @@ impl<E: CatalogExt> Import<E> {
 
 	/// Finish the track, flushing the current group.
 	pub fn finish(&mut self) -> crate::Result<()> {
-		self.track.finish()?;
-		self.estimate();
+		self.track.end_with(None)?;
 		Ok(())
 	}
 
@@ -155,23 +146,20 @@ impl<E: CatalogExt> Import<E> {
 		self.track.abort(err);
 	}
 
-	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
-	/// the fields its config didn't supply.
-	fn estimate(&mut self) {
-		self.rendition.estimate(self.track.estimate());
-	}
-
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
 		self.track.cut(end)?;
-		self.estimate();
 		Ok(())
+	}
+
+	/// Mark a timeline break and restart measurement without lowering advertised values.
+	pub fn discontinuity(&mut self) -> crate::Result<()> {
+		self.track.discontinuity()
 	}
 
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> crate::Result<()> {
 		self.track.seek(sequence)?;
-		self.estimate();
 		Ok(())
 	}
 
@@ -181,7 +169,7 @@ impl<E: CatalogExt> Import<E> {
 	/// (see [`Producer::needs_keyframe`](crate::container::Producer::needs_keyframe)); otherwise it
 	/// extends the current group. The caller bounds groups via [`cut`](Self::cut) / [`seek`](Self::seek).
 	pub fn decode<B: moq_net::IntoBytes>(&mut self, frame: B, pts: Option<Timestamp>) -> crate::Result<()> {
-		let timestamp = self.rendition.timestamp(pts)?;
+		let timestamp = self.track.timestamp(pts)?;
 		// Only the first frame of each group is a keyframe, so the group spans until the caller cuts
 		// instead of opening one group (one QUIC stream) per packet.
 		let keyframe = self.track.needs_keyframe();
@@ -191,7 +179,6 @@ impl<E: CatalogExt> Import<E> {
 			keyframe,
 			duration: None,
 		})?;
-		self.estimate();
 		Ok(())
 	}
 }

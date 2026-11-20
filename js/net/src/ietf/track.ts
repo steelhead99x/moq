@@ -1,12 +1,13 @@
 import type * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
+import * as Filter from "./filter.ts";
 import * as Message from "./message.ts";
 import * as Namespace from "./namespace.ts";
-import { Parameters } from "./parameters.ts";
-import { type IetfVersion, Version } from "./version.ts";
-
-// we only support Group Order descending
-const GROUP_ORDER = 0x02;
+import { type MessageLocation, Parameters } from "./parameters.ts";
+import * as Properties from "./properties.ts";
+import { RequestOk } from "./request.ts";
+import { Subscribe } from "./subscribe.ts";
+import type { IetfVersion } from "./version.ts";
 
 export class TrackStatusRequest {
 	static id = 0x0d;
@@ -14,129 +15,92 @@ export class TrackStatusRequest {
 	requestId: bigint;
 	trackNamespace: Path.Valid;
 	trackName: string;
+	/** Whether the requester wants Track Properties on the answer (INCLUDE_PROPERTIES, draft-22). */
+	propertiesWanted: boolean;
 
 	constructor({
 		requestId,
 		trackNamespace,
 		trackName,
-	}: { requestId: bigint; trackNamespace: Path.Valid; trackName: string }) {
+		propertiesWanted = true,
+	}: {
+		requestId: bigint;
+		trackNamespace: Path.Valid;
+		trackName: string;
+		propertiesWanted?: boolean;
+	}) {
 		this.requestId = requestId;
 		this.trackNamespace = trackNamespace;
 		this.trackName = trackName;
+		this.propertiesWanted = propertiesWanted;
 	}
 
 	async #encode(w: Writer, version: IetfVersion): Promise<void> {
 		await w.u62(this.requestId);
-		if (version === Version.DRAFT_17) {
-			await w.u62(0n); // required_request_id_delta — always 0, not supported
-		}
-		await Namespace.encode(w, this.trackNamespace);
-		await w.string(this.trackName);
+		await Namespace.encodeTrack(w, this.trackNamespace, this.trackName);
 
-		if (version === Version.DRAFT_14) {
-			await w.u8(0); // subscriber_priority
-			await w.u8(GROUP_ORDER); // group_order
-			await w.bool(false); // forward
-			await w.u53(0x2); // filter_type = LargestObject
-			await w.u53(0); // no parameters
-		} else {
-			// v15+: just parameters
-			const params = new Parameters();
-			await params.encode(w, version);
-		}
+		// Only the opt-out is worth bytes, and a peer before draft-22 would read
+		// INCLUDE_PROPERTIES as unknown, which is a protocol violation.
+		const params = new Parameters();
+		if (!this.propertiesWanted && Filter.isDraft20(version)) params.includeProperties = false;
+		await params.encode(w, version);
 	}
 
 	async encode(w: Writer, version: IetfVersion): Promise<void> {
 		return Message.encode(w, (mw) => this.#encode(mw, version));
 	}
 
+	/**
+	 * Every draft defines TRACK_STATUS as identical to SUBSCRIBE, so it decodes as one and
+	 * keeps what names the track and shapes the answer. The rest goes unread: there is no
+	 * subscription for it to configure.
+	 */
 	static async decode(r: Reader, version: IetfVersion): Promise<TrackStatusRequest> {
-		return Message.decode(r, (mr) => TrackStatusRequest.#decode(mr, version));
-	}
-
-	static async #decode(r: Reader, version: IetfVersion): Promise<TrackStatusRequest> {
-		const requestId = await r.u62();
-		if (version === Version.DRAFT_17) {
-			await r.u62(); // required_request_id_delta
-		}
-		const trackNamespace = await Namespace.decode(r);
-		const trackName = await r.string();
-
-		if (version === Version.DRAFT_14) {
-			await r.u8(); // subscriber_priority
-			await r.u8(); // group_order
-			await r.bool(); // forward
-			await r.u53(); // filter_type
-			await Parameters.decode(r, version); // parameters
-		} else {
-			// v15+: just parameters
-			await Parameters.decode(r, version);
-		}
-
-		return new TrackStatusRequest({ requestId, trackNamespace, trackName });
+		const { requestId, trackNamespace, trackName, propertiesWanted } = await Subscribe.decode(r, version);
+		return new TrackStatusRequest({ requestId, trackNamespace, trackName, propertiesWanted });
 	}
 }
 
-// Track status response (0x0E) — v14 only (TRACK_STATUS_OK)
-// In v15+, the response to TrackStatusRequest is RequestOk (0x07)
-export class TrackStatus {
-	static id = 0x0e;
+/**
+ * TRACK_STATUS_OK: what a SUBSCRIBE_OK would say about the track, with no subscription.
+ *
+ * The answer is a REQUEST_OK carrying the message parameters and Track Properties.
+ */
+export class TrackStatusOk {
+	static readonly id = RequestOk.id;
 
-	trackNamespace: Path.Valid;
-	trackName: string;
-	statusCode: number;
-	lastGroupId: bigint;
-	lastObjectId: bigint;
+	/** The largest Location in the track (LARGEST_OBJECT), absent while it has no content. */
+	largest: MessageLocation | undefined;
 
-	constructor({
-		trackNamespace,
-		trackName,
-		statusCode,
-		lastGroupId,
-		lastObjectId,
-	}: {
-		trackNamespace: Path.Valid;
-		trackName: string;
-		statusCode: number;
-		lastGroupId: bigint;
-		lastObjectId: bigint;
-	}) {
-		this.trackNamespace = trackNamespace;
-		this.trackName = trackName;
-		this.statusCode = statusCode;
-		this.lastGroupId = lastGroupId;
-		this.lastObjectId = lastObjectId;
+	/** The Track Properties. */
+	properties: Properties.Properties;
+
+	constructor({ largest, properties = {} }: { largest?: MessageLocation; properties?: Properties.Properties } = {}) {
+		this.largest = largest;
+		this.properties = properties;
 	}
 
-	async #encode(w: Writer): Promise<void> {
-		await Namespace.encode(w, this.trackNamespace);
-		await w.string(this.trackName);
-		await w.u62(BigInt(this.statusCode));
-		await w.u62(this.lastGroupId);
-		await w.u62(this.lastObjectId);
+	async #encode(w: Writer, version: IetfVersion): Promise<void> {
+		// The parameters SUBSCRIBE_OK carries.
+		const params = new Parameters();
+		if (this.largest !== undefined) params.largest = this.largest;
+		await params.encode(w, version);
+
+		// Track Properties are the final field, so nothing may follow.
+		await Properties.encode(w, this.properties, version);
 	}
 
-	async encode(w: Writer, _version: IetfVersion): Promise<void> {
-		return Message.encode(w, this.#encode.bind(this));
+	async encode(w: Writer, version: IetfVersion): Promise<void> {
+		return Message.encode(w, (mw) => this.#encode(mw, version));
 	}
 
-	static async decode(r: Reader, _version: IetfVersion): Promise<TrackStatus> {
-		return Message.decode(r, TrackStatus.#decode);
+	static async decode(r: Reader, version: IetfVersion): Promise<TrackStatusOk> {
+		return Message.decode(r, (mr) => TrackStatusOk.#decode(mr, version));
 	}
 
-	static async #decode(r: Reader): Promise<TrackStatus> {
-		const trackNamespace = await Namespace.decode(r);
-		const trackName = await r.string();
-		const statusCode = Number(await r.u62());
-		const lastGroupId = await r.u62();
-		const lastObjectId = await r.u62();
-
-		return new TrackStatus({ trackNamespace, trackName, statusCode, lastGroupId, lastObjectId });
+	static async #decode(r: Reader, version: IetfVersion): Promise<TrackStatusOk> {
+		const params = await Parameters.decode(r, version, "subscribe-ok");
+		const properties = await Properties.decode(r, version);
+		return new TrackStatusOk({ largest: params.largest, properties });
 	}
-
-	// Track status codes
-	static readonly STATUS_IN_PROGRESS = 0x00;
-	static readonly STATUS_NOT_FOUND = 0x01;
-	static readonly STATUS_NOT_AUTHORIZED = 0x02;
-	static readonly STATUS_ENDED = 0x03;
 }

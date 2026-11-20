@@ -1,0 +1,20 @@
+# drill: relay_killed_mid_group_aborts_then_resumes::loopback
+# expect: subscriber: reconnect loop gave up
+#
+# Removes redialing after an established session is lost. The reconnect loop
+# treats a healthy session's end the way connecting once does and stops, so a
+# relay restart becomes a permanent outage instead of a bounded gap the same
+# handles resume across.
+diff --git a/rs/moq-net/src/reconnect.rs b/rs/moq-net/src/reconnect.rs
+--- a/rs/moq-net/src/reconnect.rs
++++ b/rs/moq-net/src/reconnect.rs
+@@ -991,7 +991,8 @@ impl<A: Target, E: Clone + std::fmt::Display + From<Error> + From<Failure>> Reco
+ 	fn closed(&mut self, now: Instant, err: Error, healthy: bool, url: &Url) {
+ 		let err = E::from(err);
+ 		// Connecting once, the session ending ends the policy with its close reason.
+-		if self.config.once {
++		// MUTATION: losing an established session ends the policy instead of redialing.
++		if self.config.once || healthy {
+ 			return self.done(Err(err));
+ 		}
+ 

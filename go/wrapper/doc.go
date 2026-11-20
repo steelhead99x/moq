@@ -1,0 +1,34 @@
+// Package moq is the ergonomic Go API for Media over QUIC: real-time pub/sub
+// with built-in caching, fan-out, and prioritization.
+//
+// It wraps the raw UniFFI bindings in moq.dev/moq-ffi with
+// idiomatic Go: context.Context cancellation, Go error returns, and Go 1.23
+// range-over-func iterators (iter.Seq2) for live streams. The raw record,
+// enum, and small object types are re-exported here without the Moq prefix (see types.go),
+// media timestamps are exact Timestamp records (see records.go), so
+// most programs never need to import the ffi package directly.
+//
+// A typical full-duplex client wires a single origin as both publish source
+// and consume sink; Dial does this automatically when no origin is supplied.
+// See the package README for a runnable example.
+//
+// # Cancellation
+//
+// Every call that can block takes a context.Context, and cancelling it (or
+// hitting its deadline) returns ctx.Err() promptly and tears the in-flight
+// native work down with it. Nothing is left running in the background, so a
+// per-call deadline is a real bound on resource use. When a call finishes at the
+// very moment its context expires, either may win: the caller gets the result or
+// it gets ctx.Err(). What is guaranteed is that the losing side costs nothing, so
+// a result the caller never sees is disposed of rather than left live with no
+// owner.
+//
+// A cancel aborts only the call it bounds and leaves the object usable, so the
+// same broadcast, producer, consumer, or server takes the next call. A stream
+// read (any Next, RecvGroup, ReadFrame) may lose the item it was about to
+// return. A range loop over a consumer's stream (All, Groups, Frames) is the
+// exception: when its context ends, it cancels the stream too, since the loop
+// is done with it. Route.All and Server.All leave the route advertised and the
+// listener open. Calls that own a session or listener (Dial, Listen, a session's
+// Closed) tear it down when cancelled.
+package moq

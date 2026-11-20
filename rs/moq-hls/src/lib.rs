@@ -1,49 +1,54 @@
 //! HLS / LL-HLS <-> MoQ gateway.
 //!
 //! Bridges HLS (and Low-Latency HLS) and [`moq_net`] broadcasts in both
-//! directions, mirroring the WHIP/WHEP split in `moq-rtc`:
+//! directions, mirroring the WHIP/WHEP split in `moq-webrtc`:
 //!
 //! - [`import`] pulls a remote HLS master/media playlist and publishes its CMAF
 //!   segments into MoQ (an HTTP *client* that *publishes*).
-//! - [`server`] serves HLS playlists and CMAF segments over HTTP for MoQ
-//!   broadcasts (an HTTP *server*). It subscribes only to each broadcast's
-//!   catalog and per-rendition timeline tracks; media bytes are FETCHed from
+//! - [`server`] serves HLS playlists, DASH manifests, and CMAF segments over
+//!   HTTP for MoQ broadcasts (an HTTP *server*). It subscribes only to each
+//!   broadcast's catalog and HLS record tracks; media bytes are FETCHed from
 //!   the relay one group at a time, only when a segment is actually requested.
 //!   It serves every request; gate access by layering your own middleware onto
-//!   [`Server::router`](server::Server::router).
+//!   [`Server::router`](server::Server::router), or parse and authorize each request
+//!   yourself and answer it with [`Server::respond`](server::Server::respond).
 //!
 //! All CMAF byte handling (import via [`moq_mux::container::fmp4::Import`],
 //! export via [`moq_mux::container::fmp4::Muxer`]) lives in `moq-mux`; this
-//! crate owns the HLS manifest generation, the timeline-driven playlist
-//! window, and the HTTP surface.
+//! crate owns the HLS playlist and DASH manifest generation, the
+//! record-driven playlist window, and the HTTP surface.
+//!
+//! Its cryptography is [rind](https://docs.rs/rind), so every constructor that first needs it
+//! refuses a CPU missing a feature rind requires with [`Error::UnsupportedCpu`], carrying [`moq_crypto::cpu::UnsupportedCpu`].
+//!
+//! The gateway drives its HTTP fetches and background watchers as async code, so [`import`] and
+//! [`export`] need the `async` feature. The default `server` feature enables it.
 
 #![warn(missing_docs)]
+#![cfg_attr(
+	not(feature = "async"),
+	allow(
+		rustdoc::broken_intra_doc_links,
+		reason = "the docs link the gateways, which a poll-only build leaves out"
+	)
+)]
 
 mod error;
+#[cfg(feature = "async")]
 pub mod export;
+#[cfg(feature = "async")]
 pub mod import;
 #[cfg(feature = "server")]
 pub mod server;
 
-pub(crate) use error::status_retryable;
 pub use error::*;
 #[cfg(feature = "server")]
 pub use server::Server;
 
-/// Re-export of the HTTP stack behind the export server, so consumers can name the
-/// types that surface through [`Server::router`] (and layer their own middleware on
-/// it) without adding their own axum dependency and risking a version mismatch.
-/// `axum::http` covers the `http` crate types too. A major axum bump is therefore a
-/// breaking change for this crate.
-#[cfg(feature = "server")]
-pub use axum;
-
-/// Re-export of the HTTP client used by [`import`], so consumers can name the
-/// [`reqwest::Error`] carried by [`Error::Reqwest`] without adding their own reqwest
-/// dependency. A major reqwest bump is therefore a breaking change for this crate.
-pub use reqwest;
-
-/// Re-export of the URL parser, so consumers can name the [`url::Url`] and
-/// [`url::ParseError`] carried by [`Error`] without adding their own url dependency.
-/// A major url bump is therefore a breaking change for this crate.
-pub use url;
+/// Test helper: a [`moq_mux::Source`] for the broadcast at `path`, resolved through `origin`.
+#[cfg(test)]
+pub(crate) async fn resolved(origin: &moq_net::origin::Producer, path: &str) -> moq_mux::Source {
+	let consumer = origin.consume();
+	let broadcast = consumer.request(path, None).await.expect("the broadcast resolves");
+	moq_mux::Source::new(consumer, broadcast)
+}

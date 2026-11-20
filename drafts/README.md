@@ -35,6 +35,11 @@ which emails you a confirmation link. The submission is final only once you
 click that link. For a brand-new draft (`-00`), set "Replaces" on the
 confirmation page.
 
+The script uploads the source as it is and refuses a heading that still ends
+in `(in progress)`. Before publishing, close the changelog heading for the
+version you submit and commit it as the record of the publish. Open the next
+version's section only after the upload.
+
 ## Contributing
 
 All contributions are made under the IETF Standards Process; see

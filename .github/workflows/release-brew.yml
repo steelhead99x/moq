@@ -15,11 +15,12 @@ name: release-brew
 # hour.
 
 on:
-  workflow_run:
+  # Publishes only a protected release tag at the run's commit; see
+  # "Require a release tag at the run's commit".
+  workflow_run: # zizmor: ignore[dangerous-triggers]
     workflows:
       - moq-relay
       - moq-cli
-      - moq-token-cli
       - moq-gst
     types:
       - completed
@@ -34,13 +35,47 @@ permissions:
 jobs:
   publish:
     name: Publish formula to homebrew-tap
-    if: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'moq-') }}
+    # workflow_run has the base repository's privileges and this job checks out
+    # the triggering commit, so accept only a successful tag push in this
+    # repository: a fork PR can rename a workflow and its branch to match. Only
+    # the tag patterns the `release tags` ruleset protects are accepted.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (startsWith(github.event.workflow_run.head_branch, 'moq-relay-v') ||
+       startsWith(github.event.workflow_run.head_branch, 'moq-cli-v') ||
+       startsWith(github.event.workflow_run.head_branch, 'moq-gst-v'))
     runs-on: ubuntu-latest
+    # The moq-bot key lives in the `bot` Environment, which only protected
+    # refs can deploy to; workflow_run runs on `main`.
+    environment: bot
 
     steps:
+      # head_branch names a branch as readily as a tag, and anyone who can push
+      # may name a branch and a workflow after a release. Only a tag the
+      # `release tags` ruleset protects, at the run's commit, is a release.
+      - name: Require a release tag at the run's commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.workflow_run.head_branch }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha)
+          if [[ "$commit" != "$SHA" ]]; then
+            echo "::error::$TAG is not a release tag at $SHA"
+            exit 1
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # workflow_run runs the default branch's file, whose checkout would
+          # otherwise take trunk rather than the tag that was released.
+          ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
+
+      - uses: ./.github/actions/just
 
       - name: Parse crate and version
         id: parse
@@ -99,7 +134,7 @@ jobs:
           VERSION: ${{ steps.parse.outputs.version }}
         run: |
           mkdir -p rendered
-          ./.github/scripts/render-formula.sh \
+          just gh formula \
             --template ".github/homebrew/Formula/${CRATE}.rb.tmpl" \
             --version "$VERSION" \
             --release-dir release-assets \
@@ -109,7 +144,7 @@ jobs:
           cat "rendered/${CRATE}.rb"
 
       - name: Generate moq-bot token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         id: token
         with:
           client-id: ${{ secrets.APP_CLIENT_ID }}
@@ -122,7 +157,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: moq-dev/homebrew-tap
-          token: ${{ steps.token.outputs.token }}
+          # The next step pushes the formula with this credential.
+          token: ${{ steps.token.outputs.token }} # zizmor: ignore[artipacked]
           path: homebrew-tap
 
       - name: Commit and push formula
@@ -135,10 +171,8 @@ jobs:
           GIT_COMMITTER_EMAIL: moq-bot[bot]@users.noreply.github.com
         run: |
           cd homebrew-tap
-          mkdir -p Formula
-          cp "../rendered/${CRATE}.rb" "Formula/${CRATE}.rb"
 
-          # Seed a README the first time the tap repo receives a push.
+          # Seed the tap README; install-formula updates each name as it ships.
           if [[ ! -f README.md ]]; then
             cat > README.md <<'EOF'
           # moq Homebrew tap
@@ -149,7 +183,6 @@ jobs:
           brew tap moq-dev/tap
           brew install moq-dev/tap/moq-relay
           brew install moq-dev/tap/moq-cli
-          brew install moq-dev/tap/moq-token-cli
           brew install moq-dev/tap/moq-gst
           ```
 
@@ -160,11 +193,13 @@ jobs:
           EOF
           fi
 
+          just gh install-formula "$CRATE" "rendered/${CRATE}.rb" homebrew-tap
+
           if git diff --quiet && [[ -z "$(git status --porcelain)" ]]; then
             echo "No changes to commit (formula already up to date)."
             exit 0
           fi
 
-          git add Formula/ README.md
+          git add -A Formula/ README.md formula_renames.json
           git commit -m "${CRATE}: bump to v${VERSION}"
           git push

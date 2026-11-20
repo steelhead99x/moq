@@ -9,9 +9,9 @@
 //! here, so the ioctl sequence, the buffer pool, and the plane arithmetic are
 //! written once.
 //!
-//! Built on the raw layer of the `v4l` crate that the camera capture path
-//! already uses: `v4l::v4l_sys` supplies the `videodev2.h` structs and
-//! `v4l::v4l2::vidioc` the request codes, so nothing here hand-rolls a struct
+//! Built on the raw layer of the `moq_v4l` crate that the camera capture path
+//! already uses: `moq_v4l::sys` supplies the `videodev2.h` structs and
+//! `moq_v4l::v4l2::vidioc` the request codes, so nothing here hand-rolls a struct
 //! offset.
 //!
 //! The driver, not the caller, decides the raw layout. `VIDIOC_S_FMT` is a
@@ -28,18 +28,22 @@ use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::time::Duration;
 
-use v4l::v4l_sys::{
+use moq_v4l::sys::{
 	V4L2_BUF_FLAG_ERROR, V4L2_BUF_FLAG_LAST, V4L2_CAP_DEVICE_CAPS, V4L2_CAP_STREAMING, V4L2_CAP_VIDEO_M2M,
-	V4L2_CAP_VIDEO_M2M_MPLANE, V4L2_EVENT_SOURCE_CHANGE, V4L2_SEL_TGT_COMPOSE, timeval,
+	V4L2_CAP_VIDEO_M2M_MPLANE, V4L2_CTRL_FLAG_DISABLED, V4L2_EVENT_SOURCE_CHANGE, V4L2_SEL_TGT_COMPOSE, timeval,
 	v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, v4l2_buffer,
-	v4l2_capability, v4l2_colorspace_V4L2_COLORSPACE_REC709, v4l2_colorspace_V4L2_COLORSPACE_SMPTE170M, v4l2_control,
-	v4l2_decoder_cmd, v4l2_encoder_cmd, v4l2_event, v4l2_event_subscription, v4l2_field_V4L2_FIELD_NONE, v4l2_fmtdesc,
-	v4l2_format, v4l2_memory_V4L2_MEMORY_MMAP, v4l2_plane, v4l2_quantization_V4L2_QUANTIZATION_FULL_RANGE,
-	v4l2_quantization_V4L2_QUANTIZATION_LIM_RANGE, v4l2_requestbuffers, v4l2_selection, v4l2_streamparm,
-	v4l2_xfer_func_V4L2_XFER_FUNC_709, v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_601, v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_709,
+	v4l2_capability, v4l2_colorspace_V4L2_COLORSPACE_470_SYSTEM_BG, v4l2_colorspace_V4L2_COLORSPACE_BT2020,
+	v4l2_colorspace_V4L2_COLORSPACE_REC709, v4l2_colorspace_V4L2_COLORSPACE_SMPTE170M, v4l2_control, v4l2_decoder_cmd,
+	v4l2_encoder_cmd, v4l2_event, v4l2_event_subscription, v4l2_field_V4L2_FIELD_NONE, v4l2_fmtdesc, v4l2_format,
+	v4l2_memory_V4L2_MEMORY_MMAP, v4l2_plane, v4l2_quantization_V4L2_QUANTIZATION_FULL_RANGE,
+	v4l2_quantization_V4L2_QUANTIZATION_LIM_RANGE, v4l2_queryctrl, v4l2_requestbuffers, v4l2_selection,
+	v4l2_streamparm, v4l2_xfer_func_V4L2_XFER_FUNC_709, v4l2_xfer_func_V4L2_XFER_FUNC_SMPTE2084,
+	v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_601, v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_709,
+	v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_BT2020,
 };
-use v4l::v4l2::vidioc;
+use moq_v4l::v4l2::vidioc;
 
+use crate::color::{Matrix, Primaries, Range, Transfer};
 use crate::frame::I420;
 use crate::{Color, Error, Size};
 
@@ -72,51 +76,6 @@ pub(crate) const RAW: &[u32] = &[NV12, NV12M, YUV420, YUV420M];
 /// Planes a format may use here: Y, U, and V.
 const MAX_PLANES: usize = 3;
 
-/// Requests the `v4l` crate does not export, built the way
-/// `linux/ioctl.h` builds them. The shifts are `asm-generic`'s, which is what
-/// `v4l`'s own table already assumes.
-mod request {
-	use v4l::v4l_sys::{v4l2_decoder_cmd, v4l2_event, v4l2_event_subscription, v4l2_selection};
-	use v4l::v4l2::vidioc::_IOC_TYPE;
-
-	const READ: u32 = 2;
-	const WRITE: u32 = 1;
-
-	const fn code(dir: u32, nr: u32, size: usize) -> _IOC_TYPE {
-		((dir as _IOC_TYPE) << 30) | ((size as _IOC_TYPE) << 16) | ((b'V' as _IOC_TYPE) << 8) | nr as _IOC_TYPE
-	}
-
-	pub(super) const DQEVENT: _IOC_TYPE = code(READ, 89, size_of::<v4l2_event>());
-	pub(super) const SUBSCRIBE_EVENT: _IOC_TYPE = code(WRITE, 90, size_of::<v4l2_event_subscription>());
-	pub(super) const G_SELECTION: _IOC_TYPE = code(READ | WRITE, 94, size_of::<v4l2_selection>());
-	pub(super) const DECODER_CMD: _IOC_TYPE = code(READ | WRITE, 96, size_of::<v4l2_decoder_cmd>());
-
-	#[cfg(test)]
-	mod tests {
-		use v4l::v4l_sys::{v4l2_capability, v4l2_format};
-		use v4l::v4l2::vidioc;
-
-		use super::*;
-
-		/// The codes above have to come out the way `linux/ioctl.h` builds
-		/// the rest, and nothing else here would notice if they did not: a wrong
-		/// code is `ENOTTY` at runtime on whichever board reaches it first.
-		///
-		/// Checked against requests the `v4l` crate does export, one per direction,
-		/// so the shifts, the direction bits, and the struct size all have to agree
-		/// on whatever target this compiles for.
-		#[test]
-		fn the_codes_are_built_the_way_the_crate_builds_its_own() {
-			assert_eq!(code(READ, 0, size_of::<v4l2_capability>()), vidioc::VIDIOC_QUERYCAP);
-			assert_eq!(code(WRITE, 18, size_of::<std::ffi::c_int>()), vidioc::VIDIOC_STREAMON);
-			assert_eq!(code(READ | WRITE, 5, size_of::<v4l2_format>()), vidioc::VIDIOC_S_FMT);
-			// `v4l` 0.14 omits this newer request. This is the value from
-			// `videodev2.h`, and also checks the generated command struct's ABI size.
-			assert_eq!(DECODER_CMD, 0xc048_5660);
-		}
-	}
-}
-
 /// A `videodev2.h` struct an ioctl reads or fills.
 ///
 /// # Safety
@@ -142,6 +101,7 @@ unsafe impl Arg for v4l2_event {}
 unsafe impl Arg for v4l2_event_subscription {}
 unsafe impl Arg for v4l2_fmtdesc {}
 unsafe impl Arg for v4l2_format {}
+unsafe impl Arg for v4l2_queryctrl {}
 unsafe impl Arg for v4l2_requestbuffers {}
 unsafe impl Arg for v4l2_selection {}
 unsafe impl Arg for v4l2_streamparm {}
@@ -210,9 +170,6 @@ pub(crate) struct Format {
 
 /// How to recognize the M2M node for one codec, since node numbering is per SoC.
 pub(crate) struct Role {
-	/// Environment variable naming a node directly, for a driver whose format
-	/// enumeration doesn't match what it can actually do.
-	pub env: &'static str,
 	/// Fourccs the OUTPUT queue has to accept, any one of them.
 	pub input: &'static [u32],
 	/// Fourccs the CAPTURE queue has to produce, any one of them.
@@ -224,16 +181,17 @@ pub(crate) struct Role {
 ///
 /// The path is per SoC (`/dev/video11` encodes on a Raspberry Pi, and other SoCs
 /// number theirs differently), so the node is identified by what it converts
-/// rather than by a table of guesses. `role.env` overrides the search.
-pub(crate) fn open(role: &Role) -> Result<Device, Error> {
-	if let Ok(path) = std::env::var(role.env) {
-		let device = Device::open(Path::new(&path))?;
+/// rather than by a table of guesses. A `named` node skips the search, for a
+/// driver whose format enumeration doesn't match what it can actually do.
+pub(crate) fn open(role: &Role, named: Option<&Path>) -> Result<Device, Error> {
+	if let Some(path) = named {
+		let device = Device::open(path)?;
 		device.check(role)?;
 		return Ok(device);
 	}
 
-	let mut nodes = v4l::context::enum_devices();
-	nodes.sort_by_key(v4l::context::Node::index);
+	let mut nodes = moq_v4l::context::enum_devices();
+	nodes.sort_by_key(moq_v4l::context::Node::index);
 
 	let mut refused = Vec::new();
 	for node in nodes {
@@ -246,11 +204,10 @@ pub(crate) fn open(role: &Role) -> Result<Device, Error> {
 		}
 	}
 
-	Err(Error::Codec(anyhow::anyhow!(
-		"no V4L2 M2M node converts {} to {} (set {} to name one; tried {})",
+	Err(Error::codec(anyhow::anyhow!(
+		"no V4L2 M2M node converts {} to {} (name one in the config; tried {})",
 		join_fourcc(role.input),
 		join_fourcc(role.output),
-		role.env,
 		match refused.is_empty() {
 			true => "no nodes".to_owned(),
 			false => refused.join(", "),
@@ -285,7 +242,7 @@ impl Device {
 			.write(true)
 			.custom_flags(libc::O_NONBLOCK)
 			.open(path)
-			.map_err(|err| Error::Codec(anyhow::anyhow!("{}: open: {err}", path.display())))?;
+			.map_err(|err| Error::codec(anyhow::anyhow!("{}: open: {err}", path.display())))?;
 
 		let device = Self {
 			file,
@@ -300,12 +257,12 @@ impl Device {
 				0 => "not an M2M device",
 				_ => "single-planar M2M only",
 			};
-			return Err(Error::Codec(anyhow::anyhow!("{}: {what}", path.display())));
+			return Err(Error::codec(anyhow::anyhow!("{}: {what}", path.display())));
 		}
 		// Everything below streams MMAP buffers, so a node without streaming I/O is
 		// the wrong node however its formats enumerate.
 		if caps & V4L2_CAP_STREAMING == 0 {
-			return Err(Error::Codec(anyhow::anyhow!("{}: no streaming I/O", path.display())));
+			return Err(Error::codec(anyhow::anyhow!("{}: no streaming I/O", path.display())));
 		}
 		Ok(device)
 	}
@@ -315,7 +272,7 @@ impl Device {
 		for (dir, wanted) in [(Dir::Output, role.input), (Dir::Capture, role.output)] {
 			let offered = self.formats(dir)?;
 			if !wanted.iter().any(|code| offered.contains(code)) {
-				return Err(Error::Codec(anyhow::anyhow!(
+				return Err(Error::codec(anyhow::anyhow!(
 					"offers {} where {} is needed",
 					join_fourcc(&offered),
 					join_fourcc(wanted)
@@ -338,12 +295,12 @@ impl Device {
 	unsafe fn ioctl<T>(&self, request: vidioc::_IOC_TYPE, arg: &mut T) -> std::io::Result<()> {
 		// SAFETY: the caller guarantees `arg` matches `request`, and the pointer
 		// stays valid for the call, which is the only thing the kernel needs.
-		unsafe { v4l::v4l2::ioctl(self.file.as_raw_fd(), request, (arg as *mut T).cast()) }
+		unsafe { moq_v4l::v4l2::ioctl(self.file.as_raw_fd(), request, (arg as *mut T).cast()) }
 	}
 
 	/// Wrap an ioctl failure with the node and the operation that failed.
 	fn err(&self, what: impl std::fmt::Display, err: std::io::Error) -> Error {
-		Error::Codec(anyhow::anyhow!("{}: {what}: {err}", self.path.display()))
+		Error::codec(anyhow::anyhow!("{}: {what}: {err}", self.path.display()))
 	}
 
 	/// The capabilities of this node specifically, rather than of the driver as a
@@ -418,25 +375,27 @@ impl Device {
 				pix.plane_fmt[0].sizeimage = sizeimage;
 			}
 			if let Some(color) = request.color {
-				let (colorspace, ycbcr) = match color {
-					// SMPTE 170M primaries and matrix with the BT.709 transfer curve,
-					// the same triple the other backends emit: the two curves are
-					// defined identically and only 709 has a name everywhere.
-					Color::Bt601Limited | Color::Bt601Full => (
-						v4l2_colorspace_V4L2_COLORSPACE_SMPTE170M,
-						v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_601,
-					),
-					Color::Bt709Limited | Color::Bt709Full => (
-						v4l2_colorspace_V4L2_COLORSPACE_REC709,
-						v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_709,
-					),
+				// V4L2 names the primaries by colorspace and has no HLG curve.
+				pix.colorspace = match color.primaries {
+					Primaries::Smpte170m => v4l2_colorspace_V4L2_COLORSPACE_SMPTE170M,
+					Primaries::Bt470bg => v4l2_colorspace_V4L2_COLORSPACE_470_SYSTEM_BG,
+					Primaries::Bt709 => v4l2_colorspace_V4L2_COLORSPACE_REC709,
+					Primaries::Bt2020 => v4l2_colorspace_V4L2_COLORSPACE_BT2020,
 				};
-				pix.colorspace = colorspace;
+				let ycbcr = match color.matrix {
+					Matrix::Bt601 => v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_601,
+					Matrix::Bt709 => v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_709,
+					Matrix::Bt2020 => v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_BT2020,
+				};
 				pix.__bindgen_anon_1.ycbcr_enc = ycbcr as u8;
-				pix.xfer_func = v4l2_xfer_func_V4L2_XFER_FUNC_709 as u8;
-				pix.quantization = match color.limited() {
-					true => v4l2_quantization_V4L2_QUANTIZATION_LIM_RANGE as u8,
-					false => v4l2_quantization_V4L2_QUANTIZATION_FULL_RANGE as u8,
+				pix.xfer_func = match color.transfer {
+					Transfer::Bt709 => v4l2_xfer_func_V4L2_XFER_FUNC_709,
+					Transfer::Pq => v4l2_xfer_func_V4L2_XFER_FUNC_SMPTE2084,
+					Transfer::Hlg => return Err(Error::Unsupported("V4L2 cannot signal the HLG transfer".into())),
+				} as u8;
+				pix.quantization = match color.range {
+					Range::Limited => v4l2_quantization_V4L2_QUANTIZATION_LIM_RANGE as u8,
+					Range::Full => v4l2_quantization_V4L2_QUANTIZATION_FULL_RANGE as u8,
 				};
 			}
 		}
@@ -487,7 +446,7 @@ impl Device {
 		selection.type_ = dir.buf_type();
 		selection.target = V4L2_SEL_TGT_COMPOSE;
 		// SAFETY: `VIDIOC_G_SELECTION` takes a `v4l2_selection`.
-		unsafe { self.ioctl(request::G_SELECTION, &mut selection) }.ok()?;
+		unsafe { self.ioctl(vidioc::VIDIOC_G_SELECTION, &mut selection) }.ok()?;
 
 		let rect = Rect {
 			left: selection.r.left.max(0) as u32,
@@ -506,7 +465,7 @@ impl Device {
 		let mut subscription = v4l2_event_subscription::zeroed();
 		subscription.type_ = V4L2_EVENT_SOURCE_CHANGE;
 		// SAFETY: `VIDIOC_SUBSCRIBE_EVENT` takes a `v4l2_event_subscription`.
-		unsafe { self.ioctl(request::SUBSCRIBE_EVENT, &mut subscription) }
+		unsafe { self.ioctl(vidioc::VIDIOC_SUBSCRIBE_EVENT, &mut subscription) }
 			.map_err(|err| self.err("SUBSCRIBE_EVENT", err))
 	}
 
@@ -519,7 +478,7 @@ impl Device {
 		loop {
 			let mut event = v4l2_event::zeroed();
 			// SAFETY: `VIDIOC_DQEVENT` takes a `v4l2_event`.
-			if unsafe { self.ioctl(request::DQEVENT, &mut event) }.is_err() {
+			if unsafe { self.ioctl(vidioc::VIDIOC_DQEVENT, &mut event) }.is_err() {
 				return changed;
 			}
 			changed |= event.type_ == V4L2_EVENT_SOURCE_CHANGE;
@@ -536,7 +495,7 @@ impl Device {
 	}
 
 	/// Declare the input framerate, which rate control uses to spend the bitrate.
-	pub(crate) fn set_framerate(&self, dir: Dir, framerate: u32) -> Result<(), Error> {
+	pub(crate) fn set_framerate(&self, dir: Dir, framerate: crate::FrameRate) -> Result<(), Error> {
 		let mut parm = v4l2_streamparm::zeroed();
 		parm.type_ = dir.buf_type();
 		// SAFETY: the buffer type just written picks the arm the driver reads, so
@@ -548,8 +507,8 @@ impl Device {
 				Dir::Capture => &mut parm.parm.capture.timeperframe,
 			}
 		};
-		time_per_frame.numerator = 1;
-		time_per_frame.denominator = framerate;
+		time_per_frame.numerator = framerate.denominator();
+		time_per_frame.denominator = framerate.numerator();
 
 		// SAFETY: `VIDIOC_S_PARM` takes a `v4l2_streamparm`.
 		unsafe { self.ioctl(vidioc::VIDIOC_S_PARM, &mut parm) }.map_err(|err| self.err("S_PARM", err))
@@ -579,7 +538,7 @@ impl Device {
 		let mut command = v4l2_decoder_cmd::zeroed();
 		command.cmd = cmd;
 		// SAFETY: `VIDIOC_DECODER_CMD` takes a `v4l2_decoder_cmd`.
-		unsafe { self.ioctl(request::DECODER_CMD, &mut command) }
+		unsafe { self.ioctl(vidioc::VIDIOC_DECODER_CMD, &mut command) }
 			.map_err(|err| self.err(format_args!("DECODER_CMD {cmd}"), err))
 	}
 
@@ -589,6 +548,25 @@ impl Device {
 		// SAFETY: `VIDIOC_S_CTRL` takes a `v4l2_control`.
 		unsafe { self.ioctl(vidioc::VIDIOC_S_CTRL, &mut control) }
 			.map_err(|err| self.err(format_args!("S_CTRL {id:#x} = {value}"), err))
+	}
+
+	/// Whether the driver implements control `id` and will take it.
+	///
+	/// `VIDIOC_QUERYCTRL` answers `EINVAL` for a control the driver does not
+	/// have, and flags one it has but will not take as disabled. Asked before
+	/// the control is needed, so a caller that depends on it can refuse up front
+	/// instead of finding out on the frame it mattered for.
+	pub(crate) fn has_control(&self, id: u32) -> bool {
+		let mut query = v4l2_queryctrl::zeroed();
+		query.id = id;
+		// SAFETY: `VIDIOC_QUERYCTRL` takes a `v4l2_queryctrl`.
+		match unsafe { self.ioctl(vidioc::VIDIOC_QUERYCTRL, &mut query) } {
+			Ok(()) => query.flags & V4L2_CTRL_FLAG_DISABLED == 0,
+			Err(err) => {
+				tracing::debug!(control = format!("{id:#x}"), %err, "V4L2 control not present");
+				false
+			}
+		}
 	}
 
 	/// Set a control the driver is allowed not to have.
@@ -662,6 +640,10 @@ impl Device {
 		// A negative return is `EINTR` or `ENOMEM` and leaves `revents` untouched,
 		// so there is nothing to read and the caller's own deadline still bounds it.
 		if ready > 0 && event.revents & (libc::POLLIN | libc::POLLOUT | libc::POLLPRI) == 0 {
+			#[expect(
+				clippy::disallowed_methods,
+				reason = "the device thread runs outside any runtime, so it blocks on the host clock"
+			)]
 			std::thread::sleep(timeout);
 		}
 	}
@@ -682,7 +664,7 @@ impl Drop for Mapping {
 	fn drop(&mut self) {
 		// SAFETY: the pointer and length are what `mmap` returned and this is the
 		// only owner, so nothing can still be reading the region.
-		let _ = unsafe { v4l::v4l2::munmap(self.ptr.as_ptr().cast(), self.len) };
+		let _ = unsafe { moq_v4l::v4l2::munmap(self.ptr.as_ptr().cast(), self.len) };
 	}
 }
 
@@ -728,7 +710,7 @@ impl Queue {
 				// this plane, on an mmap queue, so `m` holds `mem_offset`. The length
 				// is the one it reported alongside.
 				let ptr = unsafe {
-					v4l::v4l2::mmap(
+					moq_v4l::v4l2::mmap(
 						std::ptr::null_mut(),
 						len,
 						libc::PROT_READ | libc::PROT_WRITE,
@@ -890,19 +872,22 @@ impl Queue {
 		Ok(())
 	}
 
-	/// Stop and restart a queue, taking every buffer back from the driver.
-	pub(crate) fn restart(&mut self, device: &Device) -> Result<(), Error> {
-		if self.streaming {
-			device.stream(self.dir, false)?;
-			self.streaming = false;
-		}
+	/// Stop the queue, taking every buffer back from the driver.
+	///
+	/// Issued even on a queue that never streamed: buffers queued ahead of a
+	/// `STREAMON` that failed are still the driver's, and `STREAMOFF` is what
+	/// hands them back.
+	pub(crate) fn stop(&mut self, device: &Device) -> Result<(), Error> {
+		device.stream(self.dir, false)?;
+		self.streaming = false;
 		self.free = (0..self.buffers.len() as u32).collect();
-		self.stream_on(device)
+		Ok(())
 	}
 
-	/// Whether the queue has been started.
-	pub(crate) fn streaming(&self) -> bool {
-		self.streaming
+	/// Stop and restart a queue, taking every buffer back from the driver.
+	pub(crate) fn restart(&mut self, device: &Device) -> Result<(), Error> {
+		self.stop(device)?;
+		self.stream_on(device)
 	}
 
 	/// Buffers currently owned by the driver.
@@ -1082,7 +1067,7 @@ impl Planes {
 		let size = rect.size;
 		size.validate("V4L2 4:2:0 frame")?;
 		if rect.left + size.width > format.size.width || rect.top + size.height > format.size.height {
-			return Err(Error::Codec(anyhow::anyhow!(
+			return Err(Error::codec(anyhow::anyhow!(
 				"V4L2 negotiated {} for a {size} picture at {},{}",
 				format.size,
 				rect.left,
@@ -1098,7 +1083,7 @@ impl Planes {
 			NV12 | NV12M => true,
 			YUV420 | YUV420M => false,
 			other => {
-				return Err(Error::Codec(anyhow::anyhow!(
+				return Err(Error::codec(anyhow::anyhow!(
 					"V4L2 chose the unsupported raw format {}",
 					name(other)
 				)));
@@ -1108,7 +1093,7 @@ impl Planes {
 		let luma = *format
 			.planes
 			.first()
-			.ok_or_else(|| Error::Codec(anyhow::anyhow!("V4L2 reported a format with no planes")))?;
+			.ok_or_else(|| Error::codec(anyhow::anyhow!("V4L2 reported a format with no planes")))?;
 		let stride = luma.stride.max(format.size.width) as usize;
 		let y = Component {
 			plane: 0,
@@ -1161,7 +1146,7 @@ impl Planes {
 				)
 			}
 			(false, true) => {
-				return Err(Error::Codec(anyhow::anyhow!(
+				return Err(Error::codec(anyhow::anyhow!(
 					"V4L2 chose planar {} with {} planes",
 					name(format.pixelformat),
 					format.planes.len()
@@ -1224,7 +1209,7 @@ impl Planes {
 		let (width, height) = (self.size.width as usize, self.size.height as usize);
 		let (chroma_width, chroma_rows) = (width / 2, height / 2);
 
-		let mut data = vec![0u8; I420::len(self.size.width, self.size.height)];
+		let mut data = vec![0u8; I420::len(self.size)?];
 		let (luma, chroma) = data.split_at_mut(width * height);
 		let (u, v) = chroma.split_at_mut(chroma_width * chroma_rows);
 
@@ -1250,7 +1235,7 @@ impl Planes {
 			)?,
 		}
 
-		I420::new(self.size.width, self.size.height, data)
+		I420::new(self.size, data)
 	}
 }
 
@@ -1292,7 +1277,7 @@ fn interleave(dst: &mut [u8], at: Component, u: &[u8], v: &[u8], width: usize, r
 			.get_mut(start..start + width * 2)
 			.ok_or_else(|| short(len, start + width * 2))?;
 		let (u, v) = (&u[row * width..][..width], &v[row * width..][..width]);
-		for (pair, (u, v)) in out.chunks_exact_mut(2).zip(u.iter().zip(v)) {
+		for (pair, (u, v)) in out.as_chunks_mut::<2>().0.iter_mut().zip(u.iter().zip(v)) {
 			pair[0] = *u;
 			pair[1] = *v;
 		}
@@ -1321,7 +1306,7 @@ fn deinterleave(u: &mut [u8], v: &mut [u8], src: &[u8], at: Component, width: us
 			.get(start..start + width * 2)
 			.ok_or_else(|| short(src.len(), start + width * 2))?;
 		let (u, v) = (&mut u[row * width..][..width], &mut v[row * width..][..width]);
-		for (pair, (u, v)) in line.chunks_exact(2).zip(u.iter_mut().zip(v)) {
+		for (pair, (u, v)) in line.as_chunks::<2>().0.iter().zip(u.iter_mut().zip(v)) {
 			*u = pair[0];
 			*v = pair[1];
 		}
@@ -1330,7 +1315,7 @@ fn deinterleave(u: &mut [u8], v: &mut [u8], src: &[u8], at: Component, width: us
 }
 
 fn short(len: usize, needed: usize) -> Error {
-	Error::Codec(anyhow::anyhow!(
+	Error::codec(anyhow::anyhow!(
 		"V4L2 buffer of {len} bytes is too small for the {needed} its format implies"
 	))
 }

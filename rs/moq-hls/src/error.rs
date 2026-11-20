@@ -18,15 +18,6 @@ impl std::fmt::Display for SequenceKind {
 	}
 }
 
-/// Whether an HTTP response status means "ask again later".
-///
-/// A response that arrived is the server's answer, and only this narrow set invites another
-/// attempt: request timeout, rate limit, and the gateway/overload statuses. Every other status,
-/// `404` and `403` included, is settled.
-pub(crate) fn status_retryable(status: u16) -> bool {
-	matches!(status, 408 | 429 | 502 | 503 | 504)
-}
-
 /// Errors produced by the HLS <-> MoQ gateway (import and export).
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
@@ -39,19 +30,18 @@ pub enum Error {
 	#[error("mux: {0}")]
 	Mux(#[from] moq_mux::Error),
 
-	/// The playlist argument looked like an HTTP(S) URL but failed to parse.
-	#[error("invalid playlist URL")]
-	InvalidPlaylistUrl,
-
-	/// The playlist argument was a local path that could not be made into a `file://` URL.
-	#[error("invalid file path")]
-	InvalidFilePath,
+	/// An import resource or redirect hop left the playlist's origin, or the playlist uses an unsupported scheme.
+	#[error("resource is outside the playlist's origin")]
+	ResourceRefused,
 
 	/// A `file://` URL could not be turned back into a filesystem path.
 	#[error("invalid file URL")]
 	InvalidFileUrl,
 
 	/// The fetched HLS playlist could not be parsed.
+	///
+	/// Carries only the parser's error kind: its unparsed input holds segment URIs, and so any
+	/// signed query they carry.
 	#[error("failed to parse HLS playlist: {0}")]
 	ParsePlaylist(String),
 
@@ -70,14 +60,14 @@ pub enum Error {
 	/// An implicit HLS byte range had no preceding range for the same resource.
 	#[error("implicit byte range for {url} has no preceding range for the same resource")]
 	MissingByteRangeOffset {
-		/// The resource whose range omitted an offset.
+		/// The resource whose range omitted an offset, without its credentials.
 		url: url::Url,
 	},
 
 	/// An HLS byte range was empty or overflowed its integer representation.
 	#[error("invalid byte range {start}+{length} for {url}")]
 	InvalidByteRange {
-		/// The ranged resource.
+		/// The ranged resource, without its credentials.
 		url: url::Url,
 		/// The first requested byte.
 		start: u64,
@@ -88,23 +78,42 @@ pub enum Error {
 	/// A ranged resource response had a different length than requested.
 	#[error("byte range for {url} returned {actual} bytes, expected {expected}")]
 	ByteRangeLengthMismatch {
-		/// The ranged resource.
+		/// The ranged resource, without its credentials.
 		url: url::Url,
 		/// The requested byte count.
 		expected: u64,
-		/// The returned byte count.
+		/// The returned byte count, or the count read when an overrun was refused.
 		actual: usize,
 	},
 
 	/// A partial HTTP response identified a different byte range than requested.
 	#[error("byte range for {url} returned a mismatched Content-Range, expected bytes {start}-{end}")]
 	ByteRangeResponseMismatch {
-		/// The ranged resource.
+		/// The ranged resource, without its credentials.
 		url: url::Url,
 		/// The first requested byte.
 		start: u64,
 		/// The last requested byte, inclusive.
 		end: u64,
+	},
+
+	/// An HTTP origin answered a byte range request with a status other than `206 Partial Content`,
+	/// such as a `200` carrying the whole resource.
+	#[error("byte range for {url} was answered with status {status}, expected 206 Partial Content")]
+	ByteRangeIgnored {
+		/// The ranged resource.
+		url: url::Url,
+		/// The status the origin answered with.
+		status: u16,
+	},
+
+	/// A playlist or init segment, which import must hold whole, was larger than it holds.
+	#[error("{url} is larger than the {limit} bytes import holds")]
+	ResourceTooLarge {
+		/// The resource, without its credentials.
+		url: url::Url,
+		/// The most bytes import holds for this kind of resource.
+		limit: usize,
 	},
 
 	/// An HLS media or discontinuity sequence was too large to pack into a MoQ group sequence.
@@ -115,6 +124,10 @@ pub enum Error {
 		/// The offending sequence value.
 		value: u64,
 	},
+
+	/// An export generation had characters a URL path segment can't carry verbatim.
+	#[error("invalid generation {0:?}: expected ASCII letters, digits, '-', or '_'")]
+	InvalidGeneration(String),
 
 	/// A playlist or segment URI could not be resolved against its base.
 	#[error("url parse: {0}")]
@@ -128,9 +141,55 @@ pub enum Error {
 	#[error("io: {0}")]
 	Io(std::sync::Arc<std::io::Error>),
 
-	/// Catch-all for gateway logic that reports via `anyhow`.
-	#[error("{0}")]
-	Other(std::sync::Arc<anyhow::Error>),
+	/// A rendition's media track failed, so its listings refuse rather than read as a finished
+	/// recording.
+	#[error("media track {track} failed: {source}")]
+	MediaFailed {
+		/// The media track's name.
+		track: String,
+		/// Why the track failed.
+		source: Box<Error>,
+	},
+
+	/// The catalog failed before it finished, so every rendition's listings refuse and its
+	/// recording cursors end, rather than read as a finished recording or a transient fetch error.
+	#[error("catalog failed: {source}")]
+	CatalogFailed {
+		/// Why the catalog failed.
+		source: Box<Error>,
+	},
+
+	/// A media playlist already carried `EXT-X-ENDLIST` when import first saw it; import follows live playlists only.
+	#[error("playlist already ended (EXT-X-ENDLIST); HLS import follows live playlists only")]
+	PlaylistEnded,
+
+	/// Import refused a rendition whose timestamps went backwards, such as a reset at an
+	/// `EXT-X-DISCONTINUITY` under the same init segment. A restarted source is a new broadcast.
+	#[error("rendition {rendition} rewound its timestamps; HLS import refuses a timestamp reset: {source}")]
+	Rewind {
+		/// The rendition's label.
+		rendition: String,
+		/// The rewind the importer refused.
+		source: moq_mux::Error,
+	},
+	/// A recording source closed without confirming its complete end.
+	#[error("recording closed before finishing")]
+	IncompleteRecording,
+
+	/// A recording cursor missed rows that left its window or were reset.
+	#[error("recording cursor missed segments")]
+	RecordingLagged,
+
+	/// A listed recording segment no longer has all its media available.
+	#[error("recording segment {segment} is unavailable")]
+	SegmentUnavailable {
+		/// The segment whose media cannot be recorded.
+		segment: u64,
+	},
+
+	/// This CPU lacks a feature the crate's cryptography requires, named in rind's message.
+	#[error(transparent)]
+	UnsupportedCpu(#[from] moq_crypto::cpu::UnsupportedCpu),
 }
 
 impl Error {
@@ -145,23 +204,61 @@ impl Error {
 			_ => None,
 		}
 	}
+
+	/// Whether the source denied access to a broadcast or track, which a server answers with `403`.
+	pub fn is_denied(&self) -> bool {
+		match self {
+			Self::Moq(moq_net::Error::Unauthorized) | Self::Mux(moq_mux::Error::Moq(moq_net::Error::Unauthorized)) => {
+				true
+			}
+			Self::CatalogFailed { source } | Self::MediaFailed { source, .. } => source.is_denied(),
+			_ => false,
+		}
+	}
+
+	/// Whether this is the source's settled answer, which another import pass cannot change.
+	///
+	/// A response that arrived is the server's answer, and only a narrow set of statuses invites
+	/// another attempt: request timeout, rate limit, and the gateway/overload statuses. Every other
+	/// status, `404` and `403` included, is settled, as is a playlist that had already ended when
+	/// the import joined it. A failure with no answer at all is left to the backoff budget.
+	#[cfg(feature = "async")]
+	pub(crate) fn settled(&self) -> bool {
+		match self {
+			Self::PlaylistEnded => true,
+			_ => self
+				.status()
+				.is_some_and(|status| !matches!(status, 408 | 429 | 502 | 503 | 504)),
+		}
+	}
+}
+
+/// `url` without its userinfo, query, or fragment, any of which may carry a signed credential.
+///
+/// Every variant naming a resource stores it through here rather than redacting at display, so
+/// its `Debug` print is as safe as its `Display`.
+#[cfg(feature = "async")]
+pub(crate) fn redact(url: &url::Url) -> url::Url {
+	let mut url = url.clone();
+	// Fails only for a URL that cannot carry userinfo at all, such as `file:`.
+	let _ = url.set_username("");
+	let _ = url.set_password(None);
+	url.set_query(None);
+	url.set_fragment(None);
+	url
 }
 
 impl From<reqwest::Error> for Error {
 	fn from(err: reqwest::Error) -> Self {
-		Error::Reqwest(std::sync::Arc::new(err))
+		// reqwest prints the full URL in its error, and a playlist or segment URL
+		// routinely carries a signed token in its query.
+		Error::Reqwest(std::sync::Arc::new(err.without_url()))
 	}
 }
 
 impl From<std::io::Error> for Error {
 	fn from(err: std::io::Error) -> Self {
 		Error::Io(std::sync::Arc::new(err))
-	}
-}
-
-impl From<anyhow::Error> for Error {
-	fn from(err: anyhow::Error) -> Self {
-		Error::Other(std::sync::Arc::new(err))
 	}
 }
 
@@ -172,12 +269,37 @@ pub type Result<T> = std::result::Result<T, Error>;
 mod tests {
 	use super::*;
 
-	/// The import loop consults this, so an origin's settled answer has to reach it intact.
+	/// A denial stays one however the export wraps it.
 	#[test]
-	fn an_http_failure_reports_its_status() {
-		// A failure the origin never answered carries no status, so the budget decides instead.
-		assert_eq!(Error::NoVariants.status(), None);
-		assert_eq!(Error::ParsePlaylist("not a playlist".to_string()).status(), None);
-		assert_eq!(Error::Moq(moq_net::Error::Transport("lost".to_string())).status(), None);
+	fn denial_survives_wrapping() {
+		let denied = Error::Mux(moq_mux::Error::Moq(moq_net::Error::Unauthorized));
+		let wrapped = Error::CatalogFailed {
+			source: Box::new(Error::MediaFailed {
+				track: "video".into(),
+				source: Box::new(denied),
+			}),
+		};
+		assert!(wrapped.is_denied());
+		assert!(!Error::Moq(moq_net::Error::NotFound).is_denied());
+	}
+
+	#[tokio::test]
+	async fn http_error_redacts_url() {
+		// A freed port refuses the connection, so reqwest fails with the dialed URL attached.
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+		let address = listener.local_addr().expect("local address");
+		drop(listener);
+
+		// reqwest reads rustls's process default, as the importer installs it.
+		moq_crypto::provider::install_default().expect("supported CPU");
+		let err: Error = reqwest::get(format!("http://user:pass@{address}/media.m3u8?jwt=secret"))
+			.await
+			.expect_err("dial a closed port")
+			.into();
+
+		let printed = format!("{err} {err:?}");
+		for secret in ["jwt", "secret", "user:pass"] {
+			assert!(!printed.contains(secret), "error leaked {secret}: {printed}");
+		}
 	}
 }

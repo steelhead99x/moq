@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { Duration } from "@moq/clock";
+import { Manual } from "@moq/clock/test";
 import { DuplicateTrackAlias, RetiredTrackAlias, SharedTrackAlias, TrackAliases } from "./aliases.ts";
 
 test("waits for the control message that establishes an alias", async () => {
@@ -38,7 +40,7 @@ test("a track name containing a slash does not collide with a longer namespace",
 	expect(() => aliases.set(7n, {}, { broadcast: "a/b", name: "c" })).toThrow(DuplicateTrackAlias);
 });
 
-// Draft-19 section 5.1 lets a publisher give several subscriptions to one track the same
+// Draft-22 section 3.1.3 lets a publisher give several subscriptions to one track the same
 // alias. We cannot demux that, but it is a legal choice: failing the session over it would
 // drop every other broadcast on the connection.
 test("sharing an alias across subscriptions to one track is not fatal", () => {
@@ -70,7 +72,7 @@ test("does not let stale cleanup retire a reused alias", async () => {
 });
 
 // A cancelled subscription leaves its alias behind, so the groups the publisher is still
-// sending are discarded at once instead of waiting out the timeout (draft-19 section 11.1).
+// sending are discarded at once instead of waiting out the timeout (draft-22 section 3.1.3).
 test("a retired alias rejects late groups immediately", async () => {
 	const aliases = new TrackAliases<object>();
 	const track = {};
@@ -94,9 +96,34 @@ test("a later subscribe reclaims a retired alias", async () => {
 	expect(await aliases.get(7n)).toBe(fresh);
 });
 
+// Subscribing to a track again forgets its tombstone, so a publisher that reuses the alias
+// (draft-22 section 3.1.3) can have its first group beat the SUBSCRIBE_OK. Another track's
+// tombstone still drops its stragglers at once.
+test("a resubscribe lets a reused alias beat its SUBSCRIBE_OK", async () => {
+	const aliases = new TrackAliases<object>();
+	const catalog = { broadcast: "demo", name: "catalog.json" };
+	const old = {};
+	aliases.set(0n, old, catalog);
+	aliases.retire(0n, old);
+	const video = {};
+	aliases.set(1n, video, { broadcast: "demo", name: "video" });
+	aliases.retire(1n, video);
+
+	aliases.resubscribe(catalog);
+
+	const early = aliases.get(0n);
+	const fresh = {};
+	aliases.set(0n, fresh, catalog);
+	expect(await early).toBe(fresh);
+	await expect(aliases.get(1n)).rejects.toBeInstanceOf(RetiredTrackAlias);
+});
+
 // Tombstones are bounded: a session churning through subscriptions must not accumulate
 // one entry per alias it ever used.
 test("retired aliases are capped", async () => {
+	const clock = new Manual();
+	const installed = clock.install();
+	using _clock = { [Symbol.dispose]: () => installed.close() };
 	const aliases = new TrackAliases<object>();
 
 	for (let i = 0n; i < 74n; i++) {
@@ -106,6 +133,8 @@ test("retired aliases are capped", async () => {
 	}
 
 	// The oldest tombstones are forgotten, so they fall back to the unknown-alias wait.
-	await expect(aliases.get(0n)).rejects.toThrow("unknown track alias");
+	const forgotten = aliases.get(0n).catch((error: unknown) => error);
+	await clock.advance(Duration.millis(1000));
+	expect(await forgotten).toHaveProperty("message", "unknown track alias: 0");
 	await expect(aliases.get(73n)).rejects.toBeInstanceOf(RetiredTrackAlias);
 });

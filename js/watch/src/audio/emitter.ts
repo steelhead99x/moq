@@ -1,9 +1,11 @@
+import { Duration } from "@moq/clock";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Decoder } from "./decoder";
 
-const MIN_GAIN = 0.001;
-const FADE_TIME = 0.2;
+// How long a volume change ramps for.
+const FADE = Duration.millis(200);
 
+/** Signals the emitter reads. */
 export type EmitterInput = {
 	volume: Getter<number>;
 
@@ -15,20 +17,30 @@ export type EmitterInput = {
 	paused: Getter<boolean>;
 };
 
-type EmitterOutput = {
+/** Constructor properties for {@link Emitter}. */
+export type EmitterProps = Inputs<EmitterInput> & {
+	/** Decoder supplying PCM. */
+	source: Decoder;
+};
+
+/** Signals the emitter derives. */
+export type EmitterOutput = {
 	// Whether audio should be downloaded. Wired into the decoder's `enabled` input by the owner.
 	enabled: Signal<boolean>;
 };
 
-/** A helper that emits audio directly to the speakers. Not for spatial graphs; connect `Decoder.out.root` yourself. */
+/** A helper that emits audio directly to the speakers. */
 export class Emitter {
+	/** The decoder supplying samples. */
 	readonly source: Decoder;
 
+	/** The wired inputs, read-only. */
 	readonly in: Readonlys<EmitterInput>;
 
 	readonly #out: EmitterOutput = {
 		enabled: new Signal<boolean>(false),
 	};
+	/** The derived outputs, read-only. */
 	readonly out = readonlys(this.#out);
 
 	#signals = new Effect();
@@ -36,15 +48,15 @@ export class Emitter {
 	// The gain node used to adjust the volume.
 	#gain = new Signal<GainNode | undefined>(undefined);
 
-	constructor(source: Decoder, props?: Inputs<EmitterInput>) {
-		this.source = source;
+	constructor(props: EmitterProps) {
+		this.source = props.source;
 		this.in = {
 			volume: getter(props?.volume ?? 0.5),
 			muted: getter(props?.muted ?? false),
 			paused: getter(props?.paused ?? false),
 		};
 
-		// Only download while playing audible audio. Pausing or muting stops it.
+		// Only download while playing and unmuted. Volume is an independent output level.
 		this.#signals.run((effect) => {
 			const enabled = !effect.get(this.in.paused) && !effect.get(this.in.muted);
 			this.#out.enabled.set(enabled);
@@ -54,7 +66,9 @@ export class Emitter {
 			const root = effect.get(this.source.out.root);
 			if (!root) return;
 
-			const gain = new GainNode(root.context, { gain: effect.get(this.in.volume) });
+			// Seed the level without subscribing: rebuilding the node on a volume change would jump
+			// straight to the new level and skip the fade below.
+			const gain = new GainNode(root.context, { gain: this.in.muted.peek() ? 0 : this.in.volume.peek() });
 			root.connect(gain);
 
 			effect.set(this.#gain, gain);
@@ -74,19 +88,22 @@ export class Emitter {
 			const gain = effect.get(this.#gain);
 			if (!gain) return;
 
-			// Cancel any scheduled transitions on change.
-			effect.cleanup(() => gain.gain.cancelScheduledValues(gain.context.currentTime));
+			// On a change, hold wherever the ramp in progress has reached, so the next one starts from
+			// there. Cancelling alone would snap back to the level the ramp started from.
+			effect.cleanup(() => {
+				const now = gain.context.currentTime;
+				const level = gain.gain.value;
+				gain.gain.cancelScheduledValues(now);
+				gain.gain.setValueAtTime(level, now);
+			});
 
-			const volume = effect.get(this.in.volume);
-			if (volume < MIN_GAIN) {
-				gain.gain.exponentialRampToValueAtTime(MIN_GAIN, gain.context.currentTime + FADE_TIME);
-				gain.gain.setValueAtTime(0, gain.context.currentTime + FADE_TIME + 0.01);
-			} else {
-				gain.gain.exponentialRampToValueAtTime(volume, gain.context.currentTime + FADE_TIME);
-			}
+			// Linear, like the publisher's gain: an exponential ramp can't start from or reach silence.
+			const volume = effect.get(this.in.muted) ? 0 : effect.get(this.in.volume);
+			gain.gain.linearRampToValueAtTime(volume, gain.context.currentTime + FADE.asSecs());
 		});
 	}
 
+	/** Stop and release everything this holds. */
 	close() {
 		this.#signals.close();
 	}

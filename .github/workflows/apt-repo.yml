@@ -2,7 +2,7 @@ name: apt-repo
 
 # Mirrors .deb artifacts attached to a release into the apt.moq.dev repo.
 # Invoked via workflow_dispatch from each per-binary release workflow's
-# final job (gh workflow run apt-repo.yml -f tag=...), or manually.
+# final job (gh workflow run apt-repo.yml --ref release -f tag=...), or manually.
 #
 # Note: we do NOT trigger on release:published because releases created
 # with the default GITHUB_TOKEN don't cascade to other workflows. The
@@ -28,11 +28,16 @@ jobs:
   publish:
     name: Publish to apt.moq.dev
     runs-on: ubuntu-22.04
+    # Write credentials live in the `publish` Environment, which only release
+    # refs can deploy to, so dispatch this on `release` (any tag ingests there).
+    environment: publish
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - uses: ./.github/actions/just
 
       - name: Set up packaging tools
         uses: ./.github/actions/setup-packaging
@@ -53,10 +58,9 @@ jobs:
       - name: Publish to R2
         shell: bash
         env:
-          ARTIFACTS_DIR: artifacts
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
           SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
-        run: ./infra/apt/publish.sh
+        run: just infra apt publish "$GITHUB_WORKSPACE/artifacts"

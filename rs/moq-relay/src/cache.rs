@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use clap::Args;
+use futures::FutureExt;
 use moq_net::cache;
 use serde::{Deserialize, Serialize};
 
@@ -15,24 +15,24 @@ const GOVERNOR_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Configuration for the relay's group cache.
 ///
-/// Non-latest groups stay cached until their track's retention window expires,
-/// the `duration` ceiling is reached, or the pool runs out of room, whichever
-/// comes first (the latest group of every track is always retained). With none
-/// of the knobs set the pool is unbounded and only each track's own window
-/// bounds memory.
-#[derive(Args, Clone, Debug, Default, Deserialize, Serialize)]
+/// Non-latest groups stay cached until they sit unaccessed past the wall-clock
+/// LRU window (`duration`, 30s by default) or the pool runs out of room,
+/// whichever comes first (the latest group of every track is always retained).
+/// With none of the knobs set the pool is unbounded in bytes and only the
+/// default LRU window bounds memory.
+#[derive(usage_rs::Args, Clone, Debug, Default, Deserialize, Serialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
-#[group(id = "cache-config")]
-pub struct CacheConfig {
+pub struct Config {
 	/// Target bytes of cached group payload, e.g. "8GiB", "512MB", or a
 	/// percentage of memory like "75%" (respecting the cgroup limit when set).
 	/// Unbounded when unset.
 	///
-	/// A target that usage converges toward as tracks write, not a hard limit, and
-	/// it counts payload bytes, not process RSS; leave some slack below physical
-	/// memory or combine with `headroom`.
-	#[arg(long = "cache-capacity", env = "MOQ_CACHE_CAPACITY")]
+	/// A target that usage converges toward as tracks write, not a hard limit, and it
+	/// counts cached group bytes (payload plus a fixed cost per group), not process
+	/// RSS; leave some slack below physical memory or combine with `headroom`.
+	#[usage(long = "cache-capacity", env = "MOQ_CACHE_CAPACITY", setting = "cache.capacity")]
 	pub capacity: Option<String>,
 
 	/// Keep at least this much system memory available, e.g. "2GiB" or "10%".
@@ -41,68 +41,90 @@ pub struct CacheConfig {
 	/// so the cache soaks up idle memory but is the first thing reclaimed when
 	/// the rest of the system needs it. Combine with `capacity` to also cap the
 	/// absolute size.
-	#[arg(long = "cache-headroom", env = "MOQ_CACHE_HEADROOM")]
+	#[usage(long = "cache-headroom", env = "MOQ_CACHE_HEADROOM", setting = "cache.headroom")]
 	pub headroom: Option<String>,
 
-	/// Maximum time a non-latest cached group is retained since it was last
-	/// written or served from cache by a FETCH, e.g. "30s" or "500ms".
+	/// Maximum age of a non-latest cached group, e.g. "30s" or "500ms".
 	///
-	/// Caps each track's own retention window: a publisher advertising a longer
-	/// window is clamped down to this, bounding how much history a track can
-	/// accumulate no matter what upstream asks for. A FETCH cache hit restarts
-	/// the clock, so actively-read history stays cached. This bounds memory by
-	/// age where `capacity` bounds it by bytes. Unbounded (each track keeps its
-	/// own window) when unset.
+	/// Sets two separate bounds. The pool's wall-clock LRU window becomes this: a
+	/// group nobody has read or written for this long is reclaimed, so actively-read
+	/// history stays cached. Each track's max age, how long a superseded group stays
+	/// fresh, is also clamped down to this, so a publisher advertising a longer max
+	/// age can't promise more history than the relay serves. The LRU window bounds
+	/// memory by age where `capacity` bounds it by bytes. When unset, the LRU window
+	/// keeps its 30 second default and each track keeps its own max age.
 	///
-	/// Two caveats on the ceiling. The latest group of every track is always
-	/// retained, since it is the live edge. And expiry is evaluated when a track
-	/// writes its next group, so a publisher that stops writing without
-	/// disconnecting keeps whatever it had cached until it resumes or the
-	/// broadcast closes; under memory pressure the `capacity` budget is repaid by
-	/// the tracks that are still writing.
-	#[arg(long = "cache-duration", env = "MOQ_CACHE_DURATION", value_parser = humantime::parse_duration)]
-	#[serde(default, with = "humantime_serde")]
-	pub duration: Option<Duration>,
+	/// One caveat: the latest group of every track is always retained, since it is
+	/// the live edge. This window otherwise holds whether or not a publisher is
+	/// still writing, since the relay sweeps every cached track on a wall-clock
+	/// cadence. The `capacity` budget is the one that depends on writes: a
+	/// publisher that stops writing pays none of it down, so under memory pressure
+	/// it is repaid by the tracks that are still writing.
+	#[usage(long = "cache-duration", env = "MOQ_CACHE_DURATION", setting = "cache.duration")]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub duration: Option<moq_tokio::cli::Duration>,
 }
 
 /// The relay's resolved cache settings: the shared byte-budget pool plus the
-/// age ceiling applied to every track.
+/// max age ceiling applied to every track.
+///
+/// The headroom governor, when configured, moves into the
+/// [`Driver`](crate::cluster::Driver) that [`Cluster::new`](crate::cluster::Cluster::new)
+/// returns once this is handed to it, and starts sampling only while that driver is
+/// polled ([`Relay::run`](crate::Relay::run) does). It is then owned by [`Self::pool`]: it holds only a [`cache::PoolWeak`] and stops on
+/// its next tick once every [`cache::Pool`] clone has dropped. Holding a clone of
+/// [`Self::pool`] past the relay keeps the governor running, deliberately: as long as
+/// anything can still cache into the budget, resizing it is still the right thing to do.
+#[non_exhaustive]
 pub struct Cache {
-	/// The shared byte-budget pool every session's groups register with.
+	/// The shared pool every session's groups register with: the byte budget plus
+	/// the wall-clock LRU window that reclaims idle groups.
+	///
+	/// Also what owns the headroom governor; see the type docs.
 	pub pool: cache::Pool,
 
-	/// Ceiling on how long a non-latest group is retained (the latest group of every
-	/// track is always kept). [`Duration::MAX`] imposes no ceiling, leaving each
-	/// track's own window in force.
-	pub duration: Duration,
+	/// Ceiling on each track's max age (the latest group of every track never goes
+	/// stale). `None` imposes no ceiling, leaving each track's own max age in force.
+	pub duration: Option<Duration>,
+
+	/// The headroom governor, not yet running.
+	pub(crate) governor: Option<futures::future::BoxFuture<'static, ()>>,
 }
 
-impl CacheConfig {
+impl Config {
 	/// Resolve the size knobs into a shared [`cache::Pool`] and age ceiling,
-	/// spawning the headroom governor when configured. Requires a tokio runtime.
+	/// plus the headroom governor when configured.
+	///
+	/// The governor starts only once the [`Cache`] is attached to a cluster and
+	/// that cluster's [`Driver`](crate::cluster::Driver) is polled, so a caller that
+	/// drops it first (a setup step failing after this point, say) leaves nothing
+	/// sampling memory behind.
 	pub fn init(&self) -> anyhow::Result<Cache> {
 		let capacity = self.capacity.as_deref().map(parse_limit).transpose()?;
-		let pool = match capacity {
-			Some(bytes) => cache::Pool::new(bytes),
-			None => cache::Pool::unbounded(),
-		};
+		let duration = self.duration.map(Into::into);
+		let config = cache::Config::default()
+			.with_capacity(capacity)
+			.with_expiry(duration.unwrap_or(cache::DEFAULT_EXPIRY));
+		let pool = cache::Pool::new(config);
 
+		let mut governed = None;
 		if let Some(headroom) = self.headroom.as_deref() {
 			let headroom = parse_limit(headroom)?;
 			anyhow::ensure!(headroom > 0, "cache headroom must be non-zero");
 			tracing::info!(?capacity, headroom, "cache governor enabled");
-			tokio::spawn(governor(pool.clone(), capacity, headroom));
+			governed = Some(governor(system()?, pool.downgrade(), capacity, headroom).boxed());
 		} else if let Some(capacity) = capacity {
 			tracing::info!(capacity, "cache capacity set");
 		}
 
-		if let Some(duration) = self.duration {
+		if let Some(duration) = duration {
 			tracing::info!(?duration, "cache duration ceiling set");
 		}
 
 		Ok(Cache {
 			pool,
-			duration: self.duration.unwrap_or(Duration::MAX),
+			duration,
+			governor: governed,
 		})
 	}
 }
@@ -117,7 +139,7 @@ fn parse_limit(value: &str) -> anyhow::Result<u64> {
 			percent > 0.0 && percent <= 100.0,
 			"memory percentage must be within (0, 100], got {percent}"
 		);
-		return Ok((total_memory() as f64 * percent / 100.0) as u64);
+		return Ok((total_memory()? as f64 * percent / 100.0) as u64);
 	}
 	let size: bytesize::ByteSize = value
 		.parse()
@@ -127,25 +149,39 @@ fn parse_limit(value: &str) -> anyhow::Result<u64> {
 
 /// Total memory this process can use: the cgroup limit when confined (e.g. a
 /// container), otherwise physical memory.
-fn total_memory() -> u64 {
-	let mut sys = sysinfo::System::new();
+fn total_memory() -> anyhow::Result<u64> {
+	let mut sys = system()?;
 	sys.refresh_memory();
-	match sys.cgroup_limits() {
+	Ok(match sys.cgroup_limits() {
 		Some(limits) => limits.total_memory,
 		None => sys.total_memory(),
-	}
+	})
+}
+
+fn system() -> anyhow::Result<sysinfo::System> {
+	sysinfo::System::new().map_err(|err| anyhow::anyhow!("failed to read system memory: {err}"))
 }
 
 /// Re-size the pool periodically so at least `headroom` bytes of system memory
 /// stay available: the cache grows into idle memory and shrinks (tracks evict
 /// their stalest groups as they write) when the rest of the system needs it.
-async fn governor(pool: cache::Pool, capacity: Option<u64>, headroom: u64) {
-	let mut sys = sysinfo::System::new();
-	let mut interval = tokio::time::interval(GOVERNOR_INTERVAL);
-	interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+///
+/// Weak on purpose. The pool is the one handle that reaches everything charging
+/// into the budget, so tying the task to it means the task ends when the last
+/// thing that could use the budget does, with no guard to route through the
+/// relay's construction shapes. Returns on the first tick after that.
+async fn governor(mut sys: sysinfo::System, pool: cache::PoolWeak, capacity: Option<u64>, headroom: u64) {
+	let mut interval = kio::clock::interval(GOVERNOR_INTERVAL);
+	interval.set_missed_tick_behavior(kio::clock::MissedTickBehavior::Delay);
 
 	loop {
 		interval.tick().await;
+
+		let Some(pool) = pool.upgrade() else {
+			tracing::debug!("cache pool dropped; stopping governor");
+			return;
+		};
+
 		sys.refresh_memory();
 
 		let available = match sys.cgroup_limits() {
@@ -168,7 +204,31 @@ async fn governor(pool: cache::Pool, capacity: Option<u64>, headroom: u64) {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	};
+
 	use super::*;
+
+	#[test]
+	fn default_config_enables_expiry_without_clamping_media_time() {
+		let cache = Config::default().init().unwrap();
+		assert_eq!(cache.pool.expiry(), Some(cache::DEFAULT_EXPIRY));
+		assert_eq!(cache.duration, None);
+	}
+
+	#[test]
+	fn explicit_duration_configures_both_bounds() {
+		let duration = Duration::from_secs(5);
+		let config = Config {
+			duration: Some((duration).into()),
+			..Default::default()
+		};
+		let cache = config.init().unwrap();
+		assert_eq!(cache.pool.expiry(), Some(duration));
+		assert_eq!(cache.duration, Some(duration));
+	}
 
 	#[test]
 	fn parse_limit_bytes() {
@@ -191,5 +251,147 @@ mod tests {
 		assert!(parse_limit("lots").is_err());
 		assert!(parse_limit("0%").is_err());
 		assert!(parse_limit("150%").is_err());
+	}
+
+	/// A config whose only knob is the headroom governor.
+	fn governed() -> Config {
+		Config {
+			headroom: Some("10%".to_string()),
+			..Default::default()
+		}
+	}
+
+	/// Spawned tasks currently alive in this test's runtime.
+	fn spawned() -> usize {
+		tokio::runtime::Handle::current().metrics().num_alive_tasks()
+	}
+
+	/// Let every parked governor reach its next tick and finish stopping.
+	async fn settle() {
+		for _ in 0..3 {
+			tokio::time::advance(GOVERNOR_INTERVAL).await;
+			tokio::task::yield_now().await;
+		}
+	}
+
+	/// The prefix of [`crate::Relay::load`] that owns the cache: resolve it, then
+	/// hand it to a cluster whose construction can still fail.
+	fn attach(
+		cache: &Config,
+		cluster: crate::cluster::Config,
+	) -> anyhow::Result<(crate::cluster::Cluster, crate::cluster::Driver)> {
+		let cache = cache.init()?;
+		crate::cluster::Cluster::new(crate::cluster::Options::new(cluster).with_cache(cache))
+	}
+
+	/// Drive `driver` on its own task, reporting how many of its tasks still run.
+	fn drive(mut driver: crate::cluster::Driver) -> Arc<AtomicUsize> {
+		let running = Arc::new(AtomicUsize::new(driver.len()));
+		let report = running.clone();
+		tokio::spawn(kio::wait(move |waiter| {
+			let poll = driver.poll(waiter);
+			report.store(driver.len(), Ordering::SeqCst);
+			poll
+		}));
+		running
+	}
+
+	/// The governor runs in the cluster's driver: its panic fails the driver, which
+	/// stops [`Relay::run`](crate::Relay::run), rather than leaving the budget fixed.
+	#[tokio::test(start_paused = true)]
+	async fn governor_panic_fails_the_driver() {
+		let mut cache = governed().init().unwrap();
+		cache.governor = Some(async { panic!("injected") }.boxed());
+		let (_cluster, driver) =
+			crate::cluster::Cluster::new(crate::cluster::Options::default().with_cache(cache)).unwrap();
+
+		let err = driver.run().await.expect_err("the driver kept running");
+		assert_eq!(err.to_string(), "cache governor panicked: injected");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn governor_stops_when_pool_drops() {
+		let pool = cache::Pool::unbounded();
+		let governor = tokio::spawn(governor(system().unwrap(), pool.downgrade(), None, 1024));
+
+		settle().await;
+		assert!(!governor.is_finished(), "governor should run while the pool lives");
+
+		drop(pool);
+		governor.await.expect("governor should stop, not panic");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn governor_runs_while_any_pool_clone_lives() {
+		let pool = cache::Pool::unbounded();
+		let clone = pool.clone();
+		let governor = tokio::spawn(governor(system().unwrap(), pool.downgrade(), None, 1024));
+
+		drop(pool);
+		settle().await;
+		assert!(!governor.is_finished(), "a retained pool keeps the governor running");
+
+		drop(clone);
+		governor.await.expect("governor should stop, not panic");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn setup_failure_stops_governor() {
+		let before = spawned();
+
+		// `--cluster-max-hops 0` is rejected, so the cache is dropped before it is attached.
+		let cluster = crate::cluster::Config {
+			max_hops: Some(0),
+			..Default::default()
+		};
+		assert!(attach(&governed(), cluster).is_err(), "a hop limit of 0 is rejected");
+
+		settle().await;
+		assert_eq!(spawned(), before, "a failed setup should not strand the governor");
+	}
+
+	/// The governor and the origin driver both run until the last cluster handle drops.
+	#[tokio::test(start_paused = true)]
+	async fn last_owner_drop_stops_governor() {
+		let (cluster, driver) = attach(&governed(), crate::cluster::Config::default()).unwrap();
+		let running = drive(driver);
+
+		settle().await;
+		assert_eq!(
+			running.load(Ordering::SeqCst),
+			2,
+			"the cluster should keep the governor running"
+		);
+
+		drop(cluster);
+		settle().await;
+		assert_eq!(
+			running.load(Ordering::SeqCst),
+			0,
+			"the last cluster handle should stop the governor"
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn extra_cluster_handle_keeps_governor() {
+		let (cluster, driver) = attach(&governed(), crate::cluster::Config::default()).unwrap();
+		let running = drive(driver);
+		let session = cluster.clone();
+
+		drop(cluster);
+		settle().await;
+		assert_eq!(
+			running.load(Ordering::SeqCst),
+			2,
+			"a surviving cluster clone keeps the governor"
+		);
+
+		drop(session);
+		settle().await;
+		assert_eq!(
+			running.load(Ordering::SeqCst),
+			0,
+			"the last cluster handle should stop the governor"
+		);
 	}
 }

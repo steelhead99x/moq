@@ -1,0 +1,3 @@
+# Suites share one process and so one native library, so a concurrent suite
+# would add its allocations to the moq heap that leak_test.dart measures.
+concurrency: 1

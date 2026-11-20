@@ -6,44 +6,42 @@ use crate::container::Frame;
 ///
 /// The catalog comes from an AudioSpecificConfig (variable-length, typically extracted from an MP4
 /// ESDS atom); build the config with [`config`]. Every AAC packet is independently decodable, so
-/// [`decode`](Self::decode) marks only the first frame of each group a keyframe (the rest extend it):
-/// frames accumulate into the current group until the caller [`cut`](Self::cut)s or [`seek`](Self::seek)s.
-/// The [`import::Track`](crate::import::Track) facade cuts after every packet by default (one group
-/// per frame, so the relay forwards without waiting); a caller that drives its own boundaries (a
-/// segment cadence) cuts less often. The codec's packet loss concealment handles drops.
-pub struct Import<E: CatalogExt = ()> {
-	track: crate::container::Producer<crate::catalog::hang::Container>,
-	rendition: crate::catalog::AudioTrack<E>,
+/// [`decode`](Self::decode) marks only the first frame of each group a keyframe (the rest extend
+/// it): frames accumulate into the current group until the caller [`cut`](Self::cut)s or
+/// [`seek`](Self::seek)s. The [`import::Track`](crate::import::Track) facade passes that through,
+/// so boundaries are the caller's either way: cut per packet for one group (one QUIC stream) the
+/// relay forwards without waiting, or less often to batch frames into fewer groups. The codec's
+/// packet loss concealment handles drops.
+pub struct Import {
+	track: crate::container::Producer<crate::catalog::hang::Container, hang::catalog::AudioConfig>,
 }
 
-impl<E: CatalogExt> Import<E> {
+impl Import {
 	/// Publish on an existing track producer with a resolved catalog config.
 	///
 	/// Build one from an AudioSpecificConfig with [`config`] (which keeps its bytes as the catalog
-	/// `description`), or from an out-of-band [`Config`] via `into()` (which synthesizes the
-	/// description). The rendition publishes immediately.
-	pub fn new(
+	/// `description`), or from an out-of-band [`Config`] via `try_into()` (which synthesizes the
+	/// description, refusing a channel count that does not pick a channelConfiguration). The rendition
+	/// publishes immediately.
+	pub fn new<E: CatalogExt>(
 		track: moq_net::track::Producer,
 		reserved: crate::catalog::Reserved<E>,
-		mut config: hang::catalog::AudioConfig,
+		config: hang::catalog::AudioConfig,
 	) -> crate::Result<Self> {
+		if config.description.is_none() {
+			let err = crate::Error::from(super::Error::MissingDescription);
+			track.abort(err.reason())?;
+			return Err(err);
+		}
 		tracing::debug!(name = ?track.name(), ?config, "starting track");
-		// Advertise this rendition's timeline before publishing (the generic set() no longer does).
-		config.timeline = Some(reserved.producer().timeline(track.name())?.section());
 		// The caller's config names the container; the writer is built from that same value so the
 		// wire cannot disagree with what the rendition advertises.
-		let wire = crate::catalog::hang::Container::try_from(&config.container)?;
-		let name = track.name().to_string();
-		// Build the writer before advertising the rendition: it is fallible (its timeline track can
-		// collide), and a rendition published for a track we then fail to produce would be
-		// advertised to consumers but never served.
-		let media = reserved.producer().media_producer(track, wire)?;
-		let mut rendition = reserved.audio(name);
-		rendition.set(config);
-		Ok(Self {
-			track: media,
-			rendition,
-		})
+		let wire = crate::catalog::hang::Container::try_from(&config)?;
+		// Build the writer before advertising the rendition: it is fallible (enrolling the track in
+		// the broadcast timeline can collide), and a rendition published for a track we then fail to
+		// produce would be advertised to consumers but never served.
+		let track = reserved.audio(track, wire, config)?;
+		Ok(Self { track })
 	}
 
 	/// The MoQ track name this importer publishes on.
@@ -56,18 +54,9 @@ impl<E: CatalogExt> Import<E> {
 		self.track.track().demand()
 	}
 
-	/// Refine the single audio rendition in place, republishing the catalog.
-	///
-	/// The TS importer uses this to set the synthesized `description` and an
-	/// audio-burst `jitter` once it knows them.
-	pub(crate) fn update_rendition(&mut self, f: impl FnOnce(&mut hang::catalog::AudioConfig)) {
-		self.rendition.update(f);
-	}
-
 	/// Finish the track, flushing the current group.
 	pub fn finish(&mut self) -> crate::Result<()> {
-		self.track.finish()?;
-		self.estimate();
+		self.track.end_with(None)?;
 		Ok(())
 	}
 
@@ -77,23 +66,28 @@ impl<E: CatalogExt> Import<E> {
 		self.track.abort(err);
 	}
 
-	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
-	/// the fields its config didn't supply.
-	fn estimate(&mut self) {
-		self.rendition.estimate(self.track.estimate());
+	/// Record the media duration emitted together by the TS importer.
+	pub(crate) fn burst(&mut self, duration: std::time::Duration) -> crate::Result<()> {
+		self.track.burst(duration)
 	}
 
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
 		self.track.cut(end)?;
-		self.estimate();
+		Ok(())
+	}
+
+	/// Mark a break in the timeline by publishing a marker group. To bound the closing
+	/// group's final frame first, [`cut(end)`](Self::cut) before this. See
+	/// [`Producer::discontinuity`](crate::container::Producer::discontinuity).
+	pub fn discontinuity(&mut self) -> crate::Result<()> {
+		self.track.discontinuity()?;
 		Ok(())
 	}
 
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> crate::Result<()> {
 		self.track.seek(sequence)?;
-		self.estimate();
 		Ok(())
 	}
 
@@ -103,7 +97,7 @@ impl<E: CatalogExt> Import<E> {
 	/// (see [`Producer::needs_keyframe`](crate::container::Producer::needs_keyframe)); otherwise it
 	/// extends the current group. The caller bounds groups via [`cut`](Self::cut) / [`seek`](Self::seek).
 	pub fn decode<B: moq_net::IntoBytes>(&mut self, frame: B, pts: Option<moq_net::Timestamp>) -> crate::Result<()> {
-		let timestamp = self.rendition.timestamp(pts)?;
+		let timestamp = self.track.timestamp(pts)?;
 		// Only the first frame of each group is a keyframe, so the group spans until the caller cuts
 		// instead of opening one group (one QUIC stream) per packet.
 		let keyframe = self.track.needs_keyframe();
@@ -113,7 +107,6 @@ impl<E: CatalogExt> Import<E> {
 			keyframe,
 			duration: None,
 		})?;
-		self.estimate();
 		Ok(())
 	}
 }
@@ -123,24 +116,60 @@ impl<E: CatalogExt> Import<E> {
 /// Errors on a malformed or empty buffer.
 pub fn config(init: &[u8]) -> crate::Result<hang::catalog::AudioConfig> {
 	let mut buf = init;
-	let mut audio: hang::catalog::AudioConfig = Config::parse(&mut buf)?.into();
+	let parsed = Config::parse(&mut buf)?;
+	// Keep the bytes verbatim. Re-encoding would refuse a program config element whose count does
+	// not pick a channelConfiguration, and would drop any SBR or PS extension the parse ignores.
+	let mut audio = catalog_config(&parsed);
 	audio.description = Some(bytes::Bytes::copy_from_slice(init));
 	Ok(audio)
 }
 
-impl From<Config> for hang::catalog::AudioConfig {
+impl TryFrom<Config> for hang::catalog::AudioConfig {
+	type Error = super::Error;
+
 	/// Build a catalog config from a config resolved out of band (an ADTS header, gstreamer caps),
 	/// synthesizing the AudioSpecificConfig `description` since no verbatim bytes are available.
-	fn from(config: Config) -> Self {
-		let mut audio = hang::catalog::AudioConfig::new(
-			hang::catalog::AAC {
-				profile: config.profile,
-			},
-			config.sample_rate,
-			config.channel_count,
-		);
-		audio.container = hang::catalog::Container::Legacy;
-		audio.description = Some(config.encode());
-		audio
+	///
+	/// Refuses a channel count that does not pick a channelConfiguration, rather than describing it as
+	/// another layout.
+	fn try_from(config: Config) -> Result<Self, Self::Error> {
+		let mut audio = catalog_config(&config);
+		audio.description = Some(config.encode()?);
+		Ok(audio)
+	}
+}
+
+fn catalog_config(config: &Config) -> hang::catalog::AudioConfig {
+	let mut audio = hang::catalog::AudioConfig::new(
+		hang::catalog::AAC {
+			profile: config.profile,
+		},
+		config.sample_rate,
+		config.channel_count,
+	);
+	audio.container = hang::catalog::Container::Legacy;
+	audio
+}
+
+#[cfg(test)]
+mod tests {
+	#[tokio::test(start_paused = true)]
+	async fn raw_publication_needs_a_description_before_advertising() {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let track = broadcast
+			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		let mut subscriber = track.subscribe(None);
+		let config = hang::catalog::AudioConfig::new(hang::catalog::AAC { profile: 2 }, 48_000, 2);
+		assert!(matches!(
+			super::Import::new(track, catalog.reserve(), config),
+			Err(crate::Error::Aac(super::super::Error::MissingDescription))
+		));
+		assert!(catalog.snapshot().audio.renditions.is_empty());
+		assert!(matches!(
+			subscriber.poll_finished(&kio::Waiter::noop()),
+			std::task::Poll::Ready(Err(_))
+		));
 	}
 }

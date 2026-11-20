@@ -1,8 +1,8 @@
 //! CPU conversion of native video surfaces to packed pixels.
 //!
-//! [`Surface::into_rgba`](crate::Surface::into_rgba) is the portable rendering
-//! exit: it downloads a GPU surface when necessary, applies the surface's color
-//! space, and returns owned RGBA pixels for an image or UI toolkit.
+//! [`Surface::to_rgba`](crate::Surface::to_rgba) is the portable rendering exit: it
+//! downloads a GPU surface when necessary, applies the surface's color space, and
+//! returns owned pixels for an image or UI toolkit.
 
 use yuv::{YuvPlanarImage, yuv420_to_rgba};
 
@@ -32,21 +32,36 @@ impl Config {
 /// Owned, tightly packed RGBA8 pixels in row-major order.
 #[derive(Clone)]
 pub struct Rgba {
-	width: u32,
-	height: u32,
+	size: Size,
 	stride: usize,
 	data: Vec<u8>,
 }
 
 impl Rgba {
+	/// Wrap tightly packed `size` RGBA8 pixels.
+	#[cfg(feature = "render")]
+	pub(crate) fn new(size: Size, data: Vec<u8>) -> Self {
+		debug_assert_eq!(data.len(), size.width as usize * size.height as usize * 4);
+		Self {
+			size,
+			stride: size.width as usize * 4,
+			data,
+		}
+	}
+
+	/// Image dimensions in pixels.
+	pub fn size(&self) -> Size {
+		self.size
+	}
+
 	/// Image width in pixels.
 	pub fn width(&self) -> u32 {
-		self.width
+		self.size.width
 	}
 
 	/// Image height in pixels.
 	pub fn height(&self) -> u32 {
-		self.height
+		self.size.height
 	}
 
 	/// Bytes between adjacent rows, always `width * 4`.
@@ -65,37 +80,44 @@ impl Rgba {
 	}
 }
 
-pub(crate) fn rgba(surface: Surface, config: &Config) -> Result<Rgba, Error> {
+/// Downloads `surface` if it is not already on the CPU and converts it to RGBA.
+///
+/// By reference rather than by value: a caller often holds the surface behind
+/// an `Arc` it cannot unwrap, most obviously a publisher's preview frame, which
+/// is shared with every rendition's encoder and so never has a refcount of one.
+/// Nothing here needs to own the surface, and requiring it forced those callers
+/// into a full-resolution rescale purely to obtain pixels they already had.
+pub(crate) fn rgba(surface: &Surface, config: &Config) -> Result<Rgba, Error> {
 	let size = Size::new(surface.width(), surface.height());
 	let color = config
 		.color
 		.or_else(|| surface.color())
 		.unwrap_or_else(|| Color::infer(size));
-	let i420 = surface.into_i420()?;
+	let i420 = surface.to_i420()?;
 	let luma = usize::try_from(size.pixels())
-		.map_err(|_| Error::Codec(anyhow::anyhow!("RGBA frame {size}: dimensions too large to represent")))?;
+		.map_err(|_| Error::codec(anyhow::anyhow!("RGBA frame {size}: dimensions too large to represent")))?;
 	let stride = size.width.checked_mul(4).ok_or_else(|| {
-		Error::Codec(anyhow::anyhow!(
+		Error::codec(anyhow::anyhow!(
 			"RGBA frame {size}: row stride is too large to represent"
 		))
 	})?;
 	let stride_usize = usize::try_from(stride).map_err(|_| {
-		Error::Codec(anyhow::anyhow!(
+		Error::codec(anyhow::anyhow!(
 			"RGBA frame {size}: row stride is too large to represent"
 		))
 	})?;
 	let len = stride_usize.checked_mul(size.height as usize).ok_or_else(|| {
-		Error::Codec(anyhow::anyhow!(
+		Error::codec(anyhow::anyhow!(
 			"RGBA frame {size}: byte length is too large to represent"
 		))
 	})?;
 	let chroma = luma / 4;
 	let planar = YuvPlanarImage {
-		y_plane: &i420[..luma],
+		y_plane: &i420.data[..luma],
 		y_stride: size.width,
-		u_plane: &i420[luma..luma + chroma],
+		u_plane: &i420.data[luma..luma + chroma],
 		u_stride: size.width / 2,
-		v_plane: &i420[luma + chroma..],
+		v_plane: &i420.data[luma + chroma..],
 		v_stride: size.width / 2,
 		width: size.width,
 		height: size.height,
@@ -103,11 +125,10 @@ pub(crate) fn rgba(surface: Surface, config: &Config) -> Result<Rgba, Error> {
 	let mut data = vec![0; len];
 	let (range, matrix) = color.yuv();
 	yuv420_to_rgba(&planar, &mut data, stride, range, matrix)
-		.map_err(|e| Error::Codec(anyhow::anyhow!("yuv420_to_rgba failed for {size}: {e}")))?;
+		.map_err(|e| Error::codec(anyhow::anyhow!("RGBA conversion failed for {size}: {e}")))?;
 
 	Ok(Rgba {
-		width: size.width,
-		height: size.height,
+		size,
 		stride: stride_usize,
 		data,
 	})
@@ -125,13 +146,13 @@ mod tests {
 	fn conversion_uses_the_surface_color() {
 		let source_size = Size::new(64, 64);
 		let red = [255u8, 0, 0, 255].repeat(source_size.pixels() as usize);
-		let source = I420::from_rgba(&red, source_size.width * 4, source_size.width, source_size.height).unwrap();
-		let source = source.resize(1280, 720).unwrap();
-		assert_eq!(source.color(), Some(Color::Bt601Limited));
-		assert_eq!(Color::infer(Size::new(1280, 720)), Color::Bt709Limited);
+		let source = I420::from_rgba(&red, source_size.width * 4, source_size).unwrap();
+		let source = source.resize(Size::new(1280, 720)).unwrap();
+		assert_eq!(source.color(), Some(Color::BT601));
+		assert_eq!(Color::infer(Size::new(1280, 720)), Color::BT709);
 
-		let image = rgba(Surface::I420(source), &Config::default()).unwrap();
-		let center = (image.height as usize / 2 * image.stride) + image.width as usize / 2 * 4;
+		let image = rgba(&Surface::I420(source), &Config::default()).unwrap();
+		let center = (image.height() as usize / 2 * image.stride) + image.width() as usize / 2 * 4;
 		let pixel = &image.data[center..center + 4];
 		assert!(pixel[0] >= 250, "red channel drifted: {pixel:?}");
 		assert!(pixel[1] <= 2 && pixel[2] <= 2, "surface matrix was ignored: {pixel:?}");
@@ -141,9 +162,10 @@ mod tests {
 	#[test]
 	fn conversion_reports_a_tightly_packed_layout() {
 		let size = Size::new(64, 32);
-		let surface = Surface::I420(I420::new(size.width, size.height, vec![128; I420::len(64, 32)]).unwrap());
+		let surface = Surface::I420(I420::new(size, vec![128; I420::len(size).unwrap()]).unwrap());
 
-		let image = rgba(surface, &Config::default()).unwrap();
+		let image = rgba(&surface, &Config::default()).unwrap();
+		assert_eq!(image.size(), size);
 		assert_eq!(image.width(), size.width);
 		assert_eq!(image.height(), size.height);
 		assert_eq!(image.stride(), size.width as usize * 4);

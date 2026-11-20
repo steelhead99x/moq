@@ -1,0 +1,191 @@
+//! What a connection's TLS handshake negotiated.
+//!
+//! The handshake runs on rustls with rind. The traits here are crate-private:
+//! rustls is their one real implementation, and the plaintext one behind the `fuzz` feature
+//! serves the fuzz target and the benchmarks.
+
+use std::{str, sync::Arc};
+
+use ::rustls::pki_types::CertificateDer;
+use bytes::BytesMut;
+
+use crate::{
+	Side, TransportError, Version, endpoint::ConnectError, shared::ConnectionId,
+	transport_parameters::TransportParameters,
+};
+
+/// Reset and token cryptography from rind.
+mod rind;
+/// TLS interface based on rustls
+pub(crate) mod rustls;
+
+/// What the handshake negotiated, available once the connection's `poll_handshake_data` is ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HandshakeData {
+	/// The negotiated application protocol, if ALPN is in use.
+	///
+	/// Always set when the client offered protocols, since rustls refuses a handshake without one.
+	pub alpn: Option<Vec<u8>>,
+	/// The server name the client sent, seen only by the server.
+	pub server_name: Option<String>,
+}
+
+/// The requested keying material is longer than the handshake's hash can export.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ExportKeyingMaterialError;
+
+/// A cryptographic session (commonly TLS)
+pub(crate) trait Session: Send + Sync + 'static {
+	/// Create the initial set of keys given the client's initial destination ConnectionId
+	fn initial_keys(&self, dst_cid: ConnectionId, side: Side) -> Keys;
+
+	/// Get data negotiated during the handshake, if available
+	///
+	/// Returns `None` until the connection's `poll_handshake_data` is ready.
+	fn handshake_data(&self) -> Option<HandshakeData>;
+
+	/// The certificate chain the peer presented, end entity first, if any
+	fn peer_identity(&self) -> Option<Vec<CertificateDer<'static>>>;
+
+	/// Returns `true` until the connection is fully established.
+	fn is_handshaking(&self) -> bool;
+
+	/// Read bytes of handshake data
+	///
+	/// This should be called with the contents of `CRYPTO` frames. If it returns `Ok`, the
+	/// caller should call `write_handshake()` to check if the crypto protocol has anything
+	/// to send to the peer. This method will only return `true` the first time that
+	/// handshake data is available. Future calls will always return false.
+	///
+	/// On success, returns `true` iff `self.handshake_data()` has been populated.
+	fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError>;
+
+	/// The peer's QUIC transport parameters
+	///
+	/// These are only available after the first flight from the peer has been received.
+	fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError>;
+
+	/// Writes handshake bytes into the given buffer and optionally returns the negotiated keys
+	///
+	/// When the handshake proceeds to the next phase, this method will return a new set of
+	/// keys to encrypt data with.
+	fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys>;
+
+	/// Compute keys for the next key update
+	fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>>;
+
+	/// Verify the integrity of a retry packet
+	fn is_valid_retry(&self, orig_dst_cid: ConnectionId, header: &[u8], payload: &[u8]) -> bool;
+
+	/// Fill `output` with `output.len()` bytes of keying material derived
+	/// from the [Session]'s secrets, using `label` and `context` for domain
+	/// separation.
+	///
+	/// This function will fail, returning [ExportKeyingMaterialError],
+	/// if the requested output length is too large.
+	fn export_keying_material(
+		&self,
+		output: &mut [u8],
+		label: &[u8],
+		context: &[u8],
+	) -> Result<(), ExportKeyingMaterialError>;
+}
+
+/// A pair of keys for bidirectional communication
+pub(crate) struct KeyPair<T> {
+	/// Key for encrypting data
+	pub local: T,
+	/// Key for decrypting data
+	pub remote: T,
+}
+
+/// A complete set of keys for a certain packet space
+pub(crate) struct Keys {
+	/// Header protection keys
+	pub header: KeyPair<Box<dyn HeaderKey>>,
+	/// Packet protection keys
+	pub packet: KeyPair<Box<dyn PacketKey>>,
+}
+
+/// Client-side configuration for the crypto protocol
+pub(crate) trait ClientConfig: Send + Sync {
+	/// Start a client session with this configuration
+	fn start_session(
+		self: Arc<Self>,
+		version: Version,
+		server_name: &str,
+		params: &TransportParameters,
+	) -> Result<Box<dyn Session>, ConnectError>;
+}
+
+/// Server-side configuration for the crypto protocol
+pub(crate) trait ServerConfig: Send + Sync {
+	/// Create the initial set of keys given the client's initial destination ConnectionId
+	///
+	/// `None` when the config cannot protect Initial packets, so no connection can start.
+	fn initial_keys(&self, version: Version, dst_cid: ConnectionId) -> Option<Keys>;
+
+	/// Generate the integrity tag for a retry packet
+	fn retry_tag(&self, version: Version, orig_dst_cid: ConnectionId, packet: &[u8]) -> [u8; 16];
+
+	/// Start a server session with this configuration
+	///
+	/// Sessions must reject early data; the transport only processes 1-RTT application packets.
+	fn start_session(
+		self: Arc<Self>,
+		version: Version,
+		params: &TransportParameters,
+	) -> Result<Box<dyn Session>, TransportError>;
+}
+
+/// Keys used to protect packet payloads
+pub(crate) trait PacketKey: Send + Sync {
+	/// Encrypt the packet payload with the given packet number
+	fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize);
+	/// Decrypt the packet payload with the given packet number
+	fn decrypt(&self, packet: u64, header: &[u8], payload: &mut BytesMut) -> Result<(), CryptoError>;
+	/// The length of the AEAD tag appended to packets on encryption
+	fn tag_len(&self) -> usize;
+	/// Maximum number of packets that may be sent using a single key
+	fn confidentiality_limit(&self) -> u64;
+	/// Maximum number of incoming packets that may fail decryption before the connection must be
+	/// abandoned
+	fn integrity_limit(&self) -> u64;
+}
+
+/// Keys used to protect packet headers
+pub(crate) trait HeaderKey: Send + Sync {
+	/// Decrypt the given packet's header
+	fn decrypt(&self, pn_offset: usize, packet: &mut [u8]);
+	/// Encrypt the given packet's header
+	fn encrypt(&self, pn_offset: usize, packet: &mut [u8]);
+	/// The sample size used for this key's algorithm
+	fn sample_size(&self) -> usize;
+}
+
+/// A key for signing with HMAC-based algorithms
+pub(crate) trait HmacKey: Send + Sync {
+	/// Method for signing a message
+	fn sign(&self, data: &[u8], signature_out: &mut [u8]);
+	/// Length of `sign`'s output
+	fn signature_len(&self) -> usize;
+}
+
+/// A pseudo random key for HKDF
+pub(crate) trait HandshakeTokenKey: Send + Sync {
+	/// Derive AEAD using hkdf
+	fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Box<dyn AeadKey>;
+}
+
+/// A key for sealing data with AEAD-based algorithms
+pub(crate) trait AeadKey {
+	/// Method for sealing message `data`
+	fn seal(&self, data: &mut Vec<u8>, additional_data: &[u8]) -> Result<(), CryptoError>;
+	/// Method for opening a sealed message `data`
+	fn open<'a>(&self, data: &'a mut [u8], additional_data: &[u8]) -> Result<&'a mut [u8], CryptoError>;
+}
+
+/// Generic crypto errors
+#[derive(Debug)]
+pub(crate) struct CryptoError;

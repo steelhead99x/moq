@@ -7,6 +7,194 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Breaking:** `Bus::channel` and `bus::Channel` are renamed `Bus::live` and
+  `bus::Live`, pairing with `Bus::positioned` and `bus::Positioned`. See
+  `MIGRATE.md`.
+- `Bus::positioned` adds a bus source whose every write names the bus position
+  its first frame plays at, for audio scheduled against video on the bus's
+  clock. A write that would land where the bus already mixed, overlap the
+  channel's own audio, or end past `bus::REACH` (200 ms) fails whole instead of
+  moving. It takes the bus's sample rate. Given a nonzero stretch bound, at
+  most `bus::MAX_STRETCH` (2 s), it instead plays each write after the audio
+  it holds and time-stretches onto the positions, as the playback sink does
+  onto its clock, so a playout target's step glides rather than writing
+  silence or failing.
+- A bus `Strip` has a pan, `set_pan` and `pan`, that places its source between
+  left and right in every mix: constant power for a mono source, at -3 dB per
+  side when centered (so a mono source now plays 3 dB quieter by default), and
+  balance for any other. Only a stereo bus pans: another refuses a strip panned
+  off center, and the strip refuses a pan while a channel is open on one.
+- **Breaking:** the bus routes sources into several mixes. `Bus::new` returns
+  the bus and the one `Driver` that advances it on the caller's clock; each mix
+  has its own meter and independent readers whose blocks carry their clock
+  position, and a mix-minus drops any set of its sources. A strip carries a
+  per-source sync delay. See `MIGRATE.md`.
+- **Breaking:** open one `capture::Producer` and pass its independent consumers
+  to the bus and encoder. Samples, timestamps, source gaps, and terminal failures
+  are shared; slow readers lose only their own expired buffers. See `MIGRATE.md`.
+- Retained (on-demand) audio stays on the track after `encode::Control::stop` and
+  after a source failure: a subscriber still encodes it on demand, and it
+  expires on the track's `max_age`. After a failure, the driver returns the
+  error once that history is served or expired, and the track ends with the
+  error while keeping what it published.
+- The `pulseaudio` feature compiles on every platform and does nothing off
+  Linux and the BSDs, so a dependent can enable the sound-server features
+  unconditionally.
+
+## [0.1.10](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.9...moq-audio-v0.1.10) - 2026-10-05
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.1.9](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.8...moq-audio-v0.1.9) - 2026-10-03
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.1.8](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.7...moq-audio-v0.1.8) - 2026-09-30
+
+### Fixed
+
+- *(audio)* conceal one Opus packet's length for a lost packet, not 120 ms ([#4442](https://github.com/moq-dev/moq/pull/4442))
+
+### Other
+
+- compile the Windows, macOS, and OBS plugin code on every PR ([#4370](https://github.com/moq-dev/moq/pull/4370))
+
+## [0.1.7](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.6...moq-audio-v0.1.7) - 2026-09-27
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.1.6](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.5...moq-audio-v0.1.6) - 2026-09-26
+
+### Other
+
+- updated the following local packages: kio, moq-net, hang, moq-mux
+
+## [0.1.5](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.4...moq-audio-v0.1.5) - 2026-09-26
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.1.4](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.3...moq-audio-v0.1.4) - 2026-09-25
+
+### Fixed
+
+- *(audio)* honor and validate Opus stream descriptions ([#4130](https://github.com/moq-dev/moq/pull/4130))
+
+### Other
+
+- *(capture)* drive native capture through clock edge cases in CI ([#4125](https://github.com/moq-dev/moq/pull/4125))
+
+## [0.1.3](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.2...moq-audio-v0.1.3) - 2026-09-25
+
+### Added
+
+- *(mux)* measure encoder flush jitter per rendition ([#3940](https://github.com/moq-dev/moq/pull/3940))
+
+## [0.1.2](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.1...moq-audio-v0.1.2) - 2026-09-25
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, hang
+
+## [0.1.1](https://github.com/moq-dev/moq/compare/moq-audio-v0.1.0...moq-audio-v0.1.1) - 2026-09-24
+
+### Other
+
+- updated the following local packages: moq-net, hang, moq-mux
+
+## [0.0.27](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.26...moq-audio-v0.0.27) - 2026-09-23
+
+### Other
+
+- updated the following local packages: hang, moq-mux
+
+## [0.0.26](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.25...moq-audio-v0.0.26) - 2026-09-23
+
+### Added
+
+- *(hang)* [**breaking**] unify catalog APIs ([#3813](https://github.com/moq-dev/moq/pull/3813))
+- *(net)* [**breaking**] slim the moq-net public surface ([#3779](https://github.com/moq-dev/moq/pull/3779))
+- [**breaking**] borrow publisher finish so abort can still run ([#3714](https://github.com/moq-dev/moq/pull/3714))
+- *(hang)* [**breaking**] timelines only move forward ([#3711](https://github.com/moq-dev/moq/pull/3711))
+
+### Fixed
+
+- *(audio)* [**breaking**] enforce exclusive AEC ownership ([#3844](https://github.com/moq-dev/moq/pull/3844))
+- *(moq-audio,moq-video)* build capture and Android again, and gate both on PRs ([#3850](https://github.com/moq-dev/moq/pull/3850))
+- *(ci)* repair nightly and meta-review failures ([#3799](https://github.com/moq-dev/moq/pull/3799))
+- *(net)* drop origin source track when last reader leaves
+
+### Other
+
+- *(rs)* read constant-size chunks with as_chunks ([#3899](https://github.com/moq-dev/moq/pull/3899))
+- *(quest)* complete the media release review ([#3878](https://github.com/moq-dev/moq/pull/3878))
+- Report dropped playback sample frames ([#3845](https://github.com/moq-dev/moq/pull/3845))
+- *(audio)* [**breaking**] separate configuration contracts ([#3843](https://github.com/moq-dev/moq/pull/3843))
+- *(audio)* [**breaking**] expose demand without track authority ([#3842](https://github.com/moq-dev/moq/pull/3842))
+- Unify mux track and rendition ownership ([#3857](https://github.com/moq-dev/moq/pull/3857))
+- Make media backends optional ([#3839](https://github.com/moq-dev/moq/pull/3839))
+- *(audio)* [**breaking**] remove ineffective FEC flag ([#3841](https://github.com/moq-dev/moq/pull/3841))
+- Merge origin/main into dev
+- Merge remote-tracking branch 'origin/main' into merge-main-into-dev-20260914
+
+### Changed
+
+- PipeWire and PulseAudio host flags no longer activate device I/O without
+  `capture` or `playback`.
+- [**breaking**] separate source PCM, codec settings, decoded output, and subscription policy;
+  replace ambiguous channel counts with `Layout` and add explicit decoder backend selection.
+- [**breaking**] `encode::Producer::finish` borrows (`&mut self`) instead of consuming, so a later
+  `abort(self)` can still run after a clean end. Writes after finish fail with `Closed`.
+- [**breaking**] `encode::Producer::track` is replaced by the watch-only `demand()`,
+  `publish_capture` takes `PublicationOptions`, `Resampler` is no longer exported, and
+  `Frame` and `encode::Encoded` are non-exhaustive with `new` constructors.
+- [**breaking**] The `fec` flag is removed from `encode::Settings` and `Options`; it never
+  produced redundancy.
+- [**breaking**] `aec::Canceller` is `aec::Control`, `playback::Engine::canceller` returns
+  `Result`, and `capture::Config::aec` takes a `Control`. An engine owns one AEC reference and a
+  control attaches to one live microphone; conflicts fail with `Error::Busy`.
+- [**breaking**] `playback::Sink::write` returns `playback::Write`, reporting accepted and
+  dropped input sample frames instead of silently discarding overflow.
+
+## [0.0.25](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.24...moq-audio-v0.0.25) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, hang
+
+## [0.0.24](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.23...moq-audio-v0.0.24) - 2026-09-13
+
+### Fixed
+
+- *(moq-video,moq-audio)* open a decoder at the live edge ([#3565](https://github.com/moq-dev/moq/pull/3565))
+
+## [0.0.23](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.22...moq-audio-v0.0.23) - 2026-09-09
+
+### Added
+
+- *(moq-audio)* [**breaking**] let publish_capture carry a catalog extension ([#3356](https://github.com/moq-dev/moq/pull/3356))
+- *(audio,video)* compile the device, render, and VAAPI code by default ([#3353](https://github.com/moq-dev/moq/pull/3353))
+
+### Fixed
+
+- *(audio)* stamp resampled output from the frames it starts with ([#3482](https://github.com/moq-dev/moq/pull/3482))
+- *(moq-audio)* treat a media gap as a hole rather than a splice ([#3386](https://github.com/moq-dev/moq/pull/3386))
+
+### Other
+
+- *(deps)* bump the cargo group with 2 updates ([#3476](https://github.com/moq-dev/moq/pull/3476))
+- take every feature that needs a library or libclang at build time off the defaults ([#3464](https://github.com/moq-dev/moq/pull/3464))
+- *(moq-audio)* scope the local-task guidance to macOS ([#3436](https://github.com/moq-dev/moq/pull/3436))
+- *(moq-audio,moq-cli)* assert publish_capture stays Send off macOS ([#3433](https://github.com/moq-dev/moq/pull/3433))
+- *(deps)* bump the cargo group across 1 directory with 5 updates ([#3395](https://github.com/moq-dev/moq/pull/3395))
+
 ## [0.0.22](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.21...moq-audio-v0.0.22) - 2026-09-02
 
 ### Added

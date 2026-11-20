@@ -1,4 +1,4 @@
-use crate::coding::{Decode, DecodeError, Encode, EncodeError};
+use crate::coding::{Decode, DecodeError, Decoder, Encode, EncodeError, Encoder};
 use crate::{Timescale, Timestamp};
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
@@ -7,107 +7,65 @@ use super::Version;
 use crate::ietf::Param;
 
 /// MOQ Object Property IDs (the MOQ Object Properties registry, shared with
-/// draft-ietf-moq-loc-04). Even type ids carry a single varint value.
+/// draft-ietf-moq-loc-04). Even type ids carry a single varint value. The object-scope
+/// Timescale is only skipped on decode, so only tests name it.
+#[cfg(test)]
 const PROP_TIMESCALE: u64 = 0x08;
 const PROP_TIMESTAMP: u64 = 0x10;
 
-/// The Timestamp id from draft-ietf-moq-loc-03, accepted on decode only.
-///
-/// Draft-03's body text and its IANA table disagreed (0x0A vs 0x06); this is the
-/// table's value, which is what we and other implementations shipped. Draft-04
-/// assigns 0x0A to Secure Objects private properties, so it is not accepted here.
-const PROP_TIMESTAMP_DRAFT03: u64 = 0x06;
+/// Implementation limit for an object's extension (property) block, independent of the
+/// IETF draft. Checked at the length prefix, before the block is buffered.
+pub(crate) const MAX_OBJECT_EXTENSIONS: usize = 64 * 1024;
+
+/// The length prefix of an object's extension block, refused past [`MAX_OBJECT_EXTENSIONS`].
+#[derive(Debug)]
+pub(super) struct ObjectExtensionsLength(pub usize);
+
+impl<'a> Decode<'a, Version> for ObjectExtensionsLength {
+	fn decode(buf: &mut Decoder<'a>, _: Version) -> Result<Self, DecodeError> {
+		let size = usize::try_from(buf.varint()?).map_err(|_| DecodeError::BoundsExceeded)?;
+		if size > MAX_OBJECT_EXTENSIONS {
+			return Err(DecodeError::MessageTooLarge {
+				size,
+				max: MAX_OBJECT_EXTENSIONS,
+			});
+		}
+		Ok(Self(size))
+	}
+}
 
 /// Encode a frame's presentation timestamp as a moq-transport Object Property.
 ///
 /// Matches the LOC encoding of the same registry id so a relay or LOC-aware peer
-/// reads the same bytes on drafts that delta-encode KVP type ids. The Timestamp
-/// value is always absolute. Writes the raw KVP bytes
+/// reads the same bytes. The Timestamp value is always absolute. Writes the raw KVP bytes
 /// (no outer length prefix); the caller frames the block with its byte length.
 ///
 /// The units come from the track's TIMESCALE property, not from here: repeating the
 /// timescale on every object would cost bytes per frame to restate something fixed for
 /// the track's lifetime. `timescale` is what the track advertised, and the timestamp is
 /// converted into it so the value on the wire matches the declared units.
-pub fn encode_object_time<W: bytes::BufMut>(
-	w: &mut W,
-	timestamp: Timestamp,
-	timescale: Timescale,
-	version: Version,
-) -> Result<(), EncodeError> {
+pub fn encode_object_time(w: &mut Encoder<'_>, timestamp: Timestamp, timescale: Timescale) -> Result<(), EncodeError> {
 	let timestamp = timestamp.convert(timescale).map_err(|_| EncodeError::BoundsExceeded)?;
-	encode_object_property_type(w, PROP_TIMESTAMP, 0, version)?;
-	timestamp.value().encode(w, version)?;
+	// The first property's type is a delta from zero, so it is written as is.
+	w.varint(PROP_TIMESTAMP)?;
+	w.varint(timestamp.value())?;
 	Ok(())
 }
 
-fn encode_object_property_type<W: bytes::BufMut>(
-	w: &mut W,
-	kind: u64,
-	prev: u64,
-	version: Version,
-) -> Result<(), EncodeError> {
-	let encoded = match version {
-		Version::Draft14 | Version::Draft15 => kind,
-		_ => kind.checked_sub(prev).ok_or(EncodeError::BoundsExceeded)?,
-	};
-	encoded.encode(w, version)
-}
-
-/// Decode the Timestamp (0x10) Object Property from an object's extension block,
-/// skipping any other properties. Returns `None` when no Timestamp property is present.
-///
-/// `timescale` is the track's declared units. An object-scope Timescale (0x08) overrides
-/// it for that object alone, which draft-ietf-moq-loc-04 permits and we still honor on
-/// decode even though we no longer write one.
-pub fn decode_object_time<R: bytes::Buf>(
-	r: &mut R,
+/// Decode the same property list as ingest when checking timestamps in wire tests.
+#[cfg(test)]
+pub fn decode_object_time(
+	r: &mut Decoder<'_>,
 	timescale: Timescale,
 	version: Version,
 ) -> Result<Option<Timestamp>, DecodeError> {
-	let mut timestamp: Option<u64> = None;
-	let mut override_scale: Option<u64> = None;
-	let mut prev_type: u64 = 0;
-	let mut first = true;
-
-	while r.has_remaining() {
-		let step = u64::decode(r, version)?;
-		let abs = match version {
-			Version::Draft14 | Version::Draft15 => step,
-			_ if first => step,
-			_ => prev_type.checked_add(step).ok_or(DecodeError::BoundsExceeded)?,
-		};
-		first = false;
-		prev_type = abs;
-
-		if abs % 2 == 0 {
-			// Even type: a single varint value.
-			let value = u64::decode(r, version)?;
-			match abs {
-				PROP_TIMESTAMP | PROP_TIMESTAMP_DRAFT03 => timestamp = Some(value),
-				PROP_TIMESCALE => override_scale = Some(value),
-				_ => {}
-			}
-		} else {
-			// Odd type: length-prefixed bytes we don't care about.
-			let len = u64::decode(r, version)? as usize;
-			if r.remaining() < len {
-				return Err(DecodeError::Short);
-			}
-			r.advance(len);
-		}
-	}
-
-	let Some(value) = timestamp else {
-		return Ok(None);
-	};
-	let scale = match override_scale {
-		Some(s) => Timescale::new(s).map_err(|_| DecodeError::InvalidValue)?,
-		None => timescale,
-	};
-	Ok(Some(
-		Timestamp::new(value, scale).map_err(|_| DecodeError::InvalidValue)?,
-	))
+	let data = bytes::Bytes::copy_from_slice(r.rest());
+	super::object::read(&data, version, Some(timescale))
+		.map(|decoded| decoded.timestamp)
+		.map_err(|error| match error {
+			crate::Error::Decode(error) => error,
+			_ => DecodeError::InvalidValue,
+		})
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
@@ -119,38 +77,49 @@ pub enum GroupOrder {
 }
 
 impl GroupOrder {
-	/// Map `Any` (0x0) to `Descending`, leaving other values unchanged.
-	pub fn any_to_descending(self) -> Self {
+	/// The model's order: `Any` leaves the choice to the publisher, which serves newest
+	/// first.
+	pub fn to_order(self) -> crate::track::Order {
 		match self {
-			Self::Any => Self::Descending,
-			other => other,
+			Self::Ascending => crate::track::Order::Ascending,
+			Self::Any | Self::Descending => crate::track::Order::Descending,
+		}
+	}
+}
+
+impl From<crate::track::Order> for GroupOrder {
+	fn from(order: crate::track::Order) -> Self {
+		match order {
+			crate::track::Order::Ascending => Self::Ascending,
+			crate::track::Order::Descending => Self::Descending,
 		}
 	}
 }
 
 impl Encode<Version> for GroupOrder {
-	fn encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
-		u8::from(*self).encode(w, version)?;
+	fn encode(&self, w: &mut Encoder<'_>, _: Version) -> Result<(), EncodeError> {
+		w.u8(u8::from(*self));
 		Ok(())
 	}
 }
 
-impl Decode<Version> for GroupOrder {
-	fn decode<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
-		Self::try_from(u8::decode(r, version)?).map_err(|_| DecodeError::InvalidValue)
+impl<'a> Decode<'a, Version> for GroupOrder {
+	fn decode(r: &mut Decoder<'a>, _: Version) -> Result<Self, DecodeError> {
+		Self::try_from(r.u8()?).map_err(|_| DecodeError::InvalidValue)
 	}
 }
 
 impl Param for GroupOrder {
-	fn param_encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
+	fn param_encode(&self, w: &mut Encoder<'_>, version: Version) -> Result<(), EncodeError> {
 		u8::from(*self).param_encode(w, version)
 	}
 
-	fn param_decode<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
-		let v = u8::param_decode(r, version)?;
-		Ok(GroupOrder::try_from(v)
-			.unwrap_or(GroupOrder::Descending)
-			.any_to_descending())
+	fn param_decode(r: &mut Decoder<'_>, version: Version) -> Result<Self, DecodeError> {
+		match u8::param_decode(r, version)? {
+			1 => Ok(GroupOrder::Ascending),
+			2 => Ok(GroupOrder::Descending),
+			_ => Err(DecodeError::InvalidValue),
+		}
 	}
 }
 
@@ -162,9 +131,8 @@ pub struct GroupFlags {
 	// There's an explicit subgroup on the wire.
 	pub has_subgroup: bool,
 
-	// Use the first object ID as the subgroup ID
-	// Since we don't support subgroups or object ID > 0, this is trivial to support.
-	// Not compatibile with has_subgroup
+	// Use the first object ID as the subgroup ID, so only a first object ID of 0 is
+	// subgroup 0. Not compatible with has_subgroup.
 	pub has_subgroup_object: bool,
 
 	// There's an implicit end marker when the stream is closed.
@@ -176,9 +144,8 @@ pub struct GroupFlags {
 
 	/// Whether this stream carries the subgroup from its first published object.
 	///
-	/// A subgroup that starts partway through has a hole at the front, which moq-lite cannot
-	/// represent. Always true on the drafts that predate the FIRST_OBJECT bit (before
-	/// draft-18), where there is no such signal to read.
+	/// Independent of its first Object ID: a publisher can start a subgroup above 0.
+	/// Always true before draft-18, where there is no such signal to read.
 	pub first_object: bool,
 }
 
@@ -195,7 +162,7 @@ impl GroupFlags {
 	// moq-lite always sets this bit on emit because every subgroup starts at object 0.
 	pub const FIRST_OBJECT_BIT: u64 = 0x40;
 
-	pub fn encode(&self, version: Version) -> Result<u64, EncodeError> {
+	pub fn encode(&self) -> Result<u64, EncodeError> {
 		if self.has_subgroup && self.has_subgroup_object {
 			return Err(EncodeError::InvalidState);
 		}
@@ -220,27 +187,18 @@ impl GroupFlags {
 		}
 		// Draft-18+: moq-lite always starts subgroups at object 0 and never has gaps, so
 		// the publisher side sets this on everything it produces.
-		if self.first_object
-			&& !matches!(
-				version,
-				Version::Draft14 | Version::Draft15 | Version::Draft16 | Version::Draft17
-			) {
+		if self.first_object {
 			id |= Self::FIRST_OBJECT_BIT;
 		}
 		Ok(id)
 	}
 
-	pub fn decode(id: u64, version: Version) -> Result<Self, DecodeError> {
-		// Draft-18+ allows bit 0x40 (FIRST_OBJECT), which says the stream carries the
-		// subgroup from its first published object. Strip it before the range check, but
-		// keep the value: it is the only signal that a subgroup starts partway through.
-		// The drafts that predate it carry no such signal, so they are taken at their word.
-		let legacy = matches!(
-			version,
-			Version::Draft14 | Version::Draft15 | Version::Draft16 | Version::Draft17
-		);
-		let first_object = legacy || (id & Self::FIRST_OBJECT_BIT) != 0;
-		let id = if legacy { id } else { id & !Self::FIRST_OBJECT_BIT };
+	pub fn decode(id: u64) -> Result<Self, DecodeError> {
+		// Bit 0x40 (FIRST_OBJECT) says the stream carries the subgroup from its first
+		// published object. Strip it before the range check, but keep the value: it is the
+		// only signal that a subgroup starts partway through.
+		let first_object = (id & Self::FIRST_OBJECT_BIT) != 0;
+		let id = id & !Self::FIRST_OBJECT_BIT;
 
 		let (has_priority, base_id) = if (Self::START..=Self::END).contains(&id) {
 			(true, id)
@@ -293,44 +251,44 @@ pub struct GroupHeader {
 }
 
 impl Encode<Version> for GroupHeader {
-	fn encode<W: bytes::BufMut>(&self, w: &mut W, version: Version) -> Result<(), EncodeError> {
+	fn encode(&self, w: &mut Encoder<'_>, _: Version) -> Result<(), EncodeError> {
 		tracing::trace!(?self, "encoding group header");
-		self.flags.encode(version)?.encode(w, version)?;
-		self.track_alias.encode(w, version)?;
-		self.group_id.encode(w, version)?;
+		w.varint(self.flags.encode()?)?;
+		w.varint(self.track_alias)?;
+		w.varint(self.group_id)?;
 
 		if !self.flags.has_subgroup && self.sub_group_id != 0 {
 			return Err(EncodeError::InvalidState);
 		}
 
 		if self.flags.has_subgroup {
-			self.sub_group_id.encode(w, version)?;
+			w.varint(self.sub_group_id)?;
 		}
 
 		// Publisher priority (only if has_priority flag is set)
 		if self.flags.has_priority {
-			self.publisher_priority.encode(w, version)?;
+			w.u8(self.publisher_priority);
 		}
 		Ok(())
 	}
 }
 
-impl Decode<Version> for GroupHeader {
-	fn decode<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {
-		let flags = GroupFlags::decode(u64::decode(r, version)?, version)?;
-		let track_alias = u64::decode(r, version)?;
-		let group_id = u64::decode(r, version)?;
+impl<'a> Decode<'a, Version> for GroupHeader {
+	fn decode(r: &mut Decoder<'a>, _: Version) -> Result<Self, DecodeError> {
+		let flags = GroupFlags::decode(r.varint()?)?;
+		let track_alias = r.varint()?;
+		let group_id = r.varint()?;
 
 		let sub_group_id = match flags.has_subgroup {
-			true => u64::decode(r, version)?,
+			true => r.varint()?,
 			false => 0,
 		};
 
 		// Priority present only if has_priority flag is set
 		let publisher_priority = if flags.has_priority {
-			u8::decode(r, version)?
+			r.u8()?
 		} else {
-			128 // Default priority when absent
+			super::priority::DEFAULT_WIRE
 		};
 
 		let result = Self {
@@ -349,22 +307,45 @@ impl Decode<Version> for GroupHeader {
 mod tests {
 	use super::*;
 
-	use bytes::Buf;
+	/// Encode an object's properties at `version`.
+	fn encode_time(ts: Timestamp, timescale: Timescale, version: Version) -> Vec<u8> {
+		let mut buf = Vec::new();
+		encode_object_time(&mut Encoder::new(&mut buf, version.into()), ts, timescale).unwrap();
+		buf
+	}
+
+	/// Read `buf` back as a flat list of varints.
+	fn varints(buf: &[u8], version: Version) -> Vec<u64> {
+		let mut r = Decoder::new(buf, version.into());
+		std::iter::from_fn(|| (!r.is_empty()).then(|| r.varint().unwrap())).collect()
+	}
+
+	/// Write `values` as a flat list of varints.
+	fn from_varints(values: &[u64], version: Version) -> Vec<u8> {
+		let mut buf = Vec::new();
+		let mut w = Encoder::new(&mut buf, version.into());
+		for value in values {
+			w.varint(*value).unwrap();
+		}
+		buf
+	}
+
+	fn decode_time(buf: &[u8], timescale: Timescale, version: Version) -> Option<Timestamp> {
+		let mut r = Decoder::new(buf, version.into());
+		let decoded = decode_object_time(&mut r, timescale, version).unwrap();
+		assert!(r.is_empty());
+		decoded
+	}
 
 	/// An object Timestamp round-trips through encode/decode at the track's scale.
 	#[test]
 	fn test_object_time_roundtrip() {
 		let ts = Timestamp::new(96_000, Timescale::MICRO).unwrap();
-		let mut buf = bytes::BytesMut::new();
-		encode_object_time(&mut buf, ts, Timescale::MICRO, Version::Draft18).unwrap();
+		let buf = encode_time(ts, Timescale::MICRO, Version::Draft18);
 
-		let mut bytes = buf.freeze();
-		let decoded = decode_object_time(&mut bytes, Timescale::MICRO, Version::Draft18)
-			.unwrap()
-			.unwrap();
+		let decoded = decode_time(&buf, Timescale::MICRO, Version::Draft18).unwrap();
 		assert_eq!(decoded.value(), 96_000);
 		assert_eq!(decoded.scale(), Timescale::MICRO);
-		assert!(!bytes.has_remaining());
 	}
 
 	/// The value on the wire is in the track's units, not the frame's.
@@ -372,257 +353,176 @@ mod tests {
 	fn test_object_time_converts_into_the_track_scale() {
 		// 2 seconds, expressed in milliseconds by the frame.
 		let ts = Timestamp::new(2_000, Timescale::MILLI).unwrap();
-		let mut buf = bytes::BytesMut::new();
-		encode_object_time(&mut buf, ts, Timescale::MICRO, Version::Draft18).unwrap();
+		let buf = encode_time(ts, Timescale::MICRO, Version::Draft18);
+		assert_eq!(varints(&buf, Version::Draft18), [PROP_TIMESTAMP, 2_000_000]);
 
-		let mut bytes = buf.clone().freeze();
-		assert_eq!(u64::decode(&mut bytes, Version::Draft18).unwrap(), PROP_TIMESTAMP);
-		assert_eq!(u64::decode(&mut bytes, Version::Draft18).unwrap(), 2_000_000);
-		assert!(!bytes.has_remaining());
-
-		let mut bytes = buf.freeze();
-		let decoded = decode_object_time(&mut bytes, Timescale::MICRO, Version::Draft18)
-			.unwrap()
-			.unwrap();
+		let decoded = decode_time(&buf, Timescale::MICRO, Version::Draft18).unwrap();
 		assert_eq!(decoded.value(), 2_000_000);
 		assert_eq!(decoded.scale(), Timescale::MICRO);
 	}
 
-	/// No Timescale rides along with the object; the track declared it once.
+	/// An object-scope Timescale (which LOC permits) is ignored: the track's units apply.
 	#[test]
-	fn test_object_time_omits_the_timescale() {
-		let ts = Timestamp::new(96_000, Timescale::MILLI).unwrap();
-		let mut buf = bytes::BytesMut::new();
-		encode_object_time(&mut buf, ts, Timescale::MILLI, Version::Draft16).unwrap();
+	fn test_object_time_ignores_an_object_scope_timescale() {
+		let buf = from_varints(
+			&[
+				PROP_TIMESCALE,
+				u64::from(Timescale::MILLI),
+				PROP_TIMESTAMP - PROP_TIMESCALE,
+				42,
+			],
+			Version::Draft18,
+		);
 
-		let mut bytes = buf.freeze();
-		assert_eq!(u64::decode(&mut bytes, Version::Draft16).unwrap(), PROP_TIMESTAMP);
-		assert_eq!(u64::decode(&mut bytes, Version::Draft16).unwrap(), 96_000);
-		assert!(!bytes.has_remaining());
-	}
-
-	/// Draft-14/15 write absolute property types rather than deltas.
-	#[test]
-	fn test_object_time_legacy_uses_absolute_types() {
-		let ts = Timestamp::new(96_000, Timescale::MILLI).unwrap();
-		let mut buf = bytes::BytesMut::new();
-		encode_object_time(&mut buf, ts, Timescale::MILLI, Version::Draft15).unwrap();
-
-		let mut bytes = buf.freeze();
-		assert_eq!(u64::decode(&mut bytes, Version::Draft15).unwrap(), PROP_TIMESTAMP);
-		assert_eq!(u64::decode(&mut bytes, Version::Draft15).unwrap(), 96_000);
-		assert!(!bytes.has_remaining());
-	}
-
-	/// An object-scope Timescale (which LOC permits) overrides the track's for that object.
-	#[test]
-	fn test_object_time_honors_an_object_scope_timescale() {
-		let mut buf = bytes::BytesMut::new();
-		PROP_TIMESCALE.encode(&mut buf, Version::Draft18).unwrap();
-		u64::from(Timescale::MILLI).encode(&mut buf, Version::Draft18).unwrap();
-		(PROP_TIMESTAMP - PROP_TIMESCALE)
-			.encode(&mut buf, Version::Draft18)
-			.unwrap();
-		42u64.encode(&mut buf, Version::Draft18).unwrap();
-
-		let mut bytes = buf.freeze();
-		let decoded = decode_object_time(&mut bytes, Timescale::MICRO, Version::Draft18)
-			.unwrap()
-			.unwrap();
+		let decoded = decode_time(&buf, Timescale::MICRO, Version::Draft18).unwrap();
 		assert_eq!(decoded.value(), 42);
-		assert_eq!(decoded.scale(), Timescale::MILLI);
+		assert_eq!(decoded.scale(), Timescale::MICRO);
 	}
 
-	/// Without an object-scope override, the track's timescale supplies the units.
+	/// The track's timescale supplies the units.
 	#[test]
 	fn test_object_time_defaults_to_the_track_scale() {
-		let mut buf = bytes::BytesMut::new();
-		PROP_TIMESTAMP.encode(&mut buf, Version::Draft18).unwrap();
-		1234u64.encode(&mut buf, Version::Draft18).unwrap();
+		let buf = from_varints(&[PROP_TIMESTAMP, 1234], Version::Draft18);
 
-		let mut bytes = buf.freeze();
-		let decoded = decode_object_time(&mut bytes, Timescale::MILLI, Version::Draft18)
-			.unwrap()
-			.unwrap();
+		let decoded = decode_time(&buf, Timescale::MILLI, Version::Draft18).unwrap();
 		assert_eq!(decoded.value(), 1234);
 		assert_eq!(decoded.scale(), Timescale::MILLI);
 	}
 
-	/// A peer on draft-ietf-moq-loc-03 wrote the Timestamp at 0x06; still decode it.
-	#[test]
-	fn test_object_time_decodes_draft03_timestamp() {
-		let mut buf = bytes::BytesMut::new();
-		PROP_TIMESTAMP_DRAFT03.encode(&mut buf, Version::Draft18).unwrap();
-		777u64.encode(&mut buf, Version::Draft18).unwrap();
-
-		let mut bytes = buf.freeze();
-		let decoded = decode_object_time(&mut bytes, Timescale::MICRO, Version::Draft18)
-			.unwrap()
-			.unwrap();
-		assert_eq!(decoded.value(), 777);
-		assert_eq!(decoded.scale(), Timescale::MICRO);
-	}
-
-	/// No Timestamp property at all yields None (the caller wall-clock-stamps).
+	/// No Timestamp property at all yields None.
 	#[test]
 	fn test_object_time_absent() {
-		let mut empty = bytes::Bytes::new();
-		assert!(
-			decode_object_time(&mut empty, Timescale::MICRO, Version::Draft18)
-				.unwrap()
-				.is_none()
-		);
+		assert!(decode_time(&[], Timescale::MICRO, Version::Draft18).is_none());
 	}
 
 	// Test table from draft-ietf-moq-transport-14 Section 10.4.2 Table 7
 	#[test]
 	fn test_group_flags_spec_table() {
 		// Type 0x10: No subgroup field, Subgroup ID = 0, No extensions, No end
-		let flags = GroupFlags::decode(0x10, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x10).unwrap();
 		assert!(!flags.has_subgroup);
 		assert!(!flags.has_subgroup_object);
 		assert!(!flags.has_extensions);
 		assert!(!flags.has_end);
 		assert!(flags.has_priority);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x10);
+		assert_eq!(flags.encode().unwrap(), 0x10);
 
 		// Type 0x11: No subgroup field, Subgroup ID = 0, Extensions, No end
-		let flags = GroupFlags::decode(0x11, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x11).unwrap();
 		assert!(!flags.has_subgroup);
 		assert!(!flags.has_subgroup_object);
 		assert!(flags.has_extensions);
 		assert!(!flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x11);
+		assert_eq!(flags.encode().unwrap(), 0x11);
 
 		// Type 0x12: No subgroup field, Subgroup ID = First Object ID, No extensions, No end
-		let flags = GroupFlags::decode(0x12, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x12).unwrap();
 		assert!(!flags.has_subgroup);
 		assert!(flags.has_subgroup_object);
 		assert!(!flags.has_extensions);
 		assert!(!flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x12);
+		assert_eq!(flags.encode().unwrap(), 0x12);
 
 		// Type 0x13: No subgroup field, Subgroup ID = First Object ID, Extensions, No end
-		let flags = GroupFlags::decode(0x13, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x13).unwrap();
 		assert!(!flags.has_subgroup);
 		assert!(flags.has_subgroup_object);
 		assert!(flags.has_extensions);
 		assert!(!flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x13);
+		assert_eq!(flags.encode().unwrap(), 0x13);
 
 		// Type 0x14: Subgroup field present, No extensions, No end
-		let flags = GroupFlags::decode(0x14, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x14).unwrap();
 		assert!(flags.has_subgroup);
 		assert!(!flags.has_subgroup_object);
 		assert!(!flags.has_extensions);
 		assert!(!flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x14);
+		assert_eq!(flags.encode().unwrap(), 0x14);
 
 		// Type 0x15: Subgroup field present, Extensions, No end
-		let flags = GroupFlags::decode(0x15, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x15).unwrap();
 		assert!(flags.has_subgroup);
 		assert!(!flags.has_subgroup_object);
 		assert!(flags.has_extensions);
 		assert!(!flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x15);
+		assert_eq!(flags.encode().unwrap(), 0x15);
 
 		// Type 0x18: No subgroup field, Subgroup ID = 0, No extensions, End of group
-		let flags = GroupFlags::decode(0x18, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x18).unwrap();
 		assert!(!flags.has_subgroup);
 		assert!(!flags.has_subgroup_object);
 		assert!(!flags.has_extensions);
 		assert!(flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x18);
+		assert_eq!(flags.encode().unwrap(), 0x18);
 
 		// Type 0x19: No subgroup field, Subgroup ID = 0, Extensions, End of group
-		let flags = GroupFlags::decode(0x19, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x19).unwrap();
 		assert!(!flags.has_subgroup);
 		assert!(!flags.has_subgroup_object);
 		assert!(flags.has_extensions);
 		assert!(flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x19);
+		assert_eq!(flags.encode().unwrap(), 0x19);
 
 		// Type 0x1A: No subgroup field, Subgroup ID = First Object ID, No extensions, End of group
-		let flags = GroupFlags::decode(0x1A, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x1A).unwrap();
 		assert!(!flags.has_subgroup);
 		assert!(flags.has_subgroup_object);
 		assert!(!flags.has_extensions);
 		assert!(flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x1A);
+		assert_eq!(flags.encode().unwrap(), 0x1A);
 
 		// Type 0x1B: No subgroup field, Subgroup ID = First Object ID, Extensions, End of group
-		let flags = GroupFlags::decode(0x1B, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x1B).unwrap();
 		assert!(!flags.has_subgroup);
 		assert!(flags.has_subgroup_object);
 		assert!(flags.has_extensions);
 		assert!(flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x1B);
+		assert_eq!(flags.encode().unwrap(), 0x1B);
 
 		// Type 0x1C: Subgroup field present, No extensions, End of group
-		let flags = GroupFlags::decode(0x1C, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x1C).unwrap();
 		assert!(flags.has_subgroup);
 		assert!(!flags.has_subgroup_object);
 		assert!(!flags.has_extensions);
 		assert!(flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x1C);
+		assert_eq!(flags.encode().unwrap(), 0x1C);
 
 		// Type 0x1D: Subgroup field present, Extensions, End of group
-		let flags = GroupFlags::decode(0x1D, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x1D).unwrap();
 		assert!(flags.has_subgroup);
 		assert!(!flags.has_subgroup_object);
 		assert!(flags.has_extensions);
 		assert!(flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x1D);
+		assert_eq!(flags.encode().unwrap(), 0x1D);
 
 		// Invalid: Both has_subgroup and has_subgroup_object (would be 0x16)
-		assert!(GroupFlags::decode(0x16, Version::Draft14).is_err());
+		assert!(GroupFlags::decode(0x16).is_err());
 	}
 
 	#[test]
 	fn test_group_flags_no_priority_range() {
 		// v15: 0x30 range = same flags as 0x10 range but no priority
-		let flags = GroupFlags::decode(0x30, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x30).unwrap();
 		assert!(!flags.has_priority);
 		assert!(!flags.has_subgroup);
 		assert!(!flags.has_extensions);
 		assert!(!flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x30);
+		assert_eq!(flags.encode().unwrap(), 0x30);
 
-		let flags = GroupFlags::decode(0x38, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x38).unwrap();
 		assert!(!flags.has_priority);
 		assert!(flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x38);
+		assert_eq!(flags.encode().unwrap(), 0x38);
 
-		let flags = GroupFlags::decode(0x3D, Version::Draft14).unwrap();
+		let flags = GroupFlags::decode(0x3D).unwrap();
 		assert!(!flags.has_priority);
 		assert!(flags.has_subgroup);
 		assert!(flags.has_extensions);
 		assert!(flags.has_end);
-		assert_eq!(flags.encode(Version::Draft14).unwrap(), 0x3D);
+		assert_eq!(flags.encode().unwrap(), 0x3D);
 
 		// Invalid: Both has_subgroup and has_subgroup_object in no-priority range
-		assert!(GroupFlags::decode(0x36, Version::Draft14).is_err());
-	}
-
-	/// Draft-18 introduces the FIRST_OBJECT bit (0x40) per spec §11.4.2.
-	/// moq-lite always sets it on emit and ignores it on decode (we already
-	/// require what the bit asserts).
-	#[test]
-	fn test_first_object_bit_draft18() {
-		// Encoding sets bit 0x40 for default flags.
-		let flags = GroupFlags::default();
-		let encoded = flags.encode(Version::Draft18).unwrap();
-		assert_eq!(encoded & GroupFlags::FIRST_OBJECT_BIT, GroupFlags::FIRST_OBJECT_BIT);
-		// The base value is what draft-17 would have produced.
-		let v17 = flags.encode(Version::Draft17).unwrap();
-		assert_eq!(encoded, v17 | GroupFlags::FIRST_OBJECT_BIT);
-
-		// Decoding accepts and discards the bit.
-		let decoded = GroupFlags::decode(v17 | GroupFlags::FIRST_OBJECT_BIT, Version::Draft18).unwrap();
-		assert_eq!(decoded, flags);
-
-		// Draft-17 rejects the FIRST_OBJECT bit (it's outside the 0x10-0x1d / 0x30-0x3d ranges).
-		assert!(GroupFlags::decode(v17 | GroupFlags::FIRST_OBJECT_BIT, Version::Draft17).is_err());
+		assert!(GroupFlags::decode(0x36).is_err());
 	}
 
 	/// FIRST_OBJECT says the stream carries the subgroup from its first published object.
@@ -630,57 +530,20 @@ mod tests {
 	/// to survive decode rather than being stripped with the bit.
 	#[test]
 	fn first_object_round_trips() {
-		for version in [Version::Draft18, Version::Draft19, Version::Draft20] {
+		for version in [Version::Draft18, Version::Draft20, Version::Draft22] {
 			for first_object in [true, false] {
 				let flags = GroupFlags {
 					first_object,
 					..Default::default()
 				};
-				let encoded = flags.encode(version).unwrap();
+				let encoded = flags.encode().unwrap();
 				assert_eq!(
 					(encoded & GroupFlags::FIRST_OBJECT_BIT) != 0,
 					first_object,
 					"{version} {first_object}"
 				);
-				assert_eq!(GroupFlags::decode(encoded, version).unwrap().first_object, first_object);
+				assert_eq!(GroupFlags::decode(encoded).unwrap().first_object, first_object);
 			}
-		}
-	}
-
-	/// The bit arrived in draft-18. Earlier drafts carry no such signal, so a group there
-	/// is taken at its word rather than read as starting partway through.
-	#[test]
-	fn older_drafts_have_no_first_object_signal() {
-		for version in [Version::Draft14, Version::Draft15, Version::Draft16, Version::Draft17] {
-			let flags = GroupFlags {
-				first_object: false,
-				..Default::default()
-			};
-			let encoded = flags.encode(version).unwrap();
-			assert_eq!(encoded & GroupFlags::FIRST_OBJECT_BIT, 0, "{version}");
-			assert!(GroupFlags::decode(encoded, version).unwrap().first_object, "{version}");
-		}
-	}
-
-	/// Draft-19 makes no changes to the subgroup header wire format, so the flags
-	/// byte must be byte-identical to draft-18 on both encode and decode.
-	#[test]
-	fn test_draft19_matches_draft18() {
-		for flags in [
-			GroupFlags::default(),
-			GroupFlags {
-				has_subgroup: true,
-				has_extensions: true,
-				has_end: true,
-				has_subgroup_object: false,
-				has_priority: false,
-				first_object: true,
-			},
-		] {
-			let v18 = flags.encode(Version::Draft18).unwrap();
-			let v19 = flags.encode(Version::Draft19).unwrap();
-			assert_eq!(v18, v19, "draft-19 must encode the subgroup header like draft-18");
-			assert_eq!(GroupFlags::decode(v19, Version::Draft19).unwrap(), flags);
 		}
 	}
 
@@ -688,23 +551,24 @@ mod tests {
 	#[test]
 	fn test_draft18_extended_range() {
 		// 0x70 = 0x30 (no-priority, no flags) + 0x40 (FIRST_OBJECT)
-		let flags = GroupFlags::decode(0x70, Version::Draft18).unwrap();
+		let flags = GroupFlags::decode(0x70).unwrap();
 		assert!(!flags.has_priority);
 		assert!(!flags.has_subgroup);
 		assert!(!flags.has_extensions);
 		assert!(!flags.has_end);
 
 		// 0x7D = 0x3D + 0x40
-		let flags = GroupFlags::decode(0x7D, Version::Draft18).unwrap();
+		let flags = GroupFlags::decode(0x7D).unwrap();
 		assert!(!flags.has_priority);
 		assert!(flags.has_subgroup);
 		assert!(flags.has_extensions);
 		assert!(flags.has_end);
 	}
 
-	/// Regression: a publisher-emitted Draft18 GroupHeader byte must satisfy the
-	/// subscriber's uni-stream classifier mask `(byte & 0x90) == 0x10`. Otherwise
-	/// the uni stream is dropped as UnexpectedStream and the data plane stalls.
+	/// Regression: a publisher-emitted Draft18 GroupHeader byte must match the
+	/// SUBGROUP_HEADER form `(byte & 0x90) == 0x10` and decode as flags, which is how
+	/// the uni-stream classifier recognizes it. Otherwise the uni stream is an unknown
+	/// type, which closes the session.
 	#[test]
 	fn test_draft18_group_header_passes_stream_classifier() {
 		let header = GroupHeader {
@@ -715,14 +579,20 @@ mod tests {
 			flags: GroupFlags::default(),
 		};
 
-		let mut buf = bytes::BytesMut::new();
-		header.encode(&mut buf, Version::Draft18).unwrap();
+		let mut buf = Vec::new();
+		header
+			.encode(&mut Encoder::new(&mut buf, Version::Draft18.into()), Version::Draft18)
+			.unwrap();
 		let type_byte = buf[0] as u64;
 
-		// The check in session.rs::run_uni_group.
 		assert_eq!(
 			type_byte & 0x90,
 			0x10,
+			"draft-18 SUBGROUP_HEADER type 0x{type_byte:02x} is outside the SUBGROUP_HEADER form",
+		);
+		// The check in session.rs::UniType::classify.
+		assert!(
+			GroupFlags::decode(type_byte).is_ok(),
 			"draft-18 SUBGROUP_HEADER type 0x{type_byte:02x} not recognized by uni-stream classifier",
 		);
 	}

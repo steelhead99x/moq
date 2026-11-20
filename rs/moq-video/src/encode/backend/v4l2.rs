@@ -5,10 +5,10 @@
 //! Without it a Pi either republishes what `rpicam-vid` already encoded or
 //! spends its CPU on openh264.
 //!
-//! Behind the default-on `v4l2` feature. It costs no runtime dependency (the
-//! interface is ioctls on a device node), only the `v4l` crate's build-time
-//! bindgen, and a host with no M2M node fails at open so automatic selection
-//! falls through to the next encoder.
+//! Behind the opt-in `v4l2` feature. It costs nothing at build or run time (the
+//! interface is ioctls on a device node and `moq_v4l` checks its bindings in),
+//! and a host with no M2M node fails at open so automatic selection falls
+//! through to the next encoder.
 //!
 //! Feeds the driver 8-bit 4:2:0 and takes back Annex-B with in-band SPS/PPS
 //! ahead of every IDR, which is the avc3 shape the H.264 importer expects.
@@ -34,12 +34,13 @@
 //! from an implementation that also ran on a Pi Zero 2 W and a Pi 3; those two
 //! have not been re-run with this port.
 
+use kio::clock::Instant;
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use moq_net::Timestamp;
-use v4l::v4l_sys::{
+use moq_v4l::sys::{
 	V4L2_CID_MPEG_VIDEO_BITRATE, V4L2_CID_MPEG_VIDEO_BITRATE_MODE, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME,
 	V4L2_CID_MPEG_VIDEO_GOP_SIZE, V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_CID_MPEG_VIDEO_H264_PROFILE,
 	V4L2_CID_MPEG_VIDEO_HEADER_MODE, V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER,
@@ -63,8 +64,8 @@ use v4l::v4l_sys::{
 	v4l2_mpeg_video_header_mode_V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME,
 };
 
-use super::super::encoder::Config;
-use super::{Backend, Encoded};
+use super::super::encoder::{Applied, Codec, Config};
+use super::{Backend, Encoded, keyframe_annexb};
 use crate::v4l2::{self, Dequeue, Device, Dir, Planes, Queue, Rect, Request, Role};
 use crate::{Error, Frame, Size};
 
@@ -72,7 +73,6 @@ pub(crate) const NAME: &str = "v4l2";
 
 /// Which node encodes: one that takes raw 4:2:0 in and gives H.264 back.
 const ROLE: Role = Role {
-	env: "MOQ_V4L2_ENCODER",
 	input: v4l2::RAW,
 	output: &[v4l2::H264],
 };
@@ -119,14 +119,37 @@ pub(crate) struct V4l2 {
 	size: Size,
 	/// Frames the driver has taken and not yet answered with an access unit.
 	pending: Pending,
+	/// Access units dequeued and not yet received.
+	ready: VecDeque<Encoded>,
+	phase: Phase,
 	/// Whether the driver takes `VIDIOC_ENCODER_CMD`. Cleared the first time it
 	/// refuses one, after which a flush can only take what the codec has already
 	/// finished.
 	drainable: bool,
-	/// Whether the driver takes `V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME`. Cleared
-	/// the first time it refuses one, which is worth saying once and not per
-	/// keyframe.
-	keyframes: bool,
+	/// Whether the driver has `V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME`, asked at
+	/// open so a cut on a driver without it is refused up front rather than
+	/// discovered on the frame it was meant for.
+	cuts: bool,
+}
+
+/// Whether the queues stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+	/// Neither queue streams: no frame has gone in since open or since a drain
+	/// that failed stopped them. The next frame starts both.
+	Stopped,
+	/// Both queues stream.
+	Streaming,
+	/// The queues could not be started or stopped, so the encoder takes no
+	/// more frames.
+	Failed,
+}
+
+/// The error every call reports once the encoder has failed.
+fn failed() -> Error {
+	Error::codec(anyhow::anyhow!(
+		"the V4L2 encoder could not start or stop its queues and takes no more frames"
+	))
 }
 
 impl V4l2 {
@@ -134,7 +157,7 @@ impl V4l2 {
 		let size = config.size();
 		size.validate("V4L2 encode of")?;
 
-		let device = v4l2::open(&ROLE)?;
+		let device = v4l2::open(&ROLE, config.v4l2.as_deref())?;
 
 		// Before `VIDIOC_S_FMT`: bcm2835-codec picks its encoder configuration
 		// from the profile and level at format time, and a level set afterwards
@@ -144,8 +167,11 @@ impl V4l2 {
 			v4l2_mpeg_video_h264_profile_V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE as i32,
 		)?;
 		device.set_control(V4L2_CID_MPEG_VIDEO_H264_LEVEL, h264_level(config)?)?;
-		device.set_control(V4L2_CID_MPEG_VIDEO_GOP_SIZE, config.gop as i32)?;
-		set_bitrate(&device, config.resolved_bitrate())?;
+		device.set_control(
+			V4L2_CID_MPEG_VIDEO_GOP_SIZE,
+			config.keyframe_interval().min(i32::MAX as u32) as i32,
+		)?;
+		set_bitrate(&device, config.resolved_bitrate().as_bps())?;
 		// Constant rate is what a live uplink wants: the congestion controller
 		// already owns the rate, and a variable-rate encoder would spend it on the
 		// wrong frames.
@@ -179,6 +205,18 @@ impl V4l2 {
 			);
 		}
 
+		// A driver without the control keeps to `V4L2_CID_MPEG_VIDEO_GOP_SIZE`
+		// alone, so every group falls on its boundary rather than the caller's.
+		// Said once here; each refused cut then names the backend in its error.
+		let cuts = device.has_control(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME);
+		if !cuts {
+			tracing::info!(
+				encoder = NAME,
+				device = %device.path().display(),
+				"driver takes no keyframe request; cuts are refused and groups fall on the GOP boundary"
+			);
+		}
+
 		// Coded first, raw second, which is the order
 		// `Documentation/userspace-api/media/v4l/dev-encoder.rst` gives under
 		// "Initialization" and not just a preference: an encoder derives a new
@@ -195,7 +233,7 @@ impl V4l2 {
 			},
 		)?;
 		if coded.pixelformat != v4l2::H264 {
-			return Err(Error::Codec(anyhow::anyhow!(
+			return Err(Error::codec(anyhow::anyhow!(
 				"V4L2 encoder answered an H264 request with {}",
 				v4l2::name(coded.pixelformat)
 			)));
@@ -239,8 +277,10 @@ impl V4l2 {
 			planes,
 			size,
 			pending: Pending::default(),
+			ready: VecDeque::new(),
+			phase: Phase::Stopped,
 			drainable: true,
-			keyframes: true,
+			cuts,
 		}))
 	}
 
@@ -249,7 +289,24 @@ impl V4l2 {
 	/// bcm2835-codec wants the first OUTPUT buffer queued before `STREAMON` and
 	/// the CAPTURE queue started last. The ordering is legal on every driver, so
 	/// it is unconditional rather than a quirk to detect.
+	///
+	/// A start that fails partway is stopped again, so the next frame starts
+	/// from the same place rather than finding one queue streaming without the
+	/// other.
 	fn start(&mut self) -> Result<(), Error> {
+		match self.start_queues() {
+			Ok(()) => {
+				self.phase = Phase::Streaming;
+				Ok(())
+			}
+			Err(err) => {
+				self.stop()?;
+				Err(err)
+			}
+		}
+	}
+
+	fn start_queues(&mut self) -> Result<(), Error> {
 		self.raw.stream_on(&self.device)?;
 		while let Some(index) = self.coded.take_free() {
 			self.coded.queue(&self.device, index, &[], Duration::ZERO)?;
@@ -257,17 +314,38 @@ impl V4l2 {
 		self.coded.stream_on(&self.device)
 	}
 
+	/// Stop both queues, which takes every buffer back from the driver and ends
+	/// a drain in progress, or leave the encoder [`Phase::Failed`].
+	///
+	/// Stopping is the only way out of a drain that did not finish:
+	/// `V4L2_ENC_CMD_START` fails with `EBUSY` while one is in progress. Stopping
+	/// CAPTURE also resets the encoder, so the next frame begins a stream that
+	/// needs nothing from before. See
+	/// `Documentation/userspace-api/media/v4l/dev-encoder.rst`, "Drain" and
+	/// "Reset".
+	fn stop(&mut self) -> Result<(), Error> {
+		self.phase = Phase::Failed;
+		self.raw.stop(&self.device)?;
+		self.coded.stop(&self.device)?;
+		// Frames the driver handed back unencoded, which no access unit answers,
+		// and a header carried for a stream the reset encoder starts over.
+		self.pending.forget();
+		self.pending.header = None;
+		self.phase = Phase::Stopped;
+		Ok(())
+	}
+
 	/// Take a raw buffer, waiting for the driver to release one if it holds them
 	/// all.
 	fn free_buffer(&mut self) -> Result<u32, Error> {
-		let deadline = Instant::now() + BUFFER_TIMEOUT;
+		let deadline = Instant::now().saturating_add(BUFFER_TIMEOUT);
 		loop {
 			self.reclaim()?;
 			if let Some(index) = self.raw.take_free() {
 				return Ok(index);
 			}
 			if Instant::now() >= deadline {
-				return Err(Error::Codec(anyhow::anyhow!(
+				return Err(Error::codec(anyhow::anyhow!(
 					"V4L2 encoder held every input buffer for {BUFFER_TIMEOUT:?}"
 				)));
 			}
@@ -290,12 +368,12 @@ impl V4l2 {
 		Ok(())
 	}
 
-	/// Collect every access unit the driver has finished, re-queueing each coded
+	/// Queue every access unit the driver has finished, re-queueing each coded
 	/// buffer as it is emptied.
 	///
 	/// Returns whether the driver marked the end of a sequence, which is how a
 	/// drain knows it is over.
-	fn drain(&mut self, out: &mut Vec<Encoded>) -> Result<bool, Error> {
+	fn drain(&mut self) -> Result<bool, Error> {
 		self.reclaim()?;
 
 		loop {
@@ -329,7 +407,9 @@ impl V4l2 {
 				// The driver copies the raw buffer's timestamp onto the coded buffer its
 				// work came out on, so this is the picture that was encoded rather than
 				// whatever went in last, and the timestamp is that frame's own.
-				out.push(Encoded::new(payload, timestamp));
+				// Read from the bitstream: drivers set `V4L2_BUF_FLAG_KEYFRAME` unevenly.
+				let keyframe = keyframe_annexb(Codec::H264, &payload);
+				self.ready.push_back(Encoded::new(payload, timestamp, keyframe));
 			}
 
 			if buffer.last() {
@@ -351,12 +431,14 @@ impl V4l2 {
 	/// the stream stopped, and a flush falls on every group boundary, so the first
 	/// boundary would time out and take the broadcast with it. bcm2835-codec
 	/// happens to be one-in-one-out, so a Pi would not have shown this.
-	fn drain_tail(&mut self) -> Result<Vec<Encoded>, Error> {
-		// The sequence needs both queues streaming. `VIDIOC_ENCODER_CMD` succeeds
-		// without starting one otherwise, and there is nothing to drain before the
-		// first frame anyway.
-		if !self.raw.streaming() || !self.coded.streaming() {
-			return Ok(Vec::new());
+	fn drain_tail(&mut self) -> Result<(), Error> {
+		match self.phase {
+			Phase::Failed => return Err(failed()),
+			// The sequence needs both queues streaming. `VIDIOC_ENCODER_CMD`
+			// succeeds without starting one otherwise, and nothing is held
+			// before a frame goes in anyway.
+			Phase::Stopped => return Ok(()),
+			Phase::Streaming => {}
 		}
 
 		if self.drainable
@@ -379,21 +461,29 @@ impl V4l2 {
 		}
 	}
 
-	/// Run the rest of the drain sequence, up to and including the restart.
-	fn drain_to_last(&mut self) -> Result<Vec<Encoded>, Error> {
-		let mut out = Vec::new();
-		let mut deadline = Instant::now() + FLUSH_TIMEOUT;
+	/// Run the rest of the drain sequence, up to and including the restart, or
+	/// stop both queues when it fails.
+	fn drain_to_last(&mut self) -> Result<(), Error> {
+		let drained = self.resume_after_last();
+		if drained.is_err() {
+			self.stop()?;
+		}
+		drained
+	}
+
+	fn resume_after_last(&mut self) -> Result<(), Error> {
+		let mut deadline = Instant::now().saturating_add(FLUSH_TIMEOUT);
 		loop {
-			let before = out.len();
-			if self.drain(&mut out)? {
+			let before = self.ready.len();
+			if self.drain()? {
 				break;
 			}
 			// Progress earns more time, so a slow encoder finishes a long tail while
 			// a stalled one still gives up after `FLUSH_TIMEOUT` of silence.
-			if out.len() > before {
-				deadline = Instant::now() + FLUSH_TIMEOUT;
+			if self.ready.len() > before {
+				deadline = Instant::now().saturating_add(FLUSH_TIMEOUT);
 			} else if Instant::now() >= deadline {
-				return Err(Error::Codec(anyhow::anyhow!(
+				return Err(Error::codec(anyhow::anyhow!(
 					"V4L2 encoder did not finish its drain within {FLUSH_TIMEOUT:?}, holding {} frame(s)",
 					self.pending.len()
 				)));
@@ -416,7 +506,7 @@ impl V4l2 {
 		// A stopped encoder accepts OUTPUT buffers but does not process them, so
 		// without this the frames after the boundary would sit in the driver.
 		self.device.encoder_cmd(V4L2_ENC_CMD_START)?;
-		Ok(out)
+		Ok(())
 	}
 
 	/// Take what the codec has already finished, for a driver that cannot be told
@@ -424,19 +514,18 @@ impl V4l2 {
 	///
 	/// Only a drain where the encoder holds nothing it has not been asked for,
 	/// which is what an empty [`Pending`] says here.
-	fn wait_out(&mut self) -> Result<Vec<Encoded>, Error> {
-		let mut out = Vec::new();
-		let mut deadline = Instant::now() + FLUSH_TIMEOUT;
+	fn wait_out(&mut self) -> Result<(), Error> {
+		let mut deadline = Instant::now().saturating_add(FLUSH_TIMEOUT);
 		loop {
-			let before = out.len();
-			self.drain(&mut out)?;
+			let before = self.ready.len();
+			self.drain()?;
 			if self.pending.is_empty() {
-				return Ok(out);
+				return Ok(());
 			}
-			if out.len() > before {
-				deadline = Instant::now() + FLUSH_TIMEOUT;
+			if self.ready.len() > before {
+				deadline = Instant::now().saturating_add(FLUSH_TIMEOUT);
 			} else if Instant::now() >= deadline {
-				return Err(Error::Codec(anyhow::anyhow!(
+				return Err(Error::codec(anyhow::anyhow!(
 					"V4L2 encoder held {} frame(s) for {FLUSH_TIMEOUT:?} without encoding them",
 					self.pending.len()
 				)));
@@ -447,13 +536,32 @@ impl V4l2 {
 }
 
 impl Backend for V4l2 {
-	fn encode(&mut self, frame: &Frame, keyframe: bool) -> Result<Vec<Encoded>, Error> {
+	fn encode(&mut self, frame: &Frame, cut: bool) -> Result<(), Error> {
+		if self.phase == Phase::Failed {
+			return Err(failed());
+		}
 		if frame.size() != self.size {
-			return Err(Error::Codec(anyhow::anyhow!(
+			return Err(Error::codec(anyhow::anyhow!(
 				"V4L2 encoder opened for {} was given a {} frame",
 				self.size,
 				frame.size()
 			)));
+		}
+
+		if cut {
+			// A button control: the value is ignored, the write is the request. It
+			// applies to the next frame queued, so it goes in ahead of this one, and
+			// before a raw buffer is taken so a refusal strands none. Open already
+			// asked whether the driver has the control, so a refusal here is the
+			// driver going back on its word, which is an error rather than a
+			// quietly mislaid group boundary.
+			self.device
+				.set_control(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0)
+				.map_err(|err| {
+					Error::codec(anyhow::anyhow!(
+						"driver refused the keyframe request it advertised: {err}"
+					))
+				})?;
 		}
 
 		let i420 = frame.surface.to_i420()?;
@@ -462,43 +570,24 @@ impl Backend for V4l2 {
 		let index = self.free_buffer()?;
 		self.planes.write(&mut self.raw, index, &i420)?;
 
-		if keyframe && self.keyframes {
-			// A button control: the value is ignored, the write is the request. It
-			// applies to the next frame queued, so it goes in immediately before.
-			//
-			// Best-effort: a driver that answers `EINVAL` still keeps to
-			// `V4L2_CID_MPEG_VIDEO_GOP_SIZE`, so keyframes land on its own boundary
-			// rather than the caller's, which is a worse group layout and not a
-			// broken stream.
-			self.keyframes = self.device.try_control(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0);
-			if !self.keyframes {
-				tracing::warn!(
-					encoder = NAME,
-					device = %self.device.path().display(),
-					"driver takes no keyframe request; groups fall on the encoder's own GOP boundary"
-				);
-			}
-		}
-
 		let key = key(frame.timestamp);
 		let bytesused: Vec<u32> = self.raw.format().planes.iter().map(|plane| plane.sizeimage).collect();
 		self.raw.queue(&self.device, index, &bytesused, key)?;
 		self.pending.queued(key, frame.timestamp);
 
-		if !self.raw.streaming() {
+		if self.phase == Phase::Stopped {
 			self.start()?;
 		}
 
-		let mut out = Vec::new();
-		self.drain(&mut out)?;
-		Ok(out)
+		self.drain()?;
+		Ok(())
 	}
 
-	fn flush(&mut self) -> Result<Vec<Encoded>, Error> {
-		self.drain_tail()
+	fn receive(&mut self) -> Result<Option<Encoded>, Error> {
+		Ok(self.ready.pop_front())
 	}
 
-	fn finish(&mut self) -> Result<Vec<Encoded>, Error> {
+	fn flush(&mut self) -> Result<(), Error> {
 		self.drain_tail()
 	}
 
@@ -513,8 +602,18 @@ impl Backend for V4l2 {
 		})
 	}
 
-	fn name(&self) -> &str {
+	fn can_cut(&self) -> bool {
+		self.cuts
+	}
+
+	fn name(&self) -> &'static str {
 		NAME
+	}
+
+	fn applied(&self) -> Applied {
+		// B-frames and the codec's queue depth are the driver's defaults: nothing
+		// here sets or reads them back.
+		Applied::unconfirmed("CBR; frame reordering and queue depth left to the driver")
 	}
 }
 
@@ -828,8 +927,9 @@ const LEVELS: &[Level] = &[
 fn h264_level(config: &Config) -> Result<i32, Error> {
 	let size = config.size();
 	let per_frame = size.width.div_ceil(16) * size.height.div_ceil(16);
-	let per_second = per_frame as u64 * config.framerate as u64;
-	let kbps = config.resolved_bitrate().div_ceil(1_000);
+	let per_second = (u64::from(per_frame) * u64::from(config.framerate.numerator()))
+		.div_ceil(u64::from(config.framerate.denominator()));
+	let kbps = config.resolved_bitrate().as_bps().div_ceil(1_000);
 	LEVELS
 		.iter()
 		.find(|level| {
@@ -837,7 +937,7 @@ fn h264_level(config: &Config) -> Result<i32, Error> {
 		})
 		.map(|level| level.code as i32)
 		.ok_or_else(|| {
-			Error::Codec(anyhow::anyhow!(
+			Error::codec(anyhow::anyhow!(
 				"{size} at {}fps and {kbps} kbit/s exceeds H.264 level 6.2",
 				config.framerate
 			))
@@ -877,7 +977,7 @@ mod tests {
 	use super::*;
 
 	fn config(width: u32, height: u32, framerate: u32) -> Config {
-		Config::new(width, height, framerate)
+		Config::new(width, height, crate::FrameRate::new(framerate, 1).unwrap())
 	}
 
 	fn micros(micros: u64) -> Timestamp {
@@ -916,9 +1016,9 @@ mod tests {
 	#[test]
 	fn the_level_clears_the_bitrate() {
 		let mut config = config(1280, 720, 30);
-		config.bitrate = Some(14_000_000);
+		config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(14_000_000));
 		assert_eq!(h264_level(&config).unwrap(), 9); // 3.1
-		config.bitrate = Some(14_000_001);
+		config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(14_000_001));
 		assert_eq!(h264_level(&config).unwrap(), 10); // 3.2
 	}
 

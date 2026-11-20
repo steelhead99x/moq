@@ -1,87 +1,27 @@
 /**
- * Branded time types (nanoseconds, microseconds, milliseconds, seconds) with conversions,
- * plus {@link Timescale} and {@link Timestamp} for presentation timing.
+ * {@link Timescale} and {@link Timestamp} for presentation timing.
+ *
+ * Durations and instants live in `@moq/clock`.
  *
  * @module
  */
-
-/** A duration in nanoseconds, branded so it can't be mixed with other units. */
-export type Nano = number & { readonly _brand: "nano" };
-
-/** Constructors, conversions, and arithmetic for {@link Nano} values. */
-// Calling `Nano(x)` brands a raw number as nanoseconds. The unit is the caller's assertion: no
-// conversion happens, so reach for `fromMicro`/`fromMilli`/`fromSecond` when the source has a unit.
-export const Nano = Object.assign((value: number): Nano => value as Nano, {
-	zero: 0 as Nano,
-	fromMicro: (us: Micro): Nano => (us * 1_000) as Nano,
-	fromMilli: (ms: Milli): Nano => (ms * 1_000_000) as Nano,
-	fromSecond: (s: Second): Nano => (s * 1_000_000_000) as Nano,
-	toMicro: (ns: Nano): Micro => (ns / 1_000) as Micro,
-	toMilli: (ns: Nano): Milli => (ns / 1_000_000) as Milli,
-	toSecond: (ns: Nano): Second => (ns / 1_000_000_000) as Second,
-	now: (): Nano => (performance.now() * 1_000_000) as Nano,
-	add: (a: Nano, b: Nano): Nano => (a + b) as Nano,
-	sub: (a: Nano, b: Nano): Nano => (a - b) as Nano,
-	mul: (a: Nano, b: number): Nano => (a * b) as Nano,
-	div: (a: Nano, b: number): Nano => (a / b) as Nano,
-	max: (a: Nano, b: Nano): Nano => Math.max(a, b) as Nano,
-	min: (a: Nano, b: Nano): Nano => Math.min(a, b) as Nano,
-});
-
-/** A duration in microseconds, branded so it can't be mixed with other units. */
-export type Micro = number & { readonly _brand: "micro" };
-
-/** Constructors, conversions, and arithmetic for {@link Micro} values. */
-// Calling `Micro(x)` brands a raw number as microseconds. See the `Nano` note: this asserts the unit
-// rather than converting, so use `fromNano`/`fromMilli`/`fromSecond` to convert from another unit.
-export const Micro = Object.assign((value: number): Micro => value as Micro, {
-	zero: 0 as Micro,
-	fromNano: (ns: Nano): Micro => (ns / 1_000) as Micro,
-	fromMilli: (ms: Milli): Micro => (ms * 1_000) as Micro,
-	fromSecond: (s: Second): Micro => (s * 1_000_000) as Micro,
-	toNano: (us: Micro): Nano => (us * 1_000) as Nano,
-	toMilli: (us: Micro): Milli => (us / 1_000) as Milli,
-	toSecond: (us: Micro): Second => (us / 1_000_000) as Second,
-	now: (): Micro => (performance.now() * 1_000) as Micro,
-	add: (a: Micro, b: Micro): Micro => (a + b) as Micro,
-	sub: (a: Micro, b: Micro): Micro => (a - b) as Micro,
-	mul: (a: Micro, b: number): Micro => (a * b) as Micro,
-	div: (a: Micro, b: number): Micro => (a / b) as Micro,
-	max: (a: Micro, b: Micro): Micro => Math.max(a, b) as Micro,
-	min: (a: Micro, b: Micro): Micro => Math.min(a, b) as Micro,
-});
-
-/** A duration in milliseconds, branded so it can't be mixed with other units. */
-export type Milli = number & { readonly _brand: "milli" };
-
-/** Constructors, conversions, and arithmetic for {@link Milli} values. */
-// Calling `Milli(x)` brands a raw number as milliseconds. See the `Nano` note: this asserts the unit
-// rather than converting, so use `fromNano`/`fromMicro`/`fromSecond` to convert from another unit.
-export const Milli = Object.assign((value: number): Milli => value as Milli, {
-	zero: 0 as Milli,
-	fromNano: (ns: Nano): Milli => (ns / 1_000_000) as Milli,
-	fromMicro: (us: Micro): Milli => (us / 1_000) as Milli,
-	fromSecond: (s: Second): Milli => (s * 1_000) as Milli,
-	toNano: (ms: Milli): Nano => (ms * 1_000_000) as Nano,
-	toMicro: (ms: Milli): Micro => (ms * 1_000) as Micro,
-	toSecond: (ms: Milli): Second => (ms / 1_000) as Second,
-	now: (): Milli => performance.now() as Milli,
-	add: (a: Milli, b: Milli): Milli => (a + b) as Milli,
-	sub: (a: Milli, b: Milli): Milli => (a - b) as Milli,
-	mul: (a: Milli, b: number): Milli => (a * b) as Milli,
-	div: (a: Milli, b: number): Milli => (a / b) as Milli,
-	max: (a: Milli, b: Milli): Milli => Math.max(a, b) as Milli,
-	min: (a: Milli, b: Milli): Milli => Math.min(a, b) as Milli,
-});
+import { Instant, now } from "@moq/clock";
+import { toNumber } from "./util/bigint.ts";
 
 /** Units per second for a {@link Timestamp}'s value, e.g. `1000` for milliseconds. */
 export type Timescale = number & { readonly _brand: "timescale" };
 
-/** Named timescales and a checked constructor (rejects non-positive / non-integer values). */
+/**
+ * Named timescales and a checked constructor.
+ *
+ * Units per second must be a safe integer ≥ 1. JavaScript numbers are exact only
+ * through `Number.MAX_SAFE_INTEGER` (`2^53 - 1`); the wire varint range goes
+ * to `2^62 - 1`, which Rust accepts and this constructor refuses.
+ */
 export const Timescale = Object.assign(
 	(unitsPerSecond: number): Timescale => {
-		if (!Number.isInteger(unitsPerSecond) || unitsPerSecond <= 0) {
-			throw new Error(`invalid timescale: ${unitsPerSecond}`);
+		if (!Number.isSafeInteger(unitsPerSecond) || unitsPerSecond <= 0) {
+			throw new RangeError(`invalid timescale: ${unitsPerSecond}`);
 		}
 		return unitsPerSecond as Timescale;
 	},
@@ -97,11 +37,24 @@ export const Timescale = Object.assign(
 	},
 );
 
+function assertTimestampValue(value: number): void {
+	if (!Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
+		throw new RangeError(`invalid timestamp: ${value}`);
+	}
+}
+
 /**
  * A presentation timestamp: a raw value in a given {@link Timescale}.
  *
- * Mirrors the Rust `Timestamp`. Unlike the bare `Milli`/`Micro` aliases it carries its
+ * Mirrors the Rust `Timestamp`. Unlike a `@moq/clock` `Duration` it carries its
  * own scale, so a track can pick its units and conversions can't silently mix them up.
+ *
+ * The value must be finite and in `[0, Number.MAX_SAFE_INTEGER]`. Fractions are allowed
+ * ({@link Timestamp.now}, scale conversion). Encoding rounds down to an integer at the
+ * track timescale, as the Rust `Timestamp::convert` does. Integer timestamps are exact through `2^53 - 1` units; this package
+ * does not use BigInt for timestamps. {@link Timestamp.as} also refuses a converted
+ * value that leaves that range, so a legal source timestamp cannot become an unencodable
+ * wire timestamp after a scale change.
  */
 export class Timestamp {
 	/** The raw value, in `scale` units. */
@@ -111,16 +64,14 @@ export class Timestamp {
 
 	/** Build a timestamp of `value` units at `scale`. */
 	constructor(value: number, scale: Timescale) {
-		if (!Number.isFinite(value) || value < 0) {
-			throw new Error(`invalid timestamp: ${value}`);
-		}
+		assertTimestampValue(value);
 		this.value = value;
-		this.scale = scale;
+		this.scale = Timescale(scale);
 	}
 
-	/** Monotonic now (`performance.now()`, milliseconds since page load), not wall-clock time. */
+	/** The installed clock's monotonic instant in milliseconds, not wall-clock time. */
 	static now(): Timestamp {
-		return new Timestamp(performance.now(), Timescale.MILLI);
+		return new Timestamp(now().since(Instant.ZERO).asMillis(), Timescale.MILLI);
 	}
 
 	/** A timestamp of `ms` milliseconds. */
@@ -133,9 +84,12 @@ export class Timestamp {
 		return new Timestamp(us, Timescale.MICRO);
 	}
 
-	/** This timestamp's value re-expressed at `scale` (a raw number, not a new Timestamp). */
+	/** This timestamp's value re-expressed at `scale`; throws if the result is not in the safe range. */
 	as(scale: Timescale): number {
-		return scale === this.scale ? this.value : (this.value * scale) / this.scale;
+		const dest = Timescale(scale);
+		const converted = dest === this.scale ? this.value : (this.value * dest) / this.scale;
+		assertTimestampValue(converted);
+		return converted;
 	}
 
 	/** The value in milliseconds. */
@@ -147,27 +101,41 @@ export class Timestamp {
 	asMicros(): number {
 		return this.as(Timescale.MICRO);
 	}
+
+	/** Whether this presents before `other`, whatever their scales. */
+	isBefore(other: Timestamp): boolean {
+		if (this.scale === other.scale) return this.value < other.value;
+		// Cross-scale products can pass 2^53, so they are compared exactly in BigInt, as Rust does in u128.
+		const [ma, ea] = binary(this.value);
+		const [mb, eb] = binary(other.value);
+		const e = Math.min(ea, eb);
+		return (ma * BigInt(other.scale)) << BigInt(ea - e) < (mb * BigInt(this.scale)) << BigInt(eb - e);
+	}
 }
 
-/** A duration in seconds, branded so it can't be mixed with other units. */
-export type Second = number & { readonly _brand: "second" };
+/**
+ * `timestamp`'s value at `scale`, rounded down exactly, as Rust's integer `Timestamp::convert`.
+ *
+ * A double is a dyadic rational, so the conversion runs in BigInt with no rounding before the
+ * floor: an aligned value keeps it (4611686021000000 ns is 4611686021 ms, where `as` gives
+ * 4611686020.999999), and one instant gives one result whatever scale it came from. Throws a
+ * `RangeError` past the safe integer range.
+ *
+ * @internal
+ */
+export function floorAt(timestamp: Timestamp, scale: Timescale): number {
+	if (timestamp.scale === scale) return Math.floor(timestamp.value);
+	const [mantissa, exponent] = binary(timestamp.value);
+	return toNumber((mantissa * BigInt(scale)) / (BigInt(timestamp.scale) << BigInt(-exponent)));
+}
 
-/** Constructors, conversions, and arithmetic for {@link Second} values. */
-// Calling `Second(x)` brands a raw number as seconds. See the `Nano` note: this asserts the unit
-// rather than converting, so use `fromNano`/`fromMicro`/`fromMilli` to convert from another unit.
-export const Second = Object.assign((value: number): Second => value as Second, {
-	zero: 0 as Second,
-	fromNano: (ns: Nano): Second => (ns / 1_000_000_000) as Second,
-	fromMicro: (us: Micro): Second => (us / 1_000_000) as Second,
-	fromMilli: (ms: Milli): Second => (ms / 1_000) as Second,
-	toNano: (s: Second): Nano => (s * 1_000_000_000) as Nano,
-	toMicro: (s: Second): Micro => (s * 1_000_000) as Micro,
-	toMilli: (s: Second): Milli => (s * 1_000) as Milli,
-	now: (): Second => (performance.now() / 1_000) as Second,
-	add: (a: Second, b: Second): Second => (a + b) as Second,
-	sub: (a: Second, b: Second): Second => (a - b) as Second,
-	mul: (a: Second, b: number): Second => (a * b) as Second,
-	div: (a: Second, b: number): Second => (a / b) as Second,
-	max: (a: Second, b: Second): Second => Math.max(a, b) as Second,
-	min: (a: Second, b: Second): Second => Math.min(a, b) as Second,
-});
+// A finite, non-negative `value` exactly as `mantissa * 2^exponent`. Doubling is exact, so
+// a fraction becomes an integer within its binary digits.
+function binary(value: number): [bigint, number] {
+	let exponent = 0;
+	while (!Number.isInteger(value)) {
+		value *= 2;
+		exponent--;
+	}
+	return [BigInt(value), exponent];
+}

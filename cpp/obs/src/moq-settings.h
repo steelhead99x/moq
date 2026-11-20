@@ -2,6 +2,9 @@
 #pragma once
 #include <obs-module.h>
 
+#include <moq/moq.hpp>
+
+#include <string>
 #include <vector>
 
 // Advanced MoQ connection settings.
@@ -9,10 +12,10 @@
 // One set of keys on an obs_data_t backs every surface that edits them: the service
 // properties page, the dock's advanced dialog, and the output that reads them at connect
 // time. The fields are described once in Fields() so both UIs are generated from the
-// same list; adding a knob means adding a Field entry and one call in CreateClient.
+// same list; adding a knob means adding a Field entry and one config field in Configure.
 namespace MoQSettings {
 
-// Whether any of this applies. With it off the output dials with libmoq's defaults and
+// Whether any of this applies. With it off the output dials with the library defaults and
 // ignores every other key.
 inline constexpr const char *ENABLED = "advanced";
 
@@ -39,7 +42,7 @@ struct Option {
 	const char *value;
 };
 
-// A single advanced setting, rendered by both UIs and read by CreateClient.
+// A single advanced setting, rendered by both UIs and read by BuildConfig.
 struct Field {
 	const char *key;
 	const char *label;
@@ -66,9 +69,6 @@ struct Field {
 };
 
 // Every advanced setting, in display order.
-//
-// Built on first call because the protocol version menu is populated from libmoq, so it
-// can't drift from what the library actually accepts.
 const std::vector<Field> &Fields();
 
 // Register the defaults from Fields(). Call from the service's get_defaults.
@@ -77,14 +77,14 @@ void Defaults(obs_data_t *settings);
 // Add the checkable "Advanced" group to a properties list.
 void AddProperties(obs_properties_t *props);
 
-// Build a libmoq client config handle from these settings.
+// Fill a client's config from these settings before the client is built.
 //
-// Returns 0 when the advanced group is off, meaning "dial with the defaults" (which is
-// what a 0 client handle means to moq_client_connect). Returns negative if a setting is
-// invalid, or if libmoq never reported the defaults the fields are built from; the
-// caller should refuse to start rather than connect with a setting the user asked for
-// silently dropped. The caller owns the handle and must release it with
-// moq_client_close.
-int CreateClient(obs_data_t *settings);
+// Returns why a stored setting can't be expressed in the config, such as an unknown choice
+// or an integer outside its field's range, or an empty string. Everything
+// else is validated by moq-ffi when it builds the client: a value it rejects, such as a
+// bind address that doesn't parse, fails `moq::Client::init` with a `Config` error naming
+// it. Either way the caller should refuse to start rather than dial with a setting the
+// user asked for silently dropped.
+std::string Configure(obs_data_t *settings, moq::ClientConfig &config);
 
 } // namespace MoQSettings

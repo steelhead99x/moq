@@ -1,0 +1,148 @@
+import { sleepUntil as clockSleepUntil, Duration, Instant, now } from "@moq/clock";
+import type { Timeline } from "./timeline";
+
+// Not exported from `source/index.ts`: this is an implementation detail of the file source.
+
+// A sample further behind the clock than this means nothing read the stream for a while, such as a
+// capture parked while unwatched, rather than a briefly slow reader. Seeking to the present decodes
+// at most a keyframe interval, while draining would decode and publish the whole gap.
+export const SEEK_BEHIND = Duration.secs(1);
+
+// The bits of a mediabunny sample the pacing loop touches. Video and audio samples only differ in
+// what they convert to, which the caller supplies.
+export interface Sample {
+	readonly microsecondTimestamp: number;
+	setTimestamp(seconds: number): void;
+	close(): void;
+}
+
+export interface Sink<S extends Sample> {
+	samples(startTimestamp?: number): AsyncGenerator<S, void, unknown>;
+}
+
+/**
+ * Reads decoded samples out of a sink in real time, restarting the file when it ends.
+ * A track with no samples ends instead, since restarting it would spin without ever yielding.
+ *
+ * Decoding runs far faster than realtime, so holding each sample until its presentation time is
+ * what makes this publish at 1x instead of blasting the whole file out at once. It also applies
+ * backpressure: the sink only decodes as far as the reader pulls, and nothing ahead of that.
+ *
+ * A reader that returns after a long gap resumes at the present on the shared timeline, not at
+ * the old cursor, so the file's other track stays in sync and the gap is never replayed.
+ */
+export function pace<S extends Sample, T extends { close(): void }>(
+	sink: Sink<S>,
+	timeline: Timeline,
+	convert: (sample: S) => T,
+	signal: AbortSignal,
+): ReadableStream<T> {
+	let samples = sink.samples();
+	let loop = 0;
+
+	// Whether this pass from the start of the file has yielded anything yet. A seek only follows a
+	// sample, so it never makes a populated track look empty.
+	let yielded = false;
+
+	// Cancelling the stream stops a pending wait too, not only the effect's teardown.
+	const cancelled = new AbortController();
+	const stop = AbortSignal.any([signal, cancelled.signal]);
+
+	return new ReadableStream<T>(
+		{
+			async pull(controller) {
+				// Seek at most once per pull, so a decoder that can't keep up drains instead of reseeking forever.
+				let sought = false;
+
+				for (;;) {
+					if (cancelled.signal.aborted) return;
+					if (signal.aborted) {
+						controller.close();
+						return;
+					}
+
+					let next: IteratorResult<S, void>;
+					try {
+						next = await samples.next();
+					} catch (err) {
+						// Teardown disposes the Input, which makes any decode still in flight throw.
+						if (!stop.aborted) throw err;
+						if (!cancelled.signal.aborted) controller.close();
+						return;
+					}
+
+					if (next.done) {
+						if (!timeline.loops || !yielded) {
+							controller.close();
+							return;
+						}
+
+						// A fresh generator seeks back to the start; the offset keeps timestamps rising.
+						loop++;
+						yielded = false;
+						samples = sink.samples();
+						continue;
+					}
+
+					const sample = next.value;
+					yielded = true;
+					const timestamp = timeline.at(sample.microsecondTimestamp, loop);
+
+					const present = now();
+					if (!sought && present.since(timestamp).gt(SEEK_BEHIND)) {
+						sample.close();
+						sought = true;
+
+						// The sink starts at the sample covering this position, decoding from its keyframe.
+						const position = timeline.position(present);
+						await samples.return();
+						loop = position.loop;
+						samples = sink.samples(position.timestamp.asSecs());
+						continue;
+					}
+
+					// A sample that's slightly late goes out immediately, letting a slow reader catch up.
+					await sleepUntil(timestamp, stop);
+					if (stop.aborted) {
+						sample.close();
+						if (!cancelled.signal.aborted) controller.close();
+						return;
+					}
+
+					// Restamp onto our wall clock, the same epoch live capture uses, so a publish that
+					// mixes sources keeps one timeline.
+					let value: T;
+					try {
+						sample.setTimestamp(timestamp.since(Instant.ZERO).asSecs());
+						value = convert(sample);
+					} finally {
+						sample.close();
+					}
+
+					try {
+						controller.enqueue(value);
+					} catch (err) {
+						value.close();
+						throw err;
+					}
+					return;
+				}
+			},
+
+			async cancel() {
+				cancelled.abort();
+				await samples.return();
+			},
+		},
+		// Prefetching would park a stale sample in the queue while nothing reads, and hand it out on resume.
+		{ highWaterMark: 0 },
+	);
+}
+
+// Wait until the given clock time, or until the effect tears down.
+//
+// A plain sleep rather than effect.timer because this runs once per sample: effect.timer registers a
+// cleanup that only releases on teardown, which would pile up for as long as the file publishes.
+export function sleepUntil(at: Instant, signal: AbortSignal): Promise<void> {
+	return clockSleepUntil(at, { signal }).catch(() => {});
+}

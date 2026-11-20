@@ -1,0 +1,154 @@
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { Duration, type Installed, Instant, now, yieldNow } from "@moq/clock";
+import { Manual } from "@moq/clock/test";
+import { Container } from "@moq/hang";
+import * as Moq from "@moq/net";
+import { Time } from "@moq/net";
+import { Derived, Effect, Signal } from "@moq/signals";
+import { nextMedia, subscribeMedia } from "./media";
+import { Sync } from "./sync";
+
+// The clock's sleeps fire on a Manual clock, which each test moves through its run.
+let clock: Manual;
+let installed: Installed;
+beforeEach(() => {
+	clock = new Manual();
+	installed = clock.install();
+});
+afterEach(() => {
+	installed.close();
+});
+
+// These count what is still attached rather than the heap: `Bun.gc` scans the stack conservatively,
+// so a stale pointer can pin thousands of dead cells and fail a heap count under load.
+
+// Reactions `run` attaches to promises still pending once it returns, which each hold until they
+// settle. Recorded by hand: Bun's `mock.contexts` misses the engine's own calls from `Promise.race`.
+async function pendingReactions(run: () => Promise<void>): Promise<number> {
+	const reacted: Promise<unknown>[] = [];
+	const then = Promise.prototype.then;
+	const spy = spyOn(Promise.prototype, "then").mockImplementation(function (this: Promise<unknown>, ...args) {
+		reacted.push(this);
+		return then.apply(this, args);
+	} as typeof then);
+	try {
+		await run();
+	} finally {
+		spy.mockRestore();
+	}
+	return reacted.filter((promise) => Bun.peek.status(promise) === "pending").length;
+}
+
+// Signal listeners `run` registers that neither fired nor were disposed by the time it returns.
+async function pendingListeners(run: () => Promise<void>): Promise<number> {
+	const listening = new Set<object>();
+	const changed = Signal.prototype.changed;
+	const spy = spyOn(Signal.prototype, "changed").mockImplementation(function (
+		this: Signal<unknown>,
+		fn?: (value: unknown) => void,
+	) {
+		if (!fn) return (changed as () => Promise<unknown>).call(this);
+		const token = {};
+		listening.add(token);
+		const dispose = changed.call(this, (value) => {
+			listening.delete(token);
+			fn(value);
+		});
+		return () => {
+			listening.delete(token);
+			dispose();
+		};
+	} as typeof changed);
+	try {
+		await run();
+	} finally {
+		spy.mockRestore();
+	}
+	return listening.size;
+}
+
+// Frames sleep on the clock once each, so a sleep that keeps anything on a clock that never changes
+// piles it up for the life of the player.
+test("waits on a stable clock leave nothing behind", async () => {
+	const sync = new Sync({ delay: Duration.millis(10) });
+	const video = sync.track({ target: new Signal<Duration | undefined>(undefined) });
+	// Let the delay effect run before anchoring.
+	await yieldNow();
+	video.received(now().since(Instant.ZERO));
+
+	const wait = async () => {
+		for (let round = 0; round < 10; round++) {
+			const at = now().since(Instant.ZERO);
+			await Promise.all(Array.from({ length: 100 }, () => video.wait(at)));
+		}
+	};
+	expect(await pendingReactions(() => clock.drive(wait()))).toBe(0);
+	expect(await pendingListeners(() => clock.drive(wait()))).toBe(0);
+
+	sync.close();
+});
+
+// The player path a decoder drives, one frame per group like AAC audio: the container consumer
+// reads each frame, the shared clock anchors on it, and presentation waits on the clock against
+// the effect's teardown. Retention anywhere along it grows with the frame count.
+test("a long subscription through the player path leaves nothing behind", async () => {
+	const broadcast = new Moq.Broadcast.Producer();
+	// The track's cache keeps every group here for its fixed 30s idle window whatever maxAge the
+	// track declares, and holds no reactions or listeners while it does.
+	const track = broadcast.createTrack("audio", { timescale: Time.Timescale.MILLI });
+	const format = new Container.Legacy.Format("audio");
+	const producer = new Container.Legacy.Producer(track, format);
+
+	const sync = new Sync({ delay: Duration.millis(10) });
+	const audio = sync.track({ target: new Signal<Duration | undefined>(undefined) });
+	const effect = new Effect();
+	const sub = subscribeMedia(effect, {
+		broadcast: broadcast.consume(),
+		track: "audio",
+		priority: 0,
+		delay: new Derived([sync.out.delay, sync.out.maxDelay], (min, max) => ({ min, max })),
+	});
+	if (!sub) throw new Error("no subscription");
+	const consumer = new Container.Consumer(sub, {
+		format,
+		delay: new Derived([sync.out.maxDelay], (max) => ({ max })),
+	});
+
+	// Presentations overlap, as a decoder's outputs do, so the clock's sleeps are shared.
+	const presenting = new Set<Promise<unknown>>();
+	const play = async (count: number) => {
+		for (let i = 0; i < count; i++) {
+			producer.encode(
+				new Uint8Array([i & 0xff]),
+				Duration.micros(Math.round(now().since(Instant.ZERO).asMicros())),
+				true,
+			);
+			// Pass over any gap or end.
+			let next = await nextMedia(consumer, effect.abort);
+			while (next && next.kind !== "frame") next = await nextMedia(consumer, effect.abort);
+			if (!next) throw new Error("the track ended");
+
+			const timestamp = next.frame.timestamp;
+			audio.received(timestamp);
+			const presented = effect.race(audio.wait(timestamp));
+			presenting.add(presented);
+			void presented.finally(() => presenting.delete(presented));
+			// Frames land a millisecond apart, so earlier presentations wake while later ones wait.
+			await clock.advance(Duration.millis(1));
+		}
+		await clock.drive(Promise.all(presenting));
+	};
+
+	// What stays is bounded by the track's window of open groups, not the frame count.
+	let reactions = 0;
+	const listeners = await pendingListeners(async () => {
+		reactions = await pendingReactions(() => play(2000));
+	});
+	expect(reactions).toBeLessThan(100);
+	expect(listeners).toBeLessThan(100);
+
+	consumer.close();
+	effect.close();
+	sync.close();
+	broadcast.close();
+});

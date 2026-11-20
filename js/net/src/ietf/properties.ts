@@ -1,6 +1,7 @@
 import type { Reader, Writer } from "../stream.ts";
 import { Timescale } from "../time.ts";
-import { type IetfVersion, Version } from "./version.ts";
+import { toNumber } from "../util/bigint.ts";
+import type { IetfVersion } from "./version.ts";
 
 // TIMESCALE (0x08), from the MOQ Properties registry shared with draft-ietf-moq-loc-04.
 // Track scope: it declares the units of every object Timestamp on the track, and its
@@ -11,6 +12,7 @@ const TIMESCALE = 0x08n;
 // It shares its number with the GROUP_ORDER *message parameter*, which is a different
 // registry: that one is only legal in SUBSCRIBE, PUBLISH_OK, and FETCH, where the
 // subscriber states its own preference.
+const DEFAULT_PUBLISHER_PRIORITY = 0x0en;
 const DEFAULT_PUBLISHER_GROUP_ORDER = 0x22n;
 
 /**
@@ -21,10 +23,16 @@ export const DESCENDING = 0x02;
 
 /// The Track Properties block carried at the end of SUBSCRIBE_OK, PUBLISH, and FETCH_OK.
 export interface Properties {
+	/** The publisher's cache window in milliseconds, omitted when unconstrained. */
+	maxCacheDuration?: bigint;
+
 	/// The track's Timescale, which declares the units of every object Timestamp on it.
 	///
-	/// `undefined` declares no timeline, so the subscriber times objects by arrival.
+	/// `undefined` declares no timeline, so the track and its objects are untimed.
 	timescale?: Timescale;
+
+	/// Publisher priority for a group header without its priority flag. Omitted, it is the wire default 128, priority -1.
+	priority?: number;
 
 	/// The publisher's preference for prioritizing groups within a subscription,
 	/// Ascending (0x1) or Descending (0x2).
@@ -37,21 +45,28 @@ export interface Properties {
 /// the caller must not append anything after it.
 ///
 /// Properties are serialized in ascending order by type, delta-encoded.
-export async function encode(w: Writer, properties: Properties, version: IetfVersion): Promise<void> {
-	// Draft-16 carries the same block under the name Track Extensions, but we only write it
-	// from draft-17 on: a draft-16 peer running an older build rejects any trailing bytes it
-	// doesn't parse, and draft-16 never registered TIMESCALE (0x08). We still read the block
-	// on draft-16, so a peer that sends one is understood.
-	if (version === Version.DRAFT_14 || version === Version.DRAFT_15 || version === Version.DRAFT_16) {
-		return;
-	}
-
+export async function encode(w: Writer, properties: Properties, _version: IetfVersion): Promise<void> {
 	let prevType = 0n;
 
+	if (properties.maxCacheDuration !== undefined) {
+		await w.u62(4n);
+		await w.u62(properties.maxCacheDuration);
+		prevType = 4n;
+	}
+
 	if (properties.timescale !== undefined) {
-		await w.u62(TIMESCALE);
+		await w.u62(TIMESCALE - prevType);
 		await w.u62(BigInt(properties.timescale));
 		prevType = TIMESCALE;
+	}
+
+	if (properties.priority !== undefined) {
+		if (!Number.isInteger(properties.priority) || properties.priority < 0 || properties.priority > 255) {
+			throw new RangeError(`invalid publisher priority: ${properties.priority}`);
+		}
+		await w.u62(DEFAULT_PUBLISHER_PRIORITY - prevType);
+		await w.u62(BigInt(properties.priority));
+		prevType = DEFAULT_PUBLISHER_PRIORITY;
 	}
 
 	if (properties.groupOrder !== undefined) {
@@ -68,15 +83,7 @@ export async function encode(w: Writer, properties: Properties, version: IetfVer
 ///
 /// Unlike an unknown message parameter, an unknown property is skipped rather than fatal,
 /// which is what lets a relay forward properties it does not implement.
-///
-/// Drafts before 16 have no such block, so this reads nothing and leaves the reader alone.
-export async function decode(r: Reader, version: IetfVersion): Promise<Properties> {
-	// Draft-16 calls the block Track Extensions, draft-17+ Track Properties. Same encoding, so
-	// read either rather than faulting the message for trailing bytes.
-	if (version === Version.DRAFT_14 || version === Version.DRAFT_15) {
-		return {};
-	}
-
+export async function decode(r: Reader, _version: IetfVersion): Promise<Properties> {
 	const properties: Properties = {};
 	let prevType = 0n;
 	let i = 0;
@@ -90,10 +97,15 @@ export async function decode(r: Reader, version: IetfVersion): Promise<Propertie
 		if (abs % 2n === 0n) {
 			// Even type: single varint value
 			const value = await r.u62();
-			if (abs === TIMESCALE && value > 0n) {
+			if (abs === 4n) {
+				properties.maxCacheDuration = value;
+			} else if (abs === TIMESCALE && value > 0n) {
 				// A zero timescale is invalid; treat it as no declaration rather than
 				// failing the whole message over one property we could have ignored.
-				properties.timescale = Timescale(Number(value));
+				properties.timescale = Timescale(toNumber(value));
+			} else if (abs === DEFAULT_PUBLISHER_PRIORITY) {
+				if (value > 255n) throw new Error(`invalid publisher priority: ${value}`);
+				properties.priority = Number(value);
 			} else if (abs === DEFAULT_PUBLISHER_GROUP_ORDER) {
 				// Only Ascending (0x1) and Descending (0x2) are defined here. Unlike the draft-14
 				// fields, 0x0 has no "publisher decides" meaning to fall back on.

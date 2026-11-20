@@ -1,8 +1,8 @@
-use crate::Error;
+use crate::{Error, FrameRate};
 
 /// A frame resolution in pixels.
 ///
-/// Names the pair that [`decode::Config::resize`](crate::decode::Config::resize)
+/// Names the pair that [`decode::Config::scale_hint`](crate::decode::Config::scale_hint)
 /// and [`Frame::resize`](crate::Frame::resize) both take, so
 /// width and height can't be swapped at a call site.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -24,6 +24,13 @@ impl Size {
 		self.width as u64 * self.height as u64
 	}
 
+	pub(crate) fn byte_len(&self, bytes_per_pixel: usize, what: &str) -> Result<usize, Error> {
+		usize::try_from(self.pixels())
+			.ok()
+			.and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+			.ok_or_else(|| Error::codec(anyhow::anyhow!("{what} {self}: byte length is too large to represent")))
+	}
+
 	/// Reject anything the I420 pipeline can't represent.
 	///
 	/// I420 chroma is subsampled 2x2, so every stage (encode, decode, resize)
@@ -32,7 +39,7 @@ impl Size {
 	pub(crate) fn validate(&self, what: &str) -> Result<(), Error> {
 		self.validate_nonzero(what)?;
 		if !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) {
-			return Err(Error::Codec(anyhow::anyhow!("{what} {self}: dimensions must be even")));
+			return Err(Error::codec(anyhow::anyhow!("{what} {self}: dimensions must be even")));
 		}
 		Ok(())
 	}
@@ -43,18 +50,20 @@ impl Size {
 	/// before anything else looks at them. That overflows the two things every
 	/// encoder derives from a size: the default bitrate (pixels x framerate) and
 	/// a packed frame's byte count (up to 4 bytes per pixel for RGBA). Both would
-	/// panic, which for a binding is an aborted host process rather than an
-	/// error return, so refuse the config here instead.
+	/// panic, which a binding reports as a bug rather than an invalid config, so
+	/// refuse the config here instead.
 	///
 	/// This is arithmetic, not policy: it rejects only what cannot be represented,
 	/// leaving "no encoder handles a frame that large" to the backend.
-	pub(crate) fn validate_encodable(&self, what: &str, framerate: u32) -> Result<(), Error> {
+	pub(crate) fn validate_encodable(&self, what: &str, framerate: FrameRate) -> Result<(), Error> {
 		let pixels = self.pixels();
-		let representable = pixels.checked_mul(framerate as u64).is_some()
+		let representable = u128::from(pixels)
+			.checked_mul(u128::from(framerate.numerator()))
+			.is_some_and(|value| value / u128::from(framerate.denominator()) <= u128::from(u64::MAX))
 			&& usize::try_from(pixels).is_ok_and(|pixels| pixels.checked_mul(4).is_some());
 
 		if !representable {
-			return Err(Error::Codec(anyhow::anyhow!(
+			return Err(Error::codec(anyhow::anyhow!(
 				"{what} {self} at {framerate}fps: dimensions too large to represent"
 			)));
 		}
@@ -66,7 +75,7 @@ impl Size {
 	/// window).
 	pub(crate) fn validate_nonzero(&self, what: &str) -> Result<(), Error> {
 		if self.width == 0 || self.height == 0 {
-			return Err(Error::Codec(anyhow::anyhow!(
+			return Err(Error::codec(anyhow::anyhow!(
 				"{what} {self}: dimensions must be non-zero"
 			)));
 		}
@@ -106,20 +115,22 @@ mod tests {
 	fn validate_encodable_rejects_unrepresentable_sizes() {
 		// A frame nobody can encode, but whose arithmetic still fits: the backend
 		// decides, not us.
-		assert!(Size::new(65534, 65534).validate_encodable("frame", 30).is_ok());
+		let rate = FrameRate::new(30, 1).unwrap();
+		assert!(Size::new(65534, 65534).validate_encodable("frame", rate).is_ok());
 
 		// pixels x framerate overflows u64.
 		assert!(
 			Size::new(u32::MAX - 1, u32::MAX - 1)
-				.validate_encodable("frame", 30)
+				.validate_encodable("frame", rate)
 				.is_err()
 		);
 		// ...and it is the product that matters, not either side alone.
-		assert!(Size::new(u32::MAX - 1, 2).validate_encodable("frame", 30).is_ok());
-	}
-
-	#[test]
-	fn display_reads_as_a_resolution() {
-		assert_eq!(Size::new(1920, 1080).to_string(), "1920x1080");
+		assert!(Size::new(u32::MAX - 1, 2).validate_encodable("frame", rate).is_ok());
+		let extreme = FrameRate::new(crate::frame_rate::MAX_FRAMES_PER_SECOND, 1).unwrap();
+		assert!(
+			Size::new(u32::MAX - 1, u32::MAX - 1)
+				.validate_encodable("frame", extreme)
+				.is_err()
+		);
 	}
 }

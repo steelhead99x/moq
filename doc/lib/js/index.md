@@ -8,20 +8,33 @@ description: The browser implementation, published as @moq/* on npm
 A from-scratch implementation for browsers, built on WebTransport, WebCodecs,
 and WebAudio. `@moq/net` also runs in Node, Bun, and Deno.
 
+For a player or publisher, start with the [web components](#web-components).
+For custom data, start with [@moq/net](/lib/js/net); for a meeting, use
+[@moq/room](/lib/js/room). [Examples](/setup/examples) links complete apps and
+small examples. The [API reference](/lib/js/api/) covers every package; source lives under
+[`js/`](https://github.com/moq-dev/moq/tree/main/js).
+
 ## Packages
 
 | Package | Does |
 | --- | --- |
 | [@moq/net](/lib/js/net) | The pub/sub layer: connections, broadcasts, tracks, groups, frames, discovery. |
+| [@moq/pattern](/lib/js/api/pattern) | Exact path patterns: grammar, matching, and set algebra. Re-exported by `@moq/net` and `@moq/auth`. |
 | [@moq/hang](/lib/js/hang) | The media layer: catalog types and containers. |
+| [@moq/libav](/lib/js/api/libav) | libav.js decoding Opus and AAC, which `@moq/hang` loads as its WebCodecs fallback in Node, Bun, and browsers without `AudioDecoder`. LGPL-2.1-or-later. |
 | [@moq/watch](/lib/js/watch) | Subscribe, decode, and render. `<moq-watch>` plus an optional UI overlay. |
+| [@moq/video](/lib/js/video) | Draw video frames into a canvas through WebGPU or Canvas2D. Used by `@moq/watch` and `@moq/publish`. |
 | [@moq/publish](/lib/js/publish) | Capture, encode, and publish. `<moq-publish>` plus an optional UI overlay. |
-| [@moq/token](/lib/js/token) | Mint and verify relay JWTs. |
+| [@moq/ui](/lib/js/api/ui) | The base of the watch and publish browser support banners. |
+| [@moq/room](/lib/js/room) | Headless rooms: announce-derived roster, local publish, remote watch, and a chat track. |
+| [@moq/auth](/lib/js/auth) | Validate a relay's request, build its grant, and mint and verify relay JWTs. |
+| [@moq/clock](/lib/js/clock) | Logical monotonic time, wall time, and deterministic timers. |
 | [@moq/signals](/lib/js/signals) | The reactive primitives every package exposes its state through. |
-| [@moq/json](https://www.npmjs.com/package/@moq/json) | JSON over tracks: snapshots with merge-patch deltas, or append logs. |
-| [@moq/flate](https://www.npmjs.com/package/@moq/flate) | Group-scoped DEFLATE for any track. |
-| [@moq/loc](https://www.npmjs.com/package/@moq/loc), [@moq/msf](https://www.npmjs.com/package/@moq/msf) | The IETF LOC container and MSF catalog. |
-| [@moq/boy](https://www.npmjs.com/package/@moq/boy) | The [MoQ Boy](/bin/demo) player element. |
+| [@moq/json](/lib/js/json) | JSON over tracks: snapshots with merge-patch deltas, or append logs. |
+| [@moq/stats](/lib/js/api/stats) | Read a relay's published traffic stats: discover nodes and yield typed frames. |
+| [@moq/obs](/lib/js/api/obs) | Set up the OBS on the user's machine from a web page: a MoQ or RTMP(S) destination, live stats, and MoQ Sources. |
+| [@moq/crypto](https://github.com/moq-dev/moq/tree/main/js/crypto) | End-to-end encryption of groups, datagrams, and track names, scoped to a publisher run's epoch, and per-frame Ed25519 signatures, so relays forward content they cannot read, forge, retime, or relocate. Workspace-only until the browser components or the mesh use it. |
+| [@moq/loc](/lib/js/api/loc), [@moq/msf](/lib/js/api/msf) | The IETF LOC container and MSF catalog. |
 
 ## Web components
 
@@ -52,8 +65,8 @@ React and Solid adapters for the reactive state.
 
 ## JavaScript API
 
-Below the elements, `Watch.Broadcast` and `Publish.Broadcast` are the same
-pipelines without DOM, and `@moq/net` is the protocol itself. Examples:
+Below the elements, `Watch.Player` owns a headless playback pipeline,
+`Publish.Broadcast` owns a headless publisher, and `@moq/net` is the protocol itself. Examples:
 [`js/net/examples/`](https://github.com/moq-dev/moq/tree/main/js/net/examples)
 covers connecting, publishing, subscribing, and discovery.
 
@@ -63,7 +76,7 @@ covers connecting, publishing, subscribing, and discovery.
 | --- | --- |
 | Chrome, Edge 97+ | WebTransport |
 | Firefox 153+ | WebTransport. Earlier Firefox ships it but allows too few incoming streams, so the client falls back to WebSocket there. |
-| Safari | WebSocket fallback. Safari 26.4 ships WebTransport, but WebKit bugs stall long sessions, so the client doesn't use it yet. |
+| WebKit (Safari, Chrome, Firefox, and Edge on iOS) | WebSocket fallback. Safari 26.4 ships WebTransport, but WebKit bugs stall long sessions, so the client doesn't use it yet. |
 | Anything else | Automatic WebSocket fallback, with TCP's head-of-line blocking |
 
 WebCodecs support varies per codec and browser; `<moq-watch-support>` and

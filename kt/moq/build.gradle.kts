@@ -6,25 +6,24 @@
 // `dev.moq.*` typealiases and adds idiomatic helpers (a `connect()` facade,
 // Flow extensions, AutoCloseable ergonomics).
 //
-// Versioning is INDEPENDENT of the crate: `-Pmoq.version` (default in
-// gradle.properties), bumped by hand. release-kt-lib.yml publishes a new
-// version only when that property changes. The dependency on `moq-ffi` is a
-// floating range so consumers transitively pick up new bindings patches
-// without this wrapper being re-cut. See MOQ_FFI_RANGE below.
+// `-Pmoq.version` (default in gradle.properties) owns the wrapper version.
+// Shared cuts set its minor; patches are independent of the bindings.
+// release-kt-lib.yml publishes when that property changes. MOQ_FFI_RANGE
+// lets consumers pick up bindings patches without a wrapper re-release.
 //
 // Local builds and CI resolve `moq-ffi` from the sibling project via the
 // dependency substitution below, so tests run against freshly-built bindings.
-// The published POM keeps the range (substitution only affects resolution).
+// release-kt-lib.yml publishes only once those bindings match a released tag.
 //
 // Publishing uses com.vanniktech.maven.publish; CI runs
 // `:moq:publishAndReleaseToMavenCentral`. Credentials come from env vars set by
 // release-kt-lib.yml (ORG_GRADLE_PROJECT_*). Signing is only wired up when a key
 // is present (see mavenPublishing below), so keyless local and fork-PR builds work.
 
-import com.android.build.gradle.LibraryExtension
+import com.android.build.api.dsl.LibraryExtension
 import com.vanniktech.maven.publish.JavadocJar
 import com.vanniktech.maven.publish.KotlinMultiplatform
-import com.vanniktech.maven.publish.SonatypeHost
+import org.gradle.api.publish.maven.tasks.GenerateMavenPom
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 // Plugin versions are pinned in the root build.gradle.kts (Kotlin, publish) and
@@ -41,9 +40,26 @@ plugins {
 
 version = providers.gradleProperty("moq.version").get()
 
-// Compatible-patch range for the bindings: any 0.3.x, never 0.4.0. Published
-// into the wrapper's POM so consumers float to the newest bindings patch.
-val MOQ_FFI_RANGE = "[0.3,0.4)"
+// Sessions advertise the wrapper's version in SETUP (see Client.kt), so compile it in
+// from the same property rather than keeping a second copy in source.
+val generateVersion =
+    tasks.register("generateVersion") {
+        val output = layout.buildDirectory.dir("generated/version")
+        val wrapperVersion = version.toString()
+        inputs.property("version", wrapperVersion)
+        outputs.dir(output)
+        doLast {
+            val file = output.get().file("dev/moq/Version.kt").asFile
+            file.parentFile.mkdirs()
+            file.writeText(
+                "package dev.moq\n\n/** This wrapper's version. */\ninternal const val VERSION = \"$wrapperVersion\"\n"
+            )
+        }
+    }
+
+// The published POM admits newer bindings patches within the cut's minor.
+// Shared cuts move this range; raise its floor when newer FFI API is required.
+val MOQ_FFI_RANGE = "[0.4.3,0.5)"
 
 val androidEnabled = providers.gradleProperty("android.enabled").orNull == "true"
 
@@ -68,49 +84,55 @@ kotlin {
         }
     }
 
-    @Suppress("UNUSED_VARIABLE")
     sourceSets {
-        val commonMain by getting {
-            dependencies {
-                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
-                // api: the typed JSON helpers are inline+reified, so they
-                // resolve serializers at the consumer's call site.
-                api("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
-            }
-        }
-        val commonTest by getting {
-            dependencies {
-                implementation(kotlin("test"))
-                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
-            }
-        }
-
-        val jvmAndAndroidMain by creating {
-            dependsOn(commonMain)
-            dependencies {
-                // api: the wrapper re-exports the FFI types, so consumers get
-                // `uniffi.moq.*` (and the native libs) transitively.
-                api("dev.moq:moq-ffi") {
-                    version { require(MOQ_FFI_RANGE) }
+        // Gradle 9.6 deprecates the `by getting` / `by creating` delegates,
+        // and Kotlin DSL treats those as script compilation errors.
+        val commonMain =
+            getByName("commonMain") {
+                dependencies {
+                    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+                    // api: the typed JSON helpers are inline+reified, so they
+                    // resolve serializers at the consumer's call site.
+                    api("org.jetbrains.kotlinx:kotlinx-serialization-json:1.12.0")
                 }
             }
-        }
-        val jvmAndAndroidTest by creating {
-            dependsOn(commonTest)
-        }
+        val commonTest =
+            getByName("commonTest") {
+                dependencies {
+                    implementation(kotlin("test"))
+                    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
+                }
+            }
 
-        val jvmMain by getting {
+        val jvmAndAndroidMain =
+            create("jvmAndAndroidMain") {
+                dependsOn(commonMain)
+                kotlin.srcDir(generateVersion)
+                dependencies {
+                    // api: the wrapper re-exports the FFI types, so consumers get
+                    // `uniffi.moq.*` (and the native libs) transitively.
+                    api("dev.moq:moq-ffi") {
+                        version { require(MOQ_FFI_RANGE) }
+                    }
+                }
+            }
+        val jvmAndAndroidTest =
+            create("jvmAndAndroidTest") {
+                dependsOn(commonTest)
+            }
+
+        getByName("jvmMain") {
             dependsOn(jvmAndAndroidMain)
         }
-        val jvmTest by getting {
+        getByName("jvmTest") {
             dependsOn(jvmAndAndroidTest)
         }
 
         if (androidEnabled) {
-            val androidMain by getting {
+            getByName("androidMain") {
                 dependsOn(jvmAndAndroidMain)
             }
-            val androidUnitTest by getting {
+            getByName("androidUnitTest") {
                 dependsOn(jvmAndAndroidTest)
             }
         }
@@ -140,9 +162,9 @@ mavenPublishing {
     // Bundle the Dokka-generated KDoc HTML as the javadoc jar. Without this the
     // KMP default is an empty javadoc jar, so javadoc.io (which mirrors whatever
     // Maven Central holds) would serve a docless page.
-    configure(KotlinMultiplatform(javadocJar = JavadocJar.Dokka("dokkaHtml")))
+    configure(KotlinMultiplatform(javadocJar = JavadocJar.Dokka("dokkaGeneratePublicationHtml")))
 
-    publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
+    publishToMavenCentral(automaticRelease = true)
     // Only sign when a key is actually configured. signAllPublications() registers a
     // *required* sign task, so calling it unconditionally makes publishToMavenLocal
     // fail ("no configured signatory") on fork-PR dry-runs, which run without secrets.
@@ -173,5 +195,22 @@ mavenPublishing {
             connection.set("scm:git:https://github.com/moq-dev/moq.git")
             developerConnection.set("scm:git:ssh://git@github.com/moq-dev/moq.git")
         }
+    }
+}
+
+// The target POMs (moq-jvm, moq-android) name the substituted project's
+// version, which is never published. Kotlin rewrites those dependencies in its
+// own withXml, whose order against ours varies, so restore the range after the
+// POM is written.
+tasks.withType<GenerateMavenPom>().configureEach {
+    val range = MOQ_FFI_RANGE
+    val ffi =
+        Regex(
+            "(<groupId>dev\\.moq</groupId>\\s*<artifactId>moq-ffi[^<]*</artifactId>\\s*<version>)[^<]*(</version>)"
+        )
+    doLast {
+        destination.writeText(
+            ffi.replace(destination.readText()) { it.groupValues[1] + range + it.groupValues[2] }
+        )
     }
 }

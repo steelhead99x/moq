@@ -4,22 +4,27 @@
  *
  * @module
  */
-import * as Util from "@moq/hang/util";
+
 import { Connection } from "@moq/net";
 import { workerSupported } from "../video/processor";
+import { probe } from "./video";
 
+/** How well a feature works: natively, through a fallback, or not at all. */
 export type Level = "full" | "partial" | "none";
 
+/** Whether a codec encodes in hardware and in software. */
 export type Codec = {
 	hardware?: boolean; // undefined when we can't detect hardware acceleration
 	software: boolean;
 };
 
+/** Which audio codecs encode. */
 export type Audio = {
-	aac: boolean;
+	aac: Level;
 	opus: Level;
 };
 
+/** Which video codecs encode. */
 export type Video = {
 	h264: Codec;
 	h265: Codec;
@@ -28,6 +33,7 @@ export type Video = {
 	av1: Codec;
 };
 
+/** The full publishing support report. */
 export type Full = {
 	webtransport: Level;
 	audio: {
@@ -64,34 +70,7 @@ async function audioEncoderSupported(codec: keyof typeof CODECS): Promise<boolea
 	return res.supported === true;
 }
 
-async function videoEncoderSupported(codec: keyof typeof CODECS): Promise<Codec> {
-	const software = await VideoEncoder.isConfigSupported({
-		codec: CODECS[codec],
-		width: 1280,
-		height: 720,
-		hardwareAcceleration: "prefer-software",
-	});
-
-	// We can't reliably detect hardware encoding on Firefox: https://github.com/w3c/webcodecs/issues/896
-	const hardware = await VideoEncoder.isConfigSupported({
-		codec: CODECS[codec],
-		width: 1280,
-		height: 720,
-		hardwareAcceleration: "prefer-hardware",
-	});
-
-	// Safari always echoes "prefer-hardware" back, so the hint tells us nothing. Treat it like
-	// Firefox and report hardware support as unknown rather than advertising hardware VP9/AV1 it
-	// doesn't have.
-	const unknown =
-		Util.Hacks.isFirefox || Util.Hacks.isSafari || hardware.config?.hardwareAcceleration !== "prefer-hardware";
-
-	return {
-		hardware: unknown ? undefined : hardware.supported === true,
-		software: software.supported === true,
-	};
-}
-
+/** Detect what this browser supports for publishing. */
 export async function isSupported(): Promise<Full> {
 	return {
 		// Report "partial" when @moq/net forces the WebSocket fallback.
@@ -99,7 +78,8 @@ export async function isSupported(): Promise<Full> {
 		audio: {
 			capture: typeof AudioWorkletNode !== "undefined",
 			encoding: {
-				aac: await audioEncoderSupported("aac"),
+				// No fallback encodes AAC, so it is native or nothing.
+				aac: (await audioEncoderSupported("aac")) ? "full" : "none",
 				opus: (await audioEncoderSupported("opus")) ? "full" : "partial",
 			},
 		},
@@ -107,7 +87,6 @@ export async function isSupported(): Promise<Full> {
 			capture:
 				// Chrome has MediaStreamTrackProcessor on the window; Safari and Firefox only in a
 				// worker, which we hop through. Either way it's the native pipeline, so full points.
-				// @ts-expect-error No typescript types yet.
 				typeof MediaStreamTrackProcessor !== "undefined" || (await workerSupported())
 					? "full"
 					: // The fallback drives a <video> element via requestVideoFrameCallback, which is
@@ -118,11 +97,11 @@ export async function isSupported(): Promise<Full> {
 			encoding:
 				typeof VideoEncoder !== "undefined"
 					? {
-							h264: await videoEncoderSupported("h264"),
-							h265: await videoEncoderSupported("h265"),
-							vp8: await videoEncoderSupported("vp8"),
-							vp9: await videoEncoderSupported("vp9"),
-							av1: await videoEncoderSupported("av1"),
+							h264: await probe(CODECS.h264),
+							h265: await probe(CODECS.h265),
+							vp8: await probe(CODECS.vp8),
+							vp9: await probe(CODECS.vp9),
+							av1: await probe(CODECS.av1),
 						}
 					: undefined,
 		},

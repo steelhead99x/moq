@@ -1,0 +1,5 @@
+{
+	// Tests and the test preload stay type-checked but are not distributed.
+	"extends": "./tsconfig.json",
+	"exclude": ["src/**/*.test.ts", "src/preload.ts"]
+}

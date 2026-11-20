@@ -1,0 +1,159 @@
+//! Session limits and QUIC limits selected after the relay authorizes a session.
+
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
+
+/// Session and transport limits grouped by the authorized connection's role.
+#[derive(usage_rs::Args, Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Config {
+	/// Session limits for ordinary clients.
+	#[usage(flatten)]
+	pub client: Client,
+	/// Session and QUIC limits for authenticated cluster peers.
+	#[usage(flatten)]
+	pub peer: Peer,
+}
+
+/// Session limits for ordinary client sessions.
+#[derive(usage_rs::Args, Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Client {
+	/// Maximum simultaneously announced broadcasts or namespaces.
+	#[usage(
+		long = "limits-client-announces",
+		env = "MOQ_LIMITS_CLIENT_ANNOUNCES",
+		default = "1000",
+		setting = "limits.client.announces"
+	)]
+	pub announces: usize,
+}
+
+impl Default for Client {
+	fn default() -> Self {
+		Self { announces: 1000 }
+	}
+}
+
+impl Client {
+	pub(crate) fn resolve(&self) -> moq_net::session::Limits {
+		resolve(self.announces)
+	}
+}
+
+/// Session limits and QUIC limits for authenticated cluster peer sessions.
+#[derive(usage_rs::Args, Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Peer {
+	/// Maximum simultaneously announced broadcasts or namespaces.
+	#[usage(
+		long = "limits-peer-announces",
+		env = "MOQ_LIMITS_PEER_ANNOUNCES",
+		default = "100000",
+		setting = "limits.peer.announces"
+	)]
+	pub announces: usize,
+	/// QUIC limits a peer session widens to (`[limits.peer.quic]`).
+	#[usage(flatten)]
+	pub quic: Quic,
+}
+
+impl Default for Peer {
+	fn default() -> Self {
+		Self {
+			announces: 100000,
+			quic: Quic::default(),
+		}
+	}
+}
+
+impl Peer {
+	pub(crate) fn resolve(&self) -> moq_net::session::Limits {
+		resolve(self.announces)
+	}
+}
+
+/// QUIC limits for peer sessions and the links the relay dials, keyed like `[quic]`.
+#[derive(usage_rs::Args, Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Quic {
+	/// Maximum concurrent QUIC streams the peer may open, per direction.
+	#[usage(
+		long = "limits-peer-quic-max-streams",
+		env = "MOQ_LIMITS_PEER_QUIC_MAX_STREAMS",
+		default = "100000",
+		setting = "limits.peer.quic.max_streams"
+	)]
+	pub max_streams: std::num::NonZeroU64,
+	/// Connection-wide QUIC receive window, in bytes.
+	#[usage(
+		long = "limits-peer-quic-receive-window",
+		env = "MOQ_LIMITS_PEER_QUIC_RECEIVE_WINDOW",
+		default = "16777216",
+		setting = "limits.peer.quic.receive_window"
+	)]
+	pub receive_window: std::num::NonZeroU64,
+	/// Cap on unacknowledged outgoing QUIC data, in bytes.
+	#[usage(
+		long = "limits-peer-quic-send-window",
+		env = "MOQ_LIMITS_PEER_QUIC_SEND_WINDOW",
+		default = "16777216",
+		setting = "limits.peer.quic.send_window"
+	)]
+	pub send_window: std::num::NonZeroU64,
+}
+
+impl Default for Quic {
+	fn default() -> Self {
+		// Above the `[quic]` defaults, which are sized for one viewer rather than a link
+		// carrying a whole cluster's traffic: about 450 Mbps at a 250 ms RTT, and a paused
+		// stream budget of half of it for the groups slow readers hold back.
+		let window = std::num::NonZeroU64::new(16 << 20).expect("non-zero");
+		Self {
+			max_streams: std::num::NonZeroU64::new(10 * moq_tokio::quic::DEFAULT_MAX_STREAMS).expect("non-zero"),
+			receive_window: window,
+			send_window: window,
+		}
+	}
+}
+
+impl Quic {
+	/// Refuses limits QUIC cannot advertise, as `[quic]` does, so the accept and
+	/// dial paths never disagree about them.
+	pub(crate) fn validate(&self) -> anyhow::Result<()> {
+		self.limits().validate().context("invalid [limits.peer.quic]")?;
+		// Incomplete messages hold connection credit until they are complete.
+		let min = moq_net::transport::MIN_RECEIVE_WINDOW;
+		anyhow::ensure!(
+			self.receive_window.get() >= min,
+			"invalid [limits.peer.quic]: receive_window must be at least {min} bytes to fit the largest message"
+		);
+		Ok(())
+	}
+
+	/// Apply these limits to the `[quic]` section a peer link is dialed with.
+	pub(crate) fn dial(&self, quic: &mut moq_tokio::quic::Config) {
+		quic.max_streams = Some(self.max_streams.get());
+		quic.receive_window = Some(self.receive_window.get());
+		quic.send_window = Some(self.send_window.get());
+	}
+
+	/// The limits an accepted peer connection widens to, as either QUIC runtime takes them.
+	pub(crate) fn limits(&self) -> moq_quic::Limits {
+		let mut limits = moq_quic::Limits::default();
+		limits.max_streams = Some(self.max_streams);
+		limits.receive_window = Some(self.receive_window);
+		limits.send_window = Some(self.send_window);
+		limits
+	}
+}
+
+fn resolve(announces: usize) -> moq_net::session::Limits {
+	let mut limits = moq_net::session::Limits::default();
+	limits.announces = announces;
+	limits
+}

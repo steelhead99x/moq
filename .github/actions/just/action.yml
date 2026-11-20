@@ -1,0 +1,17 @@
+name: Install just
+description: Install the pinned just for jobs outside the nix dev shell, which already provides it.
+
+runs:
+  using: composite
+  steps:
+    # A checksum-verified prebuilt, so it costs seconds rather than a
+    # `cargo install`. Keep the version in step with nixpkgs' just in flake.lock.
+    - name: Use the NixOS runner toolchain
+      if: runner.environment == 'self-hosted'
+      shell: bash
+      run: just --version
+
+    - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      if: runner.environment != 'self-hosted'
+      with:
+        tool: just@1.58.0

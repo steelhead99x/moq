@@ -3,29 +3,36 @@
 //! The fallback when no hardware encoder is available. Emits Annex-B with
 //! in-band SPS/PPS, ready for `moq_mux::codec::h264::Import` in avc3 mode.
 
+use std::collections::VecDeque;
+
 use bytes::Bytes;
 use openh264::OpenH264API;
 use openh264::encoder::{
-	BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, TransferCharacteristics, UsageType,
-	VuiConfig,
+	BitRate, ColorPrimaries, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod,
+	MatrixCoefficients, RateControlMode, TransferCharacteristics, UsageType, VuiConfig,
 };
 use openh264::formats::YUVSlices;
 use openh264_sys2::{ENCODER_OPTION_BITRATE, SBitrateInfo, SPATIAL_LAYER_ALL};
+#[cfg(test)]
+use openh264_sys2::{ENCODER_OPTION_COMPLEXITY, LOW_COMPLEXITY, MEDIUM_COMPLEXITY};
 
-use super::super::encoder::Config;
+use super::super::encoder::{Applied, Config, Preset};
 use super::{Backend, Encoded};
-use crate::{Color, Error, Frame};
+use crate::color::{Matrix, Primaries, Range, Transfer};
+use crate::{Error, Frame};
 
 pub(crate) const NAME: &str = "openh264";
 
 pub(crate) struct Openh264 {
 	encoder: Encoder,
+	applied: Applied,
 	/// openh264 builds the underlying encoder lazily on the first frame and
 	/// rejects `SetOption` with `cmInitExpected` until it exists, so a rate set
 	/// before then waits here and is applied once there's something to set it on.
 	pending: Option<u64>,
 	/// Whether a frame has gone through, i.e. whether the encoder exists yet.
 	started: bool,
+	ready: VecDeque<Encoded>,
 }
 
 impl Openh264 {
@@ -34,34 +41,55 @@ impl Openh264 {
 	}
 
 	fn new(config: &Config) -> Result<Self, Error> {
+		let interval = config.keyframe_interval();
 		let color = config.resolved_color();
 		// State the color space in the SPS so a decoder doesn't fall back to
-		// guessing it from the frame height.
-		//
-		// `VuiConfig::bt601()` would pair SMPTE 170M primaries and matrix with the
-		// SMPTE 170M transfer curve (code point 6). We override the curve to BT.709
-		// (1), which is defined identically, because CoreVideo's 170M transfer
-		// constant is deprecated and Media Foundation has none, so 1 is the only
-		// value every backend can emit. Same curve, one number across all of them.
-		let vui = match color {
-			Color::Bt601Limited | Color::Bt601Full => {
-				VuiConfig::bt601().transfer_characteristics(TransferCharacteristics::Bt709)
-			}
-			Color::Bt709Limited | Color::Bt709Full => VuiConfig::bt709(),
-		}
-		.full_range(!color.limited());
+		// guessing it from the frame height. The SDR curve goes out as BT.709 (1)
+		// whatever the matrix, as every backend emits it; see
+		// [`Color::code_points`].
+		let vui = VuiConfig::new()
+			.color_primaries(match color.primaries {
+				Primaries::Smpte170m => ColorPrimaries::Smpte170M,
+				Primaries::Bt470bg => ColorPrimaries::Bt470BG,
+				Primaries::Bt709 => ColorPrimaries::Bt709,
+				Primaries::Bt2020 => ColorPrimaries::Bt2020,
+			})
+			.transfer_characteristics(match color.transfer {
+				Transfer::Bt709 => TransferCharacteristics::Bt709,
+				Transfer::Pq => TransferCharacteristics::Smpte2084,
+				Transfer::Hlg => TransferCharacteristics::Hlg,
+			})
+			.matrix_coefficients(match color.matrix {
+				Matrix::Bt601 => MatrixCoefficients::Smpte170M,
+				Matrix::Bt709 => MatrixCoefficients::Bt709,
+				Matrix::Bt2020 => MatrixCoefficients::Bt2020Ncl,
+			})
+			.full_range(color.range == Range::Full);
 
+		// Measured at 720p and 1080p (see `examples/encode-presets.rs`): Low saves
+		// about 1.5 ms and 15% CPU per frame over Medium for under 0.1 dB, and High
+		// codes the same stream as Medium, only slower. So Quality gets Medium and
+		// reports itself as Balanced.
+		let (complexity, applied) = match config.preset {
+			Preset::LowLatency => (Complexity::Low, Applied::new(Preset::LowLatency, "low complexity")),
+			Preset::Balanced | Preset::Quality => {
+				(Complexity::Medium, Applied::new(Preset::Balanced, "medium complexity"))
+			}
+		};
 		let cfg = EncoderConfig::new()
-			.bitrate(BitRate::from_bps(config.resolved_bitrate().min(u32::MAX as u64) as u32))
-			.max_frame_rate(FrameRate::from_hz(config.framerate as f32))
+			.bitrate(BitRate::from_bps(
+				config.resolved_bitrate().as_bps().min(u32::MAX as u64) as u32,
+			))
+			.max_frame_rate(FrameRate::from_hz(config.framerate.as_f64() as f32))
 			.rate_control_mode(RateControlMode::Bitrate)
 			// Real-time camera: prioritize latency over compression.
 			.usage_type(UsageType::CameraVideoRealTime)
-			.intra_frame_period(IntraFramePeriod::from_num_frames(config.gop))
+			.intra_frame_period(IntraFramePeriod::from_num_frames(interval))
+			.complexity(complexity)
 			.vui(vui);
 
 		let encoder = Encoder::with_api_config(OpenH264API::from_source(), cfg)
-			.map_err(|e| Error::Codec(anyhow::anyhow!("openh264 init: {e}")))?;
+			.map_err(|e| Error::codec(anyhow::anyhow!("openh264 init: {e}")))?;
 
 		tracing::info!(
 			encoder = NAME,
@@ -71,8 +99,10 @@ impl Openh264 {
 		);
 		Ok(Self {
 			encoder,
+			applied,
 			pending: None,
 			started: false,
+			ready: VecDeque::new(),
 		})
 	}
 
@@ -92,6 +122,18 @@ impl Openh264 {
 		info.iBitrate as i64
 	}
 
+	/// Read the complexity mode back off the live encoder, like `read_bitrate`.
+	#[cfg(test)]
+	fn read_complexity(&mut self) -> i32 {
+		let mut complexity = -1i32;
+		let status = unsafe {
+			let api = self.encoder.raw_api();
+			api.get_option(ENCODER_OPTION_COMPLEXITY, std::ptr::from_mut(&mut complexity).cast())
+		};
+		assert_eq!(status, 0, "openh264 get complexity failed");
+		complexity
+	}
+
 	/// Set the rate on the live encoder. Only valid once it exists; see `pending`.
 	fn apply_bitrate(&mut self, bitrate: u64) -> Result<(), Error> {
 		// The safe wrapper only takes a bitrate at construction, so go through the
@@ -108,7 +150,7 @@ impl Openh264 {
 			api.set_option(ENCODER_OPTION_BITRATE, std::ptr::from_mut(&mut info).cast())
 		};
 		if status != 0 {
-			return Err(Error::Codec(anyhow::anyhow!(
+			return Err(Error::codec(anyhow::anyhow!(
 				"openh264 set bitrate to {bitrate}: status {status}"
 			)));
 		}
@@ -117,7 +159,7 @@ impl Openh264 {
 }
 
 impl Backend for Openh264 {
-	fn encode(&mut self, frame: &Frame, keyframe: bool) -> Result<Vec<Encoded>, Error> {
+	fn encode(&mut self, frame: &Frame, cut: bool) -> Result<(), Error> {
 		// A rate deferred from before the encoder existed lands here, ahead of the
 		// frame rather than after it, so a rejected rate can't cost us a frame's
 		// packets on the way out.
@@ -127,7 +169,7 @@ impl Backend for Openh264 {
 			self.apply_bitrate(bitrate)?;
 		}
 
-		if keyframe {
+		if cut {
 			self.encoder.force_intra_frame();
 		}
 
@@ -139,31 +181,31 @@ impl Backend for Openh264 {
 		let bitstream = self
 			.encoder
 			.encode(&yuv)
-			.map_err(|e| Error::Codec(anyhow::anyhow!("openh264 encode: {e}")))?;
+			.map_err(|e| Error::codec(anyhow::anyhow!("openh264 encode: {e}")))?;
 
 		// One Annex-B access unit per frame (low-delay, no B-frames). A skipped
 		// frame yields an empty bitstream.
 		let bytes = bitstream.to_vec();
+		let keyframe = bitstream.frame_type() == FrameType::IDR;
 
 		// The encode above built the underlying encoder, so any pending rate can
 		// be set from the next frame on.
 		self.started = true;
 		// One access unit out per frame in, so it carries that frame's timestamp.
-		Ok(if bytes.is_empty() {
-			Vec::new()
-		} else {
-			vec![Encoded::new(Bytes::from(bytes), frame.timestamp)]
-		})
+		if !bytes.is_empty() {
+			self.ready
+				.push_back(Encoded::new(Bytes::from(bytes), frame.timestamp, keyframe));
+		}
+		Ok(())
 	}
 
-	fn flush(&mut self) -> Result<Vec<Encoded>, Error> {
-		// Low-delay: nothing is buffered, so there's nothing to flush.
-		Ok(Vec::new())
+	fn receive(&mut self) -> Result<Option<Encoded>, Error> {
+		Ok(self.ready.pop_front())
 	}
 
-	fn finish(&mut self) -> Result<Vec<Encoded>, Error> {
+	fn flush(&mut self) -> Result<(), Error> {
 		// Low-delay: nothing is buffered, so there's nothing to flush.
-		Ok(Vec::new())
+		Ok(())
 	}
 
 	fn set_bitrate(&mut self, bitrate: u64) -> Result<(), Error> {
@@ -179,8 +221,16 @@ impl Backend for Openh264 {
 		self.apply_bitrate(bitrate)
 	}
 
-	fn name(&self) -> &str {
+	fn can_cut(&self) -> bool {
+		true
+	}
+
+	fn name(&self) -> &'static str {
 		NAME
+	}
+
+	fn applied(&self) -> Applied {
+		self.applied.clone()
 	}
 }
 
@@ -193,15 +243,33 @@ mod tests {
 	fn config() -> Config {
 		Config {
 			kind: Kind::Software,
-			..Config::new(320, 240, 30)
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
 		}
 	}
 
 	/// A mid-gray frame at an arbitrary time; these tests only exercise the rate
 	/// controls, so the timestamp is never read back.
 	fn gray() -> Frame {
-		let i420 = I420::new(320, 240, vec![0x80u8; I420::len(320, 240)]).unwrap();
+		let size = crate::Size::new(320, 240);
+		let i420 = I420::new(size, vec![0x80u8; I420::len(size).unwrap()]).unwrap();
 		Frame::new(Surface::I420(i420), moq_net::Timestamp::from_micros(0).unwrap())
+	}
+
+	/// Each preset reaches the codec as its complexity mode, read back off the
+	/// live encoder, and the report names the preset whose controls it got.
+	#[test]
+	fn a_preset_reaches_the_codec() {
+		for (preset, complexity, applied) in [
+			(Preset::LowLatency, LOW_COMPLEXITY, Preset::LowLatency),
+			(Preset::Balanced, MEDIUM_COMPLEXITY, Preset::Balanced),
+			// High complexity codes the same stream as Medium, so Quality reports what it got.
+			(Preset::Quality, MEDIUM_COMPLEXITY, Preset::Balanced),
+		] {
+			let mut enc = Openh264::new(&Config { preset, ..config() }).unwrap();
+			enc.encode_all(&gray(), true).unwrap();
+			assert_eq!(enc.read_complexity(), complexity, "{preset:?}");
+			assert_eq!(enc.applied().preset, Some(applied), "{preset:?}");
+		}
 	}
 
 	/// The rate reaches the encoder, verified by reading it back rather than by
@@ -209,9 +277,9 @@ mod tests {
 	#[test]
 	fn set_bitrate_reaches_the_encoder() {
 		let mut enc = Openh264::new(&config()).unwrap();
-		enc.encode(&gray(), true).unwrap();
+		enc.encode_all(&gray(), true).unwrap();
 
-		let lower = config().resolved_bitrate() / 2;
+		let lower = config().resolved_bitrate().as_bps() / 2;
 		enc.set_bitrate(lower).unwrap();
 		assert_eq!(enc.read_bitrate(), lower as i64);
 	}
@@ -223,9 +291,9 @@ mod tests {
 	#[test]
 	fn set_bitrate_above_the_opening_rate_is_rejected() {
 		let mut enc = Openh264::new(&config()).unwrap();
-		enc.encode(&gray(), true).unwrap();
+		enc.encode_all(&gray(), true).unwrap();
 
-		let higher = config().resolved_bitrate() * 4;
+		let higher = config().resolved_bitrate().as_bps() * 4;
 		assert!(enc.set_bitrate(higher).is_err());
 	}
 
@@ -235,8 +303,8 @@ mod tests {
 	#[test]
 	fn set_bitrate_at_the_opening_rate_is_accepted() {
 		let mut enc = Openh264::new(&config()).unwrap();
-		enc.encode(&gray(), true).unwrap();
-		let opened = config().resolved_bitrate();
+		enc.encode_all(&gray(), true).unwrap();
+		let opened = config().resolved_bitrate().as_bps();
 
 		enc.set_bitrate(opened / 2).unwrap();
 		enc.set_bitrate(opened).unwrap();
@@ -251,15 +319,15 @@ mod tests {
 	#[test]
 	fn a_live_set_supersedes_a_deferred_one() {
 		let mut enc = Openh264::new(&config()).unwrap();
-		let opened = config().resolved_bitrate();
+		let opened = config().resolved_bitrate().as_bps();
 
 		// Deferred: the encoder doesn't exist yet.
 		enc.set_bitrate(opened / 2).unwrap();
-		enc.encode(&gray(), true).unwrap();
+		enc.encode_all(&gray(), true).unwrap();
 
 		// Live: this is the rate the caller last asked for.
 		enc.set_bitrate(opened / 4).unwrap();
-		enc.encode(&gray(), false).unwrap();
+		enc.encode_all(&gray(), false).unwrap();
 
 		assert_eq!(enc.read_bitrate(), (opened / 4) as i64, "the deferred rate resurrected");
 	}
@@ -278,7 +346,7 @@ mod tests {
 		] {
 			let config = Config {
 				kind: Kind::Software,
-				..Config::new(size.width, size.height, 30)
+				..Config::new(size.width, size.height, crate::FrameRate::new(30, 1).unwrap())
 			};
 			let mut enc = Openh264::new(&config).unwrap();
 
@@ -288,8 +356,9 @@ mod tests {
 			let surface = Surface::rgba(&rgba, size).unwrap();
 			let frame = Frame::new(surface, moq_net::Timestamp::from_micros(0).unwrap());
 
-			let encoded = enc.encode(&frame, true).unwrap();
-			let annexb = &encoded.first().expect("a keyframe").payload;
+			let encoded = enc.encode_all(&frame, true).unwrap();
+			let encoded = encoded.first().expect("a keyframe");
+			let annexb = &encoded.payload;
 
 			assert_eq!(declared_color(annexb), Some(described), "{size} SPS color description");
 
@@ -297,5 +366,35 @@ mod tests {
 			let i420 = frame.surface.to_i420().unwrap();
 			assert_eq!(i420.color(), Some(Color::infer(size)), "{size} converted pixels");
 		}
+	}
+
+	/// Every keyframe is flagged, the GOP cadence's as well as a forced one, and
+	/// the flag agrees with the bitstream.
+	#[test]
+	fn keyframes_are_flagged_on_the_cadence_and_on_a_cut() {
+		let config = Config {
+			join: std::time::Duration::from_secs(1),
+			..config()
+		};
+		let mut enc = Openh264::new(&config).unwrap();
+
+		let mut keyframes = Vec::new();
+		for index in 0..50u64 {
+			let frame = Frame {
+				timestamp: moq_net::Timestamp::from_micros(index * 33_333).unwrap(),
+				..gray()
+			};
+			for unit in enc.encode_all(&frame, index == 45).unwrap() {
+				assert_eq!(
+					unit.keyframe,
+					super::super::keyframe_annexb(crate::encode::Codec::H264, &unit.payload),
+					"frame {index}"
+				);
+				if unit.keyframe {
+					keyframes.push(index);
+				}
+			}
+		}
+		assert_eq!(keyframes, vec![0, 30, 45], "the opening, cadence, and forced keyframes");
 	}
 }

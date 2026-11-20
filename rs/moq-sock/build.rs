@@ -1,0 +1,30 @@
+// quinn-udp's cfg aliases, used by the `udp` module and its tests.
+use cfg_aliases::cfg_aliases;
+
+fn main() {
+	cfg_aliases! {
+		// Platforms
+		apple: {
+			any(
+				target_os = "macos",
+				target_os = "ios",
+				target_os = "tvos",
+				target_os = "visionos",
+				target_os = "watchos"
+			)
+		},
+		bsd: {
+			any(
+				target_os = "freebsd",
+				target_os = "openbsd",
+				target_os = "netbsd"
+			)
+		},
+		solarish: {
+			any(
+				target_os = "solaris",
+				target_os = "illumos"
+			)
+		},
+	}
+}

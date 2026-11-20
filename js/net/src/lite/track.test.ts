@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test";
+import { Duration } from "@moq/clock";
+import { ProtocolViolation } from "../error.ts";
 import * as Path from "../path.ts";
 import { Reader, Writer } from "../stream.ts";
-import { infoDefaults } from "../track.ts";
+import { Timescale } from "../time.ts";
+import { authoredInfo } from "../track.ts";
 import { Track, TrackInfo } from "./track.ts";
 import { Version } from "./version.ts";
 
@@ -16,10 +19,11 @@ function concat(chunks: Uint8Array[]): Uint8Array {
 	return out;
 }
 
-async function bytes(f: (w: Writer) => Promise<void>): Promise<Uint8Array> {
+async function bytes(f: (w: Writer) => Promise<void>, version: Version): Promise<Uint8Array> {
 	const written: Uint8Array[] = [];
 	const writer = new Writer(
 		new WritableStream<Uint8Array>({ write: (chunk) => void written.push(new Uint8Array(chunk)) }),
+		version,
 	);
 	await f(writer);
 	writer.close();
@@ -30,28 +34,78 @@ async function bytes(f: (w: Writer) => Promise<void>): Promise<Uint8Array> {
 test("TrackInfo round-trips on draft-05", async () => {
 	const info = new TrackInfo({
 		priority: 7,
-		ordered: false,
-		latencyMax: 2000,
+		maxAge: 2000,
 		timescale: 90000,
 	});
-	const reader = new Reader(undefined, await bytes((w) => info.encode(w, Version.DRAFT_05)));
+	const reader = new Reader(
+		undefined,
+		await bytes((w) => info.encode(w, Version.DRAFT_05), Version.DRAFT_05),
+		Version.DRAFT_05,
+	);
 	const got = await TrackInfo.decode(reader, Version.DRAFT_05);
 	expect(got.priority).toBe(7);
-	expect(got.ordered).toBe(false);
-	expect(got.latencyMax).toBe(2000);
-	expect(got.timescale).toBe(90000);
+	expect(got.maxAge).toBe(2000);
+	expect(got.timescale).toBe(Timescale(90000));
 });
 
-test("TrackInfo defaults match cross-language wire bytes", async () => {
-	const info = new TrackInfo(infoDefaults());
-	expect(await bytes((w) => info.encode(w, Version.DRAFT_05))).toEqual(
-		new Uint8Array([0x06, 0x00, 0x00, 0x53, 0x88, 0x43, 0xe8]),
+test("TrackInfo for Rust's default Info matches cross-language wire bytes", async () => {
+	// The default authored track is untimed, which lite-05 declares as milliseconds, and
+	// advertises the default zero max age.
+	const model = authoredInfo();
+	const info = new TrackInfo({
+		priority: model.priority,
+		maxAge: model.maxAge?.asMillis(),
+		timescale: model.timescale ?? undefined,
+		refresh: model.refresh ?? undefined,
+		compress: model.compression === "deflate",
+	});
+	expect(await bytes((w) => info.encode(w, Version.DRAFT_05), Version.DRAFT_05)).toEqual(
+		new Uint8Array([0x05, 0x80, 0x00, 0x00, 0x43, 0xe8]),
 	);
+});
+
+test("TrackInfo carries an untimed track as zero on lite-07 and milliseconds before", async () => {
+	const info = new TrackInfo({ priority: 1 });
+	const lite07 = await bytes((w) => info.encode(w, Version.DRAFT_07), Version.DRAFT_07);
+	// The timescale, then the compression codec.
+	expect(lite07.at(-2)).toBe(0);
+	const got = await TrackInfo.decode(new Reader(undefined, lite07, Version.DRAFT_07), Version.DRAFT_07);
+	expect(got.timescale).toBeUndefined();
+
+	for (const version of [Version.DRAFT_05, Version.DRAFT_06]) {
+		const encoded = await bytes((w) => info.encode(w, version), version);
+		const legacy = await TrackInfo.decode(new Reader(undefined, encoded, version), version);
+		expect(legacy.timescale).toBe(Timescale.MILLI);
+		// Zero is malformed where no untimed encoding exists. A one-byte timescale makes room for it.
+		const zero = await bytes((w) => new TrackInfo({ priority: 1, timescale: 1 }).encode(w, version), version);
+		zero[zero.length - 1] = 0;
+		await expect(TrackInfo.decode(new Reader(undefined, zero, version), version)).rejects.toThrow(RangeError);
+	}
+});
+
+test("TrackInfo carries the compression codec on lite-07 only", async () => {
+	const info = new TrackInfo({ priority: 1, compress: true });
+	const lite07 = await bytes((w) => info.encode(w, Version.DRAFT_07), Version.DRAFT_07);
+	expect(lite07.at(-1)).toBe(1);
+	const got = await TrackInfo.decode(new Reader(undefined, lite07, Version.DRAFT_07), Version.DRAFT_07);
+	expect(got.compress).toBe(true);
+
+	// Anything but none (0) or DEFLATE (1) is a protocol violation.
+	lite07[lite07.length - 1] = 2;
+	await expect(TrackInfo.decode(new Reader(undefined, lite07, Version.DRAFT_07), Version.DRAFT_07)).rejects.toThrow(
+		ProtocolViolation,
+	);
+
+	await expect(bytes((w) => info.encode(w, Version.DRAFT_06), Version.DRAFT_06)).rejects.toThrow();
 });
 
 test("Track request round-trips on draft-05", async () => {
 	const msg = new Track(Path.from("room"), "video");
-	const reader = new Reader(undefined, await bytes((w) => msg.encode(w, Version.DRAFT_05)));
+	const reader = new Reader(
+		undefined,
+		await bytes((w) => msg.encode(w, Version.DRAFT_05), Version.DRAFT_05),
+		Version.DRAFT_05,
+	);
 	const got = await Track.decode(reader, Version.DRAFT_05);
 	expect(got.broadcast).toBe(Path.from("room"));
 	expect(got.track).toBe("video");
@@ -59,5 +113,127 @@ test("Track request round-trips on draft-05", async () => {
 
 test("TRACK_INFO is rejected before draft-05", async () => {
 	const info = new TrackInfo({ timescale: 90000 });
-	await expect(bytes((w) => info.encode(w, Version.DRAFT_04))).rejects.toThrow();
+	await expect(bytes((w) => info.encode(w, Version.DRAFT_04), Version.DRAFT_04)).rejects.toThrow();
+});
+
+test("TrackInfo round-trips valid boundary metadata", async () => {
+	const info = new TrackInfo({
+		priority: 127,
+		maxAge: Number.MAX_SAFE_INTEGER - 1,
+		timescale: Number.MAX_SAFE_INTEGER,
+	});
+	const reader = new Reader(
+		undefined,
+		await bytes((w) => info.encode(w, Version.DRAFT_05), Version.DRAFT_05),
+		Version.DRAFT_05,
+	);
+	const got = await TrackInfo.decode(reader, Version.DRAFT_05);
+	expect(got.priority).toBe(127);
+	expect(got.maxAge).toBe(Number.MAX_SAFE_INTEGER - 1);
+	expect(got.timescale).toBe(Timescale(Number.MAX_SAFE_INTEGER));
+});
+
+test("TrackInfo refuses invalid fields at construction", () => {
+	for (const fields of [
+		{ priority: 128, timescale: 1000 },
+		{ priority: -129, timescale: 1000 },
+		{ priority: 1.5, timescale: 1000 },
+		{ timescale: 0 },
+		{ timescale: -1 },
+		{ timescale: 1.5 },
+		{ timescale: Number.NaN },
+		{ timescale: Number.POSITIVE_INFINITY },
+		{ timescale: Number.MAX_SAFE_INTEGER + 1 },
+		{ timescale: 2 ** 62 },
+		{ maxAge: -1, timescale: 1000 },
+		{ maxAge: 1.5, timescale: 1000 },
+		{ maxAge: Number.MAX_SAFE_INTEGER + 1, timescale: 1000 },
+		{ maxAge: Number.NaN, timescale: 1000 },
+		{ maxAge: Number.POSITIVE_INFINITY, timescale: 1000 },
+	]) {
+		expect(() => new TrackInfo(fields)).toThrow(RangeError);
+	}
+});
+
+test("mutated TrackInfo fields emit no bytes on encode", async () => {
+	for (const mutate of [
+		(info: TrackInfo) => {
+			info.priority = 256;
+		},
+		(info: TrackInfo) => {
+			info.timescale = 0 as Timescale;
+		},
+		(info: TrackInfo) => {
+			info.timescale = (Number.MAX_SAFE_INTEGER + 1) as Timescale;
+		},
+		(info: TrackInfo) => {
+			info.maxAge = Number.MAX_SAFE_INTEGER + 1;
+		},
+	]) {
+		const info = new TrackInfo({ priority: 1, maxAge: 0, timescale: 1000 });
+		mutate(info);
+		const written: Uint8Array[] = [];
+		const writer = new Writer(
+			new WritableStream<Uint8Array>({ write: (chunk) => void written.push(new Uint8Array(chunk)) }),
+			Version.DRAFT_05,
+		);
+		await expect(info.encode(writer, Version.DRAFT_05)).rejects.toThrow(RangeError);
+		writer.close();
+		await writer.closed;
+		expect(written).toEqual([]);
+	}
+});
+
+for (const version of [Version.DRAFT_05, Version.DRAFT_06, Version.DRAFT_07]) {
+	test(`optional max age survives ${version}`, async () => {
+		for (const maxAge of [undefined, 0, 30_000, Number.MAX_SAFE_INTEGER]) {
+			const encoded = await bytes((w) => new TrackInfo({ maxAge }).encode(w, version), version);
+			const got = await TrackInfo.decode(new Reader(undefined, encoded, version), version);
+			expect(got.maxAge).toBe(
+				version !== Version.DRAFT_07 && maxAge === Number.MAX_SAFE_INTEGER ? undefined : maxAge,
+			);
+		}
+	});
+}
+
+for (const version of [Version.DRAFT_05, Version.DRAFT_06]) {
+	test(`legacy unlimited value fits the old u53 reader on ${version}`, async () => {
+		const encoded = await bytes((w) => new TrackInfo({}).encode(w, version), version);
+		const old = new Reader(undefined, encoded, version);
+		await old.u53(); // message length
+		await old.u8(); // priority
+		if (version === Version.DRAFT_05) await old.bool();
+		const maxAge = Duration.millis(await old.u53());
+		expect(maxAge).toEqual(Duration.millis(Number.MAX_SAFE_INTEGER));
+		expect(authoredInfo({ maxAge }).maxAge).toEqual(maxAge);
+		expect(await old.u53()).toBe(1000);
+	});
+	test(`legacy unlimited range decodes without unsafe numeric conversion on ${version}`, async () => {
+		const boundary = BigInt(Number.MAX_SAFE_INTEGER);
+		for (const age of [boundary - 1n, boundary, 1n << 53n, 1n << 60n, (1n << 62n) - 1n]) {
+			const payload = await bytes(async (w) => {
+				await w.u8(0);
+				if (version === Version.DRAFT_05) await w.bool(false);
+				await w.u62(age);
+				await w.u53(1000);
+			}, version);
+			const encoded = await bytes(async (w) => {
+				await w.u53(payload.length);
+				await w.write(payload);
+			}, version);
+			const info = await TrackInfo.decode(new Reader(undefined, encoded, version), version);
+			expect(info.maxAge).toBe(age < boundary ? Number(age) : undefined);
+		}
+	});
+}
+
+test("refresh ratio survives lite-07 and disappears on legacy wires", async () => {
+	for (const version of [Version.DRAFT_05, Version.DRAFT_06, Version.DRAFT_07]) {
+		for (const refresh of [undefined, 0, 3, 0xffff_ffff]) {
+			const info = new TrackInfo({ priority: 7, refresh });
+			const encoded = await bytes((w) => info.encode(w, version), version);
+			const decoded = await TrackInfo.decode(new Reader(undefined, encoded, version), version);
+			expect(decoded.refresh).toBe(version === Version.DRAFT_07 ? refresh : undefined);
+		}
+	}
 });

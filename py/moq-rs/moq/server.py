@@ -4,26 +4,34 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from typing import Literal
+from typing import NamedTuple
 
-from moq_ffi import MoqRequest, MoqServer
+from moq_ffi import MoqQuicConfig, MoqRequest, MoqServer, MoqServerConfig, MoqServerTls, MoqTransport
 
-from .origin import OriginProducer
-from .publish import BroadcastProducer
+from ._records import _implementation, _strs
+from .origin import OriginProducer, Route
 from .session import Session
+from .types import Instance
 
-# The wire transport carrying a session: raw QUIC, iroh's peer-to-peer QUIC, or WebSocket.
-Transport = Literal["quic", "iroh", "websocket"]
+# The network transport carrying an incoming session.
+Transport = MoqTransport
+
+
+class _Listening(NamedTuple):
+    """A server's bound listener, set by entering it and cleared by exiting."""
+
+    inner: MoqServer
+    local_addr: str
 
 
 class Request:
     """Wraps MoqRequest, an incoming session that can be accepted or rejected.
 
     Use `await request.accept()` to complete the handshake, or
-    `await request.reject(code)` to reject with an HTTP status code.
+    `await request.reject(code)` to reject with an application error code.
 
     Dropping a Request without responding closes the underlying connection
-    silently; call `reject(code)` to send an explicit HTTP status.
+    silently; call `reject(code)` to send an explicit MoQ error.
     """
 
     def __init__(self, inner: MoqRequest) -> None:
@@ -45,31 +53,39 @@ class Request:
         return self._inner.query()
 
     @property
+    def peer_implementation(self) -> str | None:
+        """The implementation the client advertised, like ``moq-py/0.6.0 moq-ffi/0.4.12 ...``.
+
+        Peer-controlled: use it for logs and rollout counts, never to authorize.
+        """
+        return self._inner.peer_implementation()
+
+    @property
     def transport(self) -> Transport:
-        """The wire transport carrying this session (`"quic"`, `"iroh"`, or `"websocket"`)."""
-        return self._inner.transport()  # type: ignore[return-value]
+        """The network transport carrying this session."""
+        return self._inner.transport()
 
-    def set_publish(self, origin: OriginProducer | None) -> None:
-        """Override the publish origin for this session. Falls back to the
-        server's configured publish origin if unset."""
-        self._inner.set_publish(origin._inner if origin is not None else None)
-
-    def set_consume(self, origin: OriginProducer | None) -> None:
-        """Override the consume origin for this session. Falls back to the
-        server's configured consume origin if unset."""
-        self._inner.set_consume(origin._inner if origin is not None else None)
-
-    async def accept(self) -> Session:
+    async def accept(self, *, publish: OriginProducer | None = None, consume: OriginProducer | None = None) -> Session:
         """Complete the MoQ handshake and return the established session.
+
+        None inherits the server origin; a supplied origin replaces it.
+        Pass a fresh origin for isolation, or the same origin for both sides.
 
         The caller must hold the returned session to keep the connection
         alive; dropping it closes the session. Raises `Error.AlreadyResponded`
         if `accept()` or `reject()` has already been called.
         """
-        return Session(await self._inner.accept())
+        return Session(
+            await self._inner.accept(
+                publish=publish._inner if publish is not None else None,
+                consume=consume._inner if consume is not None else None,
+            )
+        )
 
     async def reject(self, code: int) -> None:
-        """Reject the session with the given HTTP status code.
+        """Reject the session with the given application error code.
+
+        Codes 401 and 403 map to the protocol's unauthorized error.
 
         Raises `Error.AlreadyResponded` if `accept()` or `reject()` has already
         been called.
@@ -87,7 +103,7 @@ class Server:
     In simple mode (no origin provided), creates an internal origin automatically::
 
         async with Server("127.0.0.1:4443", tls_generate=["localhost"]) as server:
-            broadcast = server.create_broadcast("live")
+            route = server.route("live")  # announced while held
             await server.serve()
 
     Or hand-roll the accept loop if you need per-request control::
@@ -99,9 +115,10 @@ class Server:
                     continue
                 session = await request.accept()  # hold to keep the connection alive
 
-    Exiting the context manager stops accepting new sessions but does not
-    close in-flight sessions; those stay alive until their handles are
-    dropped or `Session.cancel()` is called.
+    Exiting the context manager stops accepting new sessions and releases the
+    listening socket before it returns, so the address can be bound again
+    immediately. In-flight sessions stay alive until their handles are dropped
+    or `Session.cancel()` is called.
 
     In advanced mode, provide your own origins for full control::
 
@@ -110,8 +127,11 @@ class Server:
             "127.0.0.1:4443",
             tls_generate=["localhost"],
             publish=origin,
-            subscribe=origin,
+            consume=origin,
         )
+
+    ``keylog=True`` writes TLS session secrets to the file ``SSLKEYLOGFILE`` names, for
+    decrypting a capture; without ``SSLKEYLOGFILE`` entering the server fails.
     """
 
     def __init__(
@@ -121,56 +141,62 @@ class Server:
         tls_cert: Sequence[str] = (),
         tls_key: Sequence[str] = (),
         tls_generate: Sequence[str] = (),
+        versions: Sequence[str] = (),
+        max_streams: int | None = None,
+        keylog: bool = False,
         publish: OriginProducer | None = None,
-        subscribe: OriginProducer | None = None,
+        consume: OriginProducer | None = None,
     ) -> None:
-        self._bind = bind
-        self._tls_cert = list(tls_cert)
-        self._tls_key = list(tls_key)
-        self._tls_generate = list(tls_generate)
-
         # If neither origin is provided, create a shared internal one.
-        if publish is None and subscribe is None:
-            self._origin: OriginProducer | None = OriginProducer()
-            self._publish_origin: OriginProducer | None = self._origin
-            self._consume_origin: OriginProducer | None = self._origin
-        else:
-            self._origin = None
-            self._publish_origin = publish
-            self._consume_origin = subscribe
+        if publish is None and consume is None:
+            publish = consume = OriginProducer()
+        self._publish_origin = publish
 
-        self._inner: MoqServer | None = None
-        self._local_addr: str | None = None
+        self._config = MoqServerConfig(
+            bind=bind,
+            versions=_strs(versions, "versions"),
+            tls=MoqServerTls(
+                cert=_strs(tls_cert, "tls_cert"),
+                key=_strs(tls_key, "tls_key"),
+                generate=_strs(tls_generate, "tls_generate"),
+            ),
+            quic=MoqQuicConfig(max_streams=max_streams, keylog=keylog),
+            implementation=_implementation(),
+            publish=None if publish is None else publish._inner,
+            consume=None if consume is None else consume._inner,
+        )
+
+        # Binding while a bare MoqServer, until exit.
+        self._state: MoqServer | _Listening | None = None
 
     async def __aenter__(self):
-        self._inner = MoqServer()
-        self._inner.set_bind(self._bind)
-        if self._tls_cert:
-            self._inner.set_tls_cert(self._tls_cert)
-        if self._tls_key:
-            self._inner.set_tls_key(self._tls_key)
-        if self._tls_generate:
-            self._inner.set_tls_generate(self._tls_generate)
-        if self._publish_origin is not None:
-            self._inner.set_publish(self._publish_origin._inner)
-        if self._consume_origin is not None:
-            self._inner.set_consume(self._consume_origin._inner)
-
-        self._local_addr = await self._inner.listen()
+        if self._state is not None:
+            raise RuntimeError("server already entered; exit it before entering again")
+        inner = MoqServer(self._config)
+        self._state = inner
+        try:
+            self._state = _Listening(inner, await inner.listen())
+        except BaseException:
+            self._state = None
+            inner.cancel()
+            raise
         return self
 
     async def __aexit__(self, *exc) -> None:
-        if self._inner is not None:
-            self._inner.cancel()
-            self._inner = None
-        self._local_addr = None
+        state = self._state
+        if isinstance(state, _Listening):
+            self._state = None
+            state.inner.cancel()
+
+    def _listening(self) -> _Listening:
+        if not isinstance(self._state, _Listening):
+            raise RuntimeError("server not listening; use 'async with'")
+        return self._state
 
     @property
     def local_addr(self) -> str:
         """The bound local address, available after entering the context manager."""
-        if self._local_addr is None:
-            raise RuntimeError("server not listening; use 'async with'")
-        return self._local_addr
+        return self._listening().local_addr
 
     def cert_fingerprints(self) -> list[str]:
         """SHA-256 fingerprints of the configured TLS certificates, hex-encoded.
@@ -178,30 +204,29 @@ class Server:
         Useful for pinning a generated self-signed certificate in a browser
         via WebTransport's `serverCertificateHashes`.
         """
-        if self._inner is None:
-            raise RuntimeError("server not listening; use 'async with'")
-        return self._inner.cert_fingerprints()
+        return self._listening().inner.cert_fingerprints()
 
     def __aiter__(self):
         return self
 
     async def __anext__(self) -> Request:
-        if self._inner is None:
-            raise RuntimeError("server not listening; use 'async with'")
-        request = await self._inner.accept()
+        request = await self._listening().inner.accept()
         if request is None:
             raise StopAsyncIteration
         return Request(request)
 
-    def create_broadcast(self, path: str) -> BroadcastProducer:
-        """Create a live broadcast at ``path``, served to incoming sessions.
+    def route(
+        self, path: str, *, hidden: bool = False, cost: int = 0, instance: Instance | None = None, epoch: int = 0
+    ) -> Route:
+        """Create a route at ``path`` owning a broadcast served to incoming sessions; hold it
+        to keep it announced.
 
-        See :meth:`OriginProducer.create_broadcast`.
+        See :meth:`OriginProducer.route`.
         """
         origin = self._publish_origin
         if origin is None:
             raise RuntimeError("no publish origin configured")
-        return origin.create_broadcast(path)
+        return origin.route(path, hidden=hidden, cost=cost, instance=instance, epoch=epoch)
 
     async def serve(self) -> None:
         """Accept every session in a loop, holding each one alive until it closes.

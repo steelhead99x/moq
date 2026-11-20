@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { type Time, Varint } from "@moq/net";
+import { Duration } from "@moq/clock";
+import { Varint } from "@moq/net";
 import { Format } from "./index.ts";
 
 const PROP_TIMESCALE = 0x08;
@@ -26,6 +27,28 @@ function concat(...parts: Uint8Array[]): Uint8Array {
 	return out;
 }
 
+test("Format treats an empty payload as a duration marker", () => {
+	const props = concat(Varint.encode(PROP_TIMESTAMP), Varint.encode(33_000));
+	const frame = buildFrame(props, new Uint8Array());
+	const fmt = new Format("video");
+	const [decoded] = fmt.decode(frame);
+	expect(decoded.payload.byteLength).toBe(0);
+	expect(fmt.end(decoded)).toEqual(Duration.micros(33_000));
+});
+
+test("Format preserves empty data payloads", () => {
+	const props = concat(Varint.encode(PROP_TIMESTAMP), Varint.encode(33_000));
+	const fmt = new Format();
+	const [decoded] = fmt.decode(buildFrame(props, new Uint8Array()));
+	expect(decoded.payload.byteLength).toBe(0);
+	expect(fmt.end(decoded)).toBeUndefined();
+});
+
+test("Format decodes no frame from a data track's empty object and throws on a media track's", () => {
+	expect(new Format("data").decode(new Uint8Array(0))).toEqual([]);
+	expect(() => new Format("video").decode(new Uint8Array(0))).toThrow();
+});
+
 test("Format decodes timestamp at default microseconds timescale", () => {
 	const props = concat(Varint.encode(PROP_TIMESTAMP), Varint.encode(12_345));
 	const payload = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
@@ -34,7 +57,7 @@ test("Format decodes timestamp at default microseconds timescale", () => {
 	const fmt = new Format();
 	const [decoded] = fmt.decode(frame);
 
-	expect(decoded.timestamp).toBe(12_345 as Time.Micro);
+	expect(decoded.timestamp).toEqual(Duration.micros(12_345));
 	expect(decoded.payload).toEqual(payload);
 	expect(decoded.keyframe).toBe(false);
 });
@@ -52,7 +75,7 @@ test("Format honors per-frame timescale property", () => {
 	const fmt = new Format();
 	const [decoded] = fmt.decode(frame);
 
-	expect(decoded.timestamp).toBe(2_000_000 as Time.Micro);
+	expect(decoded.timestamp).toEqual(Duration.micros(2_000_000));
 });
 
 test("Format skips unknown odd-typed properties", () => {
@@ -70,7 +93,7 @@ test("Format skips unknown odd-typed properties", () => {
 	const fmt = new Format();
 	const [decoded] = fmt.decode(frame);
 
-	expect(decoded.timestamp).toBe(10 as Time.Micro);
+	expect(decoded.timestamp).toEqual(Duration.micros(10));
 	expect(decoded.payload).toEqual(payload);
 });
 
@@ -113,6 +136,22 @@ test("Format decodes the draft-03 timestamp property", () => {
 	const fmt = new Format();
 	const [decoded] = fmt.decode(frame);
 
-	expect(decoded.timestamp).toBe(4242 as Time.Micro);
+	expect(decoded.timestamp).toEqual(Duration.micros(4242));
 	expect(decoded.payload).toEqual(payload);
+});
+
+test("Format skips an unknown property whose value needs all 62 bits", () => {
+	const props = concat(
+		Varint.encode(0x02),
+		Varint.encode(2n ** 62n - 1n),
+		Varint.encode(PROP_TIMESTAMP - 0x02),
+		Varint.encode(1_000),
+	);
+	const [decoded] = new Format().decode(buildFrame(props, new Uint8Array([1])));
+	expect(decoded.timestamp).toEqual(Duration.micros(1_000));
+});
+
+test("Format rejects a timestamp past 2^53 - 1 instead of rounding", () => {
+	const props = concat(Varint.encode(PROP_TIMESTAMP), Varint.encode(2n ** 53n));
+	expect(() => new Format().decode(buildFrame(props, new Uint8Array()))).toThrow(/larger than 53-bits/);
 });

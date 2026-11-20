@@ -1,19 +1,19 @@
 import type * as Catalog from "@moq/hang/catalog";
 
-/** Internal key used to describe which fields can change a support probe's result. */
-export const supportCacheKey = Symbol("supportCacheKey");
-
 /** The catalog fields that determine the demuxer and WebCodecs decoder instance. */
 export type DecoderConfig = Pick<
 	Catalog.VideoConfig,
 	"codec" | "container" | "description" | "displayAspectWidth" | "displayAspectHeight"
 > & {
 	optimizeForLatency: boolean;
+	interlaced: boolean;
 };
 
 /** The routing and decoder state whose changes require a new playback pipeline. */
 export type PlaybackIdentity = {
 	broadcast: Catalog.VideoConfig["broadcast"];
+	instance: Catalog.VideoConfig["instance"];
+	track: Catalog.VideoConfig["track"];
 	decoder: DecoderConfig;
 };
 
@@ -21,6 +21,8 @@ export type PlaybackIdentity = {
 export function playbackIdentity(config: Catalog.VideoConfig): PlaybackIdentity {
 	return {
 		broadcast: config.broadcast,
+		instance: config.instance,
+		track: config.track,
 		decoder: {
 			codec: config.codec,
 			container: config.container,
@@ -28,6 +30,7 @@ export function playbackIdentity(config: Catalog.VideoConfig): PlaybackIdentity 
 			displayAspectWidth: config.displayAspectWidth,
 			displayAspectHeight: config.displayAspectHeight,
 			optimizeForLatency: config.optimizeForLatency ?? true,
+			interlaced: config.interlaced ?? false,
 		},
 	};
 }
@@ -35,4 +38,10 @@ export function playbackIdentity(config: Catalog.VideoConfig): PlaybackIdentity 
 /** Return a stable cache key for the fields used by the WebCodecs support probe. */
 export function decoderConfigKey(config: Catalog.VideoConfig): string {
 	return JSON.stringify(playbackIdentity(config).decoder);
+}
+
+// Chrome configures a hardware H.264 decoder that then fails the first interlaced picture: field
+// coding only shows in the SPS, and Chrome falls back to software only when configure() fails.
+export function hardwareAcceleration(config: { interlaced?: boolean }): HardwareAcceleration | undefined {
+	return config.interlaced ? "prefer-software" : undefined;
 }

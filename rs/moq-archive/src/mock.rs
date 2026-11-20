@@ -1,0 +1,309 @@
+//! A test object store: any inner store plus an operation log and injected failures.
+
+use std::sync::{Arc, Mutex};
+
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
+use object_store::memory::InMemory;
+use object_store::path::Path;
+use object_store::{
+	CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
+	PutOptions, PutPayload, PutResult,
+};
+
+/// One call made against a [`Mock`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Op {
+	Get(String),
+	Put(String),
+	Delete(String),
+	/// A streaming listing, with its prefix and exclusive offset.
+	List {
+		prefix: String,
+		offset: Option<String>,
+	},
+}
+
+#[derive(Debug, Default)]
+struct State {
+	ops: Vec<Op>,
+	/// PUTs whose path contains any of these fail.
+	fail_puts: Vec<String>,
+	/// GETs whose path contains any of these return Not Found.
+	hide_gets: Vec<String>,
+	/// GETs whose path contains any of these fail, as a store outage would.
+	fail_gets: Vec<String>,
+	/// GETs whose path contains the pattern wait for a permit before reading.
+	stall_gets: Vec<(String, Arc<tokio::sync::Semaphore>)>,
+	/// Deletes whose path contains any of these fail.
+	fail_deletes: Vec<String>,
+	/// Streaming listings end with an error after every entry.
+	fail_lists: bool,
+	/// Streaming listings yield entries in descending order, like a backend that promises none.
+	unordered: bool,
+	/// PUTs whose path contains any of these wait until [`Mock::release`].
+	holds: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Mock {
+	inner: Arc<dyn ObjectStore>,
+	state: Arc<Mutex<State>>,
+	/// Wakes PUTs blocked in [`Self::hold_puts`].
+	hold: Arc<tokio::sync::Notify>,
+}
+
+impl Mock {
+	pub fn new(inner: impl ObjectStore) -> Self {
+		Self {
+			inner: Arc::new(inner),
+			state: Default::default(),
+			hold: Arc::new(tokio::sync::Notify::new()),
+		}
+	}
+
+	pub fn memory() -> Self {
+		Self::new(InMemory::new())
+	}
+
+	/// Share this store's objects, without its log or failures.
+	pub fn fork(&self) -> Self {
+		Self {
+			inner: self.inner.clone(),
+			state: Default::default(),
+			hold: Arc::new(tokio::sync::Notify::new()),
+		}
+	}
+
+	/// Every call since the last take.
+	pub fn take(&self) -> Vec<Op> {
+		std::mem::take(&mut self.state().ops)
+	}
+
+	/// Paths of every GET since the last take.
+	pub fn gets(&self) -> Vec<String> {
+		self.take()
+			.into_iter()
+			.filter_map(|op| match op {
+				Op::Get(path) => Some(path),
+				_ => None,
+			})
+			.collect()
+	}
+
+	pub fn fail_puts(&self, pattern: &str) -> &Self {
+		self.state().fail_puts.push(pattern.to_string());
+		self
+	}
+
+	pub fn hide_gets(&self, pattern: &str) -> &Self {
+		self.state().hide_gets.push(pattern.to_string());
+		self
+	}
+
+	pub fn fail_gets(&self, pattern: &str) -> &Self {
+		self.state().fail_gets.push(pattern.to_string());
+		self
+	}
+
+	/// End every [`fail_gets`](Self::fail_gets) outage.
+	pub fn heal_gets(&self) -> &Self {
+		self.state().fail_gets.clear();
+		self
+	}
+
+	/// Hold every GET whose path contains `pattern` until the returned semaphore gets a permit.
+	pub fn stall_gets(&self, pattern: &str) -> Arc<tokio::sync::Semaphore> {
+		let gate = Arc::new(tokio::sync::Semaphore::new(0));
+		self.state().stall_gets.push((pattern.to_string(), gate.clone()));
+		gate
+	}
+
+	pub fn fail_deletes(&self, pattern: &str) -> &Self {
+		self.state().fail_deletes.push(pattern.to_string());
+		self
+	}
+
+	pub fn fail_lists(&self) -> &Self {
+		self.state().fail_lists = true;
+		self
+	}
+
+	pub fn unordered(&self) -> &Self {
+		self.state().unordered = true;
+		self
+	}
+
+	/// Hold PUTs whose path contains `pattern` until [`release`](Self::release).
+	pub fn hold_puts(&self, pattern: &str) -> &Self {
+		self.state().holds.push(pattern.to_string());
+		self
+	}
+
+	/// Unblock every PUT [`hold_puts`](Self::hold_puts) is waiting on.
+	pub fn release(&self) {
+		self.state().holds.clear();
+		self.hold.notify_waiters();
+	}
+
+	/// Wait out a [`hold_puts`](Self::hold_puts) gate.
+	///
+	/// The waiter is armed before the check, so a `release` in between is not missed.
+	async fn wait_held(&self, location: &Path) {
+		loop {
+			let notified = self.hold.notified();
+			let held = self
+				.state()
+				.holds
+				.iter()
+				.any(|pattern| location.as_ref().contains(pattern));
+			if !held {
+				return;
+			}
+			notified.await;
+		}
+	}
+
+	fn state(&self) -> std::sync::MutexGuard<'_, State> {
+		self.state.lock().unwrap()
+	}
+
+	fn log(&self, op: Op) {
+		self.state().ops.push(op);
+	}
+
+	fn listed(
+		&self,
+		prefix: Option<&Path>,
+		offset: Option<&Path>,
+	) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+		self.log(Op::List {
+			prefix: prefix.map(ToString::to_string).unwrap_or_default(),
+			offset: offset.map(ToString::to_string),
+		});
+		let listed = match offset {
+			Some(offset) => self.inner.list_with_offset(prefix, offset),
+			None => self.inner.list(prefix),
+		};
+		let state = self.state();
+		let listed = match state.unordered {
+			true => futures::stream::once(async move {
+				let mut metas: Vec<ObjectMeta> = listed.try_collect().await?;
+				metas.sort_by(|a, b| b.location.cmp(&a.location));
+				Ok::<_, object_store::Error>(futures::stream::iter(metas.into_iter().map(Ok)))
+			})
+			.try_flatten()
+			.boxed(),
+			false => listed,
+		};
+		match state.fail_lists {
+			true => listed
+				.chain(futures::stream::once(async { Err(unsupported("list")) }))
+				.boxed(),
+			false => listed,
+		}
+	}
+}
+
+fn unsupported(operation: &str) -> object_store::Error {
+	object_store::Error::NotImplemented {
+		operation: operation.into(),
+		implementer: "Mock".into(),
+	}
+}
+
+impl std::fmt::Display for Mock {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "Mock({})", self.inner)
+	}
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Mock {
+	async fn put_opts(
+		&self,
+		location: &Path,
+		payload: PutPayload,
+		opts: PutOptions,
+	) -> object_store::Result<PutResult> {
+		self.log(Op::Put(location.to_string()));
+		if self.state().fail_puts.iter().any(|p| location.as_ref().contains(p)) {
+			return Err(unsupported("put"));
+		}
+		self.wait_held(location).await;
+		self.inner.put_opts(location, payload, opts).await
+	}
+
+	async fn put_multipart_opts(
+		&self,
+		location: &Path,
+		opts: PutMultipartOptions,
+	) -> object_store::Result<Box<dyn MultipartUpload>> {
+		self.inner.put_multipart_opts(location, opts).await
+	}
+
+	async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+		self.log(Op::Get(location.to_string()));
+		if self.state().hide_gets.iter().any(|p| location.as_ref().contains(p)) {
+			return Err(object_store::Error::NotFound {
+				path: location.to_string(),
+				source: "hidden".into(),
+			});
+		}
+		if self.state().fail_gets.iter().any(|p| location.as_ref().contains(p)) {
+			return Err(object_store::Error::Generic {
+				store: "mock",
+				source: "outage".into(),
+			});
+		}
+		let stall = self
+			.state()
+			.stall_gets
+			.iter()
+			.find(|(pattern, _)| location.as_ref().contains(pattern))
+			.map(|(_, gate)| gate.clone());
+		if let Some(gate) = stall {
+			gate.acquire().await.expect("stall gate closed").forget();
+		}
+		self.inner.get_opts(location, options).await
+	}
+
+	fn delete_stream(
+		&self,
+		locations: BoxStream<'static, object_store::Result<Path>>,
+	) -> BoxStream<'static, object_store::Result<Path>> {
+		let state = self.state.clone();
+		let locations = locations
+			.and_then(move |path| {
+				let mut state = state.lock().unwrap();
+				state.ops.push(Op::Delete(path.to_string()));
+				let failed = state.fail_deletes.iter().any(|p| path.as_ref().contains(p));
+				futures::future::ready(match failed {
+					true => Err(unsupported("delete")),
+					false => Ok(path),
+				})
+			})
+			.boxed();
+		self.inner.delete_stream(locations)
+	}
+
+	fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+		self.listed(prefix, None)
+	}
+
+	fn list_with_offset(
+		&self,
+		prefix: Option<&Path>,
+		offset: &Path,
+	) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+		self.listed(prefix, Some(offset))
+	}
+
+	async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+		self.inner.list_with_delimiter(prefix).await
+	}
+
+	async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> object_store::Result<()> {
+		self.inner.copy_opts(from, to, options).await
+	}
+}

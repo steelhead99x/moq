@@ -5,15 +5,18 @@
 //! the framing the catalog importer for [`Config::codec`] expects: H.264
 //! (`moq_mux::codec::h264`) or H.265 (`moq_mux::codec::h265`).
 
+use std::marker::PhantomData;
+use std::rc::Rc;
+
 use super::Encoded;
 use super::backend::{self, Backend};
-use crate::{Color, Error, Frame, Size};
+use crate::{Color, Error, Frame, FrameRate, Size};
 
 /// Output video codec. `#[non_exhaustive]` so new codecs can be added without
 /// breaking external `match`es.
 ///
 /// Not every codec has a backend on every platform: H.265 is hardware-only
-/// (VideoToolbox on macOS today). Building an [`Encoder`] returns
+/// (VideoToolbox on macOS and iOS today). Building an [`Encoder`] returns
 /// [`Error::NoEncoder`](crate::Error::NoEncoder) when nothing can encode the
 /// requested codec on this machine.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -32,69 +35,230 @@ pub enum Codec {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Kind {
-	/// Prefer a platform hardware encoder, falling back to the openh264 software
-	/// encoder when none is available.
+	/// Prefer a platform hardware encoder, falling back to OpenH264 when the
+	/// `openh264` feature is enabled.
 	#[default]
 	Auto,
 	/// Hardware only; error if none is available.
 	Hardware,
-	/// Software only (openh264 for H.264).
+	/// Software only (OpenH264 for H.264 when its feature is enabled).
 	Software,
 	/// A specific backend by name, e.g. `"videotoolbox"`, `"mediacodec"`,
 	/// `"nvenc"`, `"vaapi"`, `"v4l2"`, or `"openh264"`.
 	Named(String),
 }
 
+/// How an encoder trades latency for compression at the configured bitrate.
+///
+/// Bitrate is set separately, via [`Config::bitrate`]. Presets differ in the
+/// codec effort spent per frame and the buffering the backend allows. Each
+/// backend maps a preset onto the controls it actually has, so two presets can
+/// apply the same controls on one backend, and some backends cannot rule out
+/// frame reordering or queueing: V4L2 leaves both to the driver, and
+/// MediaCodec's no-B-frame setting is only a hint. The encoder logs the
+/// controls that took effect at debug level when it opens. A preset describes the encoder alone, not keyframe join time, transport delay,
+/// or viewer playout.
+///
+/// `#[non_exhaustive]` so a later policy can be added without breaking a
+/// `match`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Preset {
+	/// The least per-frame encode time and buffering the backend supports.
+	#[default]
+	LowLatency,
+	/// More codec effort per frame for better compression.
+	Balanced,
+	/// The most codec effort the backend spends without queueing frames.
+	Quality,
+}
+
+/// The latency and compression controls a backend actually applied at open.
+///
+/// A report, not a request: a backend that has no distinct mapping for the
+/// requested [`Preset`] names the one whose controls it did apply, and one that
+/// could not confirm the controls a preset needs names none.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Applied {
+	/// The preset whose controls took effect, or `None` when the backend could
+	/// not confirm them (a refused or advisory low-latency setting).
+	pub preset: Option<Preset>,
+	/// The backend controls that took effect, for display, e.g.
+	/// `"p1, low-latency tuning, no B-frames, CBR, 1-frame VBV"`. Not a parse target.
+	pub controls: String,
+	/// Whether [`Encoder::cut`] can force a group boundary; one that cannot (a V4L2
+	/// driver without the force-keyframe control) refuses every cut.
+	pub cut: bool,
+}
+
+impl Applied {
+	// A confirmed preset disables frame reordering even when the bitstream omits its bound.
+	fn reorder(&self, parsed: Option<u8>) -> Option<u8> {
+		self.preset.map(|_| 0).or(parsed)
+	}
+
+	// A confirmed preset neither reorders nor queues frames, so a frame trails the others by no more
+	// than its own encode, which the player's frame term already covers: the catalog `delay` is a
+	// known zero rather than one to measure. An unconfirmed one leaves it to measurement.
+	fn delay(&self) -> Option<std::time::Duration> {
+		self.preset.map(|_| std::time::Duration::ZERO)
+	}
+
+	/// A report that `preset` took effect through `controls`.
+	#[cfg_attr(
+		not(any(
+			feature = "openh264",
+			apple,
+			all(target_os = "linux", any(feature = "nvidia", feature = "vaapi"))
+		)),
+		allow(dead_code, reason = "only the encoder backends report a preset")
+	)]
+	pub(crate) fn new(preset: Preset, controls: impl Into<String>) -> Self {
+		Self {
+			preset: Some(preset),
+			controls: controls.into(),
+			// The encoder reports `cut` from the backend's `can_cut`.
+			cut: false,
+		}
+	}
+
+	/// A report of `controls` that were requested but that the backend cannot
+	/// confirm, so no preset is claimed.
+	#[cfg(any(
+		target_os = "windows",
+		all(target_os = "android", feature = "mediacodec"),
+		all(target_os = "linux", feature = "v4l2")
+	))]
+	pub(crate) fn unconfirmed(controls: impl Into<String>) -> Self {
+		Self {
+			preset: None,
+			controls: controls.into(),
+			cut: false,
+		}
+	}
+}
+
 /// Encoder configuration. `width` / `height` / `framerate` are the encoded
-/// output; input frames must already be at this resolution.
+/// output; external Vulkan frames are scaled by the backend on their GPU.
 ///
 /// `#[non_exhaustive]`: build via [`Config::new`] and set the optional fields,
 /// so future knobs don't break callers.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Config {
+	/// Encoded width in pixels.
 	pub width: u32,
+	/// Encoded height in pixels.
 	pub height: u32,
-	pub framerate: u32,
-	/// Target bitrate in bits per second. `None` derives a sane default
+	/// Encoded frame rate.
+	pub framerate: FrameRate,
+	/// Target bitrate. `None` derives a sane default
 	/// from resolution and framerate (~0.07 bits per pixel per second).
-	pub bitrate: Option<u64>,
-	/// Keyframe interval in frames. Subscribers joining mid-stream wait at
-	/// most this many frames before they can start decoding.
-	pub gop: u32,
+	pub bitrate: Option<moq_net::bandwidth::Rate>,
+	/// The time between join points: a keyframe (an IDR with its parameter sets
+	/// in band) opens a group this often, so a subscriber joining mid-stream waits
+	/// at most this long for a picture it can decode. [`Encoder::cut`] opens one
+	/// sooner. Rounded to whole frames at `framerate`, never below one; see
+	/// [`effective_join`](Self::effective_join). Measured by the frames'
+	/// timestamps on a backend that can cut, so a source running slower than
+	/// `framerate` still opens a group this often, overshooting by less than one of
+	/// its frames. [`Encoder::new`] refuses zero. Defaults to two seconds.
+	pub join: std::time::Duration,
 	/// Output codec. Defaults to [`Codec::H264`].
 	pub codec: Codec,
+	/// Which encoder implementation to use. Defaults to [`Kind::Auto`].
 	pub kind: Kind,
+	/// How the encoder trades latency for compression. Defaults to
+	/// [`Preset::LowLatency`].
+	pub preset: Preset,
 	/// The color space of the input frames, written into the bitstream's VUI so a
 	/// decoder doesn't have to guess. `None` uses [`Color::infer`], which is both
 	/// what the crate's own RGB conversions produce and what a player falls back
 	/// to, so leaving it unset keeps the pixels and the label in agreement.
 	///
-	/// Set it only when feeding frames the crate did not convert and whose space
-	/// you know from elsewhere.
+	/// Set it to the first frame's [`Surface::color`](crate::Surface::color)
+	/// when that is known: a decoded or resized frame keeps its source's space,
+	/// which need not be the one this size infers. [`Encoder::encode`] refuses a
+	/// frame labelled differently with [`Error::ColorMismatch`] rather than
+	/// mislabel it.
 	pub color: Option<Color>,
+	/// Scale frames that arrive at another size to the encoded size, rather than
+	/// refusing them. `None` (the default) refuses them.
+	///
+	/// The scale runs wherever the encoder does, which for a
+	/// [`Sink`](super::Sink) is its own thread: a caller fanning one decoded
+	/// picture out to several encoders (a transcode ladder) hands each the
+	/// native frame and keeps the per-encoder pixel work off its own threads.
+	/// On Apple platforms a `Sink` encodes inline, so the scale runs on the
+	/// caller there. External Vulkan inputs the backend scales on the GPU are
+	/// left to it.
+	///
+	/// A scaled frame keeps its source's space, and an unlabelled one is labelled
+	/// with what [`Color::infer`] guesses for its original size. Set
+	/// [`color`](Self::color) to match, or a frame scaled across 576 lines is
+	/// refused with [`Error::ColorMismatch`].
+	pub resize: Option<crate::resize::Config>,
+	/// External Vulkan input device, required before opening a GPU-only encoder.
+	/// `None` retains selection for CPU and native decoder/capture surfaces.
+	#[cfg(target_os = "linux")]
+	pub input: Option<crate::frame::vulkan::Device>,
+	/// The VA-API render node, such as `/dev/dri/renderD129`. `None` picks the
+	/// first that encodes, decodes, and scales, so a DMA-BUF moves between them
+	/// without a copy. A named node is used even when it fails to open.
+	#[cfg(all(target_os = "linux", feature = "vaapi"))]
+	pub vaapi: Option<std::path::PathBuf>,
+	/// The V4L2 M2M encoder node, such as `/dev/video11`. `None` searches every
+	/// node for one that encodes H.264, which a driver whose format enumeration
+	/// is wrong can defeat.
+	#[cfg(all(target_os = "linux", feature = "v4l2"))]
+	pub v4l2: Option<std::path::PathBuf>,
 }
 
 impl Config {
 	/// A config encoding `width` x `height` at `framerate`, with the default
-	/// codec, GOP, and bitrate.
-	pub fn new(width: u32, height: u32, framerate: u32) -> Self {
+	/// codec, join, and bitrate.
+	pub fn new(width: u32, height: u32, framerate: FrameRate) -> Self {
 		Self {
 			width,
 			height,
 			framerate,
 			bitrate: None,
-			// ~2 seconds at the configured framerate.
-			gop: framerate.saturating_mul(2).max(1),
+			join: std::time::Duration::from_secs(2),
 			codec: Codec::default(),
 			kind: Kind::Auto,
+			preset: Preset::default(),
 			color: None,
+			resize: None,
+			#[cfg(target_os = "linux")]
+			input: None,
+			#[cfg(all(target_os = "linux", feature = "vaapi"))]
+			vaapi: None,
+			#[cfg(all(target_os = "linux", feature = "v4l2"))]
+			v4l2: None,
 		}
 	}
 
 	/// The encoded resolution.
 	pub fn size(&self) -> Size {
 		Size::new(self.width, self.height)
+	}
+
+	/// The time between join points the encoder holds to: [`join`](Self::join)
+	/// rounded to whole frames at `framerate`, the value a catalog declares.
+	pub fn effective_join(&self) -> std::time::Duration {
+		// Rounded up, since a catalog declares it as the longest group.
+		let nanos = (u128::from(self.keyframe_interval()) * 1_000_000_000 * u128::from(self.framerate.denominator()))
+			.div_ceil(u128::from(self.framerate.numerator()));
+		std::time::Duration::from_nanos(nanos.try_into().unwrap_or(u64::MAX))
+	}
+
+	/// Frames between keyframes at `framerate`: [`join`](Self::join) rounded to
+	/// the nearest frame, and never below one, since a positive join shorter than
+	/// a frame still opens a group per frame. Each backend keys on this count, and
+	/// the encoder keys sooner when the timestamps reach it first.
+	pub(crate) fn keyframe_interval(&self) -> u32 {
+		self.framerate.frames(self.join).max(1)
 	}
 
 	/// The catalog rendition an encoder for this config produces.
@@ -118,33 +282,41 @@ impl Config {
 	/// Fails when this machine cannot encode the config at all, which makes it a fail-fast check:
 	/// better here than on the first frame of a track that is already advertised.
 	pub async fn probe(&self) -> Result<hang::catalog::VideoConfig, Error> {
+		// Mid-gray, since the picture only has to make the encoder emit its parameter sets.
+		let size = self.size();
+		let i420 = crate::I420::new(size, vec![0x80u8; crate::I420::len(size)?])?;
+		let frame = Frame::new(crate::Surface::I420(i420), moq_net::Timestamp::from_micros(0)?);
+		Ok(self.probe_frame(frame).await?.0)
+	}
+
+	/// [`probe`](Self::probe), encoding `frame` rather than a CPU picture and handing back the
+	/// throwaway encoder, so the probe also proves the encoder reads that kind of surface.
+	pub(crate) async fn probe_frame(&self, frame: Frame) -> Result<(hang::catalog::VideoConfig, super::Sink), Error> {
 		// A `Sink` rather than an `Encoder`: this runs on whatever executor thread the caller is on,
 		// and the Windows backend's COM apartment has to be opened and closed on one thread.
 		let mut sink = super::Sink::open(self).await?;
 
-		// Mid-gray, since the picture only has to make the encoder emit its parameter sets.
-		let size = self.size();
-		let i420 = crate::I420::new(
-			size.width,
-			size.height,
-			vec![0x80u8; crate::I420::len(size.width, size.height)],
-		)?;
-		let frame = Frame::new(crate::Surface::I420(i420), moq_net::Timestamp::from_micros(0)?);
-
-		sink.keyframe();
-		let mut encoded = sink.encode(frame).await?;
+		// No cut: the first picture out of a fresh encoder is a keyframe on every backend, which
+		// is what carries the parameter sets, and a backend that cannot cut still probes.
+		sink.encode(frame).await?;
+		let mut annexb = Vec::new();
+		while let Some(encoded) = sink.receive()? {
+			annexb.extend_from_slice(&encoded.payload);
+		}
 		// A backend that pipelines holds the first frame, so drain it rather than reading nothing.
-		if encoded.is_empty() {
-			encoded = sink.flush().await?;
+		if annexb.is_empty() {
+			sink.flush().await?;
+			while let Some(encoded) = sink.receive()? {
+				annexb.extend_from_slice(&encoded.payload);
+			}
 		}
 
-		let annexb: Vec<u8> = encoded.iter().flat_map(|frame| frame.payload.iter().copied()).collect();
 		let parsed = match self.codec {
 			Codec::H264 => moq_mux::codec::h264::config(&annexb),
 			Codec::H265 => moq_mux::codec::h265::config(&annexb),
 		};
 		let mut rendition = parsed.map_err(|err| {
-			Error::Codec(anyhow::anyhow!(
+			Error::codec(anyhow::anyhow!(
 				"{} emitted no usable parameter sets: {err}",
 				sink.name()
 			))
@@ -152,9 +324,11 @@ impl Config {
 
 		// Neither is in the bitstream: the target bitrate is nowhere in it, and the framerate only
 		// rides in an optional VUI. Fill them from the config that produced the rest.
-		rendition.bitrate.get_or_insert(self.resolved_bitrate());
-		rendition.framerate.get_or_insert(self.framerate.into());
-		Ok(rendition)
+		rendition.bitrate.get_or_insert(self.resolved_bitrate().as_bps());
+		rendition.framerate.get_or_insert(self.framerate.as_f64());
+		rendition.reorder = sink.applied().reorder(rendition.reorder);
+		rendition.delay = sink.applied().delay();
+		Ok((rendition, sink))
 	}
 
 	/// Resolved input color space: explicit override, or the size-based guess
@@ -165,8 +339,19 @@ impl Config {
 		self.color.unwrap_or_else(|| Color::infer(self.size()))
 	}
 
+	/// The resize options, scaling on this encoder's VA-API node unless they name one.
+	fn resolved_resize(&self) -> Option<crate::resize::Config> {
+		let resize = self.resize.clone()?;
+		#[cfg(all(target_os = "linux", feature = "vaapi"))]
+		let resize = crate::resize::Config {
+			vaapi: resize.vaapi.or_else(|| self.vaapi.clone()),
+			..resize
+		};
+		Some(resize)
+	}
+
 	/// Resolved bitrate: explicit override, or a pixels-per-second estimate.
-	pub(crate) fn resolved_bitrate(&self) -> u64 {
+	pub(crate) fn resolved_bitrate(&self) -> moq_net::bandwidth::Rate {
 		self.bitrate
 			.unwrap_or_else(|| default_bitrate(self.size(), self.framerate))
 	}
@@ -174,49 +359,71 @@ impl Config {
 
 /// The bitrate an unconfigured encode resolves to: 0.07 bits per pixel per second, which matches
 /// the JS publisher's default and lands ~4.4 Mbps for 1080p30.
-pub(crate) fn default_bitrate(size: Size, framerate: u32) -> u64 {
-	((size.pixels() * framerate as u64) as f64 * 0.07) as u64
+pub(crate) fn default_bitrate(size: Size, framerate: FrameRate) -> moq_net::bandwidth::Rate {
+	moq_net::bandwidth::Rate::from_bps((size.pixels() as f64 * framerate.as_f64() * 0.07) as u64)
 }
 
-/// Video encoder. Build one with [`Encoder::new`], feed it raw [`Frame`]s via
-/// [`encode`](Self::encode), and publish the resulting [`Encoded`] access units
-/// through a [`Producer`](super::Producer) built for the same [`Codec`].
+/// Video encoder. Build one with [`Encoder::new`], submit raw [`Frame`]s via
+/// [`encode`](Self::encode), [`receive`](Self::receive) the resulting
+/// [`Encoded`] access units until it returns `None`, and publish them through a
+/// [`Producer`](super::Producer) built for the same [`Codec`].
+///
+/// An encoder is bound to the thread that opens it. Use [`Sink`](super::Sink)
+/// when the owner can move between threads.
+///
+/// ```compile_fail
+/// fn move_to_another_thread(encoder: moq_video::encode::Encoder) {
+///     std::thread::spawn(move || drop(encoder));
+/// }
+/// ```
 pub struct Encoder {
 	backend: Box<dyn Backend>,
 	codec: Codec,
 	size: Size,
-	bitrate: u64,
+	bitrate: moq_net::bandwidth::Rate,
 	/// What the backend wrote into the bitstream's VUI, kept so a frame declaring
 	/// a different space is caught rather than silently mislabeled.
 	color: Color,
-	/// A keyframe asked for by [`Encoder::keyframe`], applied to the next frame.
-	/// Held rather than applied immediately because the caller decides a group
+	/// A cut asked for by [`Encoder::cut`], applied to the next frame. Held
+	/// rather than applied immediately because the caller decides a group
 	/// boundary before it has the frame that opens it.
-	pending_keyframe: bool,
+	pending_cut: bool,
+	/// Where [`Config::join`] cuts a source slower than its frame rate.
+	join: Join,
+	/// How to scale a frame at another size, if at all; see [`Config::resize`].
+	resize: Option<crate::resize::Config>,
+	#[cfg(target_os = "linux")]
+	input: Option<crate::frame::vulkan::Device>,
+	/// Keeps direct use bound to the constructing thread, regardless of backend.
+	_thread_bound: PhantomData<Rc<()>>,
 }
 
 impl Encoder {
 	/// Open an encoder for `config`.
 	pub fn new(config: &Config) -> Result<Self, Error> {
-		// Validate at the construction boundary so both entry points (the
-		// capture loop and a bring-your-own-frames caller) reject a zero
-		// framerate, which would produce a degenerate codec time base.
-		if config.framerate == 0 {
-			return Err(Error::InvalidFramerate(0));
-		}
 		// I420 chroma is subsampled 2x2, so the encoded resolution must be even.
 		let size = config.size();
 		size.validate("encoder")?;
 		size.validate_encodable("encoder", config.framerate)?;
+		if config.join.is_zero() {
+			return Err(Error::ZeroJoin);
+		}
 
 		let backend = backend::open(config)?;
+		let applied = backend.applied();
+		tracing::debug!(encoder = backend.name(), requested = ?config.preset, applied = ?applied.preset, controls = %applied.controls, "encoder preset");
 		Ok(Self {
 			backend,
 			codec: config.codec,
 			size,
 			bitrate: config.resolved_bitrate(),
 			color: config.resolved_color(),
-			pending_keyframe: false,
+			pending_cut: false,
+			join: Join::new(config),
+			resize: config.resolved_resize(),
+			#[cfg(target_os = "linux")]
+			input: config.input,
+			_thread_bound: PhantomData,
 		})
 	}
 
@@ -225,22 +432,29 @@ impl Encoder {
 		self.backend.name()
 	}
 
-	/// The resolution this encoder emits, which every frame fed to it must match.
+	/// The latency and compression controls the backend applied for
+	/// [`Config::preset`], and whether it cuts, fixed for the session's lifetime.
+	pub fn applied(&self) -> Applied {
+		Applied {
+			cut: self.backend.can_cut(),
+			..self.backend.applied()
+		}
+	}
+
+	/// The resolution this encoder emits; external Vulkan inputs may be larger.
 	pub fn size(&self) -> Size {
 		self.size
 	}
 
-	/// The current target bitrate in bits per second: what
-	/// [`Config::bitrate`] resolved to at open, or the last value
-	/// [`set_bitrate`](Self::set_bitrate) accepted.
-	pub fn bitrate(&self) -> u64 {
+	/// The current target bitrate: what [`Config::bitrate`] resolved to at open, or
+	/// the last value [`set_bitrate`](Self::set_bitrate) accepted.
+	pub fn bitrate(&self) -> moq_net::bandwidth::Rate {
 		self.bitrate
 	}
 
-	/// Retune the live encoder to `bitrate` bits per second, taking effect from
-	/// roughly the next frame. No IDR is forced, so this is cheap enough to
+	/// Retune the live encoder to `bitrate`, taking effect from roughly the next frame. No IDR is forced, so this is cheap enough to
 	/// drive from a congestion controller: pair it with
-	/// [`rate::Control`](super::rate::Control), which decides *when* the target
+	/// [`moq_mux::rate::Control`], which decides *when* the target
 	/// is worth moving.
 	///
 	/// Setting the rate the encoder is already at does nothing and succeeds.
@@ -251,11 +465,13 @@ impl Encoder {
 	/// running. That's not fatal: the encoder keeps running at its current rate,
 	/// so a caller driving a control loop should stop adapting rather than stop
 	/// encoding.
-	pub fn set_bitrate(&mut self, bitrate: u64) -> Result<(), Error> {
+	pub fn set_bitrate(&mut self, bitrate: moq_net::bandwidth::Rate) -> Result<(), Error> {
 		if bitrate == self.bitrate {
 			return Ok(());
 		}
-		self.backend.set_bitrate(bitrate)?;
+		// The backends speak to codec APIs that want a plain integer, so the unit is
+		// unwrapped once here rather than in each of them.
+		self.backend.set_bitrate(bitrate.as_bps())?;
 		// Only after the backend accepts it, so a failed set doesn't leave the
 		// getter reporting a rate the encoder isn't using.
 		self.bitrate = bitrate;
@@ -268,78 +484,147 @@ impl Encoder {
 		self.codec
 	}
 
-	/// Ask for the next frame to be encoded as a keyframe (an IDR), on top of the
-	/// ones [`Config::gop`] already inserts on its own.
+	/// Cut a new group at the next frame, on top of the boundaries
+	/// [`Config::join`] places on its own. Today that means encoding it as a
+	/// keyframe (an IDR), so a subscriber can start decoding there.
 	///
-	/// Rarely needed: the encoder keys frames automatically, so reach for this only
-	/// when something outside the encoder needs a decodable starting point at a
-	/// specific frame. Opening a new group is the usual reason (a subscriber has to
-	/// be able to start there); resuming after an idle gap is another.
+	/// Rarely needed: the encoder opens groups automatically, so reach for this
+	/// only when something outside the encoder needs a boundary at a specific
+	/// frame. A source group boundary (transcode mirrors the source's groups) is
+	/// the usual reason; a scene change, a source switch, or a subscriber joining
+	/// over [`track::Info::refresh`](moq_net::track::Info::refresh) are others.
+	/// Capture cuts for joiners itself.
 	///
 	/// The request waits for the next [`encode`](Self::encode) rather than applying
 	/// at once, so it is safe to call before the frame exists. Calling it repeatedly
-	/// before a frame arrives asks for one keyframe, not several.
-	pub fn keyframe(&mut self) {
-		self.pending_keyframe = true;
+	/// before a frame arrives cuts once, not several times.
+	///
+	/// # Errors
+	///
+	/// Returns [`Error::CutUnsupported`] when this backend cannot force a group
+	/// boundary (a V4L2 driver without the force-keyframe control), in which case
+	/// nothing is queued: groups keep falling every [`Config::join`]'s worth of
+	/// frames at [`Config::framerate`], and the caller decides whether that layout
+	/// is acceptable rather than finding out from the stream.
+	pub fn cut(&mut self) -> Result<(), Error> {
+		self.check_cut()?;
+		self.pending_cut = true;
+		Ok(())
 	}
 
-	/// Encode one raw [`Frame`], whether it came from capture, a decoder (the
+	/// What [`cut`](Self::cut) would answer, without queueing anything.
+	pub(crate) fn check_cut(&self) -> Result<(), Error> {
+		match self.backend.can_cut() {
+			true => Ok(()),
+			false => Err(Error::CutUnsupported(self.backend.name())),
+		}
+	}
+
+	/// Submit one raw [`Frame`], whether it came from capture, a decoder (the
 	/// transcode input path), or your own pixels via
 	/// [`Surface::rgba`](crate::Surface::rgba).
 	///
-	/// Returns zero or more encoded access units, each carrying the timestamp of the
-	/// raw frame it came from: a backend that buffers hands back an earlier frame's
-	/// output, so the two don't always line up.
+	/// Its access units come out of [`receive`](Self::receive), each carrying the
+	/// timestamp of the raw frame it came from: a backend that buffers readies an
+	/// earlier frame's output, so the two don't always line up.
 	///
 	/// A GPU surface feeds a hardware encoder on the same device directly
 	/// (NVDEC -> NVENC never leaves the GPU, a `CVPixelBuffer` goes straight to
 	/// VideoToolbox); anything else falls back to a CPU I420 upload. The frame must
-	/// already be at the encoder's resolution: decode with
-	/// [`decode::Config::resize`](crate::decode::Config), or scale first with
-	/// [`Frame::resize`](crate::Frame::resize).
-	pub fn encode(&mut self, frame: &Frame) -> Result<Vec<Encoded>, Error> {
+	/// already be at the encoder's resolution, except external Vulkan inputs
+	/// which the backend scales on the GPU. [`Config::resize`] scales the rest
+	/// here; without it, scale them with
+	/// [`Frame::resize`](crate::Frame::resize), which
+	/// [`decode::Config::scale_hint`](crate::decode::Config::scale_hint) lets a
+	/// hardware decoder make a no-op.
+	pub fn encode(&mut self, frame: &Frame) -> Result<(), Error> {
 		// A transposed frame is why this compares the shape rather than a byte
 		// count: 240x320 and 320x240 hold the same number of bytes.
+		#[cfg(target_os = "linux")]
+		let external = if let crate::Surface::Vulkan(image) = &frame.surface {
+			let device = image.image().device;
+			if self.input != Some(device) {
+				return Err(Error::Unsupported(format!(
+					"external Vulkan {device} does not match encoder input {:?}",
+					self.input
+				)));
+			}
+			true
+		} else {
+			false
+		};
+		#[cfg(not(target_os = "linux"))]
+		let external = false;
+		// A backend that scales a GPU surface itself writes it straight into its
+		// own input, rather than into a scaled copy made here.
+		let scaled = external
+			|| self.resize.as_ref().is_some_and(|config| {
+				config.output.resolve(&frame.surface) == crate::Output::Native && self.backend.scales(&frame.surface)
+			});
+		let resized;
+		let frame = match &self.resize {
+			Some(config) if !scaled && frame.size() != self.size => {
+				resized = frame.resize(self.size, config)?;
+				&resized
+			}
+			_ => frame,
+		};
 		let size = frame.size();
-		if size != self.size {
-			return Err(Error::Codec(anyhow::anyhow!(
+		if !scaled && size != self.size {
+			return Err(Error::codec(anyhow::anyhow!(
 				"frame {size} does not match encoder {}",
 				self.size
 			)));
 		}
 		// The VUI is fixed when the session opens, so a frame in a different space
-		// gets encoded under the wrong label. Reached by resizing across the
+		// would be encoded under the wrong label. Reached by resizing across the
 		// standard-definition boundary, where the pixels keep their space but the
-		// encoder was sized into another one; `Config::color` is the way to pin it.
-		//
-		// Warn rather than reject: a live gateway transcoding a source whose VUI
-		// disagrees with its resolution should keep serving a mislabeled stream
-		// rather than drop it, and this is no worse than the untagged stream that
-		// came before. Once, because it would otherwise fire every frame.
-		if let Some(color) = frame.surface.color()
+		// encoder was sized into another one, and by a source whose space changes
+		// mid-stream.
+		// A frame the backend scales keeps its samples' space, and an unlabelled
+		// one means what `Color::infer` guesses for its own size, as
+		// `Frame::resize` would have labelled the copy.
+		let color = match frame.surface.color() {
+			None if scaled && !external && size != self.size => Some(Color::infer(size)),
+			color => color,
+		};
+		if let Some(color) = color
 			&& color != self.color
 		{
-			static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-			WARN_ONCE.call_once(|| {
-				tracing::warn!(
-					frame = ?color,
-					encoder = ?self.color,
-					"frame color space differs from the one written into the bitstream; set encode::Config::color"
-				);
+			return Err(Error::ColorMismatch {
+				frame: color,
+				encoder: self.color,
 			});
 		}
-		let encoded = self.backend.encode(frame, self.pending_keyframe)?;
+		let timestamp = std::time::Duration::from(frame.timestamp);
+		let cut = self.pending_cut || (self.backend.can_cut() && self.join.due(timestamp));
+		self.backend.encode(frame, cut)?;
 		// Cleared only once the frame is through: a failed encode produced no
 		// picture, so the request still belongs to whatever comes next rather than
 		// being swallowed. The size check above returns early for the same reason.
-		self.pending_keyframe = false;
+		self.pending_cut = false;
+		self.join.encoded(timestamp, cut);
+		Ok(())
+	}
+
+	/// Pop the oldest ready access unit, or `None` while the codec holds the rest.
+	///
+	/// Call until it returns `None` after each [`encode`](Self::encode) and
+	/// [`flush`](Self::flush).
+	pub fn receive(&mut self) -> Result<Option<Encoded>, Error> {
+		let encoded = self.backend.receive()?;
+		if let Some(encoded) = &encoded {
+			self.join.observe(encoded);
+		}
 		Ok(encoded)
 	}
 
-	/// Return every access unit the codec is still holding, leaving the encoder
-	/// ready for the frames that follow. Each keeps the timestamp of the raw frame
-	/// it was encoded from, so a drained tail stays in step with what came before
-	/// it.
+	/// Mark the end of input, so [`receive`](Self::receive) returns every access
+	/// unit the codec is still holding. The encoder stays ready for the frames
+	/// that follow. Each keeps the timestamp of the raw frame it was encoded from,
+	/// so a drained tail stays in step with what came before it.
+	///
+	/// Call it before dropping the encoder, or its last frames are lost.
 	///
 	/// Reach for this at a boundary the output has to respect, which for a live
 	/// broadcast is a group: a hardware codec that pipelines holds the last frames
@@ -350,26 +635,124 @@ impl Encoder {
 	/// Not free: emptying the pipeline gives up the overlap between one frame's
 	/// encode and the next frame's submission, so flush at boundaries rather than
 	/// per frame.
-	pub fn flush(&mut self) -> Result<Vec<Encoded>, Error> {
+	pub fn flush(&mut self) -> Result<(), Error> {
 		self.backend.flush()
 	}
 
-	/// Flush the encoder, returning any buffered frames. Each keeps the timestamp
-	/// of the raw frame it was encoded from, so a drained tail stays in step with
-	/// what was published before it.
-	///
-	/// Consumes the encoder: nothing can be encoded after a flush, so this is the
-	/// last call rather than one leaving a drained encoder in your hands.
-	pub fn finish(mut self) -> Result<Vec<Encoded>, Error> {
-		self.backend.finish()
+	/// Submit `frame` and collect everything it readied.
+	#[cfg(test)]
+	pub(crate) fn encode_all(&mut self, frame: &Frame) -> Result<Vec<Encoded>, Error> {
+		self.encode(frame)?;
+		self.receive_all()
+	}
+
+	/// Flush and collect the tail.
+	#[cfg(test)]
+	pub(crate) fn flush_all(&mut self) -> Result<Vec<Encoded>, Error> {
+		self.flush()?;
+		self.receive_all()
+	}
+
+	#[cfg(test)]
+	fn receive_all(&mut self) -> Result<Vec<Encoded>, Error> {
+		let mut encoded = Vec::new();
+		while let Some(unit) = self.receive()? {
+			encoded.push(unit);
+		}
+		Ok(encoded)
+	}
+}
+
+/// The keyframes [`Config::join`] adds for a source slower than [`Config::framerate`].
+///
+/// Each backend keys every [`Config::keyframe_interval`] frames, which a slower
+/// source (a camera dropping to 20 fps in low light) stretches past the join the
+/// catalog declared. This keys the first frame whose distance from the last
+/// keyframe, counted in frames at the configured rate and rounded to the nearest,
+/// reaches that interval: a source at the configured rate keys on the same frame
+/// as the backend whatever its jitter, and a slower one overshoots the join by
+/// less than one of its frames. A faster source reaches the backend's count first.
+struct Join {
+	framerate: FrameRate,
+	interval: u32,
+	/// The last keyframe's timestamp, `None` before the first frame, which every
+	/// backend keys.
+	last: Option<std::time::Duration>,
+}
+
+impl Join {
+	fn new(config: &Config) -> Self {
+		Self {
+			framerate: config.framerate,
+			interval: config.keyframe_interval(),
+			last: None,
+		}
+	}
+
+	/// Whether the frame at `timestamp` is due a keyframe.
+	fn due(&self, timestamp: std::time::Duration) -> bool {
+		self.last
+			.and_then(|last| timestamp.checked_sub(last))
+			.is_some_and(|elapsed| self.framerate.frames(elapsed) >= self.interval)
+	}
+
+	/// The frame at `timestamp` went in, keyed when `cut`.
+	fn encoded(&mut self, timestamp: std::time::Duration, cut: bool) {
+		// A timestamp behind the last keyframe starts a new timeline, measured from
+		// here rather than held until it catches up with the old one.
+		if cut || self.last.is_none_or(|last| timestamp < last) {
+			self.last = Some(timestamp);
+		}
+	}
+
+	/// Count `encoded` if it is a keyframe, including one the backend placed on
+	/// its own count, so the next is measured from the latest.
+	fn observe(&mut self, encoded: &Encoded) {
+		if encoded.keyframe {
+			self.last = self.last.max(Some(encoded.timestamp.into()));
+		}
 	}
 }
 
 #[cfg(test)]
 mod tests {
+	#![cfg_attr(
+		not(feature = "openh264"),
+		allow(dead_code, unused_imports, reason = "only the `openh264` feature uses it")
+	)]
+
+	use std::collections::VecDeque;
+
 	use super::*;
 
 	use crate::{I420, Surface};
+
+	#[test]
+	fn reorder_is_declared_only_for_confirmed_controls() {
+		for preset in [Preset::LowLatency, Preset::Balanced, Preset::Quality] {
+			let applied = Applied {
+				preset: Some(preset),
+				..Applied::default()
+			};
+			assert_eq!(applied.reorder(None), Some(0));
+			assert_eq!(applied.reorder(Some(3)), Some(0));
+		}
+		let unconfirmed = Applied::default();
+		assert_eq!(unconfirmed.reorder(None), None);
+		assert_eq!(unconfirmed.reorder(Some(3)), Some(3));
+	}
+
+	#[test]
+	fn delay_is_a_known_zero_only_for_confirmed_controls() {
+		for preset in [Preset::LowLatency, Preset::Balanced, Preset::Quality] {
+			let applied = Applied {
+				preset: Some(preset),
+				..Applied::default()
+			};
+			assert_eq!(applied.delay(), Some(std::time::Duration::ZERO));
+		}
+		assert_eq!(Applied::default().delay(), None);
+	}
 
 	/// A mid-gray RGBA buffer: encodable without a camera.
 	fn gray_rgba(width: u32, height: u32) -> Vec<u8> {
@@ -394,10 +777,11 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "openh264")]
 	fn software_encoder_emits_annexb() {
 		let config = Config {
 			kind: Kind::Software,
-			..Config::new(320, 240, 30)
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
 		};
 		let mut encoder = Encoder::new(&config).expect("openh264 is vendored, always available");
 		assert_eq!(encoder.name(), "openh264");
@@ -405,11 +789,11 @@ mod tests {
 		let mut frames = Vec::new();
 		for i in 0..30 {
 			if i == 0 {
-				encoder.keyframe();
+				encoder.cut().unwrap();
 			}
-			frames.extend(encoder.encode(&gray_frame(320, 240, i)).unwrap());
+			frames.extend(encoder.encode_all(&gray_frame(320, 240, i)).unwrap());
 		}
-		frames.extend(encoder.finish().unwrap());
+		frames.extend(encoder.flush_all().unwrap());
 
 		assert!(!frames.is_empty(), "encoder produced no packets");
 
@@ -437,36 +821,22 @@ mod tests {
 		);
 	}
 
-	/// The bring-your-own-pixels path: RGBA in through `Surface::rgba`, Annex-B out.
-	#[test]
-	fn encode_rgba_surface_emits_annexb() {
-		let config = Config {
-			kind: Kind::Software,
-			..Config::new(320, 240, 30)
-		};
-		let mut encoder = Encoder::new(&config).unwrap();
-
-		let mut frames = encoder.encode(&gray_frame(320, 240, 0)).unwrap();
-		frames.extend(encoder.finish().unwrap());
-		assert!(!frames.is_empty());
-		let packets = payloads(&frames);
-		assert!(packets[0].starts_with(&[0, 0, 0, 1]) || packets[0].starts_with(&[0, 0, 1]));
-	}
-
 	/// The same path starting from planar I420 the caller already has.
 	#[test]
+	#[cfg(feature = "openh264")]
 	fn encode_i420_surface_emits_annexb() {
 		let config = Config {
 			kind: Kind::Software,
-			..Config::new(320, 240, 30)
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
 		};
 		let mut encoder = Encoder::new(&config).unwrap();
 
 		// A mid-gray I420 frame: flat 0x80 across all three planes.
-		let i420 = I420::new(320, 240, vec![0x80u8; I420::len(320, 240)]).unwrap();
+		let size = Size::new(320, 240);
+		let i420 = I420::new(size, vec![0x80u8; I420::len(size).unwrap()]).unwrap();
 		let frame = Frame::new(Surface::I420(i420), at(0));
-		let mut frames = encoder.encode(&frame).unwrap();
-		frames.extend(encoder.finish().unwrap());
+		let mut frames = encoder.encode_all(&frame).unwrap();
+		frames.extend(encoder.flush_all().unwrap());
 		assert!(!frames.is_empty());
 		let packets = payloads(&frames);
 		assert!(packets[0].starts_with(&[0, 0, 0, 1]) || packets[0].starts_with(&[0, 0, 1]));
@@ -476,10 +846,27 @@ mod tests {
 	/// top-left corner.
 	#[test]
 	fn encode_rejects_dimension_mismatch() {
-		let Ok(mut encoder) = Encoder::new(&Config::new(320, 240, 30)) else {
+		let Ok(mut encoder) = Encoder::new(&Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())) else {
 			return;
 		};
-		assert!(matches!(encoder.encode(&gray_frame(640, 480, 0)), Err(Error::Codec(_))));
+		assert!(matches!(
+			encoder.encode_all(&gray_frame(640, 480, 0)),
+			Err(Error::Codec(_))
+		));
+	}
+
+	/// An encoder told to resize scales a frame at another size itself, so a
+	/// [`Sink`](super::super::Sink) does that work on its own thread.
+	#[test]
+	fn encode_resizes_when_configured() {
+		let mut config = Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap());
+		config.resize = Some(crate::resize::Config::default());
+		let Ok(mut encoder) = Encoder::new(&config) else {
+			return;
+		};
+		let mut frames = encoder.encode_all(&gray_frame(640, 480, 0)).unwrap();
+		frames.extend(encoder.flush_all().unwrap());
+		assert!(!frames.is_empty());
 	}
 
 	/// A transposed frame is why the encoder compares the shape rather than the
@@ -487,7 +874,7 @@ mod tests {
 	/// check alone would accept this and encode garbage.
 	#[test]
 	fn encode_rejects_transposed_frame() {
-		let Ok(mut encoder) = Encoder::new(&Config::new(320, 240, 30)) else {
+		let Ok(mut encoder) = Encoder::new(&Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())) else {
 			return;
 		};
 
@@ -497,35 +884,34 @@ mod tests {
 			gray_rgba(320, 240).len(),
 			"the byte counts must collide"
 		);
-		assert!(matches!(encoder.encode(&transposed), Err(Error::Codec(_))));
-	}
-
-	#[test]
-	fn new_rejects_zero_framerate() {
-		// Framerate is validated before any backend opens, so this holds on every
-		// platform regardless of which encoders are compiled in.
-		let config = Config::new(320, 240, 0);
-		assert!(matches!(Encoder::new(&config), Err(Error::InvalidFramerate(0))));
+		assert!(matches!(encoder.encode_all(&transposed), Err(Error::Codec(_))));
 	}
 
 	#[test]
 	fn unknown_named_encoder_errors() {
 		let config = Config {
 			kind: Kind::Named("definitely_not_a_codec".into()),
-			..Config::new(320, 240, 30)
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
 		};
-		assert!(matches!(Encoder::new(&config), Err(Error::NoEncoder(_))));
+		// Not `NoEncoder`: that reads "no usable video encoder found (tried: )"
+		// and describes a machine with no encoder rather than a name that is not
+		// one. The name asked for and the names available are both here.
+		let err = Encoder::new(&config).err().expect("an unknown name cannot open");
+		assert!(
+			matches!(&err, Error::UnknownEncoder { name, .. } if name == "definitely_not_a_codec"),
+			"unexpected error: {err:?}",
+		);
 	}
 
 	/// Exercises the hand-rolled VideoToolbox backend end to end on macOS:
 	/// synthetic frames through the real `VTCompressionSession`, asserting the
 	/// AVCC -> Annex-B conversion produces a self-contained IDR (SPS+PPS+slice).
-	#[cfg(target_os = "macos")]
+	#[cfg(apple)]
 	#[test]
 	fn videotoolbox_emits_annexb_keyframe() {
 		let config = Config {
 			kind: Kind::Named("videotoolbox".into()),
-			..Config::new(320, 240, 30)
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
 		};
 		let mut encoder = Encoder::new(&config).expect("videotoolbox is available on macOS");
 		assert_eq!(encoder.name(), "videotoolbox");
@@ -533,11 +919,11 @@ mod tests {
 		let mut frames = Vec::new();
 		for i in 0..10 {
 			if i == 0 {
-				encoder.keyframe();
+				encoder.cut().unwrap();
 			}
-			frames.extend(encoder.encode(&gray_frame(320, 240, i)).unwrap());
+			frames.extend(encoder.encode_all(&gray_frame(320, 240, i)).unwrap());
 		}
-		frames.extend(encoder.finish().unwrap());
+		frames.extend(encoder.flush_all().unwrap());
 
 		assert!(!frames.is_empty(), "encoder produced no packets");
 		// VideoToolbox completes each frame before returning, so the timestamps come
@@ -566,13 +952,13 @@ mod tests {
 	/// HEVC via VideoToolbox: synthetic frames through the real
 	/// `VTCompressionSession` with `kCMVideoCodecType_HEVC`, asserting the
 	/// HVCC -> Annex-B conversion produces a self-contained IRAP (VPS+SPS+PPS+IDR).
-	#[cfg(target_os = "macos")]
+	#[cfg(apple)]
 	#[test]
 	fn videotoolbox_emits_annexb_keyframe_h265() {
 		let config = Config {
 			codec: Codec::H265,
 			kind: Kind::Named("videotoolbox".into()),
-			..Config::new(320, 240, 30)
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
 		};
 		let mut encoder = Encoder::new(&config).expect("videotoolbox HEVC is available on macOS");
 		assert_eq!(encoder.name(), "videotoolbox");
@@ -581,11 +967,11 @@ mod tests {
 		let mut frames = Vec::new();
 		for i in 0..10 {
 			if i == 0 {
-				encoder.keyframe();
+				encoder.cut().unwrap();
 			}
-			frames.extend(encoder.encode(&gray_frame(320, 240, i)).unwrap());
+			frames.extend(encoder.encode_all(&gray_frame(320, 240, i)).unwrap());
 		}
-		frames.extend(encoder.finish().unwrap());
+		frames.extend(encoder.flush_all().unwrap());
 
 		assert!(!frames.is_empty(), "encoder produced no packets");
 		let packets = payloads(&frames);
@@ -608,7 +994,7 @@ mod tests {
 	}
 
 	/// HEVC NAL unit types in an Annex-B buffer (type = `(byte >> 1) & 0x3f`).
-	#[cfg(target_os = "macos")]
+	#[cfg(apple)]
 	fn hevc_nal_types(annexb: &[u8]) -> Vec<u8> {
 		let mut types = Vec::new();
 		let mut i = 0;
@@ -625,24 +1011,24 @@ mod tests {
 
 	/// Feed a GPU surface (NV12 `CVPixelBuffer`) straight into VideoToolbox:
 	/// the zero-copy capture -> encode path, no I420 round-trip.
-	#[cfg(target_os = "macos")]
+	#[cfg(apple)]
 	#[test]
 	fn videotoolbox_encodes_surface_zero_copy() {
 		let config = Config {
 			kind: Kind::Named("videotoolbox".into()),
-			..Config::new(320, 240, 30)
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
 		};
 		let mut encoder = Encoder::new(&config).unwrap();
 
 		let mut frames = Vec::new();
 		for i in 0..10 {
 			if i == 0 {
-				encoder.keyframe();
+				encoder.cut().unwrap();
 			}
 			let frame = Frame::new(Surface::PixelBuffer(nv12_surface(320, 240)), at(i));
-			frames.extend(encoder.encode(&frame).unwrap());
+			frames.extend(encoder.encode_all(&frame).unwrap());
 		}
-		frames.extend(encoder.finish().unwrap());
+		frames.extend(encoder.flush_all().unwrap());
 
 		assert!(!frames.is_empty());
 		let packets = payloads(&frames);
@@ -655,19 +1041,19 @@ mod tests {
 
 	/// A software encoder must download a GPU surface to I420 first. Exercises
 	/// the NV12 -> I420 fallback path.
-	#[cfg(target_os = "macos")]
+	#[cfg(all(apple, feature = "openh264"))]
 	#[test]
 	fn openh264_downloads_surface() {
 		let config = Config {
 			kind: Kind::Software,
-			..Config::new(320, 240, 30)
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
 		};
 		let mut encoder = Encoder::new(&config).unwrap();
 
-		encoder.keyframe();
+		encoder.cut().unwrap();
 		let frame = Frame::new(Surface::PixelBuffer(nv12_surface(320, 240)), at(0));
-		let mut frames = encoder.encode(&frame).unwrap();
-		frames.extend(encoder.finish().unwrap());
+		let mut frames = encoder.encode_all(&frame).unwrap();
+		frames.extend(encoder.flush_all().unwrap());
 
 		assert!(!frames.is_empty());
 		let packets = payloads(&frames);
@@ -676,8 +1062,8 @@ mod tests {
 
 	/// A mid-gray NV12 `CVPixelBuffer`, the format AVFoundation/ScreenCaptureKit
 	/// hand us. Y and interleaved UV planes filled with 128.
-	#[cfg(target_os = "macos")]
-	fn nv12_surface(width: u32, height: u32) -> crate::frame::macos::PixelBuffer {
+	#[cfg(apple)]
+	fn nv12_surface(width: u32, height: u32) -> crate::frame::apple::PixelBuffer {
 		use std::ptr::{self, NonNull};
 
 		use objc2_core_foundation::CFRetained;
@@ -710,7 +1096,7 @@ mod tests {
 		}
 		unsafe { CVPixelBufferUnlockBaseAddress(&buffer, flags) };
 
-		crate::frame::macos::PixelBuffer::new(buffer, width, height)
+		crate::frame::apple::PixelBuffer::new(buffer, width, height)
 	}
 
 	/// NAL unit types in an Annex-B buffer, found via 3-byte start codes (a
@@ -734,11 +1120,11 @@ mod tests {
 	/// which GPU-less CI runners lack. Run with `--ignored`.
 	#[cfg(target_os = "windows")]
 	#[test]
-	#[ignore]
+	#[ignore = "needs a Media Foundation hardware encoder; see quest/m5/video-hardware.md"]
 	fn mediafoundation_cpu_rgba() {
 		let config = Config {
 			kind: Kind::Named("mediafoundation".into()),
-			..Config::new(640, 480, 30)
+			..Config::new(640, 480, crate::FrameRate::new(30, 1).unwrap())
 		};
 		let mut encoder = Encoder::new(&config).expect("hardware H.264 encoder available");
 		assert_eq!(encoder.name(), "mediafoundation");
@@ -746,11 +1132,11 @@ mod tests {
 		let mut frames = Vec::new();
 		for i in 0..30 {
 			if i == 0 {
-				encoder.keyframe();
+				encoder.cut().unwrap();
 			}
-			frames.extend(encoder.encode(&gray_frame(640, 480, i)).unwrap());
+			frames.extend(encoder.encode_all(&gray_frame(640, 480, i)).unwrap());
 		}
-		frames.extend(encoder.finish().unwrap());
+		frames.extend(encoder.flush_all().unwrap());
 
 		assert!(!frames.is_empty(), "encoder produced no packets");
 		// The MFT buffers, so packets come back stamped with the frame they were
@@ -777,7 +1163,7 @@ mod tests {
 	/// a GPU. Run with `--ignored`.
 	#[cfg(all(target_os = "windows", feature = "capture"))]
 	#[tokio::test]
-	#[ignore]
+	#[ignore = "needs a Windows camera and GPU; see quest/m5/video-hardware.md"]
 	async fn mediafoundation_camera_texture() {
 		let mut camera = crate::capture::open(&crate::capture::Config::default())
 			.await
@@ -786,24 +1172,27 @@ mod tests {
 
 		let config = Config {
 			kind: Kind::Named("mediafoundation".into()),
-			..Config::new(w, h, camera.framerate().unwrap_or(30))
+			..Config::new(w, h, camera.framerate().unwrap_or(crate::FrameRate::integer(30)))
 		};
 		let mut encoder = Encoder::new(&config).expect("hardware H.264 encoder available");
 
 		let mut frames = Vec::new();
 		let mut textures = 0;
 		for i in 0..30 {
-			let surface = camera.read().await.expect("read camera frame");
-			if matches!(surface, Some(Surface::Texture(_))) {
+			let frame = camera
+				.read()
+				.await
+				.expect("read camera frame")
+				.expect("frame, not end of stream");
+			if matches!(frame.surface, Surface::Texture(_)) {
 				textures += 1;
 			}
 			if i == 0 {
-				encoder.keyframe();
+				encoder.cut().unwrap();
 			}
-			let surface = surface.expect("frame, not end of stream");
-			frames.extend(encoder.encode(&Frame::new(surface, at(i))).unwrap());
+			frames.extend(encoder.encode_all(&frame).unwrap());
 		}
-		frames.extend(encoder.finish().unwrap());
+		frames.extend(encoder.flush_all().unwrap());
 
 		// On a GPU this exercises the zero-copy texture path; the assert guards
 		// against silently testing only the CPU fallback.
@@ -821,10 +1210,11 @@ mod tests {
 	/// both that the call is accepted and that the encoder keeps producing after
 	/// it. A wrong option id or a bad `SBitrateInfo` layout would fail here.
 	#[test]
+	#[cfg(feature = "openh264")]
 	fn set_bitrate_retunes_software_encoder() {
 		let config = Config {
 			kind: Kind::Software,
-			..Config::new(320, 240, 30)
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
 		};
 		let mut encoder = Encoder::new(&config).unwrap();
 
@@ -832,14 +1222,14 @@ mod tests {
 		assert_eq!(opened, config.resolved_bitrate());
 
 		// Encode first: this is the live-retune path, once the encoder exists.
-		encoder.encode(&gray_frame(320, 240, 0)).unwrap();
+		encoder.encode_all(&gray_frame(320, 240, 0)).unwrap();
 
-		let halved = opened / 2;
+		let halved = opened.scaled(0.5);
 		encoder.set_bitrate(halved).unwrap();
 		assert_eq!(encoder.bitrate(), halved);
 
 		// The retuned encoder must still emit a decodable keyframe, not wedge.
-		let frames = encoder.encode(&gray_frame(320, 240, 1)).unwrap();
+		let frames = encoder.encode_all(&gray_frame(320, 240, 1)).unwrap();
 		assert!(!frames.is_empty(), "encoder produced nothing after a retune");
 		let packets = payloads(&frames);
 		assert!(packets[0].starts_with(&[0, 0, 0, 1]) || packets[0].starts_with(&[0, 0, 1]));
@@ -849,77 +1239,71 @@ mod tests {
 	/// rejects `SetOption` with `cmInitExpected` until then. A retune before any
 	/// frame must be deferred to the first encode, not reported as a failure.
 	#[test]
+	#[cfg(feature = "openh264")]
 	fn set_bitrate_before_the_first_frame_is_deferred() {
 		let config = Config {
 			kind: Kind::Software,
-			..Config::new(320, 240, 30)
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
 		};
 		let mut encoder = Encoder::new(&config).unwrap();
 
-		let halved = encoder.bitrate() / 2;
+		let halved = encoder.bitrate().scaled(0.5);
 		encoder.set_bitrate(halved).expect("a retune before the first frame");
 		assert_eq!(encoder.bitrate(), halved);
 
 		// The deferred rate is applied during this encode, which must still work.
-		let frames = encoder.encode(&gray_frame(320, 240, 0)).unwrap();
+		let frames = encoder.encode_all(&gray_frame(320, 240, 0)).unwrap();
 		assert!(!frames.is_empty());
 
 		// And the encoder is live now, so a further retune takes the direct path.
-		encoder.set_bitrate(halved / 2).unwrap();
-		assert!(encoder.encode(&gray_frame(320, 240, 1)).is_ok());
-	}
-
-	/// Setting the current rate must not reach the backend at all: the control
-	/// loop is allowed to be chatty, and the encoder shouldn't pay for it.
-	#[test]
-	fn set_bitrate_to_current_is_a_noop() {
-		let config = Config {
-			kind: Kind::Software,
-			..Config::new(320, 240, 30)
-		};
-		let mut encoder = Encoder::new(&config).unwrap();
-
-		let opened = encoder.bitrate();
-		encoder.set_bitrate(opened).unwrap();
-		assert_eq!(encoder.bitrate(), opened);
+		encoder.set_bitrate(halved.scaled(0.5)).unwrap();
+		assert!(encoder.encode_all(&gray_frame(320, 240, 1)).is_ok());
 	}
 
 	#[test]
 	fn default_bitrate_scales_with_resolution() {
-		let small = Config::new(320, 240, 30).resolved_bitrate();
-		let large = Config::new(1920, 1080, 30).resolved_bitrate();
+		let small = Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap()).resolved_bitrate();
+		let large = Config::new(1920, 1080, crate::FrameRate::new(30, 1).unwrap()).resolved_bitrate();
 		assert!(large > small);
-		assert!(small > 0);
+		assert!(small > moq_net::bandwidth::Rate::ZERO);
 	}
 
 	/// A backend that holds each frame back by one, like the Media Foundation MFT:
-	/// `encode` returns the *previous* frame's access unit and `finish` drains the
-	/// last. The payload is the frame's timestamp in microseconds, so a test can
-	/// tell which frame a packet came from independently of what it's stamped with.
+	/// `encode` readies the *previous* frame's access unit and `flush` the last.
+	/// The payload is the frame's timestamp in microseconds, so a test can tell
+	/// which frame a packet came from independently of what it's stamped with.
+	#[derive(Default)]
 	struct Delayed {
-		pending: Option<Encoded>,
+		held: Option<Encoded>,
+		ready: VecDeque<Encoded>,
 	}
 
 	impl Backend for Delayed {
-		fn encode(&mut self, frame: &Frame, _keyframe: bool) -> Result<Vec<Encoded>, Error> {
+		fn encode(&mut self, frame: &Frame, cut: bool) -> Result<(), Error> {
 			let payload = bytes::Bytes::from(frame.timestamp.as_micros().to_string());
-			let previous = self.pending.replace(Encoded::new(payload, frame.timestamp));
-			Ok(previous.into_iter().collect())
+			self.ready
+				.extend(self.held.replace(Encoded::new(payload, frame.timestamp, cut)));
+			Ok(())
 		}
 
-		fn flush(&mut self) -> Result<Vec<Encoded>, Error> {
-			Ok(self.pending.take().into_iter().collect())
+		fn receive(&mut self) -> Result<Option<Encoded>, Error> {
+			Ok(self.ready.pop_front())
 		}
 
-		fn finish(&mut self) -> Result<Vec<Encoded>, Error> {
-			self.flush()
+		fn flush(&mut self) -> Result<(), Error> {
+			self.ready.extend(self.held.take());
+			Ok(())
 		}
 
 		fn set_bitrate(&mut self, _bitrate: u64) -> Result<(), Error> {
 			Ok(())
 		}
 
-		fn name(&self) -> &str {
+		fn can_cut(&self) -> bool {
+			true
+		}
+
+		fn name(&self) -> &'static str {
 			"delayed"
 		}
 	}
@@ -933,82 +1317,475 @@ mod tests {
 			size: config.size(),
 			bitrate: config.resolved_bitrate(),
 			color: config.resolved_color(),
-			pending_keyframe: false,
+			pending_cut: false,
+			join: Join::new(config),
+			resize: config.resolved_resize(),
+			#[cfg(target_os = "linux")]
+			input: None,
+			_thread_bound: PhantomData,
 		}
 	}
 
-	/// Records the keyframe flag each frame reached the codec with, so a test can
-	/// check what the encoder actually asked for.
-	struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<bool>>>);
+	/// Scales every surface itself, the way NVENC scales CUDA frames into its
+	/// input, and records the size each frame reached it at.
+	struct Scaling {
+		sizes: std::sync::Arc<std::sync::Mutex<Vec<Size>>>,
+	}
 
-	impl Backend for Recorder {
-		fn encode(&mut self, _frame: &Frame, keyframe: bool) -> Result<Vec<Encoded>, Error> {
-			self.0.lock().unwrap().push(keyframe);
-			Ok(Vec::new())
+	impl Backend for Scaling {
+		fn encode(&mut self, frame: &Frame, _cut: bool) -> Result<(), Error> {
+			self.sizes.lock().unwrap().push(frame.size());
+			Ok(())
 		}
 
-		fn flush(&mut self) -> Result<Vec<Encoded>, Error> {
-			Ok(Vec::new())
+		fn receive(&mut self) -> Result<Option<Encoded>, Error> {
+			Ok(None)
 		}
 
-		fn finish(&mut self) -> Result<Vec<Encoded>, Error> {
-			Ok(Vec::new())
+		fn flush(&mut self) -> Result<(), Error> {
+			Ok(())
 		}
 
 		fn set_bitrate(&mut self, _bitrate: u64) -> Result<(), Error> {
 			Ok(())
 		}
 
-		fn name(&self) -> &str {
+		fn can_cut(&self) -> bool {
+			true
+		}
+
+		fn scales(&self, _surface: &crate::Surface) -> bool {
+			true
+		}
+
+		fn name(&self) -> &'static str {
+			"scaling"
+		}
+	}
+
+	/// A backend that scales the frame itself is handed it at its own size, but
+	/// the frame is held to the space it would have after `Frame::resize`: an
+	/// unlabelled 720p frame is BT.709, which a 480p encoder would label BT.601.
+	#[test]
+	fn a_frame_the_backend_scales_keeps_its_implied_color() {
+		use crate::Color;
+
+		let unlabelled = |size: Size| {
+			let i420 = I420::new(size, vec![0x80; I420::len(size).unwrap()]).unwrap();
+			Frame::new(Surface::I420(i420), moq_net::Timestamp::from_micros(0).unwrap())
+		};
+		let mut config = Config::new(640, 480, crate::FrameRate::new(30, 1).unwrap());
+		config.resize = Some(crate::resize::Config::default());
+		let sizes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		let mut encoder = encoder_with(Box::new(Scaling { sizes: sizes.clone() }), &config);
+
+		let err = encoder
+			.encode(&unlabelled(Size::new(1280, 720)))
+			.expect_err("an implied BT.709 frame is refused");
+		assert!(
+			matches!(
+				err,
+				Error::ColorMismatch {
+					frame: Color::BT709,
+					encoder: Color::BT601
+				}
+			),
+			"{err}"
+		);
+
+		// Within the same space, the backend gets the frame unscaled.
+		encoder.encode(&unlabelled(Size::new(704, 576))).unwrap();
+		encoder.encode(&unlabelled(Size::new(640, 480))).unwrap();
+		assert_eq!(*sizes.lock().unwrap(), [Size::new(704, 576), Size::new(640, 480)]);
+	}
+
+	/// Records the cut flag each frame reached the codec with, so a test can
+	/// check what the encoder actually asked for. `cuts` is whether it claims to
+	/// honor one, the way a V4L2 driver without the force-keyframe control does
+	/// not.
+	struct Recorder {
+		log: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+		cuts: bool,
+	}
+
+	impl Backend for Recorder {
+		fn encode(&mut self, _frame: &Frame, cut: bool) -> Result<(), Error> {
+			self.log.lock().unwrap().push(cut);
+			Ok(())
+		}
+
+		fn receive(&mut self) -> Result<Option<Encoded>, Error> {
+			Ok(None)
+		}
+
+		fn flush(&mut self) -> Result<(), Error> {
+			Ok(())
+		}
+
+		fn set_bitrate(&mut self, _bitrate: u64) -> Result<(), Error> {
+			Ok(())
+		}
+
+		fn can_cut(&self) -> bool {
+			self.cuts
+		}
+
+		fn name(&self) -> &'static str {
 			"recorder"
 		}
 	}
 
-	/// Keyframes are automatic, so an untouched encoder forces none. A request is
-	/// held until a frame arrives (callers decide a group boundary before they have
-	/// the frame that opens it), collapses if made twice, and clears afterwards
-	/// rather than keying every frame from then on.
+	/// Group boundaries are automatic, so an untouched encoder forces none. A cut
+	/// is held until a frame arrives (callers decide a group boundary before they
+	/// have the frame that opens it), collapses if made twice, and clears
+	/// afterwards rather than cutting every frame from then on.
 	#[test]
-	fn a_keyframe_request_waits_for_the_next_frame_then_clears() {
+	fn a_cut_waits_for_the_next_frame_then_clears() {
 		let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-		let config = Config::new(320, 240, 30);
-		let mut encoder = encoder_with(Box::new(Recorder(log.clone())), &config);
+		let config = Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap());
+		let backend = Recorder {
+			log: log.clone(),
+			cuts: true,
+		};
+		let mut encoder = encoder_with(Box::new(backend), &config);
 
-		// Nothing asked for: `Config::gop` keys the stream on its own.
-		encoder.encode(&gray_frame(320, 240, 0)).unwrap();
+		// Nothing asked for: `Config::join` places the boundaries on its own.
+		encoder.encode_all(&gray_frame(320, 240, 0)).unwrap();
 
-		// Asked twice before a frame exists: one keyframe, on the next frame.
-		encoder.keyframe();
-		encoder.keyframe();
-		encoder.encode(&gray_frame(320, 240, 1)).unwrap();
+		// Asked twice before a frame exists: one cut, on the next frame.
+		encoder.cut().unwrap();
+		encoder.cut().unwrap();
+		encoder.encode_all(&gray_frame(320, 240, 1)).unwrap();
 
 		// And it does not carry into the frame after.
-		encoder.encode(&gray_frame(320, 240, 2)).unwrap();
+		encoder.encode_all(&gray_frame(320, 240, 2)).unwrap();
 
 		assert_eq!(*log.lock().unwrap(), vec![false, true, false]);
 	}
 
-	/// `keyframe()` has to reach the codec on a *warm* encoder, which is the case
-	/// that matters: a fresh one emits an IDR on its first frame regardless, so only
-	/// a mid-stream request proves the plumbing works. Runs on openh264, so this
-	/// holds on every platform rather than only where hardware exists.
+	/// Repeated boundaries each reach the codec: a cut per group is what a
+	/// transcode rung asks for, and a request that only worked once would leave
+	/// every later group opening on a delta frame.
 	#[test]
-	fn a_mid_stream_keyframe_request_emits_an_idr() {
+	fn every_cut_reaches_the_codec() {
+		let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		let config = Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap());
+		let backend = Recorder {
+			log: log.clone(),
+			cuts: true,
+		};
+		let mut encoder = encoder_with(Box::new(backend), &config);
+
+		for i in 0..6 {
+			if i % 3 == 0 {
+				encoder.cut().unwrap();
+			}
+			encoder.encode_all(&gray_frame(320, 240, i)).unwrap();
+		}
+
+		assert_eq!(*log.lock().unwrap(), vec![true, false, false, true, false, false]);
+	}
+
+	/// A backend that cannot force a boundary refuses the cut itself, up front,
+	/// rather than queueing a request its codec would ignore. The V4L2 backend
+	/// used to disable the request quietly and let groups fall on the driver's
+	/// own interval, which only the subscriber could tell apart from a cut that
+	/// worked.
+	#[test]
+	fn a_backend_that_cannot_cut_refuses_up_front() {
+		let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		let config = Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap());
+		let backend = Recorder {
+			log: log.clone(),
+			cuts: false,
+		};
+		let mut encoder = encoder_with(Box::new(backend), &config);
+
+		let err = encoder.cut().expect_err("the backend cannot cut");
+		assert!(
+			matches!(err, Error::CutUnsupported("recorder")),
+			"unexpected error: {err:?}"
+		);
+		assert!(!encoder.pending_cut, "a refused cut must not be queued");
+
+		// The refusal names the backend, so a log line says which one to blame.
+		assert!(err.to_string().contains("recorder"), "{err}");
+
+		// Encoding carries on at the backend's own boundaries; the refusal is the
+		// caller's to act on, not a broken encoder.
+		encoder.encode_all(&gray_frame(320, 240, 0)).unwrap();
+		assert_eq!(*log.lock().unwrap(), vec![false]);
+	}
+
+	/// A 320x240 gray frame at `micros`, for a source whose rate varies.
+	fn gray_at(micros: u64) -> Frame {
+		let surface = Surface::rgba(&gray_rgba(320, 240), Size::new(320, 240)).unwrap();
+		Frame::new(surface, moq_net::Timestamp::from_micros(micros).unwrap())
+	}
+
+	/// A source slower than the configured rate (a camera dropping frames in low
+	/// light) still opens a group every join, by its timestamps: no group holds a
+	/// frame a join past its keyframe, so it overshoots by less than one of its
+	/// frames, and none closes more than half a configured frame early. A backend
+	/// that cannot cut is never asked to.
+	#[test]
+	fn a_slow_source_keys_by_time() {
+		let config = Config {
+			join: std::time::Duration::from_secs(1),
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
+		};
+		// 30 fps, then 20, then 12.5, then 24, the rates a camera drifts through as
+		// the light changes.
+		let mut times = Vec::new();
+		let mut micros = 0u64;
+		for (interval, count) in [(33_333, 45), (50_000, 50), (80_000, 30), (41_667, 60)] {
+			for _ in 0..count {
+				times.push(micros);
+				micros += interval;
+			}
+		}
+
+		for cuts in [true, false] {
+			let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+			let backend = Recorder { log: log.clone(), cuts };
+			let mut encoder = encoder_with(Box::new(backend), &config);
+			for &micros in &times {
+				encoder.encode_all(&gray_at(micros)).unwrap();
+			}
+			let log = log.lock().unwrap();
+			if !cuts {
+				assert!(log.iter().all(|cut| !cut), "a backend that cannot cut was asked to");
+				continue;
+			}
+
+			let mut key = times[0];
+			for (&micros, &cut) in times.iter().zip(log.iter()).skip(1) {
+				if cut {
+					assert!(
+						micros - key + 16_667 >= 1_000_000,
+						"the group at {key}us closed at {micros}us"
+					);
+					key = micros;
+				} else {
+					assert!(
+						micros - key < 1_000_000,
+						"the group at {key}us holds a frame at {micros}us"
+					);
+				}
+			}
+		}
+	}
+
+	/// A source at the configured rate keys on the same frames as the backend's
+	/// own count, however its timestamps jitter, so measuring by time adds none.
+	#[test]
+	fn a_jittery_source_at_the_configured_rate_keys_on_the_count() {
+		let config = Config {
+			join: std::time::Duration::from_secs(1),
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
+		};
+		let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		let backend = Recorder {
+			log: log.clone(),
+			cuts: true,
+		};
+		let mut encoder = encoder_with(Box::new(backend), &config);
+
+		// Up to a quarter frame either way, so neither end of a group can pull it
+		// past half a frame.
+		let jitter = [0, 8_000, -8_000, 5_000, -5_000];
+		for i in 0..120u64 {
+			let micros = (i * 33_333)
+				.checked_add_signed(jitter[i as usize % jitter.len()])
+				.unwrap();
+			encoder.encode_all(&gray_at(micros)).unwrap();
+		}
+
+		let log = log.lock().unwrap();
+		let cuts: Vec<usize> = (0..log.len()).filter(|&i| log[i]).collect();
+		assert_eq!(cuts, [30, 60, 90]);
+	}
+
+	/// Keys on its own every `interval` frames, restarting the count at a cut the
+	/// way a real codec's GOP does, and records the cut flag each frame came with.
+	struct Counting {
+		log: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+		interval: u32,
+		count: u32,
+		ready: VecDeque<Encoded>,
+	}
+
+	impl Backend for Counting {
+		fn encode(&mut self, frame: &Frame, cut: bool) -> Result<(), Error> {
+			self.log.lock().unwrap().push(cut);
+			let keyframe = cut || self.count.is_multiple_of(self.interval);
+			self.count = if keyframe { 1 } else { self.count + 1 };
+			self.ready
+				.push_back(Encoded::new(bytes::Bytes::new(), frame.timestamp, keyframe));
+			Ok(())
+		}
+
+		fn receive(&mut self) -> Result<Option<Encoded>, Error> {
+			Ok(self.ready.pop_front())
+		}
+
+		fn flush(&mut self) -> Result<(), Error> {
+			Ok(())
+		}
+
+		fn set_bitrate(&mut self, _bitrate: u64) -> Result<(), Error> {
+			Ok(())
+		}
+
+		fn can_cut(&self) -> bool {
+			true
+		}
+
+		fn name(&self) -> &'static str {
+			"counting"
+		}
+	}
+
+	/// A source faster than the configured rate reaches the backend's count before
+	/// the join, and each keyframe the backend places restarts the clock, so the
+	/// encoder forces none between them.
+	#[test]
+	fn a_fast_source_keys_on_the_backend_count() {
+		let config = Config {
+			join: std::time::Duration::from_secs(1),
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
+		};
+		let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		let backend = Counting {
+			log: log.clone(),
+			interval: config.keyframe_interval(),
+			count: 0,
+			ready: VecDeque::new(),
+		};
+		let mut encoder = encoder_with(Box::new(backend), &config);
+
+		// Three seconds at 60 fps: the backend keys every half second.
+		for i in 0..180 {
+			encoder.encode_all(&gray_at(i * 16_667)).unwrap();
+		}
+		assert!(log.lock().unwrap().iter().all(|cut| !cut));
+	}
+
+	/// A timestamp behind the last keyframe starts a new timeline: the next
+	/// keyframe comes a join after the jump, not once the source catches up with
+	/// where it was.
+	#[test]
+	fn a_jump_back_restarts_the_join() {
+		let config = Config {
+			join: std::time::Duration::from_secs(1),
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
+		};
+		let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		let backend = Recorder {
+			log: log.clone(),
+			cuts: true,
+		};
+		let mut encoder = encoder_with(Box::new(backend), &config);
+
+		for i in 0..20 {
+			encoder.encode_all(&gray_at(10_000_000 + i * 33_333)).unwrap();
+		}
+		for i in 0..40 {
+			encoder.encode_all(&gray_at(i * 33_333)).unwrap();
+		}
+
+		let log = log.lock().unwrap();
+		let cuts: Vec<usize> = (0..log.len()).filter(|&i| log[i]).collect();
+		assert_eq!(cuts, [50], "a join after the jump at frame 20");
+	}
+
+	/// openh264 keys where the join asks and restarts its own count there, so a
+	/// 20 fps source on a 30 fps config keys every 20 frames, with no stray IDR
+	/// on the 30-frame count in between.
+	#[test]
+	#[cfg(feature = "openh264")]
+	fn openh264_keys_a_slow_source_by_time() {
 		let config = Config {
 			kind: Kind::Software,
-			..Config::new(320, 240, 30)
+			join: std::time::Duration::from_secs(1),
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
 		};
-		// A GOP far longer than the run, so any IDR here was asked for rather than
+		let mut encoder = Encoder::new(&config).unwrap();
+
+		let mut keys = Vec::new();
+		for i in 0..70 {
+			for encoded in encoder.encode_all(&gray_at(i * 50_000)).unwrap() {
+				if encoded.keyframe {
+					keys.push(encoded.timestamp.as_micros() / 50_000);
+				}
+			}
+		}
+		assert_eq!(keys, [0, 20, 40, 60]);
+	}
+
+	/// A join of zero opens no group, so it is refused at open rather than
+	/// handed to a backend, each of which would do something different with it
+	/// (openh264 keys every frame, V4L2 rejects the control, VideoToolbox reads
+	/// it as unlimited).
+	#[test]
+	fn a_zero_join_is_refused() {
+		let config = Config {
+			join: std::time::Duration::ZERO,
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
+		};
+		let Err(err) = Encoder::new(&config) else {
+			panic!("an empty group cannot open");
+		};
+		assert!(matches!(err, Error::ZeroJoin), "unexpected error: {err:?}");
+	}
+
+	/// The catalog declares the join after rounding to whole frames, since that
+	/// is the spacing the stream actually has: a fractional frame rate stretches
+	/// the default two seconds, and a positive join shorter than a frame rounds
+	/// up to one frame rather than down to none. Nanoseconds round up too, so
+	/// the declaration never undercuts the stream.
+	#[test]
+	fn the_effective_join_is_whole_frames() {
+		let join = |ms, framerate| {
+			let config = Config {
+				join: std::time::Duration::from_millis(ms),
+				..Config::new(320, 240, framerate)
+			};
+			(config.keyframe_interval(), config.effective_join())
+		};
+		let ntsc = crate::FrameRate::new(30_000, 1001).unwrap();
+		let thirty = crate::FrameRate::new(30, 1).unwrap();
+		assert_eq!(join(2000, ntsc), (60, std::time::Duration::from_millis(2002)));
+		assert_eq!(join(2000, thirty), (60, std::time::Duration::from_secs(2)));
+		assert_eq!(join(1, thirty), (1, std::time::Duration::from_nanos(33_333_334)));
+	}
+
+	/// `cut()` has to reach the codec on a *warm* encoder, which is the case that
+	/// matters: a fresh one emits an IDR on its first frame regardless, so only a
+	/// mid-stream request proves the plumbing works. Runs on openh264, so this
+	/// holds on every platform rather than only where hardware exists.
+	#[test]
+	#[cfg(feature = "openh264")]
+	fn a_mid_stream_cut_emits_an_idr() {
+		let config = Config {
+			kind: Kind::Software,
+			..Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
+		};
+		// A join far longer than the run, so any IDR here was asked for rather than
 		// inserted on schedule.
-		let mut encoder = Encoder::new(&Config { gop: 1000, ..config }).unwrap();
+		let mut encoder = Encoder::new(&Config {
+			join: std::time::Duration::from_secs(60),
+			..config
+		})
+		.unwrap();
 
 		let mut per_frame = Vec::new();
 		for i in 0..6 {
 			// Frame 0 opens the stream; ask again at frame 3, mid-stream.
 			if i == 3 {
-				encoder.keyframe();
+				encoder.cut().unwrap();
 			}
-			let encoded = encoder.encode(&gray_frame(320, 240, i)).unwrap();
+			let encoded = encoder.encode_all(&gray_frame(320, 240, i)).unwrap();
 			let joined: Vec<u8> = encoded.iter().flat_map(|f| f.payload.iter()).copied().collect();
 			per_frame.push(nal_types(&joined));
 		}
@@ -1036,49 +1813,53 @@ mod tests {
 	struct Failing;
 
 	impl Backend for Failing {
-		fn encode(&mut self, _frame: &Frame, _keyframe: bool) -> Result<Vec<Encoded>, Error> {
-			Err(Error::Codec(anyhow::anyhow!("no")))
+		fn encode(&mut self, _frame: &Frame, _cut: bool) -> Result<(), Error> {
+			Err(Error::codec(anyhow::anyhow!("no")))
 		}
 
-		fn flush(&mut self) -> Result<Vec<Encoded>, Error> {
-			Ok(Vec::new())
+		fn receive(&mut self) -> Result<Option<Encoded>, Error> {
+			Ok(None)
 		}
 
-		fn finish(&mut self) -> Result<Vec<Encoded>, Error> {
-			Ok(Vec::new())
+		fn flush(&mut self) -> Result<(), Error> {
+			Ok(())
 		}
 
 		fn set_bitrate(&mut self, _bitrate: u64) -> Result<(), Error> {
 			Ok(())
 		}
 
-		fn name(&self) -> &str {
+		fn can_cut(&self) -> bool {
+			true
+		}
+
+		fn name(&self) -> &'static str {
 			"failing"
 		}
 	}
 
-	/// A request outlives an encode that produced no picture, whether it was
-	/// rejected up front (wrong size) or failed in the backend. Dropping it would
-	/// leave the next frame unkeyed, so a subscriber waits out a whole GOP for a
-	/// starting point the caller already asked for.
+	/// A cut outlives an encode that produced no picture, whether it was rejected
+	/// up front (wrong size) or failed in the backend. Dropping it would leave the
+	/// next frame unkeyed, so a subscriber waits out a whole GOP for a starting
+	/// point the caller already asked for.
 	#[test]
-	fn a_failed_encode_keeps_the_keyframe_request() {
-		let config = Config::new(320, 240, 30);
+	fn a_failed_encode_keeps_the_cut() {
+		let config = Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap());
 
 		let mut encoder = encoder_with(Box::new(Failing), &config);
-		encoder.keyframe();
-		assert!(encoder.encode(&gray_frame(320, 240, 0)).is_err());
-		assert!(encoder.pending_keyframe, "the backend error swallowed the request");
+		encoder.cut().unwrap();
+		assert!(encoder.encode_all(&gray_frame(320, 240, 0)).is_err());
+		assert!(encoder.pending_cut, "the backend error swallowed the request");
 
 		// Rejected before the backend ever sees it, for the same reason.
-		let mut encoder = encoder_with(Box::new(Delayed { pending: None }), &config);
-		encoder.keyframe();
-		assert!(encoder.encode(&gray_frame(640, 480, 0)).is_err());
-		assert!(encoder.pending_keyframe, "the size check swallowed the request");
+		let mut encoder = encoder_with(Box::new(Delayed::default()), &config);
+		encoder.cut().unwrap();
+		assert!(encoder.encode_all(&gray_frame(640, 480, 0)).is_err());
+		assert!(encoder.pending_cut, "the size check swallowed the request");
 
 		// ...and the next frame that does go through claims it.
-		encoder.encode(&gray_frame(320, 240, 1)).unwrap();
-		assert!(!encoder.pending_keyframe);
+		encoder.encode_all(&gray_frame(320, 240, 1)).unwrap();
+		assert!(!encoder.pending_cut);
 	}
 
 	/// Regression: a backend that buffers hands back an earlier frame's access
@@ -1088,14 +1869,14 @@ mod tests {
 	/// collapses the drained tail onto a single instant.
 	#[test]
 	fn a_buffering_backend_keeps_each_frames_timestamp() {
-		let config = Config::new(320, 240, 30);
-		let mut encoder = encoder_with(Box::new(Delayed { pending: None }), &config);
+		let config = Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap());
+		let mut encoder = encoder_with(Box::new(Delayed::default()), &config);
 
 		// The packet handed back while frame `i` goes in belongs to frame `i - 1`, so
 		// it has to be stamped one frame back. Stamping at the call site (the only
 		// option when encode just returned bytes) would shift the whole stream.
 		for i in 0..5 {
-			let encoded = encoder.encode(&gray_frame(320, 240, i)).unwrap();
+			let encoded = encoder.encode_all(&gray_frame(320, 240, i)).unwrap();
 			if i == 0 {
 				assert!(encoded.is_empty(), "the first frame is still buffered");
 				continue;
@@ -1107,14 +1888,14 @@ mod tests {
 			assert_eq!(&encoded[0].payload[..], at(i - 1).as_micros().to_string().as_bytes());
 		}
 
-		// The tail: frame 4 never came back from an encode call, so `finish` drains
+		// The tail: frame 4 never came back from an encode call, so `flush` drains
 		// it, still carrying its own time rather than one the caller picks.
-		let tail = encoder.finish().unwrap();
+		let tail = encoder.flush_all().unwrap();
 		assert_eq!(tail.len(), 1);
 		assert_eq!(tail[0].timestamp, at(4));
 		assert!(
-			encoder_with(Box::new(Delayed { pending: None }), &config)
-				.finish()
+			encoder_with(Box::new(Delayed::default()), &config)
+				.flush_all()
 				.unwrap()
 				.is_empty()
 		);
@@ -1125,18 +1906,18 @@ mod tests {
 	/// without that they surface in the *next* group, ahead of its keyframe, where
 	/// a subscriber joining there cannot decode them.
 	///
-	/// The encoder stays usable afterwards, which is what separates this from
-	/// `finish`: a live track flushes at every group and keeps going.
+	/// The encoder stays usable afterwards: a live track flushes at every group
+	/// and keeps going.
 	#[test]
 	fn a_flush_empties_a_pipelined_backend_and_leaves_it_running() {
-		let config = Config::new(320, 240, 30);
-		let mut encoder = encoder_with(Box::new(Delayed { pending: None }), &config);
+		let config = Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap());
+		let mut encoder = encoder_with(Box::new(Delayed::default()), &config);
 
 		let mut group = Vec::new();
 		for i in 0..3 {
-			group.extend(encoder.encode(&gray_frame(320, 240, i)).unwrap());
+			group.extend(encoder.encode_all(&gray_frame(320, 240, i)).unwrap());
 		}
-		group.extend(encoder.flush().unwrap());
+		group.extend(encoder.flush_all().unwrap());
 
 		// All three frames land in the group they belong to, in order.
 		let times: Vec<_> = group.iter().map(|packet| packet.timestamp).collect();
@@ -1144,9 +1925,9 @@ mod tests {
 
 		// The next group starts clean: nothing carried over, and the encoder still
 		// takes frames.
-		let mut next = encoder.encode(&gray_frame(320, 240, 3)).unwrap();
+		let mut next = encoder.encode_all(&gray_frame(320, 240, 3)).unwrap();
 		assert!(next.is_empty(), "frame 3 is buffered, so nothing comes back yet");
-		next.extend(encoder.finish().unwrap());
+		next.extend(encoder.flush_all().unwrap());
 		let times: Vec<_> = next.iter().map(|packet| packet.timestamp).collect();
 		assert_eq!(times, vec![at(3)], "the flush left something behind");
 	}
@@ -1155,7 +1936,7 @@ mod tests {
 	/// pixels were actually converted into. VideoToolbox takes the three
 	/// properties as a request, so read the SPS back rather than trusting that it
 	/// honored them.
-	#[cfg(target_os = "macos")]
+	#[cfg(apple)]
 	#[test]
 	fn videotoolbox_sps_declares_the_color_space() {
 		use super::backend::test_util::{BT601_DESCRIBED, BT709_DESCRIBED, declared_color};
@@ -1166,15 +1947,15 @@ mod tests {
 		] {
 			let config = Config {
 				kind: Kind::Named("videotoolbox".into()),
-				..Config::new(size.width, size.height, 30)
+				..Config::new(size.width, size.height, crate::FrameRate::new(30, 1).unwrap())
 			};
 			let mut encoder = Encoder::new(&config).expect("videotoolbox is available on macOS");
 
 			let rgba = [255u8, 0, 0, 255].repeat(size.pixels() as usize);
 			let surface = crate::frame::Surface::rgba(&rgba, size).unwrap();
-			encoder.keyframe();
+			encoder.cut().unwrap();
 			let frames = encoder
-				.encode(&Frame::new(surface, moq_net::Timestamp::from_micros(0).unwrap()))
+				.encode_all(&Frame::new(surface, moq_net::Timestamp::from_micros(0).unwrap()))
 				.unwrap();
 
 			let keyframe = frames.first().expect("a keyframe");
@@ -1184,10 +1965,12 @@ mod tests {
 
 	/// Resizing across the standard-definition boundary keeps the pixels' color
 	/// space but moves the encoder into another one, which would emit BT.709
-	/// pixels under a BT.601 label. `Config::color` pins the real space, and the
-	/// bitstream then says so.
+	/// pixels under a BT.601 label. The encoder refuses that frame, and
+	/// `Config::color` pins the real space so the bitstream says so.
 	#[test]
+	#[cfg(feature = "openh264")]
 	fn config_color_pins_the_space_a_resize_carried() {
+		use super::backend::test_util::{BT709_DESCRIBED, declared_color};
 		use crate::Color;
 
 		let big = Size::new(1280, 720);
@@ -1199,41 +1982,276 @@ mod tests {
 			crate::frame::Surface::rgba(&rgba, big).unwrap(),
 			moq_net::Timestamp::from_micros(0).unwrap(),
 		);
-		let scaled = frame.resize(small).unwrap();
-		assert_eq!(
-			scaled.surface.color(),
-			Some(Color::Bt709Limited),
-			"resize keeps the space"
-		);
+		let scaled = frame.resize(small, &crate::resize::Config::default()).unwrap();
+		assert_eq!(scaled.surface.color(), Some(Color::BT709), "resize keeps the space");
 
-		// Left to infer, a 480p encoder writes BT.601 over those BT.709 samples. It
-		// still encodes (a live gateway keeps serving) but the label is wrong, which
-		// is what `Config::color` exists to fix.
+		// Left to infer, a 480p encoder would write BT.601 over those BT.709
+		// samples, so it refuses them instead.
 		let config = Config {
 			kind: Kind::Software,
-			..Config::new(small.width, small.height, 30)
+			..Config::new(small.width, small.height, crate::FrameRate::new(30, 1).unwrap())
 		};
 		let mut encoder = Encoder::new(&config).unwrap();
-		encoder.keyframe();
-		let frames = encoder.encode(&scaled).expect("a mismatch warns rather than fails");
-		use super::backend::test_util::{BT601_DESCRIBED, BT709_DESCRIBED, declared_color};
-		assert_eq!(
-			declared_color(&frames.first().expect("a keyframe").payload),
-			Some(BT601_DESCRIBED),
-			"the inferred label is the wrong one, which is the case Config::color covers"
+		encoder.cut().unwrap();
+		let err = encoder.encode_all(&scaled).expect_err("a mismatched frame is refused");
+		assert!(
+			matches!(
+				err,
+				Error::ColorMismatch {
+					frame: Color::BT709,
+					encoder: Color::BT601
+				}
+			),
+			"{err}"
 		);
 
 		// Declaring the real space fixes the label.
 		let config = Config {
 			kind: Kind::Software,
-			color: Some(Color::Bt709Limited),
-			..Config::new(small.width, small.height, 30)
+			color: Some(Color::BT709),
+			..Config::new(small.width, small.height, crate::FrameRate::new(30, 1).unwrap())
 		};
 		let mut encoder = Encoder::new(&config).unwrap();
-		encoder.keyframe();
-		let frames = encoder.encode(&scaled).expect("a declared space encodes");
+		encoder.cut().unwrap();
+		let frames = encoder.encode_all(&scaled).expect("a declared space encodes");
 
 		let keyframe = frames.first().expect("a keyframe");
 		assert_eq!(declared_color(&keyframe.payload), Some(BT709_DESCRIBED));
+	}
+
+	/// A transcode takes the space from the source's SPS, not from either size.
+	/// The decoder (openh264, which reports none) labels its pictures with the
+	/// signalled space, even where the source's size would guess another: they
+	/// convert back to the red they started as. A rung whose size guesses a
+	/// different space re-signals the source's, or refuses to mislabel it,
+	/// BT.2020 PQ and HLG included.
+	#[test]
+	#[cfg(feature = "openh264")]
+	fn transcode_keeps_the_space_the_source_signalled() {
+		use super::backend::test_util::{Described, declared_color};
+		use crate::Color;
+		use crate::color::{Matrix, Primaries, Range, Transfer};
+
+		let hdr = |transfer| Color {
+			matrix: Matrix::Bt2020,
+			range: Range::Limited,
+			primaries: Primaries::Bt2020,
+			transfer,
+		};
+		let rate = crate::FrameRate::new(30, 1).unwrap();
+		let red = [255u8, 0, 0];
+		// Only the height picks the guess, so the frames are narrow to keep the codec and the
+		// scaler cheap.
+		for (source, rung, color) in [
+			// The source's own guess, scaled across 576 lines.
+			(Size::new(160, 720), Size::new(80, 480), Color::BT709),
+			// Spaces neither size would guess.
+			(Size::new(160, 720), Size::new(240, 1080), Color::BT601),
+			(
+				Size::new(80, 480),
+				Size::new(160, 720),
+				Color::BT709.with_range(Range::Full),
+			),
+			// HDR survives the round trip with its primaries and curve.
+			(Size::new(160, 720), Size::new(80, 480), hdr(Transfer::Pq)),
+			(
+				Size::new(80, 480),
+				Size::new(160, 720),
+				hdr(Transfer::Hlg).with_range(Range::Full),
+			),
+		] {
+			let codes = color.code_points();
+			let described = || Described {
+				primaries: codes.primaries,
+				transfer: codes.transfer,
+				matrix: codes.matrix,
+				full_range: color.range == Range::Full,
+			};
+
+			// Solid red, converted in `color` rather than in the size guess.
+			let [y, u, v] = color.coefficients().apply(red);
+			let luma = source.pixels() as usize;
+			let mut data = vec![y; luma];
+			data.extend(std::iter::repeat_n(u, luma / 4));
+			data.extend(std::iter::repeat_n(v, luma / 4));
+			let frame = Frame::new(Surface::I420(I420::new(source, data).unwrap().with_color(color)), at(0));
+
+			let config = Config {
+				kind: Kind::Software,
+				color: Some(color),
+				..Config::new(source.width, source.height, rate)
+			};
+			let mut encoder = Encoder::new(&config).unwrap();
+			encoder.cut().unwrap();
+			let mut encoded = encoder.encode_all(&frame).unwrap();
+			encoded.extend(encoder.flush_all().unwrap());
+			assert_eq!(
+				declared_color(&encoded[0].payload),
+				Some(described()),
+				"{source} source SPS"
+			);
+
+			let catalog = hang::catalog::VideoConfig::new(hang::catalog::H264 {
+				inline: true,
+				profile: 0x42,
+				constraints: 0xc0,
+				level: 0x1f,
+			});
+			let mut decode = crate::decode::Config::new();
+			decode.kind = crate::decode::Kind::Software;
+			let mut decoder = crate::decode::Decoder::new(&catalog, &decode).unwrap();
+			let mut decoded = Vec::new();
+			for unit in &encoded {
+				decoded.extend(
+					decoder
+						.decode_all(&unit.payload, unit.timestamp, unit.keyframe)
+						.unwrap(),
+				);
+			}
+			decoded.extend(decoder.flush_all().unwrap());
+			let picture = decoded.first().expect("a decoded picture");
+			assert_eq!(picture.surface.color(), Some(color), "{source} decoded label");
+
+			// The label is the one the samples were made in, so they read back as red.
+			let rgba = picture.surface.to_rgba(&crate::convert::Config::default()).unwrap();
+			let center = (rgba.stride() * source.height as usize / 2) + source.width as usize / 2 * 4;
+			for (channel, expected) in red.iter().enumerate() {
+				let actual = rgba.data()[center + channel];
+				assert!(
+					actual.abs_diff(*expected) <= 8,
+					"{source} {color:?} channel {channel}: {actual}, expected {expected}"
+				);
+			}
+
+			let scaled = picture.resize(rung, &crate::resize::Config::default()).unwrap();
+			assert_eq!(scaled.surface.color(), Some(color), "{rung} rung label");
+
+			// Left to the rung's size guess, the encoder refuses rather than mislabel.
+			let mut guessed = Encoder::new(&Config {
+				kind: Kind::Software,
+				..Config::new(rung.width, rung.height, rate)
+			})
+			.unwrap();
+			assert!(matches!(
+				guessed.encode_all(&scaled),
+				Err(Error::ColorMismatch { frame, .. }) if frame == color
+			));
+
+			// Opened from the frame's label, the rung signals the source's space.
+			let mut encoder = Encoder::new(&Config {
+				kind: Kind::Software,
+				color: scaled.surface.color(),
+				..Config::new(rung.width, rung.height, rate)
+			})
+			.unwrap();
+			encoder.cut().unwrap();
+			let encoded = encoder.encode_all(&scaled).unwrap();
+			assert_eq!(
+				declared_color(&encoded[0].payload),
+				Some(described()),
+				"{rung} rung SPS"
+			);
+		}
+	}
+
+	#[cfg(all(target_os = "windows", feature = "capture", feature = "openh264"))]
+	#[test]
+	#[ignore = "requires Windows WGC video processing and a Media Foundation hardware H.264 encoder"]
+	fn wgc_nv12_encodes_with_matching_color_on_gpu_and_software() {
+		use super::backend::test_util::{BT601_DESCRIBED, BT709_DESCRIBED, declared_color};
+		use crate::frame::d3d11;
+
+		let device = d3d11::create_device(None).expect("D3D11 hardware device");
+		for (size, declared) in [
+			(Size::new(640, 480), BT601_DESCRIBED),
+			(Size::new(1280, 720), BT709_DESCRIBED),
+		] {
+			let pixels = [0, 0, 255, 255].repeat(size.pixels() as usize);
+			let source = d3d11::upload_bgra(&device, size, &pixels);
+			for backend in ["mediafoundation", "openh264"] {
+				let texture = d3d11::Texture::capture(&device, &source, size).expect("BGRA to NV12");
+				let frame = Frame::new(Surface::Texture(texture), moq_net::Timestamp::from_micros(0).unwrap());
+				let config = Config {
+					kind: Kind::Named(backend.into()),
+					color: frame.surface.color(),
+					..Config::new(size.width, size.height, crate::FrameRate::new(30, 1).unwrap())
+				};
+				let mut encoder = Encoder::new(&config).expect("requested encoder must be available");
+				assert_eq!(encoder.name(), backend);
+				let mut encoded = encoder.encode_all(&frame).expect("encode WGC texture");
+				encoded.extend(encoder.flush_all().unwrap());
+				assert!(!encoded.is_empty(), "{backend} must produce a frame");
+				assert!(
+					encoded
+						.iter()
+						.any(|frame| declared_color(&frame.payload).as_ref() == Some(&declared)),
+					"{backend} {size} SPS color"
+				);
+			}
+		}
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod external_tests {
+	use super::*;
+	use crate::frame::vulkan::{Device, Format, Handles, Image, Memory, Slot, Timeline};
+	use std::os::unix::net::UnixStream;
+
+	fn device() -> Device {
+		Device {
+			device_uuid: [0xaa; 16],
+			driver_uuid: [0xbb; 16],
+			render_node: None,
+		}
+	}
+
+	#[tokio::test]
+	async fn unknown_external_device_is_refused_at_open_and_probe() {
+		let mut config = Config::new(320, 240, FrameRate::new(30, 1).unwrap());
+		config.input = Some(device());
+		let error = match Encoder::new(&config) {
+			Ok(_) => panic!("opened an unrelated device"),
+			Err(error) => error,
+		};
+		assert!(error.to_string().contains(&device().to_string()), "{error}");
+		let error = config.probe().await.unwrap_err();
+		assert!(error.to_string().contains(&device().to_string()), "{error}");
+		config.kind = Kind::Software;
+		assert!(matches!(Encoder::new(&config), Err(Error::NoEncoder(_))));
+	}
+
+	#[test]
+	fn refuses_external_frame_on_an_encoder_without_that_device() {
+		let config = {
+			let mut config = Config::new(320, 240, FrameRate::new(30, 1).unwrap());
+			config.kind = Kind::Named("probe".into());
+			config
+		};
+		let mut encoder = Encoder::new(&config).unwrap();
+		let (memory, timeline) = UnixStream::pair().unwrap();
+		let slot = Slot::new(
+			Handles {
+				memory: memory.into(),
+				timeline: timeline.into(),
+			},
+			Image {
+				device: device(),
+				memory: Memory::OpaqueFd { memory_type: 0 },
+				size: config.size(),
+				allocation_size: 4096,
+				format: Format::Rgba8,
+			},
+			(),
+		)
+		.unwrap();
+		let (image, _) = slot.publish(Timeline::new(1, 2).unwrap()).unwrap();
+		let frame = Frame::new(
+			crate::Surface::Vulkan(image),
+			moq_net::Timestamp::from_micros(0).unwrap(),
+		);
+		let error = encoder.encode_all(&frame).unwrap_err();
+		assert!(error.to_string().contains(&device().to_string()), "{error}");
+		assert!(frame.surface.to_i420().is_err());
 	}
 }

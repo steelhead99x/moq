@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <obs-module.h>
+#include <obs.hpp>
+
+#include <moq/moq.hpp>
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <vector>
 #include "logger.h"
 #include "moq-event.h"
+#include "moq-worker.h"
 
 class MoQOutput {
 public:
@@ -22,112 +27,215 @@ public:
 	void Stop(bool signal = true);
 	void Data(struct encoder_packet *packet);
 
-	inline size_t GetTotalBytes() { return total_bytes_sent; }
+	inline uint64_t GetTotalBytes() { return total_bytes_sent.load(std::memory_order_relaxed); }
 
 	inline int GetConnectTime() { return connect_time_ms; }
 
+	// Point-in-time QUIC/WebTransport health for the live session. False when
+	// there is no session or it is between reconnects (no live connection).
+	// A failed read leaves the caller's snapshot unchanged.
+	struct ConnectionStats {
+		int reconnects = 0;
+		bool rtt_valid = false;
+		double rtt_ms = 0;
+		bool estimated_send_rate_valid = false;
+		double estimated_send_rate_bps = 0;
+		bool estimated_recv_rate_valid = false;
+		double estimated_recv_rate_bps = 0;
+		bool bytes_sent_valid = false;
+		uint64_t bytes_sent = 0;
+		bool loss_valid = false;
+		double loss_pct = 0;
+		// Negotiated draft name (e.g. moq-lite-05), empty when unavailable.
+		std::string protocol;
+		// Dial URL scheme (https, wss, …). Not the negotiated carrier when https races.
+		std::string dial;
+	};
+	bool TryGetConnectionStats(ConnectionStats *out);
+
+	// Successful (re)connects after the first for this Start(); 0 until state().connects >= 2.
+	int GetReconnectCount();
+
+	// True while the current Start() attempt has an open MoQ session.
+	// Prefer this over obs_output_get_connect_time_ms, which stays 0 for sub-ms connects.
+	bool IsLiveSession();
+
+	// The route's instance for this Start(), kept through session reconnects; empty when stopped.
+	std::string GetInstance();
+
+	// Most recent connect/reconnect failure for this Start(), or empty when none.
+	// Thread-safe; the dock polls this while connecting, while reconnecting, and on stop.
+	void CopyLastFailure(int *code, std::string *reason);
+
+	// The bitrate the video encoders follow the bandwidth grant at, summed over
+	// every encoder that follows, beside the configured rate that caps it. A rung
+	// disabled for lack of bandwidth counts as zero. False when no video encoder
+	// follows the grant.
+	struct VideoRate {
+		uint64_t target_bps = 0;
+		uint64_t configured_bps = 0;
+	};
+	bool TryGetVideoRate(VideoRate *out);
+
+	// Replace the session's tokens with a fresh publish token, presented without
+	// reconnecting and on every reconnect; the one it replaces is withdrawn once the
+	// relay answers. False when there is no session yet. The answer is logged, and a
+	// refusal is kept for TokenRefusal(); a session without in-band AUTH refuses it.
+	bool PresentToken(const std::string &token);
+	// Why the relay refused the token PresentToken() last presented, or empty.
+	std::string TokenRefusal();
+
+	// Live-event controls. Opt-in via the service flag event_mode_enabled. Markers are
+	// logged as video frames pass; they are not written onto the broadcast.
+	void StartEvent();
+	void EndEvent();
+	uint32_t InsertAdBreak(uint32_t duration_sec);
+	uint32_t InsertCustomSlate(const std::string &source_name, uint32_t duration_sec);
+
 private:
-	// Handed to libmoq as the status callback's user_data. Carries everything a
-	// callback needs about its own Start() attempt, so it never has to read a
-	// member the OBS thread may already be rewriting for the next attempt.
-	// Freed by the terminal callback.
-	struct SessionRef {
-		MoQOutput *output;
-		uint64_t attempt;
+	friend struct MoQOutputStatsTest;
+	bool CommitConnectionStats(const std::shared_ptr<moq::Session> &current, ConnectionStats snapshot,
+				   ConnectionStats *out);
+
+	// One Start()'s connection: the client dialing, the session once it connects,
+	// and the pending call whose continuation reports on it. Replaced wholesale by
+	// the next Start() and dropped by Stop(), which cancels that call.
+	struct Attempt {
+		std::shared_ptr<moq::Client> client;
+		std::shared_ptr<moq::Session> session;
+		std::optional<moq::Continuation> pending;
 		std::string url;
 		std::chrono::steady_clock::time_point started;
+		// The last state revision seen, which the next state_changed waits past.
+		uint64_t revision = 0;
+		// The wait for the relay's answer to the token PresentToken() set last.
+		std::optional<moq::Continuation> presenting;
 	};
 
-	static void SessionStatus(void *user_data, int code);
-	void SessionConnected(const SessionRef &ref, int epoch);
-	void SessionClosed(const SessionRef &ref, int code);
+	void OnConnect(const std::shared_ptr<Attempt> &attempt, moq::expected<std::shared_ptr<moq::Session>> result);
+	void OnState(const std::shared_ptr<Attempt> &attempt, moq::expected<moq::ConnectionState> result);
+	void WatchState(const std::shared_ptr<Attempt> &attempt);
+	void Fail(const std::shared_ptr<Attempt> &attempt, const moq::Error &error);
 
-	// Tell OBS the output stopped. Every obs_output_signal_stop goes through here
-	// or through an explicit signal_mutex hold.
-	void SignalStop(int code);
+	// Runs `callback` on the worker if `attempt` is still the current one once it
+	// holds signal_mutex. Cancelling the call on Stop() is not enough on its own: a
+	// result that already completed may be queued on the worker by then.
+	template<typename Output, typename Callback>
+	std::function<void(Output)> Current(const std::shared_ptr<Attempt> &attempt, Callback callback);
 
 	// Tear down the publish state without telling OBS.
 	void Reset();
+
+	// One encoder's track. A null producer means its init failed, so it isn't retried.
+	struct Track {
+		std::shared_ptr<moq::MediaTrackProducer> producer;
+		// The configured bitrate this track reserves, or 0 to reserve nothing.
+		uint64_t bitrate_bps = 0;
+		// Claimed on the first frame after the session connects.
+		std::shared_ptr<moq::Reservation> reservation;
+		// Video only, when the encoder can retune: the grant it follows, which
+		// disables it while the grant cannot fund it above a lower rendition, and a
+		// weak ref so Reset() can hand the configured bitrate back.
+		std::shared_ptr<moq::RateControl> rate;
+		OBSWeakEncoder encoder;
+		// The bitrate the encoder was last told, which Reset() restores when it moved.
+		uint64_t applied_bps = 0;
+		// Whether the last target enabled this rendition.
+		bool enabled = true;
+		// False from a disable until the keyframe that resumes it, dropping packets.
+		bool sending = true;
+		// Whether a frame was written. Until one is, the importer still holds the
+		// init's parameter sets, which a discontinuity would discard.
+		bool started = false;
+	};
 
 	void VideoInit(obs_encoder_t *encoder);
 	void VideoData(struct encoder_packet *packet);
 	void AudioInit(obs_encoder_t *encoder);
 	void AudioData(struct encoder_packet *packet);
+	// NOTE: Caller must hold media_mutex.
+	void Reserve(Track &track);
+	// Apply a rate target to `encoder`'s track: retune it, or stop sending it.
+	// NOTE: Caller must hold media_mutex.
+	void Retarget(obs_encoder_t *encoder, Track &track, const moq::RateTarget &target);
 
 	void ProcessEventMarkers(uint64_t pts_us);
+	void ApplyEventSettings(obs_data_t *settings);
+
+	// Guarded by media_mutex, same as the video path that drains its markers.
+	std::unique_ptr<MoQEventController> event_controller;
 
 	obs_output_t *output;
 
-	std::unique_ptr<MoQEventController> event_controller;
+	// Runs every continuation, so none runs once the destructor has stopped it.
+	MoQWorker worker;
 
-	// Serializes reporting the output's fate to OBS against tearing it down, and
-	// is held across the OBS calls themselves. Without it the status callback can
-	// decide to report a failure, lose the race to Stop(), and still signal:
+	// Serializes reporting the output's fate to OBS against tearing it down, and is
+	// held across the OBS calls themselves. Without it a continuation can decide to
+	// report a failure, lose the race to Stop(), and still signal:
 	// OBS_OUTPUT_DISCONNECTED then makes OBS reconnect a stream the user just
-	// stopped, since obs_output_signal_stop never checks whether the output is
-	// still active. Start() also holds it from the connect through
-	// obs_output_begin_data_capture, so a session that dies mid-startup cannot
+	// stopped, since obs_output_signal_stop never checks whether the output is still
+	// active. Start() also holds it from the connect through
+	// obs_output_begin_data_capture, so a session that fails mid-startup cannot
 	// report against an output that isn't committed yet.
 	//
-	// Recursive because obs_output_signal_stop and obs_output_begin_data_capture
-	// run the frontend's handlers inline, and a frontend may call obs_output_stop
+	// Recursive because obs_output_signal_stop and obs_output_begin_data_capture run
+	// the frontend's handlers inline, and a frontend may call obs_output_stop
 	// straight back into Stop() on this thread.
 	//
-	// Lock order: signal_mutex first, then session_mutex. Never the reverse, and
-	// never take signal_mutex from inside a libmoq call. That keeps it ordered
-	// ahead of libmoq's runtime lock too, since the status callback runs with no
-	// libmoq locks held.
-	//
-	// Two costs this buys, both bounded and deliberate:
-	// - A frontend that re-enters this output from a *different* thread while we
-	//   hold it would deadlock, which recursion does not help with. OBS reaches
-	//   one such point, the pthread_join in end_data_capture_internal. Studio's
-	//   frontend queues its handlers, so it does not arise there.
-	// - libmoq's runtime is single threaded, so a terminal callback parked here
-	//   stalls every MoQ session in the process. The holds are short, and the
-	//   expensive part of starting (obs_output_initialize_encoders) is
-	//   deliberately outside the lock.
+	// Lock order: signal_mutex, then mutex, then media_mutex.
 	std::recursive_mutex signal_mutex;
 
-	std::string server_url;
+	// The current attempt, or null once it was stopped or failed. Guarded by
+	// signal_mutex; the fields the dock polls are copied out under `mutex`.
+	std::shared_ptr<Attempt> attempt;
+
+	// How far the current attempt got. Reaching the server picks between telling OBS
+	// the connection failed and telling it the stream dropped.
+	enum class Link {
+		// Not reached the server yet, or no attempt.
+		kPending,
+		kLive,
+		// Reached the server, and now between reconnects.
+		kLost,
+	};
+
+	// Guards the group below, which the dock reads from the UI thread.
+	std::mutex mutex;
+	std::shared_ptr<moq::Session> session;
+	std::shared_ptr<moq::BandwidthConsumer> recv_bandwidth;
+	Link link = Link::kPending;
+	std::string url;
+	std::string instance;
+	int last_failure_code = 0;
+	std::string last_failure_reason;
+	std::string token_refusal;
+
+	// Written on the worker, read by GetConnectTime().
+	std::atomic<int> connect_time_ms{0};
+
+	// Guards the publishing side, which the encoder threads write through Data().
+	// Never held across an OBS call that can wait on an encoder thread.
+	std::mutex media_mutex;
+	std::shared_ptr<moq::OriginProducer> origin;
+	// Keeps the broadcast announced; the broadcast closing retracts it.
+	std::shared_ptr<moq::Route> route;
+	std::shared_ptr<moq::BroadcastProducer> broadcast;
+	std::map<obs_encoder_t *, Track> video_tracks;
+	std::map<obs_encoder_t *, Track> audio_tracks;
+	// The session's allocator once it connects. It survives reconnects: grants
+	// read empty while disconnected and resume on the next connection.
+	std::shared_ptr<moq::Allocator> allocator;
+
+	// `closed()` of retired sessions still draining, which the destructor waits
+	// out. Guarded by signal_mutex.
+	std::vector<moq::Future<void>> draining;
+
 	std::string path;
 
-	size_t total_bytes_sent;
-	// Written by the session status callback (libmoq runtime thread), read by
-	// GetConnectTime() (OBS thread); atomic to avoid a data race.
-	std::atomic<int> connect_time_ms;
-
-	int origin;
-	int broadcast;
-
-	// Session subscription lifetime. libmoq delivers a terminal status callback
-	// (code <= 0) asynchronously on its runtime thread after moq_session_close,
-	// and may touch `this` until then. outstanding_sessions counts sessions whose
-	// terminal callback hasn't fired; the destructor waits for it to reach zero
-	// so a late callback can't touch freed memory.
-	//
-	// The rest of this group is shared with that callback thread, so it is all
-	// guarded by session_mutex. It is also the only state a callback may touch:
-	// everything a callback needs about its own attempt is copied into its
-	// SessionRef, since the members above belong to whichever attempt is current.
-	std::mutex session_mutex;
-	std::condition_variable session_cv;
-	int outstanding_sessions;
-	// The live session handle, or 0 when there is none. libmoq drops the handle
-	// before firing the terminal callback, so it is retired there rather than
-	// closed later (the close would just fail with "session not found").
-	int session;
-	// Bumped whenever the publish state is torn down or restarted. A status
-	// callback stamped with an older value belongs to a superseded attempt and
-	// must leave both OBS and `session` alone, which is also what limits the
-	// failure signal to one per Start().
-	uint64_t session_attempt;
-	// Whether the current attempt ever reached the server, which picks between
-	// telling OBS the connection failed and telling it the stream dropped.
-	bool session_connected;
-
-	std::map<obs_encoder_t *, int> video_tracks;
-	std::map<obs_encoder_t *, int> audio_tracks;
+	// Bytes handed to MoQ since the last Start. Written by the encoder thread,
+	// read by OBS's stats.
+	std::atomic<uint64_t> total_bytes_sent;
 };
 
 void register_moq_output();

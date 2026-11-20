@@ -1,5 +1,6 @@
+import * as Json from "@moq/json";
 import type * as Moq from "@moq/net";
-import * as z from "@zod/mini";
+import * as z from "zod/mini";
 
 /** Zod schema for a track's wire packaging. Accepts known values or any future string. */
 export const PackagingSchema = z.union([
@@ -23,11 +24,17 @@ export type Role = z.infer<typeof RoleSchema>;
 // is exposed inline via `initData`, regardless of how it was carried on the wire.
 const trackShape = {
 	name: z.string(),
+	/** The track's absolute namespace; absent inherits the catalog's namespace. */
+	namespace: z.optional(z.string()),
 	packaging: PackagingSchema,
 	// draft-00 marks isLive required but omits it on mediatimeline/eventtimeline
 	// tracks, so accept its absence rather than reject the whole catalog.
 	isLive: z.optional(z.boolean()),
 	role: z.optional(RoleSchema),
+	/** A human-readable label for the track. */
+	label: z.optional(z.string()),
+	/** The BCP-47 language tag of the track. */
+	lang: z.optional(z.string()),
 	codec: z.optional(z.string()),
 	width: z.optional(z.number()),
 	height: z.optional(z.number()),
@@ -35,8 +42,6 @@ const trackShape = {
 	samplerate: z.optional(z.number()),
 	channelConfig: z.optional(z.string()),
 	bitrate: z.optional(z.number()),
-	// Non-standard: whether the publisher recommends temporarily avoiding this track.
-	stalled: z.optional(z.boolean()),
 	/** Resolved base64 initialization data (draft-01's initRef indirection is resolved away). */
 	initData: z.optional(z.string()),
 	renderGroup: z.optional(z.number()),
@@ -48,6 +53,11 @@ const trackShape = {
 	// The player's buffer must be at least this large to avoid underruns.
 	// Mirrors the `jitter` field in the hang catalog.
 	jitter: z.optional(z.number()),
+
+	// Non-standard: how far this rendition trails the broadcast's earliest, in milliseconds.
+	// Mirrors hang `delay`. A player holds `delay + jitter` and does not subtract across renditions.
+	// A rendition cannot trail the earliest by a negative amount, so that is malformed.
+	delay: z.optional(z.number().check(z.nonnegative())),
 };
 
 /** Zod schema describing a single track entry in an MSF catalog. */
@@ -59,10 +69,35 @@ export type Track = z.infer<typeof TrackSchema>;
 /** Zod schema for the top-level MSF catalog: a version-agnostic snapshot of tracks. */
 export const CatalogSchema = z.object({
 	tracks: z.array(TrackSchema),
+	// The application extension: root members beyond the ones MSF defines, kept
+	// verbatim. An extension adds a section here, e.g. the `mpegts` section of
+	// draft-lcurley-moq-mpegts. Mirrors `Catalog::ext` in `moq-msf`, which is typed;
+	// here it stays an untyped map, so members this build has never seen survive a
+	// decode/encode round trip unchanged.
+	ext: z.optional(
+		z.pipe(
+			// A record parser drops `__proto__`; every own extension member is application data.
+			// Only plain objects qualify, as with a record: a `Map` or class instance has no
+			// own members to copy, so accepting one would silently empty the extension. A plain
+			// object's prototype is null or some realm's `Object.prototype`, recognized by shape
+			// rather than identity so an object parsed in another realm (an iframe, `vm`) passes.
+			z.custom<Record<string, unknown>>((value) => {
+				if (typeof value !== "object" || value === null) return false;
+				const proto = Object.getPrototypeOf(value);
+				return (
+					proto === null || (Object.getPrototypeOf(proto) === null && Object.hasOwn(proto, "isPrototypeOf"))
+				);
+			}),
+			z.transform((value) => Object.assign(Object.create(null), value) as Record<string, unknown>),
+		),
+	),
 });
 
 /** The MSF catalog: a snapshot of the available tracks. */
 export type Catalog = z.infer<typeof CatalogSchema>;
+
+/** Root member names MSF itself defines, which an extension section must not reuse. */
+const RESERVED_ROOT = ["version", "generatedAt", "isComplete", "tracks", "initDataList"];
 
 /** The newest MSF draft version string this package emits on the wire. */
 export const VERSION = "draft-01";
@@ -93,6 +128,9 @@ const WireCatalogSchema = z.object({
 
 /** Serialize a catalog to its JSON wire representation (draft-01). */
 export function encode(catalog: Catalog): Uint8Array {
+	// Refuse what `decode` would reject, so a publisher fails here instead of its subscribers.
+	CatalogSchema.parse(catalog);
+
 	// Hoist inline init payloads into a shared, deduplicated initDataList and
 	// reference each from its track via initRef (the draft-01 wire shape).
 	const initDataList: z.infer<typeof InitDataSchema>[] = [];
@@ -112,44 +150,77 @@ export function encode(catalog: Catalog): Uint8Array {
 		return { ...wireTrack, initRef: id };
 	});
 
-	const wire: Record<string, unknown> = { version: VERSION, tracks };
+	// Null prototype: a `__proto__` member of the extension must land as an own property.
+	// Assigning it to an ordinary object would invoke the prototype setter instead, dropping
+	// the member from the encoded catalog.
+	const wire: Record<string, unknown> = Object.assign(Object.create(null), { version: VERSION, tracks });
 	if (initDataList.length > 0) wire.initDataList = initDataList;
+
+	// Extension members are written flat, so one named after a field MSF defines would
+	// emit a duplicate key and lose one of the two on re-parse. Refuse instead. The Rust
+	// side needs no such check: there the extension is a struct, not a map.
+	for (const [name, value] of Object.entries(catalog.ext ?? {})) {
+		if (RESERVED_ROOT.includes(name)) {
+			throw new Error(`MSF catalog section "${name}" collides with a reserved root field`);
+		}
+		wire[name] = value;
+	}
 
 	return new TextEncoder().encode(JSON.stringify(wire));
 }
 
 /** Parse and validate a catalog from its JSON wire representation. Throws if invalid. */
 export function decode(raw: Uint8Array): Catalog {
-	const str = new TextDecoder().decode(raw);
-	try {
-		const wire = WireCatalogSchema.parse(JSON.parse(str));
+	const root = new Json.Stream.Decoder().decode(raw);
+	const wire = WireCatalogSchema.parse(root);
 
-		// id -> inline payload, built once so resolution is linear in the number
-		// of tracks rather than tracks x entries.
-		const inline = new Map((wire.initDataList ?? []).filter((e) => e.type === "inline").map((e) => [e.id, e.data]));
-
-		const tracks = (wire.tracks ?? []).map(({ initRef, ...track }) => {
-			track.isLive ??= false;
-
-			// Resolve draft-01 initRef into inline initData so callers never see
-			// the indirection. Inline initData (draft-00) is left untouched.
-			if (track.initData === undefined && initRef !== undefined) {
-				// Only inline entries are resolved here. A non-inline (e.g. `url`) initRef
-				// legitimately stays undefined; the consumer fetches that init out-of-band.
-				track.initData = inline.get(initRef);
-			}
-			return track;
-		});
-
-		return { tracks };
-	} catch (error) {
-		console.warn("invalid MSF catalog", str);
-		throw error;
+	// Every root member MSF itself does not define belongs to the extension, kept verbatim.
+	// Null prototype for the same reason as `encode`, and so a `__proto__` member of an
+	// untrusted catalog cannot become an inherited property of this map.
+	const ext: Record<string, unknown> = Object.create(null);
+	for (const [name, value] of Object.entries(root as Record<string, unknown>)) {
+		if (!RESERVED_ROOT.includes(name)) ext[name] = value;
 	}
+
+	// id -> init data entry, built once so resolution is linear in the number
+	// of tracks rather than tracks x entries. A repeated id is refused: readers
+	// that kept different entries would disagree on a track's init bytes.
+	const byId = new Map<string, z.infer<typeof InitDataSchema>>();
+	for (const entry of wire.initDataList ?? []) {
+		if (byId.has(entry.id)) throw new Error(`MSF catalog has duplicate initData id "${entry.id}"`);
+		byId.set(entry.id, entry);
+	}
+
+	const tracks = (wire.tracks ?? []).map(({ initRef, ...track }) => {
+		track.isLive ??= false;
+
+		// Resolve draft-01 initRef into inline initData so callers never see the
+		// indirection. Inline initData (draft-00) is kept as-is, but a catalog that
+		// carries both forms must not disagree. Every refusal mirrors `moq-msf`, so a
+		// malformed reference never looks like a track without init data.
+		if (initRef !== undefined) {
+			const entry = byId.get(initRef);
+			if (entry === undefined) {
+				throw new Error(`MSF track "${track.name}" references missing initData "${initRef}"`);
+			}
+			if (entry.type !== "inline") {
+				throw new Error(
+					`MSF track "${track.name}" references initData "${initRef}" with unsupported type "${entry.type}"`,
+				);
+			}
+			if (track.initData !== undefined && track.initData !== entry.data) {
+				throw new Error(`MSF track "${track.name}" carries conflicting initData and initRef "${initRef}"`);
+			}
+			track.initData = entry.data;
+		}
+		return track;
+	});
+
+	return Object.keys(ext).length > 0 ? { tracks, ext } : { tracks };
 }
 
 /** Read and decode the next catalog frame from a track, or undefined if the track ended. */
-export async function fetch(track: Moq.Track.Subscriber): Promise<Catalog | undefined> {
+export async function fetch(track: Moq.Track.Ordered): Promise<Catalog | undefined> {
 	const frame = await track.readFrame();
 	if (!frame) return undefined;
 	return decode(frame.payload);

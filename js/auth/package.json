@@ -1,0 +1,37 @@
+{
+	"name": "@moq/auth",
+	"type": "module",
+	"version": "0.2.2",
+	"description": "Media over QUIC - the authorization contract: requests, grants, and the JWT that rides them",
+	"license": "(MIT OR Apache-2.0)",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/moq-dev/moq.git",
+		"directory": "js/auth"
+	},
+	"sideEffects": false,
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"bin": {
+		"moq-auth": "./src/cli.ts"
+	},
+	"scripts": {
+		"build": "rm -rf dist && tsc -b tsconfig.build.json && bun ../common/package.ts",
+		"check": "tsc --noEmit && tsc -b examples/tsconfig.json",
+		"test": "bun test --only-failures",
+		"release": "bun ../common/release.ts"
+	},
+	"dependencies": {
+		"@moq/clock": "workspace:^",
+		"@moq/pattern": "workspace:^",
+		"commander": "^15.0.0",
+		"jose": "^6.2.15",
+		"zod": "^4.6.7"
+	},
+	"devDependencies": {
+		"@types/bun": "^1.4.4",
+		"@types/node": "^26.6.6",
+		"typescript": "7.0.2"
+	}
+}

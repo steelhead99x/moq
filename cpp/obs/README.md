@@ -3,16 +3,14 @@
 An OBS Studio plugin for publishing to and subscribing from MoQ relays.
 
 It loads into a stock OBS Studio install (no OBS source build required) and links
-`libmoq`, built from the in-tree [`rs/libmoq`](../../rs/libmoq) crate.
+the moq C++ package, built from the in-tree [`cpp/moq`](../moq) over
+[`rs/moq-ffi`](../../rs/moq-ffi).
 
-## Features
+## Live events
 
-- **Simple Broadcast**: Direct publish to MoQ relay with minimal configuration
-- **Live Events**: Professional event production with SCTE-35 markers, ad break insertion, and slate management
-- **Flexible Control**: In-app dock UI or external control via OBS WebSocket
-- **Standards-Based**: SCTE-35 signaling for broadcast interoperability
-
-See [EVENT\_API.md](EVENT_API.md) for live event API documentation and [UPSTREAM\_NOTES.md](UPSTREAM_NOTES.md) for contribution guidance.
+The dock's Mode selector adds an opt-in live event panel: start and end, ad breaks, and
+slate source names. Due markers are logged as video frames pass. They are not muxed into
+the broadcast. See [EVENT_API.md](EVENT_API.md). Simple broadcast is the default.
 
 Build instructions for each platform live in [`doc/bin/obs.md`](../../doc/bin/obs.md).
 In short, from the repo root:
@@ -29,3 +27,8 @@ just obs build
 
 Licensed under GPL-2.0-or-later (see [LICENSE](LICENSE)), separate from the rest of the
 repository, because it links OBS.
+
+Release dry runs use `just obs package --target TARGET --moq-archive FILE` to
+link the matching local C++ release archive. Tag builds use
+`--moq-release VERSION` to download the published archive. The two inputs are
+mutually exclusive; neither changes the plugin version in `VERSION`.

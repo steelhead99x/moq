@@ -1,17 +1,26 @@
-import { Time } from "@moq/net";
+import { Duration } from "@moq/clock";
 import type { AudioFrame } from "./capture";
 
-type FrameSize = { samples: number } | { duration: Time.Micro };
+type FrameSize = { samples: number } | { duration: Duration };
+
+// How far an input timestamp may sit from where the running timeline expects it before it counts as
+// a new segment rather than rounding noise. Capture quanta and container packets are both exact to
+// well under this, so anything past it is a real gap.
+const DISCONTINUITY = 1_000;
 
 /** Collects capture quanta into codec-aligned audio frames. */
 export class Framer {
 	readonly #sampleRate: number;
 	readonly #channels: number;
 	readonly #size: FrameSize;
+	// The fixed frame duration in microseconds, when sized by duration.
+	readonly #duration: number | undefined;
 
-	#origin: Time.Micro | undefined;
+	// Microseconds.
+	#origin: number | undefined;
 	#frameIndex = 0;
 	#sampleIndex = 0;
+	#inputSamples = 0;
 	#buffer: Float32Array[] = [];
 	#written = 0;
 
@@ -20,11 +29,12 @@ export class Framer {
 		if (props.sampleRate <= 0) throw new Error("invalid sample rate");
 		if (props.channels <= 0) throw new Error("invalid channel count");
 		if ("samples" in props.size && props.size.samples <= 0) throw new Error("invalid frame samples");
-		if ("duration" in props.size && props.size.duration <= 0) throw new Error("invalid frame duration");
+		if ("duration" in props.size && props.size.duration.isZero()) throw new Error("invalid frame duration");
 
 		this.#sampleRate = props.sampleRate;
 		this.#channels = props.channels;
 		this.#size = props.size;
+		this.#duration = "duration" in props.size ? props.size.duration.asMicros() : undefined;
 	}
 
 	/** Append captured samples and return every complete codec frame they form. */
@@ -37,7 +47,15 @@ export class Framer {
 		}
 		if (samples === 0) return [];
 
-		this.#origin ??= input.timestamp;
+		// Output timestamps are counted forward from #origin, so a gap in the input would otherwise
+		// be swallowed: the stream would slide earlier by the length of the gap and stay there.
+		// Looping a file whose audio is shorter than its video hits this on every wrap, and the
+		// error accumulates, so audio drifts further from video with each pass.
+		const timestamp = input.timestamp.asMicros();
+		if (this.#discontinuous(timestamp)) this.#reset(timestamp);
+
+		this.#origin ??= timestamp;
+		this.#inputSamples += samples;
 
 		const output: AudioFrame[] = [];
 		let offset = 0;
@@ -67,27 +85,52 @@ export class Framer {
 		return output;
 	}
 
+	/** Where the next frame will start. Throws until the first input sets the origin. */
+	get next(): Duration {
+		return this.#timestamp();
+	}
+
+	// Whether this chunk starts somewhere other than where the previous one left off.
+	#discontinuous(timestamp: number): boolean {
+		if (this.#origin === undefined) return false;
+
+		const elapsed = (this.#inputSamples / this.#sampleRate) * 1_000_000;
+		return Math.abs(timestamp - this.#origin - elapsed) > DISCONTINUITY;
+	}
+
+	// Start a new segment at `timestamp`, dropping the partial frame the previous one left behind.
+	// Those samples sit on the old timeline, so padding them out with new ones would encode a splice
+	// that never happened. It costs less than one frame of audio at the seam.
+	#reset(timestamp: number): void {
+		this.#origin = timestamp;
+		this.#frameIndex = 0;
+		this.#sampleIndex = 0;
+		this.#inputSamples = 0;
+		this.#buffer = [];
+		this.#written = 0;
+	}
+
 	#createBuffer(): Float32Array[] {
 		const samples = this.#frameSamples();
 		return Array.from({ length: this.#channels }, () => new Float32Array(samples));
 	}
 
 	#frameSamples(): number {
-		if ("samples" in this.#size) return this.#size.samples;
+		if (this.#duration === undefined) return "samples" in this.#size ? this.#size.samples : 0;
 
 		// Round cumulative boundaries instead of each frame independently. This alternates neighboring
 		// integer sizes when a duration is a fractional number of source samples without accumulating drift.
-		const end = Math.round(((this.#frameIndex + 1) * this.#size.duration * this.#sampleRate) / 1_000_000);
+		const end = Math.round(((this.#frameIndex + 1) * this.#duration * this.#sampleRate) / 1_000_000);
 		return end - this.#sampleIndex;
 	}
 
-	#timestamp(): Time.Micro {
+	#timestamp(): Duration {
 		if (this.#origin === undefined) throw new Error("missing timestamp origin");
 
 		const offset =
-			"duration" in this.#size
-				? this.#frameIndex * this.#size.duration
-				: Time.Micro.fromSecond((this.#sampleIndex / this.#sampleRate) as Time.Second);
-		return (this.#origin + offset) as Time.Micro;
+			this.#duration !== undefined
+				? this.#frameIndex * this.#duration
+				: (this.#sampleIndex / this.#sampleRate) * 1_000_000;
+		return Duration.micros(this.#origin + offset);
 	}
 }

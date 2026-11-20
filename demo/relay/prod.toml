@@ -1,12 +1,26 @@
 # An example of a production configuration.
 # Here's a real one: https://github.com/moq-dev/moq.dev/blob/b4da7dd8f09879cefb593d5e35f99f064caa3943/infra/relay.yml.tpl#L56
 
-[server]
+[listen]
 # Listen for QUIC connections on UDP:443
 # This is the default port for WebTransport
-listen = "[::]:443"
+bind = "[::]:443"
 
-[server.tls]
+# Every version, plus the opt-in moq-lite-07-wip that sockets (such as MoQ Boy's) need.
+version = [
+    "moq-lite-07-wip",
+    "moq-lite-06",
+    "moq-lite-05",
+    "moq-lite-04",
+    "moq-lite-03",
+    "moq-lite-02",
+    "moq-lite-01",
+    "moq-transport-22",
+    "moq-transport-20",
+    "moq-transport-18",
+]
+
+[listen.tls]
 # You'll need to provide a real certificate and key in production.
 # You can get this via a service like Let's Encrypt.
 cert = "cert.pem"
@@ -27,18 +41,22 @@ key = "key.pem"
 
 # See docs/auth.md for more information.
 [auth]
-# A single JWK key file for authentication. No kid required in JWTs.
-key = "root.jwk"
-
-# Allow anonymous subscribing for anon/** and demo/**
-# Allow anonymous publishing for anon/** only
-[auth.public]
-subscribe = ["anon", "demo"]
-publish = ["anon", "demo/viewer"]
-
-# For multiple keys with rotation, use a directory instead:
-# key_dir = "/path/to/keys/"
-# Keys are named {kid}.jwk and resolved by the kid in the JWT header.
-
-# Or use a URL for remote key management:
-# key_dir = "https://api.example.com/keys"
+# The auth server asked once per session event. The policy lives there:
+#
+#   moq auth serve --listen 127.0.0.1:4440 --key root.jwk \
+#     --public-subscribe 'anon/**' --public-subscribe 'demo/**' \
+#     --public-publish 'anon/**' \
+#     --public-publish 'demo/boy/.client/*' \
+#     --public-publish 'demo/carla/.client/*' \
+#     --mtls-publish '**' --mtls-subscribe '**' --mtls-link peer
+#
+# Anonymous MoQ Boy viewers and CARLA drivers get one shared grant each, covering only
+# client socket endpoints: a game's or truck's server endpoint, `.server/<name>`, stays
+# its publisher's, which signs in with a token. `demo/**` lets viewers dial those
+# servers, and also read another viewer's client endpoint, which yields nothing without
+# a session's secret id. Each viewer's id is 128 random bits, so no viewer can guess
+# another's.
+#
+# For multiple keys with rotation, give it `--key-dir /path/to/keys/` instead:
+# keys are named {kid}.jwk and resolved by the kid in the JWT header.
+url = "http://127.0.0.1:4440/"

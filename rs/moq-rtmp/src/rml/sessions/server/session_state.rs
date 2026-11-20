@@ -1,5 +1,8 @@
-#[derive(Eq, PartialEq)]
 pub enum SessionState {
 	Started,
-	Connected,
+	/// A connect was accepted for `app_name`.
+	Connected {
+		app_name: String,
+	},
+	Completed,
 }

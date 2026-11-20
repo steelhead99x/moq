@@ -1,410 +1,254 @@
-//! The local cluster topology view behind the internal `/nodes` endpoint.
+//! The local cluster view behind the internal `/nodes` endpoint.
 //!
-//! Combines the node advertisements gossiped under [`MESH_PREFIX`] with the
-//! direct relay sessions this process currently holds, so an operator can see
-//! which peers are visible, which are connected, and who dialed whom.
+//! Lists every peer this relay is configured to dial, whether or not a session
+//! is up, with its live sessions and when one last connected. A peer's history
+//! is keyed by its dial identity, so it survives failed attempts and a dial
+//! restarted for a new cost or credential, and is retired only when the peer
+//! leaves the dial set. Accepted peer sessions are not listed: a peer declares
+//! no URL, so there is nothing to name it by.
 
 use std::{
-	collections::{BTreeMap, HashMap},
-	sync::{Arc, Mutex},
+	collections::BTreeMap,
+	sync::{Arc, Mutex, PoisonError},
 };
 
-use moq_net::{Origin, origin};
 use serde::Serialize;
 
-/// Namespace containing the empty broadcasts used to advertise cluster nodes.
-pub(crate) const MESH_PREFIX: &str = ".internal/origins";
+use crate::cluster::PeerKey;
 
-/// A local view of announced cluster nodes and established direct connections.
-#[derive(Clone)]
+/// Outbound cluster peers by dial identity.
+#[derive(Clone, Default)]
 pub(crate) struct Nodes {
-	origin: origin::Producer,
-	connections: Arc<Connections>,
+	state: Arc<Mutex<State>>,
 }
 
 #[derive(Default)]
-struct Connections {
-	entries: Mutex<HashMap<u64, ConnectionRecord>>,
+struct State {
+	/// Keyed by the dial set's peer identity.
+	peers: BTreeMap<PeerKey, Peer>,
+	/// Distinguishes the dials of one peer, so a replaced dial clears only its own session.
+	next_dial: u64,
 }
 
-#[derive(Clone)]
-struct ConnectionRecord {
-	direction: Direction,
-	target: ConnectionTarget,
-}
-
-#[derive(Clone)]
-enum ConnectionTarget {
-	Node(String),
-	Origin(Origin),
+#[derive(Default)]
+struct Peer {
+	/// Live sessions by `conn` id, each with the dial that owns it.
+	connections: BTreeMap<u64, (u64, moq_tokio::Transport)>,
+	/// The latest successful handshake of any dial of this peer.
+	last_connected: Option<kio::clock::Instant>,
 }
 
 /// The JSON document returned by the internal `/nodes` endpoint.
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct Snapshot {
-	/// Announced or directly connected cluster nodes.
+	/// Configured outbound peers, connected or not.
 	pub nodes: Vec<Node>,
 }
 
-/// One known cluster node in the local topology view.
+/// One configured outbound peer.
 #[derive(Debug, Serialize)]
 pub(crate) struct Node {
-	/// Canonical URL advertised for the node.
+	/// The peer's canonical identity, with query, userinfo, and repeated slashes
+	/// removed: its dial URL, or for a LAN peer that advertised no node URL, its
+	/// per-run mDNS instance in URL form.
 	pub node: String,
-	/// Origin identity from the node's announcement, when available.
-	pub origin_id: Option<String>,
-	/// Selected route for the node's internal advertisement.
-	pub announced: Option<Announcement>,
-	/// Established direct connections to this node.
+	/// Live sessions to this peer; empty while it connects or retries.
 	pub connections: Vec<Connection>,
+	/// Seconds since a session to this peer last connected, including sessions
+	/// already closed. Null until the first successful handshake.
+	pub last_connected_seconds_ago: Option<f64>,
 }
 
-/// The selected route for a node advertisement.
-#[derive(Debug, Serialize)]
-pub(crate) struct Announcement {
-	/// Origin identities in traversal order, oldest first.
-	pub hops: Vec<String>,
-	/// Number of hops in the selected route.
-	pub hop_count: usize,
-	/// Accumulated cost of the selected route.
-	pub cost: u64,
-}
-
-/// An established direct cluster connection.
+/// A live outbound cluster session.
+#[serde_with::serde_as]
 #[derive(Debug, Serialize)]
 pub(crate) struct Connection {
 	/// The session's `conn` id, matching the `conn{id}` span its log lines carry.
 	/// Process-local, and only meaningful while the session lasts.
 	pub id: u64,
-	/// Whether this relay accepted or initiated the connection.
-	pub direction: Direction,
+	/// The transport the session runs over.
+	#[serde_as(as = "serde_with::DisplayFromStr")]
+	pub transport: moq_tokio::Transport,
 }
 
-/// Direction of an established cluster connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Direction {
-	/// A connection accepted from another relay.
-	Inbound,
-	/// A connection initiated by this relay.
-	Outbound,
-}
-
-struct NodeBuilder {
-	origin_id: Option<String>,
-	announced: Option<Announcement>,
-	connections: Vec<Connection>,
-}
-
-/// The advertisements one scan of the discovery namespace turned up.
-#[derive(Default)]
-struct Announced {
-	nodes: BTreeMap<String, NodeBuilder>,
-	/// Origin id to the single node advertising it, or `None` once more than one
-	/// does and the id no longer identifies a peer.
-	origins: HashMap<u64, Option<String>>,
-}
-
-/// Removes a live connection from the topology view when its session ends.
-pub(crate) struct ConnectionGuard {
+/// One dial task's handle on its peer's entry. Dropping it clears the session it
+/// holds, but keeps the peer's history: [`Nodes::retain`] retires that.
+pub(crate) struct Dial {
 	nodes: Nodes,
+	peer: PeerKey,
 	id: u64,
 }
 
 impl Nodes {
-	pub(crate) fn new(origin: origin::Producer) -> Self {
-		Self {
-			origin,
-			connections: Arc::default(),
-		}
+	fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+		self.state.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 
-	pub(crate) fn with_origin(mut self, origin: origin::Producer) -> Self {
-		self.origin = origin;
-		self
-	}
-
-	/// Record a dial this relay initiated, keyed by the URL it dialed.
-	///
-	/// `id` is the session's `conn` id from
-	/// [`Cluster::next_connection_id`](crate::Cluster::next_connection_id).
-	pub(crate) fn connect_outbound(&self, id: u64, node: impl Into<String>) -> ConnectionGuard {
-		self.connect(id, Direction::Outbound, ConnectionTarget::Node(node.into()))
-	}
-
-	/// Record a session this relay accepted, keyed by the origin the peer declared.
-	///
-	/// `id` is the session's `conn` id from
-	/// [`Cluster::next_connection_id`](crate::Cluster::next_connection_id).
-	pub(crate) fn connect_inbound(&self, id: u64, origin: Origin) -> ConnectionGuard {
-		self.connect(id, Direction::Inbound, ConnectionTarget::Origin(origin))
-	}
-
-	fn connect(&self, id: u64, direction: Direction, target: ConnectionTarget) -> ConnectionGuard {
-		self.connections
-			.entries
-			.lock()
-			.expect("node connection registry poisoned")
-			.insert(id, ConnectionRecord { direction, target });
-		ConnectionGuard {
+	/// Register a dial of `peer`, the dial set's identity for it, keeping any
+	/// history an earlier dial of the same peer left.
+	pub(crate) fn dial(&self, peer: &PeerKey) -> Dial {
+		let mut state = self.lock();
+		state.peers.entry(peer.clone()).or_default();
+		let id = state.next_dial;
+		state.next_dial += 1;
+		Dial {
 			nodes: self.clone(),
+			peer: peer.clone(),
 			id,
 		}
 	}
 
-	/// The node advertisements currently visible under [`MESH_PREFIX`].
-	fn announced(&self) -> Announced {
-		match self.origin.consume().with_root(MESH_PREFIX) {
-			Some(consumer) => self.scan_announced(&mut consumer.announced()),
-			None => Announced::default(),
-		}
-	}
-
-	/// Drain every update the cursor has buffered into a node map.
-	fn scan_announced(&self, announced: &mut moq_net::announce::Consumer) -> Announced {
-		let mut scanned = Announced::default();
-
-		while let Some(update) = announced.try_next() {
-			// The origin delivers a re-announce as unannounce-then-announce, so an
-			// unannounce can land mid-drain. Skip it rather than end the scan, which
-			// would drop every node still queued behind it.
-			let Some(broadcast) = update.broadcast else { continue };
-
-			let key = canonical_announced_node(update.path.as_str());
-			let route = broadcast.route();
-			let hop_ids = route.hops.iter().map(|origin| origin.id()).collect::<Vec<_>>();
-			// An advertisement with no hops never crossed a link, so it is our own.
-			let origin_id = hop_ids.first().copied().unwrap_or_else(|| self.origin.id());
-
-			scanned
-				.origins
-				.entry(origin_id)
-				.and_modify(|current| {
-					if current.as_deref() != Some(&key) {
-						*current = None;
-					}
-				})
-				.or_insert_with(|| Some(key.clone()));
-
-			scanned.nodes.insert(
-				key,
-				NodeBuilder {
-					origin_id: Some(origin_id.to_string()),
-					announced: Some(Announcement {
-						hop_count: hop_ids.len(),
-						hops: hop_ids.into_iter().map(|origin| origin.to_string()).collect(),
-						cost: route.cost,
-					}),
-					connections: Vec::new(),
-				},
-			);
-		}
-
-		scanned
+	/// Retire the history of every peer `keep` rejects, once it leaves the dial set.
+	pub(crate) fn retain(&self, mut keep: impl FnMut(&PeerKey) -> bool) {
+		self.lock().peers.retain(|peer, _| keep(peer));
 	}
 
 	pub(crate) fn snapshot(&self) -> Snapshot {
-		let Announced { mut nodes, origins } = self.announced();
+		let state = self.lock();
+		let nodes = state
+			.peers
+			.iter()
+			.map(|(peer, entry)| Node {
+				node: peer.to_string(),
+				// Sorted already: the map is keyed by `conn` id.
+				connections: entry
+					.connections
+					.iter()
+					.map(|(&id, &(_, transport))| Connection { id, transport })
+					.collect(),
+				last_connected_seconds_ago: entry.last_connected.map(|at| at.elapsed().as_secs_f64()),
+			})
+			.collect();
+		Snapshot { nodes }
+	}
+}
 
-		let connections = self
-			.connections
-			.entries
-			.lock()
-			.expect("node connection registry poisoned");
-		let mut connections = connections.iter().collect::<Vec<_>>();
-		connections.sort_by_key(|(id, _)| **id);
-		for (&id, connection) in connections {
-			let key = match &connection.target {
-				ConnectionTarget::Node(node) => canonical_node(node),
-				ConnectionTarget::Origin(origin) => {
-					let Some(Some(node)) = origins.get(&origin.id()) else {
-						continue;
-					};
-					node.clone()
-				}
-			};
-			let node = nodes.entry(key).or_insert_with(|| NodeBuilder {
-				origin_id: None,
-				announced: None,
-				connections: Vec::new(),
-			});
-			node.connections.push(Connection {
-				id,
-				direction: connection.direction,
-			});
+impl Dial {
+	/// Apply one lifecycle observation of session `id`, which this dial owns.
+	pub(crate) fn observe(&self, id: u64, observation: &moq_tokio::connection::Observation) {
+		let mut state = self.nodes.lock();
+		// A retired peer's dial is being cancelled; it records nothing more.
+		let Some(peer) = state.peers.get_mut(&self.peer) else {
+			return;
+		};
+		if let Some(at) = observation.last_connected {
+			peer.last_connected = Some(peer.last_connected.map_or(at, |prev| prev.max(at)));
 		}
+		use moq_tokio::connection::Phase;
+		match observation.phase {
+			Phase::Connected { transport, .. } | Phase::Migrating { transport, .. } => {
+				peer.connections.insert(id, (self.id, transport));
+			}
+			Phase::Connecting { .. } | Phase::Disconnected { .. } | Phase::Closed { .. } => {
+				peer.connections.remove(&id);
+			}
+		}
+	}
 
-		Snapshot {
-			nodes: nodes
-				.into_iter()
-				.map(|(key, node)| Node {
-					node: key,
-					origin_id: node.origin_id,
-					announced: node.announced,
-					connections: node.connections,
-				})
-				.collect(),
+	/// Clear this dial's session once it ends, keeping the peer's history.
+	pub(crate) fn disconnected(&self) {
+		if let Some(peer) = self.nodes.lock().peers.get_mut(&self.peer) {
+			peer.connections.retain(|_, (dial, _)| *dial != self.id);
 		}
 	}
 }
 
-impl Drop for ConnectionGuard {
+impl Drop for Dial {
 	fn drop(&mut self) {
-		self.nodes
-			.connections
-			.entries
-			.lock()
-			.expect("node connection registry poisoned")
-			.remove(&self.id);
+		self.disconnected();
 	}
-}
-
-fn canonical_node(node: &str) -> String {
-	crate::cluster::canonicalize_peer_key(node)
-}
-
-fn canonical_announced_node(node: &str) -> String {
-	canonical_node(&crate::cluster::advertised_node_url(node))
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use moq_net::{Origin, OriginList, broadcast};
 
-	async fn announced_node(
-		origin: &moq_net::origin::Producer,
-		node: &str,
-		hops: &[u64],
-		cost: u64,
-	) -> broadcast::Producer {
-		let hops = OriginList::try_from(
-			hops.iter()
-				.map(|id| Origin::new(*id).expect("valid test origin"))
-				.collect::<Vec<_>>(),
-		)
-		.unwrap();
-		let path = moq_net::Path::new(MESH_PREFIX).join(node);
-		let broadcast = origin
-			.create_broadcast(&path, broadcast::Route::announced().with_hops(hops).with_cost(cost))
-			.unwrap();
-		origin
-			.consume()
-			.announced_broadcast(&path)
-			.await
-			.expect("test node announced");
-		broadcast
+	fn key(peer: &str) -> PeerKey {
+		PeerKey::canonicalize(peer)
 	}
 
-	#[tokio::test]
-	async fn snapshot_combines_announcements_and_live_connections() {
-		const REMOTE_ID: u64 = 9_007_199_254_740_993;
+	fn observation(transport: Option<moq_tokio::Transport>) -> moq_tokio::connection::Observation {
+		moq_tokio::connection::Observation {
+			revision: 1,
+			connects: 1,
+			last_connected: Some(kio::clock::now()),
+			phase: match transport {
+				Some(transport) => moq_tokio::connection::Phase::Connected {
+					transport,
+					version: moq_net::Version::ALL[0],
+				},
+				None => moq_tokio::connection::Phase::Disconnected { failure: None },
+			},
+		}
+	}
 
-		let origin = Origin::new(100).unwrap().produce();
-		let nodes = Nodes::new(origin.clone());
-		let _remote = announced_node(&origin, "https://relay-b.example/", &[REMOTE_ID], 7).await;
-		let _outbound = nodes.connect_outbound(0, "https://relay-b.example/");
-		let _inbound = nodes.connect_inbound(1, Origin::new(REMOTE_ID).unwrap());
+	#[test]
+	fn configured_peers_list_before_they_connect_without_credentials() {
+		let nodes = Nodes::default();
+		let _dial = nodes.dial(&key("https://user:secret@peer.example//relay/"));
 
-		let snapshot = nodes.snapshot();
-		assert_eq!(snapshot.nodes.len(), 1);
-		let node = &snapshot.nodes[0];
-		assert_eq!(node.node, "https://relay-b.example/");
-		assert_eq!(node.origin_id.as_deref(), Some("9007199254740993"));
-		assert_eq!(node.announced.as_ref().unwrap().hops, vec!["9007199254740993"]);
-		assert_eq!(node.announced.as_ref().unwrap().hop_count, 1);
-		assert_eq!(node.announced.as_ref().unwrap().cost, 7);
-		assert_eq!(node.connections.len(), 2);
-		assert_eq!(node.connections[0].direction, Direction::Outbound);
-		assert_eq!(node.connections[1].direction, Direction::Inbound);
 		assert_eq!(
-			serde_json::to_value(&snapshot).unwrap(),
+			serde_json::to_value(nodes.snapshot()).unwrap(),
 			serde_json::json!({
-				"nodes": [{
-					"node": "https://relay-b.example/",
-					"origin_id": "9007199254740993",
-					"announced": { "hops": ["9007199254740993"], "hop_count": 1, "cost": 7 },
-					"connections": [
-						{ "id": 0, "direction": "outbound" },
-						{ "id": 1, "direction": "inbound" }
-					]
-				}]
+				"nodes": [{ "node": "https://peer.example/relay", "connections": [], "last_connected_seconds_ago": null }]
 			}),
 		);
 	}
 
 	#[test]
-	fn snapshot_omits_unresolved_inbound_connections() {
-		let origin = Origin::new(100).unwrap().produce();
-		let nodes = Nodes::new(origin);
-		let _inbound = nodes.connect_inbound(0, Origin::new(200).unwrap());
-
-		assert!(nodes.snapshot().nodes.is_empty());
-	}
-
-	#[test]
-	fn snapshot_stops_reporting_closed_outbound_connections() {
-		let origin = Origin::new(100).unwrap().produce();
-		let nodes = Nodes::new(origin);
-		let connection = nodes.connect_outbound(0, "https://relay-b.example/");
-		assert_eq!(nodes.snapshot().nodes.len(), 1);
-
-		drop(connection);
-		assert!(nodes.snapshot().nodes.is_empty());
-	}
-
-	#[test]
-	fn outbound_node_omits_credentials_from_url() {
-		let origin = Origin::new(100).unwrap().produce();
-		let nodes = Nodes::new(origin);
-		let _connection = nodes.connect_outbound(0, "https://relay-b.example/?jwt=secret");
-
-		assert_eq!(nodes.snapshot().nodes[0].node, "https://relay-b.example/");
-	}
-
-	/// A re-announce reaches the cursor as unannounce-then-announce, so a bare
-	/// unannounce can sit ahead of nodes still queued behind it. Treating that as
-	/// the end of the scan would silently truncate `/nodes` whenever the cluster
-	/// churned mid-request.
-	#[tokio::test(start_paused = true)]
-	async fn scan_skips_an_unannounce_queued_ahead_of_another_node() {
-		let origin = Origin::new(100).unwrap().produce();
-		let nodes = Nodes::new(origin.clone());
-		let mut first = announced_node(&origin, "https://relay-a.example/", &[200], 1).await;
-		let _second = announced_node(&origin, "https://relay-b.example/", &[300], 1).await;
-
-		let consumer = origin.consume().with_root(MESH_PREFIX).expect("mesh prefix is in root");
-		let mut announced = consumer.announced();
-
-		// Take relay-a's replayed announce, then retire it so the cursor queues a
-		// bare unannounce ahead of relay-b's still-pending announce.
-		let first_update = announced.try_next().expect("replayed announce");
+	fn history_survives_disconnects_and_a_replaced_dial() {
+		let nodes = Nodes::default();
+		let dial = nodes.dial(&key("https://peer.example/"));
+		dial.observe(2, &observation(Some(moq_tokio::Transport::WebSocket)));
 		assert_eq!(
-			canonical_announced_node(first_update.path.as_str()),
-			"https://relay-a.example/"
+			serde_json::to_value(&nodes.snapshot().nodes[0].connections).unwrap(),
+			serde_json::json!([{ "id": 2, "transport": "websocket" }]),
 		);
-		first.finish();
-		// The origin retires a finished source on a spawned task; time is paused, so
-		// this advances the clock instantly.
-		tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
-		let scanned = nodes.scan_announced(&mut announced);
-		assert!(
-			scanned.nodes.contains_key("https://relay-b.example/"),
-			"the unannounce ahead of relay-b truncated the scan"
+		// A connect and disconnect may both happen before the observer polls.
+		dial.observe(2, &observation(None));
+		dial.disconnected();
+		let snapshot = nodes.snapshot();
+		assert!(snapshot.nodes[0].connections.is_empty());
+		assert!(snapshot.nodes[0].last_connected_seconds_ago.is_some());
+
+		// A new cost or credential replaces the dial: the new one starts before
+		// the old one is dropped or after, and the history stays either way.
+		let replacement = nodes.dial(&key("https://peer.example/"));
+		replacement.observe(4, &observation(Some(moq_tokio::Transport::Quic)));
+		drop(dial);
+		let snapshot = nodes.snapshot();
+		assert_eq!(snapshot.nodes.len(), 1);
+		assert_eq!(
+			snapshot.nodes[0].connections.len(),
+			1,
+			"dropping one dial keeps the other's session"
 		);
+		assert_eq!(snapshot.nodes[0].connections[0].id, 4);
+
+		drop(replacement);
+		let snapshot = nodes.snapshot();
+		assert!(snapshot.nodes[0].connections.is_empty());
+		assert!(snapshot.nodes[0].last_connected_seconds_ago.is_some());
 	}
 
-	#[tokio::test]
-	async fn duplicate_origin_ids_do_not_resolve_inbound_connections() {
-		let origin = Origin::new(100).unwrap().produce();
-		let nodes = Nodes::new(origin.clone());
-		let _first = announced_node(&origin, "https://relay-b.example/", &[200], 1).await;
-		let _second = announced_node(&origin, "https://relay-c.example/", &[200], 1).await;
-		let _inbound = nodes.connect_inbound(0, Origin::new(200).unwrap());
+	#[test]
+	fn retired_peers_drop_their_history() {
+		let nodes = Nodes::default();
+		let kept = nodes.dial(&key("https://kept.example/"));
+		let retired = nodes.dial(&key("https://retired.example/"));
+		retired.observe(1, &observation(Some(moq_tokio::Transport::Quic)));
 
+		drop(retired);
+		nodes.retain(|peer| peer == &key("https://kept.example/"));
 		let snapshot = nodes.snapshot();
-		assert_eq!(snapshot.nodes.len(), 2);
-		assert!(snapshot.nodes.iter().all(|node| node.connections.is_empty()));
+		assert_eq!(snapshot.nodes.len(), 1);
+		assert_eq!(snapshot.nodes[0].node, "https://kept.example/");
+
+		// A dial cancelled after its peer retired records nothing.
+		kept.observe(2, &observation(Some(moq_tokio::Transport::Quic)));
+		nodes.retain(|_| false);
+		kept.observe(3, &observation(Some(moq_tokio::Transport::Quic)));
+		assert!(nodes.snapshot().nodes.is_empty());
 	}
 }

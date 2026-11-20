@@ -1,368 +1,657 @@
+import type { Stats as Report } from "@moq/hang";
 import * as Catalog from "@moq/hang/catalog";
 import * as Container from "@moq/hang/container";
 import * as Util from "@moq/hang/util";
 import type * as Moq from "@moq/net";
-import { Time } from "@moq/net";
-import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
+import {
+	type Computed,
+	Effect,
+	type Getter,
+	getter,
+	type Inputs,
+	type Readonlys,
+	readonlys,
+	Signal,
+} from "@moq/signals";
+import { hosted } from "../assets";
 import type { Broadcast } from "../broadcast";
-import type * as Capture from "./capture";
-import { type Kind, normalizeSource, type Source } from "./types";
+import { watched } from "../internal";
+import { Estimator, type Order } from "../order";
+import { Slot } from "../publication";
+import type { AudioFrame, Capture, Format } from "./capture";
+import { Gain } from "./gain";
+import { Resampler } from "./resampler";
+import type { CodecMime, Kind } from "./types";
+import { sourceKind } from "./types";
 
-const GAIN_MIN = 0.001;
-const FADE_TIME = 0.2;
 const OPUS_BITRATE_PER_CHANNEL = 32_000;
-const OPUS_FRAME_DURATION = Time.Milli(20);
+const OPUS_FRAME_DURATION = Duration.millis(20);
+// The only frame durations libopus (and so WebCodecs) will encode, in ms.
+const OPUS_FRAME_DURATIONS = [2.5, 5, 10, 20, 40, 60];
 const AAC_BITRATE_PER_CHANNEL = 64_000;
 const AAC_FRAME_SAMPLES = 1024; // AAC-LC encodes a fixed 1024 samples per frame.
+// Long enough that a volume change doesn't click, short enough that a mute is silent almost at once.
+const FADE = Duration.millis(50);
 
 // The WebCodecs/MP4 codec string for AAC-LC. "aac" is our user-facing shorthand.
 const AAC_CODEC = "mp4a.40.2";
 
-// Compiled and inlined as a blob URL via vite-plugin-worklet.
-import CaptureWorklet from "./capture-worklet.ts?worklet";
+import { Duration, Instant, now } from "@moq/clock";
+import { Backlog } from "./backlog";
 import { Framer } from "./framer";
 
-// Selects the audio codec and its encoder settings. Either the bare codec name (all defaults) or an
-// object with the mime plus tuning knobs.
+/**
+ * Selects the audio codec and its encoder settings. Either the bare codec name (all defaults) or an
+ * object with the mime plus tuning knobs.
+ */
 export type Codec = Opus | Aac;
 
+/** Opus, by name with every default or as a config. */
 export type Opus = "opus" | OpusConfig;
+/** AAC, by name with every default or as a config. */
 export type Aac = "aac" | AacConfig;
 
-// AAC encoder settings. AAC-LC has a fixed 1024-sample frame and no real-time tuning knobs, so
-// bitrate is the only thing to configure.
+/**
+ * AAC encoder settings. AAC-LC has a fixed 1024-sample frame and no real-time tuning knobs, so
+ * bitrate is the only thing to configure.
+ */
 export type AacConfig = {
 	mime: "aac";
 
 	bitrate?: number; // bits/sec, defaults to channelCount * 64kbps
 };
 
-// Opus encoder settings. bitrate and frameDuration also shape the catalog (decoders need them); the
-// rest are encode-only knobs that map directly to the matching OpusEncoderConfig fields:
-// https://developer.mozilla.org/en-US/docs/Web/API/AudioEncoder/configure#opus
+/**
+ * Opus encoder settings. bitrate and frameDuration also shape the catalog (decoders need them); the
+ * rest are encode-only knobs that map directly to the matching OpusEncoderConfig fields:
+ * https://developer.mozilla.org/en-US/docs/Web/API/AudioEncoder/configure#opus
+ */
 export type OpusConfig = {
 	mime: "opus";
 
 	bitrate?: number; // bits/sec, defaults to channelCount * 32kbps
-	// The type carries the unit (ms): build with Time.Milli(20). Opus supports 2.5-60ms, defaults to 20ms.
-	frameDuration?: Time.Milli;
+	// Build with Duration.millis(20). Opus takes exactly 2.5, 5, 10, 20,
+	// 40, or 60 ms, and defaults to 20.
+	frameDuration?: Duration;
 	complexity?: number; // 0-10, higher is better quality but more CPU
 	packetlossperc?: number; // 0-100, expected loss the encoder optimizes for
 	useinbandfec?: boolean; // in-band forward error correction
-	usedtx?: boolean; // discontinuous transmission (silence suppression)
 };
 
-/** Cumulative encoder output totals, measured from the chunks the encoder produces. */
-export interface Stats {
-	/** Total frames encoded while serving. Monotonic; diff over an interval for a frame rate. */
-	frames: number;
+/**
+ * Cumulative encoder output totals, measured from the chunks the encoder produces: the counters
+ * it keeps, always present, plus the bitrate it targets, absent while none is resolved.
+ */
+export type Stats = Required<Pick<Report.RenditionInput, "frames" | "bytes">> & {
+	bitrate?: NonNullable<Report.RenditionInput["bitrate"]>;
+};
 
-	/** Total bytes encoded while serving. Monotonic; diff over an interval for an upload bitrate. */
-	bytes: number;
-}
-
-// Signals the encoder reads.
+/** Signals the encoder reads. */
 export type EncoderInput = {
-	// Whether to publish (and encode) this rendition. When false the rendition drops out of the
-	// catalog and stops encoding, but stays registered so a subscriber still gets an idle track.
+	// Whether to serve this rendition. Defaults to true. When false it stops taking capture, ending the
+	// epoch, but stays in the catalog with `enabled: false` and its last config, and stays registered so a
+	// subscriber still gets an idle track. Audio retained before the disable stays too: a subscriber
+	// still gets it encoded, and it expires on the broadcast's `maxAge`. The codec stays configured, so
+	// re-enabling resumes at once. For a pause the rendition comes back from, such as push-to-talk, use
+	// `muted` instead, which costs subscribers no catalog update.
 	enabled: Getter<boolean>;
 
 	// The broadcast to register the rendition on. Undefined resolves the config but has nowhere to publish.
 	broadcast: Getter<Broadcast | undefined>;
 
-	// The microphone (or other) track supplying samples.
-	source: Getter<Source | undefined>;
+	// The capture supplying PCM. Shared: one capture feeds any number of renditions, so build it
+	// yourself and pass the same instance to each.
+	capture: Getter<Capture | undefined>;
+
+	// The connection's bandwidth allocator. While a subscriber is attached, audio reserves
+	// its configured bitrate so video's share is honest, and ignores the grant (Opus is a
+	// fixed rate today).
+	bandwidth: Getter<Moq.Bandwidth.Handle | undefined>;
 };
 
 /** Constructor options: the wired inputs plus the live-editable tuning knobs. */
 export type EncoderProps = Inputs<EncoderInput> & {
 	// User tuning knobs. Seed a value or wire a Signal; also live-editable via the matching field.
-	muted?: boolean | Signal<boolean>;
 	volume?: number | Signal<number>;
-	sampleRate?: number | Signal<number | undefined>;
-	channelCount?: number | Signal<number | undefined>;
+
+	// Send no audio while true, keeping the rendition enabled and its subscribers attached. Defaults to false.
+	muted?: boolean | Signal<boolean>;
 
 	// Codec selection plus encoder settings. Defaults to "opus".
 	codec?: Codec | Signal<Codec>;
+
+	// The time between join points: a frame opens a group once it is this far past the last one's start. Defaults to 20 ms.
+	join?: Duration | Signal<Duration>;
 };
 
-type EncoderOutput = {
-	// The catalog config published for this rendition, or undefined while there's no capture.
+/** Signals the encoder derives. */
+export type EncoderOutput = {
+	/** The encoder failure, cleared only by a new capture source or format, or new encoder settings. */
+	error: Signal<Error | undefined>;
+	// The catalog config published for this rendition, `enabled: false` while disabled, or undefined
+	// while there's no capture.
 	catalog: Signal<Catalog.AudioConfig | undefined>;
-	// The tail of the capture graph, so callers can tap the (gain-adjusted) audio.
+	// The head of the capture graph, so callers can tap the raw capture. Volume is applied to the
+	// PCM rather than in the graph, so this is pre-gain. Its context renders to no device where the
+	// browser supports `sinkId`, so nothing connected to its destination is heard. Undefined for a
+	// source that isn't a track.
 	root: Signal<AudioNode | undefined>;
-	// True when a subscriber is attached and we're encoding.
+	// True while encoding capture: enabled and unmuted with a captured format and a track, which also
+	// takes a subscriber unless the broadcast's `onDemand` is `"off"`. Retained audio encoded for a
+	// subscriber while paused does not count.
 	active: Signal<boolean>;
-	// Cumulative output totals (frames, bytes) measured while serving.
+	// Cumulative output totals (frames, bytes) measured while serving, and the target bitrate.
 	stats: Signal<Stats>;
 };
 
-// The audio format observed from the capture worklet: the AudioContext sample rate and the actual
-// channel count (which can differ from the requested count on some platforms, e.g. Safari/macOS).
-type Captured = { sampleRate: number; channelCount: number };
-
-// Which codec is in use, ignoring its tuning knobs.
-type CodecMime = OpusConfig["mime"] | AacConfig["mime"];
+// One configured encode chain. Rebuilt whenever the resolved config changes; the capture read loop
+// pushes into whichever one is current, so a codec change never interrupts the source.
+type Pipeline = {
+	channelCount: number;
+	push(frame: AudioFrame): void;
+	drain(): void;
+};
 
 /**
  * A single audio rendition encoder.
  *
- * Registers itself on the {@link Broadcast} under {@link name} (via `broadcast.audio(name)`), builds a
- * capture graph from the source track, and encodes samples only while a subscriber is attached (the
- * demand gate). Rename by constructing a new encoder; the name is not a signal.
+ * Registers itself on the {@link Broadcast} under {@link name} (via `broadcast.audio(name)`), pumps PCM
+ * off the source via a {@link Capture}, and retains raw PCM while enabled. A subscriber triggers encoding of that history followed by
+ * live audio; leaving resumes buffering without ending the epoch. The broadcast's `onDemand: "off"`
+ * keeps encoding continuously instead. Rename by constructing a new encoder; the name is not a signal.
  */
 export class Encoder {
 	/** The full track name of this rendition, e.g. `"audio/data"`. */
 	readonly name: string;
 
+	/** The wired inputs, read-only. */
 	readonly in: Readonlys<EncoderInput>;
 
-	/** Silence the encoded audio without tearing down the capture graph. */
-	muted: Signal<boolean>;
-	/** Linear gain applied before encoding, where 1 is unity. */
+	/** Linear gain applied before encoding, where 1 is unity. Each change ramps over 50 ms, so a mute is silent once it passes. */
 	volume: Signal<number>;
-	/** Override the capture sample rate in Hz. Defaults to the track's own rate. */
-	sampleRate: Signal<number | undefined>;
-	/** Override the captured channel count. Defaults to the track's requested count. */
-	channelCount: Signal<number | undefined>;
+	/**
+	 * Whether to send nothing, as push-to-talk does between presses. Unlike `enabled`, the rendition
+	 * stays enabled in the catalog and its subscribers stay attached, so the next audio reaches them
+	 * at once; each muted span is a declared end, which a player fills as intentional silence.
+	 */
+	muted: Signal<boolean>;
 	/** The live-editable codec selection plus its encoder settings. */
 	codec: Signal<Codec>;
+	/**
+	 * The time between join points: a frame opens the next group once it is at least this far past
+	 * the open group's start, closing the previous one. Defaults to 20 ms. A longer join costs the
+	 * relay fewer streams but makes loss coarser: a viewer that falls behind skips a whole group. A
+	 * join that is not a positive, finite duration refuses the rendition.
+	 */
+	join: Signal<Duration>;
 
-	// Observed capture format. #config is derived from this plus the codec; #out.catalog also folds in
-	// encoder metadata. Worklet handlers write those inputs, never read-modify-write the catalog.
-	#captured = new Signal<Captured | undefined>(undefined);
+	/**
+	 * The capture supplying this rendition, or undefined while none is wired.
+	 *
+	 * A snapshot, for reaching the shared capture format knobs (`audio.capture?.sampleRate`). Read
+	 * {@link in}.capture through an effect instead when you need to react to it being swapped.
+	 */
+	get capture(): Capture | undefined {
+		return this.in.capture.peek();
+	}
 
-	// Only the mime picks the capture sample rate, so the capture graph tracks this rather than the
-	// whole codec signal. Otherwise changing an encode-only knob (bitrate, complexity) would rebuild
-	// the AudioContext, drop #worklet, and close the track we're publishing.
-	#codecMime: Signal<CodecMime>;
+	// The exact encoder settings and probed decoder description, advertised before the first frame.
+	#config = new Signal<(Resolved & { encoder: AudioEncoderConfig }) | undefined>(undefined);
 
-	// The catalog fields known before encoding starts. Opus adds its decoder description from the
-	// first encoder output without feeding that catalog-only update back into the encoder.
-	#config = new Signal<Catalog.AudioConfig | undefined>(undefined);
-	#decoderDescription = new Signal<{ config: Catalog.AudioConfig; description: Catalog.Hex } | undefined>(undefined);
+	// The last Opus probe: the encoder settings it ran with, serialized, and the description it
+	// produced. Kept across a disable so re-enabling with the same capture format and settings
+	// republishes at once instead of probing again.
+	#probed?: { key: string; description?: Catalog.Hex };
 
 	readonly #out: EncoderOutput = {
+		error: new Signal<Error | undefined>(undefined),
 		catalog: new Signal<Catalog.AudioConfig | undefined>(undefined),
 		root: new Signal<AudioNode | undefined>(undefined),
 		active: new Signal<boolean>(false),
 		stats: new Signal<Stats>({ frames: 0, bytes: 0 }),
 	};
+	/** The derived outputs, read-only. */
 	readonly out = readonlys(this.#out);
 
-	#worklet = new Signal<AudioWorkletNode | undefined>(undefined);
+	// The encode chain currently publishing, or undefined while nothing is. The read loop pushes
+	// into this; frames that arrive while it's undefined are dropped, which the framer treats as a
+	// discontinuity and re-anchors on.
+	#pipeline: Pipeline | undefined;
+	#encoding = false;
+	// The demand's max delay, past which retained audio is stale to every subscriber, or undefined
+	// for the retention alone. Replayed groups land as fresh arrivals, so only this cut keeps a
+	// rejoining live viewer from receiving all the retained audio before the live edge.
+	#budget: Duration | undefined;
 
-	// The tail of the capture graph, typed for the gain ramps in #runGain. #out.root is the
-	// same node, widened for consumers.
-	#gain = new Signal<GainNode | undefined>(undefined);
+	// The rendition's track and producer, kept across subscriber changes.
+	// `start` is the open group's first timestamp, undefined until a frame opens one.
+	#live: { track: Moq.Track.Producer; producer: Container.Legacy.Producer; start?: Duration } | undefined;
 
+	// Where the next frame submitted to the AudioEncoder starts, i.e. the exclusive end of the
+	// newest one, where an epoch's discontinuity marker goes. Cleared once the marker is written.
+	#next: Duration | undefined;
+
+	// The newest epoch's marker. The AudioEncoder outlives a track gap too brief to skip a frame,
+	// so chunks it still held when the track went away surface after the resume; they sit below the
+	// marker and are dropped.
+	#floor: Duration | undefined;
+
+	// The end of the newest retained frame replayed into the encoder. Chunks below it are history
+	// caught up behind the live edge, not frames written late, so they never raise the catalog delay.
+	#history: Duration | undefined;
+
+	// The last valid join, which #runConfig validates.
+	#join = Duration.micros(20_000);
+	// How far apart groups start under the resolved config, a whole number of frames, which the
+	// broadcast may declare as the catalog's join interval (see groupSpacing).
+	#spacing = new Signal<Duration | undefined>(undefined);
+
+	// How many resolution runs threw for their current inputs (e.g. invalid codec settings), so no
+	// config is coming until one reruns.
+	#failures = new Signal(0);
+
+	/**
+	 * @internal Whether the catalog config resolved, or can't until something outside the encoder
+	 * changes: a failed encoder or capture, invalid codec settings, or a capture waiting on the page's
+	 * first gesture. `<moq-publish>` holds its first announce until this is set.
+	 */
+	readonly settled: Computed<boolean>;
+
+	// The capture inputs #runCaptureRecovery last saw, carried across a gap in the source or format.
+	#seen?: { capture?: Capture; source?: unknown; format?: Format };
 	#signals = new Effect();
+	#estimator = new Estimator();
+	// The estimator's delay, republished whenever it rises.
+	#estimate = new Signal<Estimator["estimate"]>({});
+	// What this rendition keeps for the current network broadcast's track: its bitrate maximum, last
+	// config, and failure. A network broadcast keeps a rendition's track when it re-registers, so
+	// returning to one continues them, while a new one starts its own.
+	#slot = new Signal<Slot<Catalog.AudioConfig> | undefined>(undefined);
+	// The slot while no network broadcast is serving the rendition.
+	#local = new Slot<Catalog.AudioConfig>();
+	// Whether the rendition was disabled or muted since a config last resolved, so it keeps advertising
+	// its last config until a new one resolves. Whether that config reads as enabled follows the
+	// current knobs alone, never how the gap began.
+	#held = false;
 
 	constructor(name: string, props?: EncoderProps) {
+		// `source` moved to Audio.Capture, which renditions share. TypeScript catches this, but a
+		// plain JS caller would otherwise get an encoder with nothing attached: no catalog, no
+		// audio, and nothing to explain why.
+		if (props && "source" in props) {
+			throw new Error("Audio.Encoder: `source` moved to Audio.Capture; construct one and pass `capture`");
+		}
+
 		this.name = name;
 		this.in = {
-			enabled: getter(props?.enabled ?? false),
+			enabled: getter(props?.enabled ?? true),
 			broadcast: getter(props?.broadcast),
-			source: getter(props?.source),
+			capture: getter(props?.capture),
+			bandwidth: getter(props?.bandwidth),
 		};
-		this.muted = Signal.from(props?.muted ?? false);
 		this.volume = Signal.from(props?.volume ?? 1);
-		this.sampleRate = Signal.from<number | undefined>(props?.sampleRate);
-		this.channelCount = Signal.from<number | undefined>(props?.channelCount);
+		this.muted = Signal.from(props?.muted ?? false);
 		this.codec = Signal.from<Codec>(props?.codec ?? "opus");
-		this.#codecMime = new Signal(normalizeCodec(this.codec.peek()).mime);
+		this.join = Signal.from(props?.join ?? Duration.millis(20));
 
+		// Only the capture graph has a node to expose.
 		this.#signals.run((effect) => {
-			this.#codecMime.set(normalizeCodec(effect.get(this.codec)).mime);
+			const capture = effect.get(this.in.capture);
+			if (!capture) return;
+			effect.proxy(this.#out.root, capture.out.root);
 		});
 
-		this.#signals.run(this.#runSource.bind(this));
-		this.#signals.run(this.#runGain.bind(this));
-		this.#signals.run(this.#runConfig.bind(this));
-		this.#signals.run(this.#runCatalog.bind(this));
+		this.settled = this.#signals.computed((effect) => {
+			if (effect.get(this.#out.catalog) !== undefined) return true;
+			if (effect.get(this.#out.error) !== undefined || effect.get(this.#failures) > 0) return true;
+			const capture = effect.get(this.in.capture);
+			return capture !== undefined && !!effect.get(capture.blocked);
+		});
+
+		this.#signals.run(this.#runCapture.bind(this));
+
+		// Every step that resolves the config counts a throw as a failure, so a bad input settles the
+		// gate instead of holding the announce forever.
+		for (const run of [this.#runConfig, this.#runCatalog]) {
+			this.#signals.run((effect) => {
+				try {
+					run.call(this, effect);
+				} catch (err) {
+					if (run === this.#runConfig) this.#config.set(undefined);
+					this.#fail(effect);
+					throw err;
+				}
+			});
+		}
+		this.#signals.run(this.#runError.bind(this));
+		this.#signals.run(this.#runSettingsRecovery.bind(this));
+		this.#signals.run(this.#runCaptureRecovery.bind(this));
 		this.#signals.run(this.#runRegister.bind(this));
+		this.#signals.run((effect) => {
+			const bitrate = effect.get(this.#config)?.encoder.bitrate;
+			this.#out.stats.update((stats) => ({ ...stats, bitrate }));
+		});
 	}
 
-	// Register the rendition on the broadcast, publish its config, and encode only while a subscriber
-	// is attached (the demand gate). Re-registers cleanly when the broadcast swaps.
+	// Pump PCM off the capture into whatever is currently publishing, applying the volume knobs on
+	// the way through. Tied to the capture's lifetime rather than the encoder's, so reconfiguring
+	// never has to reacquire the stream, which for a decoded file would be fatal.
+	#runCapture(effect: Effect): void {
+		const capture = effect.get(this.in.capture);
+		if (!capture) return;
+
+		const fanout = effect.get(capture.out.frames);
+		if (!fanout) return;
+
+		// Our own stream off the shared capture, so another rendition reading slowly can't take
+		// frames from this one.
+		const reader = fanout.subscribe(effect).getReader();
+		effect.cleanup(() => {
+			reader.cancel().catch(() => {});
+		});
+
+		const gain = new Gain(this.volume.peek());
+
+		effect.spawn(async () => {
+			for (;;) {
+				const next = await effect.race(reader.read());
+				if (!next?.value) break;
+
+				const format = capture.out.format.peek();
+				if (!format) continue;
+
+				// Every rendition shares the captured frame, so gain returns a copy rather than
+				// scaling in place; muting one rendition must not silence the rest.
+				gain.set(this.volume.peek(), FADE);
+				const frame = gain.apply(next.value, format.sampleRate);
+
+				// The config rebuilds when the channel count moves, so skip anything that arrives
+				// mid-swap rather than framing it wrong.
+				const pipeline = this.#pipeline;
+				if (pipeline && pipeline.channelCount === frame.channels.length) {
+					try {
+						pipeline.push(frame);
+					} catch (error) {
+						this.#abort(error);
+					}
+				}
+			}
+		});
+	}
+
+	// Any notification of the encoder settings re-arms a failure, including a setting mutated in place.
+	#runSettingsRecovery(effect: Effect): void {
+		effect.get(this.codec);
+		this.#rearm();
+	}
+
+	// Read only capture inputs here, never bandwidth grants or the error itself; demand is not a retry.
+	// A gap in the source or format (a capture disabled or interrupted) keeps the last ones, so only a
+	// different capture re-arms a failure, such as the new track a re-enabled microphone opens.
+	#runCaptureRecovery(effect: Effect): void {
+		const capture = effect.get(this.in.capture);
+		const seen = this.#seen;
+		const same = seen !== undefined && seen.capture === capture;
+		const source = (capture && effect.get(capture.in.source)) ?? (same ? seen.source : undefined);
+		const format = (capture && effect.get(capture.out.format)) ?? (same ? seen.format : undefined);
+		this.#seen = { capture, source, format };
+		if (
+			same &&
+			seen.source === source &&
+			seen.format?.sampleRate === format?.sampleRate &&
+			seen.format?.channelCount === format?.channelCount
+		) {
+			return;
+		}
+		this.#rearm();
+	}
+
+	// The current slot, read through `effect`.
+	#current(effect: Effect): Slot<Catalog.AudioConfig> {
+		return effect.get(this.#slot) ?? this.#local;
+	}
+
+	// The public error is the current slot's, so a new network broadcast starts without one.
+	#runError(effect: Effect): void {
+		effect.set(this.#out.error, effect.get(this.#current(effect).error));
+	}
+
+	// Clear a latched failure, so the broadcast serves the rendition again under a fresh track name.
+	#rearm(): void {
+		const failure = (this.#slot.peek() ?? this.#local).error;
+		if (!failure.peek()) return;
+		failure.set(undefined);
+		this.#floor = undefined;
+	}
+
+	// Register the rendition on the broadcast, publish its config, and encode while it hands over a
+	// track. Re-registers cleanly when the broadcast swaps.
 	#runRegister(effect: Effect): void {
 		const broadcast = effect.get(this.in.broadcast);
 		if (!broadcast) return;
 
 		const rendition = broadcast.audio(this.name);
 		effect.cleanup(() => rendition.close());
+		// How far apart groups start, which the broadcast declares as the catalog's join interval when
+		// nothing longer, such as a video GOP, sits beside it.
+		effect.proxy(rendition.join, this.#spacing);
+		effect.proxy(this.#slot, rendition.slot);
+		effect.cleanup(() => this.#slot.set(undefined));
 
 		// Publish the resolved config; undefined (no capture) drops it from the catalog.
 		effect.proxy(rendition.config, this.out.catalog);
+		effect.proxy<Report.RenditionInput | undefined>(rendition.stats, this.out.stats);
+
+		// The pipeline outlives any one subscription: it is built as soon as capture runs and
+		// #encode reads the live producer per frame rather than subscribing to it. Rebuilding on a
+		// swap would close the AudioEncoder, which discards every chunk the codec still holds, and
+		// would restart the framer mid-frame, so the output fell permanently behind its input.
+		// It outlives a disable too, so the audio retained before it stays reachable.
+		effect.run((effect) => {
+			const capture = effect.get(this.in.capture);
+			const format = capture ? effect.get(capture.out.format) : undefined;
+			const fatal = effect.get(this.#out.error);
+			const resolved = effect.get(this.#config);
+			if (!format || fatal || !resolved) return;
+
+			// Raw history needs a finite bound, so an unlimited max age keeps the media default's worth.
+			const maxAge = effect.get(broadcast.in.maxAge) ?? Container.MAX_AGE;
+			this.#encode(broadcast.order, format, maxAge, effect);
+		});
+
+		// A network track change ends the epoch; subscriber changes keep the same producer.
+		effect.run((effect) => {
+			const track = effect.get(rendition.track);
+			if (!track) return;
+
+			const live = {
+				track,
+				producer: new Container.Legacy.Producer(track, new Container.Legacy.Format("audio")),
+			};
+			this.#live = live;
+			effect.cleanup(() => {
+				this.#cut();
+				if (this.#live === live) this.#live = undefined;
+			});
+		});
 
 		effect.run((effect) => {
-			const enabled = effect.get(this.in.enabled);
-			const worklet = effect.get(this.#worklet);
+			const enabled = effect.get(this.in.enabled) && !effect.get(this.muted);
+			const capture = effect.get(this.in.capture);
+			const format = capture ? effect.get(capture.out.format) : undefined;
 			const track = effect.get(rendition.track);
-			effect.set(this.#out.active, enabled && !!worklet && !!track, false);
-			if (!enabled || !worklet || !track) return;
+			// A dead encoder can't serve anyone: the broadcast aborts its track with the real error, so
+			// the current subscriber and every later one get it rather than a track that stays silent.
+			const fatal = effect.get(this.#out.error);
 
-			this.#encode(track, worklet, effect);
-		});
-	}
-
-	#runSource(effect: Effect): void {
-		const values = effect.getAll([this.in.enabled, this.in.source]);
-		if (!values) return;
-		const [_, rawSource] = values;
-		const source = normalizeSource(rawSource);
-
-		const settings = source.track.getSettings();
-		const overrideSampleRate = effect.get(this.sampleRate);
-		const mime = effect.get(this.#codecMime);
-		const sampleRate = pickSampleRate(mime, overrideSampleRate ?? settings.sampleRate);
-
-		if (overrideSampleRate !== undefined && sampleRate !== overrideSampleRate) {
-			console.warn(`${mime} does not support ${overrideSampleRate}Hz, capturing at ${sampleRate}Hz`);
-		}
-
-		// macOS misreports a mono mic as stereo: getSettings().channelCount is undefined and
-		// MediaStreamAudioSourceNode.channelCount defaults to 2, so the graph carries (and Opus
-		// encodes) duplicated mono as stereo. Prefer an explicitly requested channel count, from
-		// the prop or the track's applied getUserMedia constraint, and force the worklet to mix to it.
-		const requestedChannels = effect.get(this.channelCount) ?? requestedChannelCount(source.track);
-
-		const context = new AudioContext({
-			latencyHint: "interactive",
-			sampleRate,
-		});
-		effect.cleanup(() => context.close());
-
-		const root = new MediaStreamAudioSourceNode(context, {
-			mediaStream: new MediaStream([source.track]),
-		});
-		effect.cleanup(() => root.disconnect());
-
-		const gain = new GainNode(context, {
-			gain: this.volume.peek(),
-		});
-		root.connect(gain);
-		effect.cleanup(() => gain.disconnect());
-
-		// Async because we need to wait for the worklet to be registered.
-		effect.spawn(async () => {
-			// Race the module load against teardown. If teardown wins, `loaded` is undefined and we bail
-			// before constructing the node: the module registration was abandoned, so building against its
-			// name would throw. Gate on the race result, not `context.state`, because `AudioContext.close()`
-			// only flips `.state` to "closed" synchronously on Chrome (Firefox/Safari report "suspended").
-			const loaded = await Promise.race([
-				context.audioWorklet.addModule(CaptureWorklet).then(() => true),
-				effect.cancel,
-			]);
-			if (!loaded) return;
-
-			const channelCount = requestedChannels ?? settings.channelCount ?? root.channelCount;
-			const worklet = new AudioWorkletNode(context, "capture", {
-				numberOfInputs: 1,
-				numberOfOutputs: 0,
-				channelCount,
-				// "explicit" forces Web Audio to (down)mix the input to channelCount before the
-				// worklet sees it. The default "max" just follows the input, which is the unreliable
-				// path on macOS. Only force it when we actually have a requested count to honor.
-				channelCountMode: requestedChannels !== undefined ? "explicit" : "max",
-				// Stamp audio against the same wall clock as video (see video/processor.ts), so both
-				// tracks share an epoch and stay in sync.
-				processorOptions: { zero: performance.now() * 1000 },
-			});
-
-			effect.set(this.#worklet, worklet);
-
-			// The information about channels count can be unreliable on different platforms (Apple's Safari).
-			// Try to get the first audio frame and only then record the captured format.
-			effect.event(
-				worklet.port,
-				"message",
-				(event: Event) => {
-					const data = (event as MessageEvent<Capture.AudioFrame>).data;
-					const channelCount = data.channels.length;
-					if (!channelCount) return;
-
-					this.#captured.set({ sampleRate: worklet.context.sampleRate, channelCount });
-				},
-				{ once: true },
-			);
-			worklet.port.start();
+			const onDemand = effect.get(broadcast.in.onDemand) !== "off";
+			const demanded = !!track && effect.get(track.demand().wanted) !== undefined;
+			// Demand from fetches alone carries no subscription, so no budget beyond the retention.
+			const max = track && effect.get(track.subscription)?.delay?.max;
+			this.#budget = max === undefined || max === null ? undefined : max;
+			// Not gated on `enabled` or `muted`: a paused rendition takes no capture, but still encodes what it retained.
+			this.#encoding = !!format && !!track && !fatal && (!onDemand || demanded);
+			effect.set(this.#out.active, enabled && this.#encoding, false);
+			try {
+				if (this.#encoding) this.#pipeline?.drain();
+			} catch (error) {
+				this.#abort(error);
+			}
 			effect.cleanup(() => {
-				this.#captured.set(undefined);
+				this.#encoding = false;
 			});
-
-			gain.connect(worklet);
-			effect.cleanup(() => worklet.disconnect());
-
-			// Only set the gain after the worklet is registered.
-			effect.set(this.#gain, gain);
-			effect.set(this.#out.root, gain);
 		});
-	}
 
-	#createConfig(captured: Captured, codec: OpusConfig | AacConfig): Catalog.AudioConfig {
-		// The catalog carries the rate the context actually realized, not the one we asked for. They
-		// only diverge if the browser ignored the request, which would put us right back to
-		// advertising a rate the codec can't decode, so make that visible instead of silent.
-		if (codec.mime === "opus" && !Util.Opus.supportsRate(captured.sampleRate)) {
-			console.warn(`capturing at ${captured.sampleRate}Hz, which opus cannot decode`);
-		}
+		// Claim the configured bitrate while a subscriber is attached, so a co-resident video
+		// encoder's share is honest. Wait for a bitrate so we never claim 0. The grant is ignored:
+		// following it for Opus is out of scope.
+		effect.run((effect) => {
+			const enabled = effect.get(this.in.enabled) && !effect.get(this.muted);
+			const track = effect.get(rendition.track);
+			const allocator = effect.get(this.in.bandwidth);
+			if (!enabled || !track || !allocator || effect.get(this.#out.error)) return;
 
-		const sampleRate = Catalog.u53(captured.sampleRate);
-		const numberOfChannels = Catalog.u53(captured.channelCount);
+			const demanded = watched(track, effect);
+			effect.run((effect) => {
+				if (!effect.get(demanded)) return;
 
-		if (codec.mime === "aac") {
-			return {
-				codec: AAC_CODEC,
-				sampleRate,
-				numberOfChannels,
-				bitrate: Catalog.u53(codec.bitrate ?? captured.channelCount * AAC_BITRATE_PER_CHANNEL),
-				container: { kind: "legacy" } as const,
-				// Frames are raw (no ADTS header), so the decoder needs the AudioSpecificConfig to init.
-				description: Util.Hex.fromBytes(
-					Util.Aac.audioSpecificConfig(captured.sampleRate, captured.channelCount),
-				),
-				// Each AAC-LC frame is 1024 samples; report that duration as the jitter hint.
-				jitter: Catalog.u53(Math.ceil((AAC_FRAME_SAMPLES / captured.sampleRate) * 1000)),
-			};
-		}
-
-		return {
-			codec: "opus",
-			sampleRate,
-			numberOfChannels,
-			bitrate: Catalog.u53(codec.bitrate ?? captured.channelCount * OPUS_BITRATE_PER_CHANNEL),
-			container: { kind: "legacy" } as const,
-			// jitter doubles as the Opus frame duration; toEncoderConfig converts it to µs for WebCodecs.
-			jitter: Catalog.u53(codec.frameDuration ?? OPUS_FRAME_DURATION),
-		};
+				let reservation: Moq.Bandwidth.Reservation | undefined;
+				effect.subscribe(this.#config, (config) => {
+					const bitrate = config?.catalog.bitrate;
+					if (bitrate === undefined) return;
+					if (!reservation) reservation = allocator.reserve(track.demand(), bitrate);
+					else reservation.update(bitrate);
+				});
+				effect.cleanup(() => reservation?.close());
+			});
+		});
 	}
 
 	// Derive the encoder config from the captured format and the codec. Re-runs whenever either changes, so a
 	// codec update (bitrate, frame duration) reconfigures without waiting for a channel-count change.
+	//
+	// Unlike the video encoder, a disabled rendition keeps resolving its config: its codec keeps
+	// serving the audio retained before the disable. A sample source keeps its format while muted
+	// rather than tearing down. A config probed once is reused, so the catalog flips back without
+	// waiting on a probe.
 	#runConfig(effect: Effect): void {
-		const captured = effect.get(this.#captured);
+		const join = effect.get(this.join);
+		if (!(join instanceof Duration) || join.isZero()) {
+			// The broadcast reads every registered rendition's spacing, listed or not.
+			this.#spacing.set(undefined);
+			throw new Error(`audio join must be a Duration greater than 0: ${join}`);
+		}
+		this.#join = join;
+
+		const capture = effect.get(this.in.capture);
+		const captured = capture ? effect.get(capture.out.format) : undefined;
 		if (!captured) {
-			effect.set(this.#config, undefined);
+			this.#config.set(undefined);
 			return;
 		}
 
-		const codec = normalizeCodec(effect.get(this.codec));
-		effect.set(this.#config, this.#createConfig(captured, codec));
+		const resolved = resolve(captured, effect.get(this.codec));
+		// Set before the config is listed, so the catalog's first listing declares it.
+		this.#spacing.set(groupSpacing(join, resolved));
+		const source = capture ? effect.get(capture.in.source) : undefined;
+		const kind = source ? sourceKind(source) : "auto";
+		const encoderConfig = toEncoderConfig(resolved, kind, this.#opusOptions(effect));
+		if (resolved.catalog.codec !== "opus") {
+			this.#config.set({ ...resolved, encoder: encoderConfig });
+			return;
+		}
+
+		const key = JSON.stringify(encoderConfig);
+		if (this.#probed?.key === key) {
+			this.#config.set(withDescription(resolved, encoderConfig, this.#probed.description));
+			return;
+		}
+
+		const superseded = effect.abort;
+		effect.spawn(async () => {
+			try {
+				await Util.Libav.polyfill(hosted.url);
+				if (superseded.aborted) return;
+				let description: Catalog.Hex | undefined;
+				let failure: Error | undefined;
+				const encoder = new AudioEncoder({
+					output: (_frame, metadata) => {
+						const source = metadata?.decoderConfig?.description;
+						if (!source) return;
+						const bytes = ArrayBuffer.isView(source)
+							? new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
+							: new Uint8Array(source);
+						description = Util.Hex.fromBytes(bytes);
+					},
+					error: (error) => {
+						failure = error;
+					},
+				});
+				effect.cleanup(() => {
+					if (encoder.state !== "closed") encoder.close();
+				});
+				encoder.configure(encoderConfig);
+				const samples = Math.round(
+					encoderConfig.sampleRate * (resolved.frameDuration ?? OPUS_FRAME_DURATION).asSecs(),
+				);
+				const frame = new AudioData({
+					format: "f32-planar",
+					sampleRate: encoderConfig.sampleRate,
+					numberOfChannels: encoderConfig.numberOfChannels,
+					numberOfFrames: samples,
+					timestamp: 0,
+					data: new Float32Array(samples * encoderConfig.numberOfChannels),
+				});
+				try {
+					encoder.encode(frame);
+				} finally {
+					frame.close();
+				}
+				await effect.race(encoder.flush());
+				if (superseded.aborted) return;
+				if (failure) throw failure;
+				encoder.close();
+				this.#probed = { key, description };
+				this.#config.set(withDescription(resolved, encoderConfig, description));
+			} catch (error) {
+				if (superseded.aborted) return;
+				this.#config.set(undefined);
+				this.#fail(effect);
+				throw error;
+			}
+		});
 	}
 
-	// Publish the config immediately so a consumer can request the demand-gated track. Once encoding
-	// starts, republish Opus with the exact decoder description reported for that encoder config.
+	#fail(effect: Effect): void {
+		this.#failures.update((n) => n + 1);
+		effect.cleanup(() => this.#failures.update((n) => n - 1));
+	}
+
+	// Publish the probed config before the first frame reaches the track. A disabled or muted rendition
+	// keeps its last config, since either may also release the capture. It reads as enabled only while
+	// muted, which keeps subscribers attached for the next word; otherwise nothing is coming until the
+	// reopened capture reports its format, so a capture that never reopens leaves it disabled.
 	#runCatalog(effect: Effect): void {
-		const config = effect.get(this.#config);
+		const estimate = effect.get(this.#estimate);
+		const enabled = effect.get(this.in.enabled) && !effect.get(this.#out.error);
+		const muted = effect.get(this.muted);
+		const slot = this.#current(effect);
+		if (!enabled || muted) this.#held = true;
+		const config = enabled ? effect.get(this.#config)?.catalog : undefined;
 		if (!config) {
-			effect.set(this.#out.catalog, undefined);
+			const last = this.#held ? slot.last : undefined;
+			const stillEnabled = enabled && muted;
+			effect.set(this.#out.catalog, last && { ...last, ...estimate, ...(!stillEnabled && { enabled: false }) });
 			return;
 		}
+		this.#held = false;
 
-		const decoder = effect.get(this.#decoderDescription);
-		const catalog = decoder?.config === config ? { ...config, description: decoder.description } : config;
-		effect.set(this.#out.catalog, catalog);
+		// The catalog bitrate is the most this track has been configured for, so lowering the knob
+		// retunes the encoder without lowering what the catalog advertises.
+		slot.bitrate = Math.max(slot.bitrate, config.bitrate ?? 0);
+		const bitrate = slot.bitrate > 0 ? Catalog.u53(slot.bitrate) : undefined;
+		slot.last = { ...config, bitrate, ...estimate };
+		effect.set(this.#out.catalog, slot.last);
 	}
 
 	// Collect the encode-only Opus knobs that are set, reading the codec through the effect so the
@@ -375,177 +664,392 @@ export class Encoder {
 		if (codec.complexity !== undefined) opus.complexity = codec.complexity;
 		if (codec.packetlossperc !== undefined) opus.packetlossperc = codec.packetlossperc;
 		if (codec.useinbandfec !== undefined) opus.useinbandfec = codec.useinbandfec;
-		if (codec.usedtx !== undefined) opus.usedtx = codec.usedtx;
 
 		return opus;
 	}
 
-	#runGain(effect: Effect): void {
-		const gain = effect.get(this.#gain);
-		if (!gain) return;
-
-		effect.cleanup(() => gain.gain.cancelScheduledValues(gain.context.currentTime));
-
-		const volume = effect.get(this.muted) ? 0 : effect.get(this.volume);
-		if (volume < GAIN_MIN) {
-			gain.gain.exponentialRampToValueAtTime(GAIN_MIN, gain.context.currentTime + FADE_TIME);
-			gain.gain.setValueAtTime(0, gain.context.currentTime + FADE_TIME + 0.01);
-		} else {
-			gain.gain.exponentialRampToValueAtTime(volume, gain.context.currentTime + FADE_TIME);
-		}
+	// End the epoch with a discontinuity marker (see Container.Legacy.Producer.discontinuity) at `end`,
+	// by default where the submitted media ends, so a subscriber that stays across the break, or joins
+	// during it, doesn't read the audio before it as live. A marker at or below the newest one is
+	// already covered by it.
+	#cut(end = this.#next): void {
+		if (end === undefined) return;
+		if (this.#next?.le(end)) this.#next = undefined;
+		if (this.#floor !== undefined && end.le(this.#floor)) return;
+		// The epoch ends here even when no track is left to mark, so whatever the codec still owes for
+		// it stays off the next track.
+		this.#floor = end;
+		const live = this.#live;
+		if (!live || live.track.closed.peek() !== undefined) return;
+		live.producer.discontinuity(end);
+		live.start = undefined;
 	}
 
-	// Encode captured audio frames into the track producer. The broadcast owns the track's lifetime, so
-	// this only aborts it on a fatal encoder error, never on teardown.
-	#encode(track: Moq.Track.Producer, worklet: AudioWorkletNode, effect: Effect): void {
+	// Encode captured audio frames into whichever track producer is live. The broadcast owns the
+	// track's lifetime, so this never closes it; a fatal encoder error aborts only the live track.
+	#encode(order: Order, format: Format, retention: Duration, effect: Effect): void {
+		// The parent owns the config subscription before the async codec scope is opened.
+		const resolved = this.#config.peek();
+		if (!resolved) return;
+		// A stopped rendition stops holding the others' delay back.
+		effect.cleanup(() => order.leave(this.#estimator));
 		effect.spawn(async () => {
 			// We're using an async polyfill temporarily for Safari support.
-			await Util.Libav.polyfill();
+			await Util.Libav.polyfill(hosted.url);
 
 			effect.run((effect: Effect) => {
-				const config = effect.get(this.#config);
-				if (!config) return;
+				const aborted = effect.abort;
+				const config = resolved.catalog;
 
-				const source = effect.get(this.in.source);
-				const kind: Kind = source ? normalizeSource(source).kind : "auto";
-				const encoderConfig = toEncoderConfig(config, kind, this.#opusOptions(effect));
-				const framer = createFramer(config);
+				const encoderConfig = resolved.encoder;
+
+				// WebCodecs rejects input whose rate doesn't match the encoder config outright, so
+				// anything arriving at a rate the codec can't carry (a 44.1kHz file as Opus) has to
+				// be converted first. A capture graph already runs at the right rate, so this is
+				// usually nothing.
+				const createResampler = () =>
+					format.sampleRate === config.sampleRate
+						? undefined
+						: new Resampler({
+								from: format.sampleRate,
+								to: config.sampleRate,
+								channels: config.numberOfChannels,
+							});
+				let resampler = createResampler();
+				let framer = createFramer(resolved, config.sampleRate);
+
+				// What the codec still owes, in submission order: each input's timestamp, or a break whose
+				// marker goes down once every chunk before it is out. Chunks are stamped from here, never
+				// by the codec: Chrome and Firefox stamp input after a gap as if it were contiguous.
+				// Every browser emits one chunk per input, in order, so a codec that holds a chunk only
+				// delays its stamp, and a break needs no flush.
+				const owed: ({ timestamp: Duration } | { cut: Duration })[] = [];
+				// Write the marker of every break the codec has caught up with.
+				const settle = () => {
+					for (let next = owed[0]; next && "cut" in next; next = owed[0]) {
+						owed.shift();
+						this.#cut(next.cut);
+					}
+				};
 
 				const encoder = new AudioEncoder({
-					output: (frame, metadata) => {
+					output: (frame) => {
 						if (frame.type !== "key") {
 							throw new Error("only key frames are supported");
 						}
-
-						this.#setDecoderDescription(config, metadata?.decoderConfig?.description);
+						const input = owed.shift();
+						if (!input || "cut" in input) {
+							this.#abort(new Error("the audio encoder emitted a chunk for no input"));
+							return;
+						}
+						const timestamp = input.timestamp;
 
 						this.#out.stats.update((stats) => ({
+							...stats,
 							frames: stats.frames + 1,
 							bytes: stats.bytes + frame.byteLength,
 						}));
 
-						// Each audio frame is its own group so the relay can forward it without
-						// waiting for a group boundary. Loss is handled by the codec's PLC.
-						track.writeFrame({
-							payload: Container.Legacy.encodeFrame(frame, frame.timestamp as Time.Micro),
-							timestamp: Time.Timestamp.fromMicros(frame.timestamp as Time.Micro),
-						});
+						const live = this.#live;
+						if (live && (this.#floor === undefined || timestamp.ge(this.#floor))) {
+							// Every audio frame decodes on its own, so any of them can open a group: the
+							// first one at or past the minimum after the open group's start. Frames forward
+							// as they are written rather than waiting for the group to fill. A dropped
+							// group leaves a gap for the codec's PLC.
+							const keyframe =
+								live.start === undefined || timestamp.saturatingSub(live.start).ge(this.#join);
+							if (keyframe) live.start = timestamp;
+							live.producer.encode(frame, timestamp, keyframe);
+							const history = this.#history !== undefined && timestamp.lt(this.#history);
+							if (!history && this.#estimator.write(timestamp.asMicros(), order, keyframe)) {
+								this.#estimate.set({ ...this.#estimator.estimate });
+							}
+						}
+						settle();
 					},
 					error: (err) => {
-						console.error("encoder error", err);
-						track.close(err);
+						if (!aborted.aborted) this.#abort(err);
 					},
 				});
-				effect.cleanup(() => encoder.close());
+				// A fatal error already closed the codec, and closing it twice throws.
+				effect.cleanup(() => {
+					if (encoder.state !== "closed") encoder.close();
+				});
 
 				console.debug("encoding audio", encoderConfig);
-				encoder.configure(encoderConfig);
+				try {
+					encoder.configure(encoderConfig);
+				} catch (error) {
+					this.#abort(error);
+					return;
+				}
 
-				effect.event(worklet.port, "message", (event: Event) => {
-					const captured = (event as MessageEvent<Capture.AudioFrame>).data;
-					const channelCount = captured.channels.length;
-					if (!channelCount) return;
+				// Where the next frame starts if it continues the last one submitted, unset after a break.
+				let contiguous: Duration | undefined;
 
-					if (channelCount !== config.numberOfChannels) {
-						this.#captured.set({ sampleRate: worklet.context.sampleRate, channelCount });
+				// Disabled or muted: capture is dropped, while the retained audio stays reachable.
+				let paused = false;
+				// A pause left retained audio, so the timeline breaks after it rather than at once.
+				let breakPending = false;
+
+				const backlog = new Backlog(retention, config.sampleRate);
+				const deadline = new Signal<Duration | undefined>(undefined);
+				const clock = () => now().since(Instant.ZERO);
+				effect.run((timer) => {
+					const at = timer.get(deadline);
+					if (at === undefined) return;
+					timer.timer(() => {
+						backlog.expire(clock());
+						deadline.set(backlog.deadline);
+					}, at.saturatingSub(clock()));
+				});
+
+				// End the epoch where the submitted audio ends, once the codec has emitted all of it: a
+				// marker placed while chunks are still owed would drop them as pre-gap.
+				const cut = () => {
+					if (contiguous === undefined) return;
+					owed.push({ cut: contiguous });
+					contiguous = undefined;
+					settle();
+				};
+
+				// Encode one frame ending at `end`, breaking the timeline first if it does not continue the
+				// last one. Timestamps round to whole microseconds, so a chunk's timestamp and the marker
+				// placed at the next frame's start agree exactly. `end` is the framer's start for the next
+				// frame, since adding a fractional frame duration to a rounded start can land a microsecond off.
+				const submit = (data: AudioFrame, end: Duration) => {
+					const micros = Math.round(data.timestamp.asMicros());
+					const timestamp = Duration.micros(micros);
+					if (contiguous !== undefined && !timestamp.eq(contiguous)) cut();
+
+					const joinedLength = data.channels.reduce((total, channel) => total + channel.length, 0);
+					const joined = new Float32Array(joinedLength);
+
+					data.channels.reduce((offset: number, channel: Float32Array): number => {
+						joined.set(channel, offset);
+						return offset + channel.length;
+					}, 0);
+
+					const frame = new AudioData({
+						format: "f32-planar",
+						sampleRate: config.sampleRate,
+						numberOfFrames: data.channels[0].length,
+						numberOfChannels: data.channels.length,
+						timestamp: micros,
+						data: joined,
+						transfer: [joined.buffer],
+					});
+
+					owed.push({ timestamp });
+					encoder.encode(frame);
+					frame.close();
+					contiguous = Duration.micros(Math.round(end.asMicros()));
+					this.#next = contiguous;
+				};
+
+				const pipeline: Pipeline = {
+					channelCount: config.numberOfChannels,
+					drain: () => {
+						backlog.expire(clock(), this.#budget);
+						// Expired history is a real gap, unlike a loss of demand: end the epoch where the
+						// encoded audio stops, so its last frame isn't stretched across the gap.
+						if (backlog.takeEvicted()) cut();
+						for (;;) {
+							const entry = backlog.peek();
+							if (!entry) break;
+							// A pause broke the timeline here.
+							if (backlog.takeCut()) cut();
+							backlog.shift();
+							submit(entry.frame, entry.end);
+							this.#history = this.#next;
+						}
+						deadline.set(backlog.deadline);
+						// The audio retained before a pause is all encoded, so the break follows it, even
+						// when resumed since.
+						if (breakPending && backlog.empty) {
+							breakPending = false;
+							cut();
+						}
+					},
+					push: (captured: AudioFrame) => {
+						if (paused) return;
+						const input = resampler ? resampler.push(captured) : captured;
+						if (!input) return;
+						const frames = framer.push(input);
+						for (const [i, data] of frames.entries()) {
+							if (!this.#live) continue;
+							const pending = breakPending;
+							breakPending = false;
+							const end = frames[i + 1]?.timestamp ?? framer.next;
+							if (this.#encoding && backlog.empty) {
+								if (pending) cut();
+								submit(data, end);
+								continue;
+							}
+							// It waits for a subscriber. Started here rather than from the backlog, which
+							// may not keep the frame: a zero max age retains nothing.
+							backlog.push(data, end, clock(), pending);
+						}
+						deadline.set(backlog.deadline);
+					},
+				};
+
+				// A disable or a mute stops taking capture but keeps the codec and retained audio, so a
+				// subscriber still gets that history and resuming needs no reconfigure. Neither flushes:
+				// the codec emits what it owes on its own, and a flush would send its lookahead tail at
+				// once, a frame ahead of its media.
+				effect.run((toggle) => {
+					if (toggle.get(this.in.enabled) && !toggle.get(this.muted)) {
+						paused = false;
 						return;
 					}
+					paused = true;
+					// The capture resumes on a later timeline, so drop the partial frame and filter state.
+					resampler = createResampler();
+					framer = createFramer(resolved, config.sampleRate);
+					if (backlog.empty) cut();
+					else breakPending = true;
+				});
 
-					for (const data of framer.push(captured)) {
-						const joinedLength = data.channels.reduce((total, channel) => total + channel.length, 0);
-						const joined = new Float32Array(joinedLength);
-
-						data.channels.reduce((offset: number, channel: Float32Array): number => {
-							joined.set(channel, offset);
-							return offset + channel.length;
-						}, 0);
-
-						const frame = new AudioData({
-							format: "f32-planar",
-							sampleRate: worklet.context.sampleRate,
-							numberOfFrames: data.channels[0].length,
-							numberOfChannels: data.channels.length,
-							timestamp: data.timestamp,
-							data: joined,
-							transfer: [joined.buffer],
-						});
-
-						encoder.encode(frame);
-						frame.close();
-					}
+				// Publish it last: the read loop starts pushing the moment this is visible.
+				this.#pipeline = pipeline;
+				effect.cleanup(() => {
+					if (this.#pipeline !== pipeline) return;
+					this.#pipeline = undefined;
+					// Whatever stopped it (a format or codec change, a lost broadcast, a fatal
+					// error), the timeline breaks here.
+					this.#cut();
 				});
 			});
-			worklet.port.start();
 		});
 	}
 
-	#setDecoderDescription(config: Catalog.AudioConfig, source: AllowSharedBufferSource | undefined): void {
-		if (config.codec !== "opus" || !source) return;
-
-		const bytes = ArrayBuffer.isView(source)
-			? new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
-			: new Uint8Array(source);
-		const description = Util.Hex.fromBytes(bytes);
-		const current = this.#decoderDescription.peek();
-		if (current?.config === config && current.description === description) return;
-
-		this.#decoderDescription.set({ config, description });
+	#abort(error: unknown): void {
+		const failure = (this.#slot.peek() ?? this.#local).error;
+		if (failure.peek()) return;
+		const cause = error instanceof Error ? error : new Error(String(error));
+		failure.set(cause);
+		this.#live?.track.abort(cause);
 	}
 
+	/** Stop and release everything this holds. */
 	close() {
 		this.#signals.close();
 	}
 }
 
-// getConstraints() echoes the constraints applied via getUserMedia, which (unlike getSettings)
-// survives the macOS mono->stereo misreport. Returns the requested channel count, if any.
-function requestedChannelCount(track: MediaStreamTrack): number | undefined {
-	const constraint = track.getConstraints().channelCount;
-	if (constraint === undefined) return undefined;
-	if (typeof constraint === "number") return constraint;
-	return constraint.exact ?? constraint.ideal ?? constraint.max ?? constraint.min;
+/**
+ * The encode settings a {@link Codec} resolves to against a captured PCM format.
+ *
+ * The catalog is a decoder hint carrying whole milliseconds, so it can only round a frame duration.
+ * {@link frameDuration} keeps the exact value the encoder is configured with, which is what lets
+ * Opus run at 2.5 ms.
+ */
+type Resolved = {
+	/** The rendition config published in the catalog. */
+	catalog: Catalog.AudioConfig;
+
+	/** The exact encoded frame duration, or undefined for a codec whose frame is a fixed sample count. */
+	frameDuration?: Duration;
+};
+
+/**
+ * Resolve a {@link Codec} against the captured PCM format, giving what the encoder will run with
+ * and the catalog rendition published alongside it.
+ * @internal
+ */
+export function resolve(captured: Format, selected: Codec): Resolved {
+	const codec = normalizeCodec(selected);
+
+	// The catalog has to describe what the encoder emits, not what we feed it. A capture graph
+	// already runs at a rate the codec supports, since Capture picks the AudioContext rate.
+	// Decoded samples arrive at whatever rate the file was authored at, which Opus may not be
+	// able to carry, so snap to one it can and let #encode resample into it.
+	const rate = pickSampleRate(codec.mime, captured.sampleRate) ?? captured.sampleRate;
+
+	const sampleRate = Catalog.u53(rate);
+	const numberOfChannels = Catalog.u53(captured.channelCount);
+
+	if (codec.mime === "aac") {
+		return {
+			catalog: {
+				codec: AAC_CODEC,
+				sampleRate,
+				numberOfChannels,
+				bitrate: Catalog.u53(codec.bitrate ?? captured.channelCount * AAC_BITRATE_PER_CHANNEL),
+				container: { kind: "legacy" } as const,
+				// Frames are raw (no ADTS header), so the decoder needs the AudioSpecificConfig to init.
+				description: Util.Hex.fromBytes(Util.Aac.audioSpecificConfig(rate, captured.channelCount)),
+			},
+		};
+	}
+
+	const frameDuration = codec.frameDuration ?? OPUS_FRAME_DURATION;
+	// Check here rather than letting AudioEncoder.configure throw: by then the rendition has been
+	// advertised and requested, so the failure surfaces to a subscriber instead of the caller.
+	if (!OPUS_FRAME_DURATIONS.includes(frameDuration.asMillis())) {
+		throw new Error(`opus frame duration must be ${OPUS_FRAME_DURATIONS.join("/")} ms: ${frameDuration}`);
+	}
+
+	return {
+		catalog: {
+			codec: "opus",
+			warmup: Catalog.u53(Util.Opus.WARMUP),
+			sampleRate,
+			numberOfChannels,
+			bitrate: Catalog.u53(codec.bitrate ?? captured.channelCount * OPUS_BITRATE_PER_CHANNEL),
+			container: { kind: "legacy" } as const,
+		},
+		frameDuration: frameDuration,
+	};
 }
 
-function createFramer(config: Catalog.AudioConfig): Framer {
+/**
+ * How far apart audio groups start: a frame opens one once it is at least `join` past the
+ * open group's start, so groups are a whole number of frames apart, and at least one.
+ * @internal
+ */
+export function groupSpacing(join: Duration, resolved: Resolved): Duration {
+	const frame = resolved.frameDuration?.asMicros() ?? (AAC_FRAME_SAMPLES * 1_000_000) / resolved.catalog.sampleRate;
+	const frames = Math.max(1, Math.ceil(join.asMicros() / frame));
+	return Duration.micros(frames * frame);
+}
+
+// The resolved config with the encoder settings and the probed decoder description, if the codec emitted one.
+function withDescription(
+	resolved: Resolved,
+	encoder: AudioEncoderConfig,
+	description: Catalog.Hex | undefined,
+): Resolved & { encoder: AudioEncoderConfig } {
+	return {
+		...resolved,
+		catalog: { ...resolved.catalog, ...(description === undefined ? {} : { description }) },
+		encoder,
+	};
+}
+
+// Build the framer for a config, given the rate the PCM actually arrives at. That's the catalog rate
+// for a capture graph, but a decoded file can arrive at a rate the codec doesn't carry (44100 for
+// Opus), and the framer has to count the samples we're handed rather than the ones the encoder emits.
+function createFramer(resolved: Resolved, sampleRate: number): Framer {
+	const config = resolved.catalog;
+
 	// WebCodecs copies input AudioData timestamps to encoded chunks. Align those inputs to codec frames
 	// because the worklet's 128-sample quanta usually do not align with Opus frame boundaries.
 	if (config.codec.startsWith("mp4a")) {
 		return new Framer({
-			sampleRate: config.sampleRate,
+			sampleRate,
 			channels: config.numberOfChannels,
 			size: { samples: AAC_FRAME_SAMPLES },
 		});
 	}
 
 	if (config.codec !== "opus") throw new Error(`unsupported audio codec: ${config.codec}`);
-	const duration = Time.Micro.fromMilli(Time.Milli(config.jitter ?? OPUS_FRAME_DURATION));
 	return new Framer({
-		sampleRate: config.sampleRate,
+		sampleRate,
 		channels: config.numberOfChannels,
-		size: { duration },
+		size: { duration: resolved.frameDuration ?? OPUS_FRAME_DURATION },
 	});
-}
-
-// Pick the rate to run the capture AudioContext at, given what the source reports (or the caller
-// asked for). Codecs only encode at a discrete set of rates, so snap to one they actually support.
-//
-// This has to happen at the AudioContext rather than just in the catalog. A context running at
-// 44100 hands 44100 AudioData to an encoder that resamples to 48000 behind our back, and we then
-// advertise 44100: a rate no Opus decoder can honor, which Safari rejects outright. Snapping here
-// keeps one rate across the capture graph, the encoder config, and the catalog.
-function pickSampleRate(mime: CodecMime, requested: number | undefined): number | undefined {
-	// Treat a nonsense rate as unknown. It would otherwise snap to the codec's floor (7350Hz for AAC)
-	// instead of throwing NotSupportedError at the AudioContext where it's obvious.
-	const rate = requested !== undefined && Number.isFinite(requested) && requested > 0 ? requested : undefined;
-
-	if (mime === "opus") {
-		// An unknown rate (captureStream reports none) would let the AudioContext fall back to the
-		// machine's output rate, which is 44100 on most Macs. Ask for full-band Opus instead.
-		return Util.Opus.pickRate(rate ?? Util.Opus.DEFAULT_SAMPLE_RATE);
-	}
-
-	// The AAC table includes 44100, so an unknown rate can safely fall through to the context default.
-	return rate !== undefined ? Util.Aac.pickRate(rate) : undefined;
 }
 
 // Resolve the bare codec shorthands to their full config object so callers can read fields uniformly.
@@ -563,14 +1067,12 @@ interface OpusEncoderConfigExt extends OpusEncoderConfig {
 }
 
 // Opus settings implied by the audio kind. These are only defaults: any field set explicitly via
-// OpusConfig (carried in opusOptions) overrides them, so a caller can always opt out. DTX (silence
-// suppression) is enabled for voice, where speech has natural gaps that collapse to tiny
-// comfort-noise packets. Music has no useful silence to suppress, and "auto" leaves every knob to
-// the browser.
+// OpusConfig (carried in opusOptions) overrides them, so a caller can always opt out. "auto" leaves
+// every knob to the browser.
 function opusKindDefaults(kind: Kind): OpusEncoderConfigExt {
 	switch (kind) {
 		case "voice":
-			return { application: "voip", signal: "voice", usedtx: true };
+			return { application: "voip", signal: "voice" };
 		case "music":
 			return { application: "audio", signal: "music" };
 		default:
@@ -578,14 +1080,14 @@ function opusKindDefaults(kind: Kind): OpusEncoderConfigExt {
 	}
 }
 
-// Build the WebCodecs encoder config from the catalog (decoder) config, a Kind hint, and any
-// Opus-only knobs. Those knobs are kept out of the catalog since they only affect encoding. AAC has
-// no such knobs, so it just uses the shared base fields (codec/sampleRate/channels/bitrate).
-function toEncoderConfig(
-	config: Catalog.AudioConfig,
-	kind: Kind,
-	opusOptions: OpusEncoderConfigExt,
-): AudioEncoderConfig {
+/**
+ * Build the WebCodecs encoder config from the catalog (decoder) config, a Kind hint, and any
+ * Opus-only knobs. Those knobs are kept out of the catalog since they only affect encoding. AAC has
+ * no such knobs, so it just uses the shared base fields (codec/sampleRate/channels/bitrate).
+ * @internal
+ */
+export function toEncoderConfig(resolved: Resolved, kind: Kind, opusOptions: OpusEncoderConfigExt): AudioEncoderConfig {
+	const config = resolved.catalog;
 	const encoderConfig: AudioEncoderConfig = {
 		codec: config.codec,
 		sampleRate: config.sampleRate,
@@ -604,9 +1106,10 @@ function toEncoderConfig(
 		// already dropped upstream, so the spread only overrides what the caller actually set).
 		const opus: OpusEncoderConfigExt = { ...opusKindDefaults(kind), ...opusOptions };
 
-		// jitter carries the frame duration in ms; WebCodecs wants µs.
-		if (config.jitter !== undefined) {
-			opus.frameDuration = Time.Micro.fromMilli(Time.Milli(config.jitter));
+		// The exact duration, not the catalog's rounded jitter hint: WebCodecs rejects anything but
+		// 2.5/5/10/20/40/60 ms, so 2.5 has to arrive as 2500 µs rather than 3000.
+		if (resolved.frameDuration !== undefined) {
+			opus.frameDuration = resolved.frameDuration.asMicros();
 		}
 
 		if (Object.keys(opus).length > 0) {
@@ -615,4 +1118,22 @@ function toEncoderConfig(
 	}
 
 	return encoderConfig;
+}
+
+/**
+ * Snap a rate to one the codec can actually encode at.
+ *
+ * The capture runs at whatever suits the device, and several renditions may share it, so each
+ * rendition converts on its own. WebCodecs rejects input whose rate doesn't match the configured
+ * one rather than converting for us, which is what #encode's resampler is for.
+ */
+function pickSampleRate(mime: CodecMime, requested: number | undefined): number | undefined {
+	// Treat a nonsense rate as unknown, rather than snapping it to the codec's floor (7350Hz for AAC).
+	const rate = requested !== undefined && Number.isFinite(requested) && requested > 0 ? requested : undefined;
+
+	// Opus only decodes at a handful of rates, and 44.1kHz is not one of them.
+	if (mime === "opus") return Util.Opus.pickRate(rate ?? Util.Opus.DEFAULT_SAMPLE_RATE);
+
+	// The AAC table includes 44100, so an unknown rate can fall through to whatever we captured.
+	return rate !== undefined ? Util.Aac.pickRate(rate) : undefined;
 }

@@ -1,0 +1,439 @@
+use std::sync::Arc;
+
+/// Renders an error and its `source()` chain into a single message.
+///
+/// Dependency errors are stored as messages so their crates stay out of this crate's public
+/// API. Several of them (reqwest above all) keep the useful detail in `source()`, which a
+/// plain `to_string()` would drop.
+#[allow(
+	dead_code,
+	reason = "a build with no transport feature compiles no backend module, so nothing calls this"
+)]
+pub(crate) fn message(err: impl std::error::Error) -> String {
+	use std::fmt::Write;
+
+	let mut out = err.to_string();
+	let mut source = err.source();
+	while let Some(err) = source {
+		let _ = write!(out, ": {err}");
+		source = err.source();
+	}
+	out
+}
+
+/// Generates `From` conversions into message-carrying variants of the enclosing module's `Error`,
+/// so `?` still works on a dependency's error without that dependency reaching our public API.
+#[allow(
+	unused_macros,
+	reason = "a build with no transport feature compiles no backend module, so nothing calls this"
+)]
+macro_rules! from_message {
+	($($ty:ty => $variant:ident),* $(,)?) => {
+		$(
+			impl From<$ty> for Error {
+				fn from(err: $ty) -> Self {
+					Self::$variant($crate::error::message(err))
+				}
+			}
+		)*
+	};
+}
+
+#[allow(
+	unused_imports,
+	reason = "a build with no transport feature compiles no backend module, so nothing calls this"
+)]
+pub(crate) use from_message;
+
+/// Whether an HTTP response status means "ask again later".
+///
+/// A response that arrived is the server's answer, and only this narrow set invites another
+/// attempt: request timeout, rate limit, and the gateway/overload statuses. Every other status,
+/// `404` and `403` included, is settled.
+#[cfg(feature = "net")]
+pub(crate) fn status_retryable(status: u16) -> bool {
+	matches!(status, 408 | 429 | 502 | 503 | 504)
+}
+
+/// Errors produced while configuring or establishing native MoQ connections.
+///
+/// Backend-specific failures live in per-backend error types ([`crate::tls::Error`],
+/// the per-backend `Error` types, etc.). They're wrapped in `Arc` here so the aggregate
+/// stays `Clone` even though the underlying transport/IO errors are not.
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+	/// A peer redirected a connection whose addresses were fixed by the caller.
+	#[error("peer redirect refused for a connection with fixed addresses")]
+	PinnedRedirect,
+
+	/// A peer's GOAWAY named a redirect the connection's policy refuses, or one it
+	/// could not parse. Terminal: the peer is leaving, so redialing is ignoring it.
+	#[error("GOAWAY redirect refused: {0}")]
+	RefusedRedirect(String),
+
+	/// Reading or writing a socket, certificate, or key file failed.
+	#[error(transparent)]
+	Io(Arc<std::io::Error>),
+
+	/// The MoQ session itself failed, after the transport was established.
+	#[cfg(feature = "net")]
+	#[error(transparent)]
+	MoqNet(#[from] moq_net::Error),
+
+	/// The log filter string (ex. `RUST_LOG`) isn't a valid tracing directive.
+	#[error("invalid log directive: {0}")]
+	Directive(String),
+
+	/// Logging was initialized twice, or something else already claimed the global subscriber.
+	#[error("failed to set global tracing subscriber: {0}")]
+	SetSubscriber(String),
+
+	/// Logging couldn't attach to Android's logcat.
+	#[error("failed to initialize Android logcat layer")]
+	Logcat(#[source] Arc<std::io::Error>),
+
+	/// No compiled-in backend or configured listener can serve this. The string names what is missing.
+	#[error("{0}")]
+	NoBackend(&'static str),
+
+	/// A qlog directory was configured but this build can't capture traces.
+	#[error("qlog capture requires the 'qlog' feature")]
+	QlogUnsupported,
+
+	/// Key logging was enabled without a destination, including a boolean binding's missing env path.
+	#[error("quic.keylog needs a nonempty path; boolean keylog settings require SSLKEYLOGFILE")]
+	KeylogUnset,
+
+	/// A zero `Backoff::healthy`, which would count every session as healthy.
+	#[error("the healthy backoff bar must be non-zero")]
+	BackoffHealthy,
+
+	/// The config was parsed from released spellings that no longer work. The
+	/// payload is the migration to print.
+	#[error("{0}")]
+	Deprecated(crate::cli::Deprecated),
+
+	/// The idle timeout is longer than QUIC's millisecond varint can carry.
+	#[error("idle timeout must be under 2^62 milliseconds")]
+	IdleTimeoutRange,
+
+	/// A QUIC flow-control window is zero or too large to express. The payload names
+	/// which one.
+	#[error("quic {0} must be non-zero and fit a QUIC varint")]
+	WindowRange(&'static str),
+
+	/// A QUIC stream limit is zero or past the 2^60 a peer accepts.
+	#[error("quic max_streams must be between 1 and 2^60")]
+	StreamsRange,
+
+	/// The QUIC connection receive window can't fit the largest message a session
+	/// assembles. The payload is the minimum, in bytes.
+	#[error("quic receive_window must be at least {0} bytes to fit the largest message")]
+	ReceiveWindowTooSmall(u64),
+
+	/// Every backend we tried gave up without reporting why.
+	#[error("failed to connect to server")]
+	ConnectFailed,
+
+	/// The dial and handshake together outlived the connect timeout.
+	///
+	/// Not every transport bounds its own dial: QUIC gives up on its own, but a peer
+	/// that completes the TCP handshake and then never speaks leaves the WebSocket
+	/// fallback (and the MoQ handshake that follows either transport) pending with
+	/// nothing to time it out. This deadline turns that into an error the caller can
+	/// retry instead of a wait that never ends.
+	#[error("connect timed out after {0:?}")]
+	ConnectTimeout(std::time::Duration),
+
+	/// A client certificate is configured, but the URL's scheme can't present it to a
+	/// server authenticated by a trusted root. The payload is the scheme.
+	#[error("{0}:// can't present the client certificate; dial https://, wss://, moqt://, moql://, or tls:// instead")]
+	ClientCertScheme(String),
+
+	/// A client on a simulated host dials only QUIC, since every other transport opens a real
+	/// socket. The payload is the scheme.
+	#[cfg(feature = "sim")]
+	#[error("{0}:// can't be dialed from a simulated host; dial https://, moqt://, or moql:// instead")]
+	SimScheme(String),
+
+	/// The server rejected the connection with an auth status. See [`crate::ConnectError`].
+	#[cfg(feature = "net")]
+	#[error(transparent)]
+	Connect(#[from] crate::ConnectError),
+
+	/// Both halves of the QUIC/WebSocket race failed, so neither error alone tells the story.
+	#[cfg(feature = "websocket")]
+	#[error("failed to connect to server: QUIC failed: {quic}; WebSocket failed: {websocket}")]
+	TransportRace {
+		/// Why the QUIC attempt failed.
+		quic: Arc<Error>,
+		/// Why the WebSocket attempt failed.
+		websocket: Arc<Error>,
+	},
+
+	/// A client CA or pinned peers were configured on a server with no QUIC or `tls://` listener to verify them.
+	#[error(
+		"mTLS (--listen-tls-root or tls.peers) needs a QUIC listener (--listen) or a TLS TCP listener (--listen-tcp-tls); the plaintext TCP and Unix listeners never ask for a client certificate"
+	)]
+	MtlsUnsupported,
+
+	/// A worker group was asked for more members than the connection ID's one-byte
+	/// steering prefix can name.
+	#[error("QUIC workers cannot exceed {max}; {count} were requested")]
+	WorkerCount {
+		/// What was asked for.
+		count: u16,
+		/// The ceiling, set by the byte the steering filter reads.
+		max: u16,
+	},
+
+	/// Another worker group already holds this listen port.
+	///
+	/// A second group on an overlapping address would silently join the first's
+	/// `SO_REUSEPORT` group and break its steering, so the port is locked while
+	/// the first is alive, whatever the address: a group on a different address
+	/// sharing the port is refused too.
+	#[error("another QUIC worker group already holds port {}", addr.port())]
+	WorkerOverlap {
+		/// The address this group asked for.
+		addr: std::net::SocketAddr,
+	},
+
+	/// The worker group's listen address did not resolve.
+	///
+	/// Resolved once for the whole group, so a DNS answer that rotates between
+	/// queries cannot hand members different addresses.
+	#[error("QUIC workers failed to resolve the listen address")]
+	WorkerResolve(#[source] Arc<std::io::Error>),
+
+	/// A worker thread could not be spawned, or died before it finished binding.
+	#[error("QUIC worker {index} failed to start")]
+	WorkerStart {
+		/// The member that failed.
+		index: u16,
+		/// Why, when the thread got far enough to say.
+		#[source]
+		source: Arc<std::io::Error>,
+	},
+
+	/// The server's WebTransport response carried a status outside the valid HTTP range.
+	#[error("invalid status code")]
+	InvalidStatusCode,
+
+	/// Reconnecting gave up, usually after the backoff timeout expired. The string has the details.
+	#[error("{0}")]
+	Reconnect(String),
+
+	/// The connection or listener was stopped locally, by closing it or dropping the last handle.
+	///
+	/// Not a failure: it is what a caller asked for. Distinct from [`Self::Reconnect`]
+	/// so a status watcher can tell an expected teardown from a connection that gave up.
+	#[error("stopped locally")]
+	Stopped,
+
+	/// A task serving this connection panicked. The panic itself is logged.
+	#[error("panicked")]
+	Panic,
+
+	/// A listener's endpoint stopped, so [`Listener::accept`](crate::Listener::accept) can never
+	/// yield another session. The endpoint's own failure is logged where it happened.
+	#[cfg(feature = "_transport")]
+	#[error("the {0} listener stopped accepting")]
+	Accept(crate::Transport),
+
+	/// Loading certificates or building the TLS config failed.
+	#[error(transparent)]
+	Tls(Arc<crate::tls::Error>),
+
+	/// The QUIC backend failed.
+	#[cfg(feature = "quic")]
+	#[error(transparent)]
+	Quic(Arc<crate::quic::Error>),
+
+	/// The WebSocket fallback transport failed.
+	#[cfg(feature = "websocket")]
+	#[error(transparent)]
+	WebSocket(Arc<crate::websocket::Error>),
+
+	/// The TCP (qmux) transport failed.
+	#[cfg(feature = "tcp")]
+	#[error(transparent)]
+	Tcp(Arc<crate::tcp::Error>),
+
+	/// The Unix socket transport failed.
+	#[cfg(all(feature = "uds", unix))]
+	#[error(transparent)]
+	Unix(Arc<crate::unix::Error>),
+
+	/// [`crate::watch::Files`] could not watch a file's directory. The string has the details.
+	#[cfg(feature = "watch")]
+	#[error("failed to watch files: {0}")]
+	Watch(String),
+
+	/// A qmux session refused the limits [`crate::server::Request::with_quic_limits`] set,
+	/// such as a rate cap, which qmux cannot pace.
+	#[cfg(feature = "qmux")]
+	#[error("qmux refused the session limits: {0}")]
+	QmuxLimits(String),
+}
+
+impl Error {
+	/// The auth rejection behind this error, digging through backend and race variants.
+	#[cfg(feature = "net")]
+	pub fn connect_error(&self) -> Option<crate::ConnectError> {
+		match self {
+			Self::Connect(err) => Some(*err),
+			Self::MoqNet(
+				moq_net::Error::Unauthorized | moq_net::Error::Session(moq_net::SessionError::Unauthorized),
+			) => Some(crate::ConnectError::Unauthorized),
+			#[cfg(feature = "quic")]
+			Self::Quic(err) => err.connect_error(),
+			#[cfg(feature = "websocket")]
+			Self::TransportRace { quic, websocket } => quic.connect_error().or_else(|| websocket.connect_error()),
+			#[cfg(feature = "websocket")]
+			Self::WebSocket(err) => err.connect_error(),
+			_ => None,
+		}
+	}
+
+	/// True if the server rejected us for auth reasons, so retrying won't help without new credentials.
+	#[cfg(feature = "net")]
+	pub fn is_auth(&self) -> bool {
+		// Neither code has an HTTP status, so neither has a `ConnectError` to report.
+		matches!(
+			self,
+			Self::MoqNet(err) if matches!(
+				moq_net::SessionError::from(err),
+				moq_net::SessionError::Expired | moq_net::SessionError::MalformedAuthToken
+			)
+		) || self.connect_error().is_some_and(|err| err.is_auth())
+	}
+
+	/// The HTTP status a server answered a connection attempt with, if it answered with one at all.
+	///
+	/// `None` covers everything else: a dial that never got a response, a QUIC handshake that
+	/// failed, a URL we couldn't parse. Only a status the peer actually sent shows up here, and
+	/// whether it invites another attempt is the caller's call (`408`, `429`, `502`, `503`, and
+	/// `504` are the ones worth repeating). This reports only HTTP responses; local configuration errors are
+	/// classified separately by the reconnect loop.
+	pub fn status(&self) -> Option<u16> {
+		match self {
+			// A race is only settled when both halves were answered, and answered with something not
+			// worth repeating: one transport being refused says nothing about the other, so a `404`
+			// over QUIC alongside a dead WebSocket is still just a failed dial.
+			#[cfg(feature = "websocket")]
+			Self::TransportRace { quic, websocket } => match (quic.status(), websocket.status()) {
+				(Some(quic), Some(websocket)) if !status_retryable(quic) && !status_retryable(websocket) => Some(quic),
+				_ => None,
+			},
+
+			#[cfg(feature = "quic")]
+			Self::Quic(err) => err.status(),
+			#[cfg(feature = "websocket")]
+			Self::WebSocket(err) => err.status(),
+			_ => None,
+		}
+	}
+}
+
+/// What a connection reports when moq-net's reconnect policy fails an attempt or gives up.
+#[cfg(feature = "net")]
+impl From<moq_net::reconnect::Failure> for Error {
+	fn from(failure: moq_net::reconnect::Failure) -> Self {
+		use moq_net::reconnect::Failure;
+		match failure {
+			Failure::Timeout(timeout) => Self::ConnectTimeout(timeout),
+			Failure::Refused(reason) => Self::RefusedRedirect(reason.to_string()),
+			Failure::Fixed => Self::PinnedRedirect,
+			failure => Self::Reconnect(failure.to_string()),
+		}
+	}
+}
+
+// The wrapped sources aren't `Clone`, so `#[from]` can't store them behind `Arc`
+// directly. These hand-written conversions keep `?` ergonomic at the call sites.
+impl From<std::io::Error> for Error {
+	fn from(err: std::io::Error) -> Self {
+		Self::Io(Arc::new(err))
+	}
+}
+
+// Flattened to its message so `tracing-subscriber` stays out of this crate's public API.
+impl From<tracing_subscriber::filter::ParseError> for Error {
+	fn from(err: tracing_subscriber::filter::ParseError) -> Self {
+		Self::Directive(err.to_string())
+	}
+}
+
+impl From<crate::tls::Error> for Error {
+	fn from(err: crate::tls::Error) -> Self {
+		Self::Tls(Arc::new(err))
+	}
+}
+
+#[cfg(feature = "quic")]
+impl From<crate::quic::Error> for Error {
+	fn from(err: crate::quic::Error) -> Self {
+		if let Some(err) = err.connect_error() {
+			return Self::Connect(err);
+		}
+
+		Self::Quic(Arc::new(err))
+	}
+}
+
+#[cfg(feature = "websocket")]
+impl From<crate::websocket::Error> for Error {
+	fn from(err: crate::websocket::Error) -> Self {
+		if let Some(err) = err.connect_error() {
+			return Self::Connect(err);
+		}
+
+		Self::WebSocket(Arc::new(err))
+	}
+}
+
+#[cfg(feature = "tcp")]
+impl From<crate::tcp::Error> for Error {
+	fn from(err: crate::tcp::Error) -> Self {
+		Self::Tcp(Arc::new(err))
+	}
+}
+
+#[cfg(all(feature = "uds", unix))]
+impl From<crate::unix::Error> for Error {
+	fn from(err: crate::unix::Error) -> Self {
+		Self::Unix(Arc::new(err))
+	}
+}
+
+/// Convenience alias for results produced by this crate.
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(all(test, feature = "websocket"))]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn expired_and_malformed_credentials_are_auth_rejections() {
+		assert!(Error::MoqNet(moq_net::Error::Expired).is_auth());
+		assert!(Error::MoqNet(moq_net::SessionError::Expired.into()).is_auth());
+		assert!(Error::MoqNet(moq_net::SessionError::MalformedAuthToken.into()).is_auth());
+	}
+
+	#[test]
+	fn transport_race_propagates_nested_connect_errors() {
+		let quic = Error::TransportRace {
+			quic: Arc::new(crate::ConnectError::Unauthorized.into()),
+			websocket: Arc::new(crate::ConnectError::Forbidden.into()),
+		};
+		assert_eq!(quic.connect_error(), Some(crate::ConnectError::Unauthorized));
+
+		let websocket = Error::TransportRace {
+			quic: Arc::new(Error::ConnectFailed),
+			websocket: Arc::new(crate::ConnectError::Forbidden.into()),
+		};
+		assert_eq!(websocket.connect_error(), Some(crate::ConnectError::Forbidden));
+	}
+}

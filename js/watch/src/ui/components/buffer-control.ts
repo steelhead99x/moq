@@ -1,18 +1,19 @@
-import * as Moq from "@moq/net";
+import { Duration } from "@moq/clock";
 import type { Effect } from "@moq/signals";
 import type { BufferedRanges } from "../..";
 import type MoqWatch from "../../element";
 
-const MIN_RANGE = Moq.Time.Milli(0);
-const RANGE_STEP = Moq.Time.Milli(10);
-const DEFAULT_MAX = Moq.Time.Milli(4000);
+// In milliseconds, as the slider draws and steps them.
+const MIN_RANGE = 0;
+const RANGE_STEP = 10;
+const DEFAULT_MAX = 4000;
 const LABEL_WIDTH = 48;
 
 function drawRanges(
 	canvas: HTMLCanvasElement,
 	ranges: BufferedRanges,
-	timestamp: Moq.Time.Milli | undefined,
-	max: Moq.Time.Milli,
+	playhead: Duration | undefined,
+	max: number,
 	isBuffering: boolean,
 ) {
 	const ctx = canvas.getContext("2d");
@@ -33,7 +34,8 @@ function drawRanges(
 	ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 	ctx.clearRect(0, 0, width, height);
 
-	if (timestamp === undefined) return;
+	if (playhead === undefined) return;
+	const timestamp = playhead.asMillis();
 
 	const padding = 2;
 	const rangeHeight = height - padding * 2;
@@ -41,8 +43,9 @@ function drawRanges(
 
 	for (let i = 0; i < ranges.length; i++) {
 		const range = ranges[i];
-		const startMs = Moq.Time.Milli(range.start - timestamp);
-		const endMs = Moq.Time.Milli(range.end - timestamp);
+		// Offsets from the playhead, negative for content already behind it.
+		const startMs = range.start.asMillis() - timestamp;
+		const endMs = range.end.asMillis() - timestamp;
 		const visibleStart = Math.max(0, startMs);
 		const visibleEnd = Math.min(endMs, max);
 
@@ -74,7 +77,7 @@ function drawRanges(
 	}
 }
 
-export function bufferControl(parent: Effect, watch: MoqWatch, max: Moq.Time.Milli = DEFAULT_MAX): HTMLElement {
+export function bufferControl(parent: Effect, watch: MoqWatch, max: number = DEFAULT_MAX): HTMLElement {
 	const wrapper = document.createElement("div");
 	wrapper.className = "buffer";
 
@@ -84,7 +87,7 @@ export function bufferControl(parent: Effect, watch: MoqWatch, max: Moq.Time.Mil
 	viz.tabIndex = 0;
 	viz.setAttribute("aria-valuemin", MIN_RANGE.toString());
 	viz.setAttribute("aria-valuemax", max.toString());
-	viz.setAttribute("aria-label", "Buffer jitter");
+	viz.setAttribute("aria-label", "Playback delay");
 
 	const playhead = document.createElement("div");
 	playhead.className = "buffer-playhead";
@@ -127,11 +130,11 @@ export function bufferControl(parent: Effect, watch: MoqWatch, max: Moq.Time.Mil
 	let hasInteracted = false;
 
 	parent.run((effect) => {
-		const jitter = effect.get(watch.sync.out.jitter);
-		const pct = (jitter / max) * 100;
+		const delay = effect.get(watch.sync.out.delay).asMillis();
+		const pct = (delay / max) * 100;
 		targetLine.style.left = `${pct}%`;
-		targetLabel.textContent = `${Math.round(jitter)}ms`;
-		viz.setAttribute("aria-valuenow", jitter.toString());
+		targetLabel.textContent = `${Math.round(delay)}ms`;
+		viz.setAttribute("aria-valuenow", delay.toString());
 	});
 
 	const updateFromX = (clientX: number) => {
@@ -139,9 +142,8 @@ export function bufferControl(parent: Effect, watch: MoqWatch, max: Moq.Time.Mil
 		const trackWidth = rect.width - LABEL_WIDTH;
 		const x = Math.max(0, Math.min(clientX - rect.left - LABEL_WIDTH, trackWidth));
 		const ms = (x / trackWidth) * max;
-		const snapped = Moq.Time.Milli(Math.round(ms / RANGE_STEP) * RANGE_STEP);
-		const clamped = Moq.Time.Milli(Math.max(MIN_RANGE, Math.min(max, snapped)));
-		watch.latencyMin = clamped;
+		const snapped = Math.round(ms / RANGE_STEP) * RANGE_STEP;
+		watch.delay = Duration.millis(Math.max(MIN_RANGE, Math.min(max, snapped)));
 	};
 
 	const interact = () => {
@@ -169,19 +171,19 @@ export function bufferControl(parent: Effect, watch: MoqWatch, max: Moq.Time.Mil
 	});
 
 	parent.event(viz, "keydown", (e) => {
-		let delta = Moq.Time.Milli(0);
+		let delta = 0;
 		if (e.key === "ArrowRight" || e.key === "ArrowUp") {
 			delta = RANGE_STEP;
 		} else if (e.key === "ArrowLeft" || e.key === "ArrowDown") {
-			delta = Moq.Time.Milli(-RANGE_STEP);
+			delta = -RANGE_STEP;
 		} else {
 			return;
 		}
 		e.preventDefault();
 		interact();
-		const current = watch.sync.out.jitter.peek();
-		const value = Moq.Time.Milli(Math.max(MIN_RANGE, Math.min(max, current + delta)));
-		watch.latencyMin = value;
+		const current = watch.sync.out.delay.peek().asMillis();
+		const value = Duration.millis(Math.max(MIN_RANGE, Math.min(max, current + delta)));
+		watch.delay = value;
 	});
 
 	const draw = () => {

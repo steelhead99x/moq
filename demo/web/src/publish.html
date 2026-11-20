@@ -20,8 +20,8 @@
 		<!-- Left: preview + player chrome. -->
 		<section>
 			<!--
-				announce="source": only advertise the broadcast once a source is picked,
-				so the watch inspector shows no phantom tile while idle.
+				announce="source": wait for the enabled source tracks before advertising,
+				then keep a camera announced across capture gaps until it is deselected.
 
 				The preview renders into the <canvas>. With "Encoded preview" off it shows
 				the raw capture (preview="source"); on, it decodes a copy of the *encoded*
@@ -29,7 +29,9 @@
 				cost of an extra encode + decode.
 			-->
 			<moq-publish-ui>
-				<moq-publish id="publish" name="me.hang" announce="source">
+				<!-- `stats` reports what each rendition sends, and `echo-path` asks viewers to report
+				     what they receive under `viewers/`: read both with `moq export report` and `moq export echo`. -->
+				<moq-publish id="publish" name="me.hang" announce="source" stats echo-path="viewers">
 					<canvas style="width: 100%; height: auto; border-radius: 4px;"></canvas>
 				</moq-publish>
 			</moq-publish-ui>
@@ -220,9 +222,6 @@
 							Expected packet loss (%)
 							<input id="opus-plc" type="number" min="0" max="100" step="1" placeholder="auto"
 								class="mt-1 w-full bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-white text-sm">
-						</label>
-						<label class="flex items-center gap-2">
-							<input id="opus-dtx" type="checkbox" class="accent-blue-600"> DTX (discontinuous transmission)
 						</label>
 					</div>
 				</details>

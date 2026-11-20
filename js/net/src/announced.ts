@@ -1,29 +1,129 @@
 /**
- * Broadcast announcement streams: which broadcast paths are available under a prefix.
+ * Broadcast announcement streams: which broadcast paths are available under a scope.
  *
  * @module
  */
-import { Effect, type GetPromise, type Getter, type GetterInit, getter, Once, Signal } from "@moq/signals";
-import type * as broadcast from "./broadcast.js";
-import type { Established } from "./connection/established.js";
-import * as Path from "./path.js";
+import { type GetPromise, type Getter, Once, Signal } from "@moq/signals";
+import { type RouteInfo, routeInfo, type WireRoute } from "./hop.ts";
+import type * as Path from "./path.js";
 
 /**
- * The availability of a broadcast.
+ * A route over a prefix, delivered inside an {@link Event}.
+ *
+ * An announcement is always a prefix, never a broadcast: a route claims that
+ * {@link prefix} and every path beneath it can be served. By convention a publisher
+ * announces each broadcast's exact path, so enumerating routes enumerates broadcasts;
+ * resolve one with the origin's `request(path)`. Narrow with a {@link Path.Pattern}
+ * locally to follow a subset.
  *
  * @public
  */
-export interface Event {
-	/** Broadcast path relative to the prefix passed to `announced()`. */
-	path: Path.Valid;
-	/** True when the broadcast is available, false when it was removed. */
-	active: boolean;
+export interface Announce {
+	/**
+	 * The prefix the route covers, relative to the origin (for a session, its URL path).
+	 */
+	prefix: Path.Valid;
+	/** What the filter's wildcards stood for, when this prefix pins all of them. */
+	captures: Path.Pattern[] | undefined;
+	/** Hops and cost of the route; on a retraction, its last advertised values. */
+	route: RouteInfo;
+}
+
+/**
+ * An {@link Announce} as the origin and sessions carry it, with the route's internal metadata.
+ *
+ * @internal
+ */
+export type Routed = Omit<Announce, "route"> & { route: WireRoute };
+
+/**
+ * What an announcement listing yields: a path becoming present, absent, or offline, or its
+ * availability changing.
+ *
+ * `present`: a route now covers the path, which was absent; it may arrive unavailable (see
+ * {@link RouteInfo.available}). `unavailable`: the present path lost every usable path to its
+ * origin but may recover one, so it stays present while requests for it may fail.
+ * `available`: it recovered one: request it again. `absent`: the origin withdrew the path, and
+ * no route covers it any more. `offline`: this side let go of the path, and no route covers it
+ * any more: the session it arrived on closed, or the network lost every path to it, so its
+ * origin may still serve it. Both carry its last advertised route.
+ *
+ * Another instance taking a path over keeps it present: follow it with the origin's
+ * `follow(path)` to see the broadcast change.
+ *
+ * @public
+ */
+export type Event = { kind: "present" | "unavailable" | "available" | "absent" | "offline" } & Announce;
+
+/**
+ * Every change to a route, for code that forwards or routes them.
+ *
+ * `start`: a route now covers the prefix. `update`: the route covering it changed hops, cost,
+ * or availability, in place. `restart`: another instance now serves the prefix. `end`: the
+ * origin withdrew it, and no route covers it any more. `offline`: this side let go of it,
+ * and no route covers it any more.
+ *
+ * @internal
+ */
+export type RouteEvent = { kind: "start" | "update" | "restart" | "end" | "offline" } & Routed;
+
+/**
+ * Options for an announcement stream.
+ *
+ * @public
+ */
+export interface Options {
+	/**
+	 * Also report hidden routes: those with a path segment starting with `.` below the
+	 * scope's literal head. Hidden routes are left out by default, so a platform can add
+	 * `.`-named broadcasts (stats, internal routes) without them turning up in apps that
+	 * list everything. Subscribing to a hidden path by name works either way.
+	 */
+	hidden?: boolean;
+
+	/**
+	 * Also report every route that could serve a path in scope, not just those whose literal
+	 * name matches it. A route is a prefix serving everything beneath it, so a scope listing
+	 * `.chat` names at any depth still reports a route at `room`, which can serve
+	 * `room/lobby.chat`. Code that routes or forwards needs these; listing broadcasts does
+	 * not. Requests resolve through covering routes either way.
+	 */
+	covering?: boolean;
+}
+
+/**
+ * Options for a route stream, which forwarding code reads.
+ *
+ * @internal
+ */
+export interface RouteOptions extends Options {
+	/**
+	 * Report each origin node's claim at a path as its own route, rather than only the one the
+	 * session ranks best, so the origin it feeds ranks every candidate as rs/moq-net's does. Only
+	 * lite-07 carries more than one route per path on a stream.
+	 */
+	claims?: boolean;
 }
 
 /** Reactive backing state shared by announcement producers and consumers. */
 class AnnounceState {
-	queue = new Signal<Event[]>([]);
+	queue = new Signal<RouteEvent[]>([]);
 	closed = new Once<Error | null>();
+	synced = new Signal(false);
+	// The queued events still to read before the stream counts as synced, or undefined
+	// while the initial set is still arriving.
+	owed: number | undefined;
+	// A reader holds the last event it took before syncing until it asks for the next
+	// one, so whatever it does with that event lands before synced flips.
+	reading = false;
+	// Open consumer handles; the stream is wanted while any is.
+	consumers = 0;
+	wanted = new Signal(false);
+}
+
+// Synced once nothing is owed and the reader has come back for more.
+function settle(state: AnnounceState) {
+	if (state.owed === 0 && !state.reading) state.synced.set(true);
 }
 
 // Once.set throws on a second settle, and both ends of a stream can close independently.
@@ -33,22 +133,19 @@ function closeState(state: AnnounceState, abort?: Error) {
 	state.queue.mutate((queue) => {
 		queue.length = 0;
 	});
+	// Nothing more is coming, so nothing waiting on the boundary should hang.
+	state.owed = 0;
+	state.reading = false;
+	state.synced.set(true);
 }
 
 /**
- * The write side of an announcement stream.
+ * The write side of a route stream.
  *
- * @public
+ * @internal
  */
 export class Producer {
-	/** Path prefix this stream is scoped to. */
-	prefix: Path.Valid;
-
 	#state = new AnnounceState();
-
-	constructor(prefix = Path.empty()) {
-		this.prefix = prefix;
-	}
 
 	/**
 	 * Settles once the stream closes: `null` on a clean close, or the abort {@link Error}.
@@ -59,16 +156,49 @@ export class Producer {
 	}
 
 	/** A read handle for this announcement stream. */
-	consume(): Consumer {
-		return makeConsumer(this.prefix, this.#state);
+	consume(): Routes {
+		return makeRoutes(this.#state);
 	}
 
-	/** Writes an announcement to the queue. */
-	append(event: Event) {
+	/**
+	 * Whether any consumer still holds the stream: false before the first {@link consume} and
+	 * once the last one {@link Routes.close}s, which is how a reader cancels it.
+	 */
+	get wanted(): Getter<boolean> {
+		return this.#state.wanted;
+	}
+
+	/** Writes an event to the queue. */
+	append(event: RouteEvent) {
 		if (this.#state.closed.peek() !== undefined) throw new Error("announcements are closed");
 		this.#state.queue.mutate((queue) => {
 			queue.push(event);
 		});
+	}
+
+	/**
+	 * Marks the initial set as delivered: the stream syncs once the reader has taken
+	 * everything queued so far. A no-op until {@link behind} once marked.
+	 *
+	 * @internal
+	 */
+	synced() {
+		const state = this.#state;
+		if (state.owed !== undefined) return;
+		state.owed = state.queue.peek().length;
+		settle(state);
+	}
+
+	/**
+	 * Takes sync back until the next {@link synced}, as when another initial set starts.
+	 *
+	 * @internal
+	 */
+	behind() {
+		const state = this.#state;
+		if (state.closed.peek() !== undefined) return;
+		state.owed = undefined;
+		state.synced.set(false);
 	}
 
 	/** Closes the writer. Idempotent. */
@@ -77,217 +207,185 @@ export class Producer {
 	}
 }
 
-// Constructs a Consumer from within this module without exposing a public constructor
+// Constructs a Routes from within this module without exposing a public constructor
 // that would leak the unexported AnnounceState. Assigned in the class's static block.
-let makeConsumer: (prefix: Path.Valid, state: AnnounceState) => Consumer;
+let makeRoutes: (state: AnnounceState) => Routes;
 
 /**
- * The read side of an announcement stream.
+ * The read side of a route stream: every change, for code that forwards or routes them.
  *
- * Created internally: obtain one from {@link Producer.consume} or the connection's
- * `announced(prefix)`.
- *
- * @public
+ * @internal
  */
-export class Consumer {
-	/** Path prefix this stream is scoped to. */
-	prefix: Path.Valid;
-
+export class Routes {
 	#state: AnnounceState;
+	// Set once this handle closes, ending its own reads and guarding the consumer count.
+	#released = new Signal(false);
 
-	private constructor(prefix: Path.Valid, state: AnnounceState) {
-		this.prefix = prefix;
+	private constructor(state: AnnounceState) {
 		this.#state = state;
+		state.consumers++;
+		state.wanted.set(true);
 	}
 
-	/** Settles once the stream closes; see {@link Producer.closed}. */
+	/** Settles once the stream closes: `null` on a clean close, or the abort {@link Error}. */
 	get closed(): GetPromise<Error | null> {
 		return this.#state.closed;
 	}
 
 	static {
-		makeConsumer = (prefix, state) => new Consumer(prefix, state);
+		makeRoutes = (state) => new Routes(state);
 	}
 
-	/** Returns the next announcement. */
-	async next(): Promise<Event | undefined> {
+	/**
+	 * Whether the stream has delivered its source's initial announcements and the reader has
+	 * taken them, so a prefix not announced by now is absent rather than not yet heard of.
+	 *
+	 * Flips once the reader asks for the event after the last of them, and is true once
+	 * closed. Through a session, the initial set is the peer's view when it answered: exact
+	 * on versions that count it, best-effort on the rest. Reading an origin, it is every
+	 * attached session's initial set, so a reconnect takes it back until the new one lands.
+	 */
+	get synced(): Getter<boolean> {
+		return this.#state.synced;
+	}
+
+	/** The events as they arrive, until the stream closes. */
+	async *[Symbol.asyncIterator](): AsyncGenerator<RouteEvent, void, undefined> {
 		for (;;) {
-			const announce = this.#state.queue.peek().shift();
-			if (announce) return announce;
+			const event = await this.next();
+			if (!event) return;
+			yield event;
+		}
+	}
+
+	/** Returns the next event, or undefined once the stream or this handle closes. */
+	async next(): Promise<RouteEvent | undefined> {
+		const state = this.#state;
+		state.reading = false;
+		settle(state);
+		for (;;) {
+			if (this.#released.peek()) return undefined;
+			const announce = state.queue.peek().shift();
+			if (announce) {
+				if (state.owed) state.owed -= 1;
+				if (!state.synced.peek()) state.reading = true;
+				return announce;
+			}
 
 			const closed = this.#state.closed.peek();
 			if (closed instanceof Error) throw closed;
 			if (closed !== undefined) return undefined;
 
-			await Signal.race(this.#state.queue, this.#state.closed);
+			await Signal.race(state.queue, state.closed, this.#released);
 		}
 	}
 
-	/** Closes the reader. Idempotent. */
-	close(abort?: Error) {
-		closeState(this.#state, abort);
-	}
-}
-
-// Connections already warned about missing broadcast discovery, so the fallback logs at most
-// once per connection instead of once per watched path.
-const warnedNoDiscovery = new WeakSet<Established>();
-
-/**
- * What to watch, for {@link Broadcast}.
- *
- * @public
- */
-export interface BroadcastProps {
 	/**
-	 * The connection to watch on. Accepts a live {@link Established} session, or a reactive one
-	 * (a `Connection.Reload`'s `established`), which is how the handle survives reconnects.
+	 * Release this handle, like dropping a Rust handle: other consumers keep reading, and the
+	 * producer sees the stream as no longer wanted once the last one closes.
+	 * Idempotent.
 	 */
-	connection: GetterInit<Established | undefined>;
-
-	/** The broadcast path to watch. */
-	path: Path.Valid;
-}
-
-/**
- * A reactive handle to a single broadcast: {@link Broadcast.active} holds a live
- * {@link broadcast.Consumer} while the path is announced and `undefined` while nobody
- * publishes it.
- *
- * Use this instead of {@link Established.consume} whenever the broadcast may not exist yet.
- * Subscribing to a path nobody publishes gets the stream reset, so a consumer that races the
- * publisher stays silent forever unless it retries; this waits for the announcement instead.
- *
- * A same-name republish re-consumes, so the handle attaches to the new instance rather than
- * clinging to the dead one. A relay failover that keeps the same publisher does *not*: the
- * subscription resumes across the new route, so `active` holds the same consumer throughout and
- * never goes offline. Only a change of publisher produces an offline/online transition.
- *
- * Built from a reconnecting `Connection.Reload`, the handle also spans reconnects: the broadcast
- * drops to `undefined` while disconnected and resolves again once the new connection announces it.
- *
- * Falls back to consuming blind (and warns once) on a relay without
- * {@link Established.discovery}, where there is no announcement to wait for. `active` then
- * means *assumed present* rather than known live: nothing reports whether the path exists, so
- * a subscribe to a missing broadcast is how a caller finds out. The handle stays usable either
- * way, and because it is scoped to the path rather than to one publisher, a subscribe made
- * after a publisher finally appears succeeds.
- *
- * If discovery fails on a live session (the announcement stream is reset, or the relay
- * refuses it) the handle goes offline and stays there: nothing reopens the stream on that
- * connection. Build it from a `Connection.Reload` if you need it to recover, since a new
- * connection starts a new stream.
- *
- * Close it to release the announcement stream and the current broadcast.
- *
- * @public
- */
-export class Broadcast {
-	/** The broadcast path this handle watches. */
-	readonly path: Path.Valid;
-
-	/**
-	 * The live broadcast, or `undefined` while it is offline.
-	 *
-	 * Borrowed, not yours to close: this handle owns the consumer and swaps it when the path is
-	 * republished. `active` keeps pointing at whatever you closed, so once you drop the last
-	 * reference the shared broadcast is gone and reads fail until the next announcement replaces
-	 * it. Take a {@link broadcast.Consumer.clone} for a lifetime of your own, or close this whole
-	 * handle to release everything.
-	 */
-	readonly active: Getter<broadcast.Consumer | undefined>;
-
-	#active = new Signal<broadcast.Consumer | undefined>(undefined);
-	#signals = new Effect();
-
-	/**
-	 * Watch a path on a connection.
-	 *
-	 * Prefer `announcedBroadcast(path)` on the connection itself. Reach for this when the
-	 * session you want to follow isn't either connection type, e.g. your own
-	 * `Getter<Established | undefined>`.
-	 */
-	constructor({ connection, path }: BroadcastProps) {
-		this.path = path;
-		this.active = this.#active;
-
-		const source = getter(connection);
-		this.#signals.run((effect) => {
-			const conn = effect.get(source);
-			if (!conn) return;
-
-			// Without discovery no announcement ever arrives, so waiting would hang forever.
-			if (!conn.discovery) {
-				if (!warnedNoDiscovery.has(conn)) {
-					warnedNoDiscovery.add(conn);
-					console.warn("relay does not support broadcast discovery; consuming without waiting.");
-				}
-
-				const blind = conn.consume(path);
-				effect.cleanup(() => blind.close());
-				effect.set(this.#active, blind, undefined);
-
-				// The announcement-gated path below goes offline when the stream ends with the
-				// session; without discovery there is no stream, so watch the session itself.
-				// A consumed broadcast is a path-scoped handle, not a subscription, so its own
-				// `closed` says nothing about whether the path exists or the session is alive.
-				// Raced against the run's teardown so a closed handle isn't retained until the
-				// session ends; the cleanup above has already cleared `active` in that case.
-				effect.spawn(async () => {
-					await Promise.race([effect.cancel, conn.closed]);
-					if (this.#active.peek() === blind) this.#active.set(undefined);
-				});
-				return;
-			}
-
-			const announced = conn.announced(path);
-			effect.cleanup(() => announced.close());
-
-			let current: broadcast.Consumer | undefined;
-			const offline = () => {
-				const mine = current;
-				current?.close();
-				current = undefined;
-				// Only clear what this run put there. A spawn task that resumes after its run was
-				// torn down would otherwise wipe the consumer a newer run already installed.
-				if (this.#active.peek() === mine) this.#active.set(undefined);
-			};
-			effect.cleanup(offline);
-
-			effect.spawn(async () => {
-				try {
-					for (;;) {
-						const event = await Promise.race([effect.cancel, announced.next()]);
-						if (!event) break;
-
-						// Scoped to `path`, so the exact broadcast arrives with an empty suffix; ignore children.
-						if (event.path !== Path.empty()) continue;
-
-						if (event.active) {
-							// A live subscription survives a redundant (re-)announce; only replace a dead one.
-							if (current && current.closed.peek() === undefined) continue;
-							current?.close();
-							current = conn.consume(path);
-							this.#active.set(current);
-						} else {
-							offline();
-						}
-					}
-				} catch (err) {
-					// Discovery failed: the session died under the stream, or the relay refused
-					// to answer. Nothing reopens it on this connection, so say so out loud.
-					console.warn("broadcast discovery failed", err);
-				}
-
-				// The stream ended, or this run was torn down (its cleanup already ran). Either
-				// way there is nothing left announcing the path, so don't hold a dead broadcast.
-				offline();
-			});
-		});
-	}
-
-	/** Closes the handle and the broadcast it currently holds. Idempotent. */
 	close() {
-		this.#signals.close();
+		if (this.#released.peek()) return;
+		this.#released.set(true);
+		if (--this.#state.consumers === 0) this.#state.wanted.set(false);
 	}
+}
+
+// Constructs a listing over a route stream without a public constructor. Declared before the
+// class, whose static block assigns it.
+let makeConsumer: (routes: Routes) => Consumer;
+
+/**
+ * The paths announced under a scope, each reported as it becomes present, absent, or offline,
+ * and as its availability changes.
+ *
+ * Created internally: obtain one from an origin or the connection's `announced(scope)`.
+ *
+ * @public
+ */
+export class Consumer {
+	#routes: Routes;
+	// The present paths last reported unavailable, bounded by the present set.
+	#unavailable = new Set<Path.Valid>();
+
+	private constructor(routes: Routes) {
+		this.#routes = routes;
+	}
+
+	static {
+		makeConsumer = (routes) => new Consumer(routes);
+	}
+
+	/** Settles once the stream closes: `null` on a clean close, or the abort {@link Error}. */
+	get closed(): GetPromise<Error | null> {
+		return this.#routes.closed;
+	}
+
+	/**
+	 * Whether the listing has delivered its source's initial announcements and the reader has
+	 * taken them, so a path not present by now is absent rather than not yet heard of.
+	 *
+	 * Flips once the reader asks for the event after the last of them, and is true once
+	 * closed. Through a session, the initial set is the peer's view when it answered: exact
+	 * on versions that count it, best-effort on the rest. Reading an origin, it is every
+	 * attached session's initial set, so a reconnect takes it back until the new one lands.
+	 */
+	get synced(): Getter<boolean> {
+		return this.#routes.synced;
+	}
+
+	/** The events as they arrive, until the listing closes. */
+	async *[Symbol.asyncIterator](): AsyncGenerator<Event, void, undefined> {
+		for (;;) {
+			const event = await this.next();
+			if (!event) return;
+			yield event;
+		}
+	}
+
+	/** Returns the next change to a path, or undefined once the listing or this handle closes. */
+	async next(): Promise<Event | undefined> {
+		for (;;) {
+			const event = await this.#routes.next();
+			if (!event) return undefined;
+			const { kind, prefix, captures } = event;
+			const route = routeInfo(event.route);
+			switch (kind) {
+				case "start":
+					if (!route.available) this.#unavailable.add(prefix);
+					return { kind: "present", prefix, captures, route };
+				case "update":
+				case "restart": {
+					const was = !this.#unavailable.has(prefix);
+					if (was === route.available) continue;
+					if (route.available) this.#unavailable.delete(prefix);
+					else this.#unavailable.add(prefix);
+					return { kind: route.available ? "available" : "unavailable", prefix, captures, route };
+				}
+				case "end":
+				case "offline":
+					this.#unavailable.delete(prefix);
+					return { kind: kind === "end" ? "absent" : "offline", prefix, captures, route };
+			}
+		}
+	}
+
+	/**
+	 * Release this handle, like dropping a Rust handle: the source sees the listing as no
+	 * longer wanted. Idempotent.
+	 */
+	close() {
+		this.#routes.close();
+	}
+}
+
+/**
+ * The listing over a route stream: only paths becoming present, absent, or offline, and their
+ * availability changing.
+ *
+ * @internal
+ */
+export function list(routes: Routes): Consumer {
+	return makeConsumer(routes);
 }

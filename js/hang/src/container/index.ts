@@ -1,15 +1,15 @@
 /**
  * Per-frame container formats (timestamp plus codec bitstream): the legacy varint
- * container, CMAF (fMP4), and LOC, with consumers and producers to read/write them.
+ * container and LOC, with consumers and producers to read/write them.
  *
  * @module
  */
 
+/** Re-export of {@link https://www.npmjs.com/package/@moq/loc | @moq/loc}, the LOC container. */
 export * as Loc from "@moq/loc";
-export * as Cmaf from "./cmaf";
-export { Consumer, type ConsumerProps } from "./consumer";
+export { Consumer, type ConsumerProps, DELAY_MAX, type Read } from "./consumer";
 export type { Format } from "./format";
+/** The legacy varint container. */
 export * as Legacy from "./legacy";
-export * as Timeline from "./timeline";
-export { type TrackInfoOptions, trackInfo } from "./track";
+export { MAX_AGE, type TrackInfoOptions, trackInfo } from "./track";
 export * from "./types";

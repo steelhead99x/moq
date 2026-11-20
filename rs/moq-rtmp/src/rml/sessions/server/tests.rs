@@ -1,8 +1,11 @@
 use super::*;
+use crate::rml::amf0;
+use crate::rml::amf0::Amf0Value;
 use crate::rml::chunk_io::ChunkDeserializer;
-use crate::rml::messages::{MessagePayload, PeerBandwidthLimitType, RtmpMessage, UserControlEventType};
+use crate::rml::messages::{
+	MessageDeserializationError, MessagePayload, PeerBandwidthLimitType, RtmpMessage, UserControlEventType,
+};
 use bytes::BytesMut;
-use rml_amf0::Amf0Value;
 use std::collections::HashMap;
 
 const DEFAULT_CHUNK_SIZE: u32 = 1111;
@@ -11,6 +14,77 @@ const DEFAULT_WINDOW_ACK_SIZE: u32 = 3333;
 
 const TEST_APP_NAME: &str = "some_app";
 const TEST_STREAM_KEY: &str = "stream_key";
+
+#[test]
+fn a_connection_request_cannot_be_replaced_while_authorization_is_pending() {
+	let (_, mut serializer, mut session) = common_basic_setup();
+	let payload = create_connect_message(TEST_APP_NAME.to_owned(), 0, 0, 0.0);
+	let packet = serializer.serialize(&payload, true, false).unwrap();
+	session.handle_input(&packet.bytes).unwrap();
+	let packet = serializer.serialize(&payload, true, false).unwrap();
+	assert!(session.handle_input(&packet.bytes).is_err());
+}
+
+#[test]
+fn publish_and_play_require_the_connections_created_stream() {
+	for name in ["publish", "play"] {
+		let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+		perform_connection(TEST_APP_NAME, &mut session, &mut serializer, &mut deserializer);
+		let message = RtmpMessage::Amf0Command {
+			command_name: name.to_owned(),
+			transaction_id: 5.0,
+			command_object: Amf0Value::Null,
+			additional_arguments: vec![
+				Amf0Value::Utf8String(TEST_STREAM_KEY.to_owned()),
+				Amf0Value::Utf8String("live".to_owned()),
+			],
+		};
+		let payload = message.into_message_payload(RtmpTimestamp::new(0), 1).unwrap();
+		let packet = serializer.serialize(&payload, true, false).unwrap();
+		let results = session.handle_input(&packet.bytes).unwrap();
+		let (responses, events) = split_results(&mut deserializer, results);
+		assert!(events.is_empty(), "an invalid stream reached authorization");
+		assert!(matches!(&responses[0].1, RtmpMessage::Amf0Command { command_name, .. } if command_name == "_error"));
+	}
+}
+
+#[test]
+fn a_stream_has_one_authorization_and_cannot_be_replaced() {
+	let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+	perform_connection(TEST_APP_NAME, &mut session, &mut serializer, &mut deserializer);
+	create_active_stream(&mut session, &mut serializer, &mut deserializer);
+	let results = session.handle_command_create_stream(9.0).unwrap();
+	let (responses, events) = split_results(&mut deserializer, results);
+	assert!(events.is_empty());
+	assert!(matches!(&responses[0].1, RtmpMessage::Amf0Command { command_name, .. } if command_name == "_error"));
+	let message = RtmpMessage::Amf0Command {
+		command_name: "publish".into(),
+		transaction_id: 5.0,
+		command_object: Amf0Value::Null,
+		additional_arguments: vec![
+			Amf0Value::Utf8String(TEST_STREAM_KEY.into()),
+			Amf0Value::Utf8String("live".into()),
+		],
+	};
+	let payload = message.into_message_payload(RtmpTimestamp::new(0), 1).unwrap();
+	let packet = serializer.serialize(&payload, true, false).unwrap();
+	let first = session.handle_input(&packet.bytes).unwrap();
+	let (_, events) = split_results(&mut deserializer, first);
+	assert!(matches!(
+		&events[0],
+		ServerSessionEvent::PublishStreamRequested { request_id: 1, .. }
+	));
+	for _ in 0..100 {
+		let packet = serializer.serialize(&payload, true, false).unwrap();
+		let results = session.handle_input(&packet.bytes).unwrap();
+		let (responses, events) = split_results(&mut deserializer, results);
+		assert!(events.is_empty());
+		assert!(matches!(&responses[0].1, RtmpMessage::Amf0Command { command_name, .. } if command_name == "_error"));
+	}
+	assert!(session.accept_request(0).is_err());
+	session.accept_request(1).unwrap();
+	assert!(session.accept_request(1).is_err());
+}
 
 #[test]
 fn new_config_creates_initial_responses() {
@@ -282,6 +356,47 @@ fn accepted_connection_responds_with_same_object_encoding_value_as_connection_re
 }
 
 #[test]
+fn connect_request_reports_tc_url() {
+	let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+	let payload = RtmpMessage::Amf0Command {
+		command_name: "connect".to_string(),
+		transaction_id: 1.0,
+		command_object: Amf0Value::Object(HashMap::from([
+			("app".to_string(), Amf0Value::Utf8String("some_app".to_string())),
+			(
+				"tcUrl".to_string(),
+				Amf0Value::Utf8String("rtmp://demo.cdn.example:1935/some_app".to_string()),
+			),
+		])),
+		additional_arguments: vec![],
+	}
+	.into_message_payload(RtmpTimestamp::new(15), 0)
+	.unwrap();
+	let packet = serializer.serialize(&payload, true, false).unwrap();
+	let results = session.handle_input(&packet.bytes[..]).unwrap();
+
+	let (_, events) = split_results(&mut deserializer, results);
+	assert_eq!(events.len(), 1, "Unexpected number of events returned");
+	match &events[0] {
+		ServerSessionEvent::ConnectionRequested { tc_url, .. } => {
+			assert_eq!(tc_url.as_deref(), Some("rtmp://demo.cdn.example:1935/some_app"));
+		}
+		_ => panic!("First event was not as expected: {:?}", events[0]),
+	}
+
+	// Absent, or an empty string, is `None`: an embedder never routes on "".
+	let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+	let payload = create_connect_message("some_app".to_string(), 15, 0, 0.0);
+	let packet = serializer.serialize(&payload, true, false).unwrap();
+	let results = session.handle_input(&packet.bytes[..]).unwrap();
+	let (_, events) = split_results(&mut deserializer, results);
+	match &events[0] {
+		ServerSessionEvent::ConnectionRequested { tc_url, .. } => assert_eq!(*tc_url, None),
+		_ => panic!("First event was not as expected: {:?}", events[0]),
+	}
+}
+
+#[test]
 fn connect_request_reports_fourcc_list() {
 	let (mut deserializer, mut serializer, mut session) = common_basic_setup();
 	let payload = RtmpMessage::Amf0Command {
@@ -295,6 +410,7 @@ fn connect_request_reports_fourcc_list() {
 				Amf0Value::StrictArray(vec![
 					Amf0Value::Utf8String("hvc1".to_string()),
 					Amf0Value::Utf8String("Opus".to_string()),
+					Amf0Value::Utf8String("hvc1".to_string()),
 				]),
 			),
 		])),
@@ -315,8 +431,8 @@ fn connect_request_reports_fourcc_list() {
 			..
 		} => {
 			assert_eq!(*caps_ex, 2);
-			assert_eq!(video_fourccs.fourccs, vec![*b"hvc1", *b"Opus"]);
-			assert_eq!(audio_fourccs.fourccs, vec![*b"hvc1", *b"Opus"]);
+			assert_eq!(video_fourccs.fourccs, vec![*b"Opus", *b"hvc1"]);
+			assert_eq!(audio_fourccs.fourccs, vec![*b"Opus", *b"hvc1"]);
 		}
 		_ => panic!("First event was not as expected: {:?}", events[0]),
 	}
@@ -362,6 +478,73 @@ fn connect_request_reports_decodable_fourcc_maps() {
 			assert!(audio_fourccs.any);
 		}
 		_ => panic!("First event was not as expected: {:?}", events[0]),
+	}
+}
+
+#[test]
+fn connect_capabilities_use_final_object_values() {
+	for field in ["videoFourCcInfoMap", "audioFourCcInfoMap", "fourCcList"] {
+		let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+		let mut data = amf0::serialize(&vec![Amf0Value::Utf8String("connect".into()), Amf0Value::Number(1.0)]).unwrap();
+		data.extend_from_slice(b"\x03\x00\x03app\x02\x00\x04live");
+		data.extend_from_slice(&(field.len() as u16).to_be_bytes());
+		data.extend_from_slice(field.as_bytes());
+		data.push(3);
+		// Encode entries directly because an owned HashMap cannot represent duplicates.
+		let entries = if field == "fourCcList" {
+			vec![
+				("0", Amf0Value::Utf8String("hvc1".into())),
+				("0", Amf0Value::Null),
+				("1", Amf0Value::Utf8String("*".into())),
+				("1", Amf0Value::Utf8String("Opus".into())),
+			]
+		} else {
+			vec![
+				("hvc1", Amf0Value::Number(1.0)),
+				("hvc1", Amf0Value::Number(0.0)),
+				("vp09", Amf0Value::Number(1.0)),
+				("vp09", Amf0Value::Null),
+				("Opus", Amf0Value::Number(0.0)),
+				("Opus", Amf0Value::Number(1.0)),
+				("*", Amf0Value::Number(1.0)),
+				("*", Amf0Value::Number(0.0)),
+			]
+		};
+		for (key, value) in entries {
+			data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+			data.extend_from_slice(key.as_bytes());
+			data.extend_from_slice(&amf0::serialize(&vec![value]).unwrap());
+		}
+		data.extend_from_slice(&[0, 0, 9, 0, 0, 9]);
+		let payload = MessagePayload {
+			timestamp: RtmpTimestamp::new(0),
+			type_id: 20,
+			message_stream_id: 0,
+			data: data.into(),
+		};
+		let packet = serializer.serialize(&payload, true, false).unwrap();
+		let results = session.handle_input(&packet.bytes).unwrap();
+		let (_, events) = split_results(&mut deserializer, results);
+		let ServerSessionEvent::ConnectionRequested {
+			video_fourccs,
+			audio_fourccs,
+			..
+		} = &events[0]
+		else {
+			panic!("expected connection request");
+		};
+		for (name, support) in [
+			("videoFourCcInfoMap", video_fourccs),
+			("audioFourCcInfoMap", audio_fourccs),
+		] {
+			assert!(!support.any, "{field}");
+			let expected = if field == name || field == "fourCcList" {
+				vec![*b"Opus"]
+			} else {
+				vec![]
+			};
+			assert_eq!(support.fourccs, expected, "{field}");
+		}
 	}
 }
 
@@ -702,7 +885,7 @@ fn publish_finished_event_raised_when_close_stream_invoked_on_publishing_stream(
 }
 
 #[test]
-fn can_request_publishing_on_closed_stream() {
+fn a_closed_stream_cannot_publish_a_second_epoch() {
 	let (mut deserializer, mut serializer, mut session) = common_basic_setup();
 	perform_connection(TEST_APP_NAME, &mut session, &mut serializer, &mut deserializer);
 	let stream_id = create_active_stream(&mut session, &mut serializer, &mut deserializer);
@@ -730,22 +913,9 @@ fn can_request_publishing_on_closed_stream() {
 		.unwrap();
 	let publish_packet = serializer.serialize(&publish_payload, false, false).unwrap();
 	let publish_results = session.handle_input(&publish_packet.bytes[..]).unwrap();
-	let (_, events) = split_results(&mut deserializer, publish_results);
-
-	assert_eq!(events.len(), 1, "Unexpected number of events returned");
-	match events[0] {
-		ServerSessionEvent::PublishStreamRequested {
-			ref app_name,
-			ref stream_key,
-			request_id: _,
-			mode: PublishMode::Live,
-		} => {
-			assert_eq!(app_name, &TEST_APP_NAME, "Unexpected app name");
-			assert_eq!(stream_key, &TEST_STREAM_KEY, "Unexpected stream key");
-		}
-
-		_ => panic!("Unexpected first event found: {:?}", events[0]),
-	}
+	let (responses, events) = split_results(&mut deserializer, publish_results);
+	assert!(events.is_empty());
+	assert!(matches!(&responses[0].1, RtmpMessage::Amf0Command { command_name, .. } if command_name == "_error"));
 }
 
 #[test]
@@ -1647,4 +1817,80 @@ fn verify_is_onstatus(subject: &RtmpMessage, expected_status: &str, expected_cod
 
 		x => panic!("Expected Amf0Command command, instead received: {:?}", x),
 	}
+}
+
+#[test]
+fn amf0_nesting_limit() {
+	// A bounded stack, so unbounded recursion overflows instead of passing on a large default.
+	std::thread::Builder::new()
+		.stack_size(2 * 1024 * 1024)
+		.spawn(|| {
+			// Object, ECMA array, and strict array markers.
+			for marker in [3, 8, 10] {
+				for depth in [64, 65, 100_000] {
+					// AMF0 data, AMF0 command, and their AMF3-labelled forms.
+					for type_id in [18, 20, 15, 17] {
+						let packet = nested_amf0_packet(marker, depth, type_id);
+						let (mut session, _) = ServerSession::new(ServerSessionConfig::new()).unwrap();
+						let result = session.handle_input(&packet);
+						let case = format!("marker {marker}, depth {depth}, type {type_id}");
+						if depth <= 64 {
+							assert!(result.is_ok(), "{case}: {result:?}");
+						} else {
+							assert!(
+								matches!(
+									result,
+									Err(ServerSessionError::MessageDeserializationError(
+										MessageDeserializationError::Amf0DeserializationError(
+											amf0::Amf0DeserializationError::MaxDepthExceeded
+										)
+									))
+								),
+								"{case}: expected nesting error, got {result:?}"
+							);
+						}
+					}
+				}
+			}
+		})
+		.unwrap()
+		.join()
+		.unwrap();
+}
+
+/// Builds wire bytes directly so preparing the input does not recurse.
+fn nested_amf0_packet(marker: u8, depth: usize, type_id: u8) -> Vec<u8> {
+	let mut data = amf0::serialize(&vec![Amf0Value::Utf8String("test".into())]).unwrap();
+	if type_id == 20 || type_id == 17 {
+		data.extend_from_slice(&[0; 9]); // transaction number
+	}
+	for _ in 0..depth {
+		data.push(marker);
+		if marker == 8 || marker == 10 {
+			data.extend_from_slice(&1u32.to_be_bytes());
+		}
+		if marker == 3 || marker == 8 {
+			data.extend_from_slice(&[0, 1, b'x']);
+		}
+	}
+	data.push(5); // null leaf
+	if marker == 3 || marker == 8 {
+		for _ in 0..depth {
+			data.extend_from_slice(&[0, 0, 9]);
+		}
+	}
+	if type_id == 17 {
+		data.insert(0, 0); // AMF0 command labelled AMF3
+	}
+	let payload = MessagePayload {
+		timestamp: RtmpTimestamp::new(0),
+		type_id,
+		message_stream_id: 0,
+		data: Bytes::from(data),
+	};
+	ChunkSerializer::new()
+		.serialize(&payload, true, false)
+		.unwrap()
+		.bytes
+		.to_vec()
 }

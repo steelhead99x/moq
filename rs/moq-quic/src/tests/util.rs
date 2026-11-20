@@ -1,0 +1,946 @@
+use std::{
+	cmp,
+	collections::{BTreeMap, HashSet, VecDeque},
+	env,
+	io::{self, Write},
+	mem,
+	net::{Ipv6Addr, SocketAddr, UdpSocket},
+	str,
+	sync::{Arc, LazyLock, Mutex},
+	task::Poll,
+};
+
+use assert_matches::assert_matches;
+use bytes::BytesMut;
+use rand::{SeedableRng, rngs::StdRng};
+use rustls::{
+	KeyLogFile,
+	pki_types::{CertificateDer, PrivateKeyDer},
+};
+use tracing::{debug_span, trace};
+
+use super::crypto::rustls::QuicServerConfig;
+use super::*;
+pub(super) use crate::sim::{Bottleneck, Link, QueueStats, Rules};
+use crate::{
+	Duration, Instant,
+	connection::{Datagrams, Streams, WindowState},
+	entropy,
+};
+
+pub(super) const DEFAULT_MTU: usize = 1452;
+
+pub(super) struct Pair {
+	pub(super) server: TestEndpoint,
+	pub(super) client: TestEndpoint,
+	/// Start time
+	epoch: Instant,
+	/// Current time
+	pub(super) time: Instant,
+	/// Simulates the maximum size allowed for UDP payloads by the link (packets exceeding this size will be dropped)
+	pub(super) mtu: usize,
+	/// Simulates explicit congestion notification
+	pub(super) congestion_experienced: bool,
+	/// Replaces the ECN codepoint of every delivered datagram after any marking, as a path that
+	/// bleaches the field (`Some(None)`) or re-marks it
+	pub(super) rewrite_ecn: Option<Option<EcnCodepoint>>,
+	/// The client-to-server direction of the path
+	pub(super) to_server: Link,
+	/// The server-to-client direction of the path
+	pub(super) to_client: Link,
+	// One-way
+	pub(super) latency: Duration,
+	/// Number of spin bit flips
+	pub(super) spins: u64,
+	last_spin: bool,
+	/// Draws every [`Link`] impairment from the test thread's seed, as the endpoints draw their
+	/// keys and connection IDs, so `entropy::reseed` before building a pair replays all of them
+	rng: StdRng,
+	/// The next port [`Self::next_port`] hands out
+	port: u16,
+	/// Judges every datagram either side sends, failing the test on the first that breaks a rule
+	pub(super) rules: Rules,
+}
+
+impl Pair {
+	pub(super) fn default_with_deterministic_pns() -> Self {
+		let mut cfg = server_config();
+		let transport = transport::Config {
+			deterministic_packet_numbers: true,
+			..transport::Config::default()
+		};
+		cfg.transport = transport;
+		Self::new(Default::default(), cfg)
+	}
+
+	pub(super) fn new(endpoint_config: endpoint::Config, server_config: server::Config) -> Self {
+		let server = Endpoint::new(
+			endpoint::Config {
+				server: Some(server_config),
+				..endpoint_config.clone()
+			},
+			true,
+		)
+		.unwrap();
+		let client = Endpoint::new(endpoint_config, true).unwrap();
+
+		Self::new_from_endpoint(client, server)
+	}
+
+	pub(super) fn new_from_endpoint(client: Endpoint, server: Endpoint) -> Self {
+		let now = Instant::now();
+		let mut pair = Self {
+			server: TestEndpoint::new(server, SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 4433)),
+			client: TestEndpoint::new(client, SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 44433)),
+			epoch: now,
+			time: now,
+			mtu: DEFAULT_MTU,
+			latency: Duration::ZERO,
+			spins: 0,
+			last_spin: false,
+			congestion_experienced: false,
+			rewrite_ecn: None,
+			to_server: Link::default(),
+			to_client: Link::default(),
+			rng: StdRng::from_rng(&mut entropy::rng()),
+			port: 44434,
+			rules: Rules::new(),
+		};
+		pair.server.bind();
+		pair.client.bind();
+		pair
+	}
+
+	/// A client port no address of this pair uses yet, as for a migration
+	pub(super) fn next_port(&mut self) -> u16 {
+		self.port += 1;
+		self.port - 1
+	}
+
+	/// Returns whether the connection is not idle
+	pub(super) fn step(&mut self) -> bool {
+		self.drive_client();
+		self.drive_server();
+		if self.client.is_idle() && self.server.is_idle() {
+			return false;
+		}
+
+		let client_t = self.client.next_wakeup();
+		let server_t = self.server.next_wakeup();
+		match min_opt(client_t, server_t) {
+			Some(t) if Some(t) == client_t => {
+				if t != self.time {
+					self.time = self.time.max(t);
+					trace!("advancing to {:?} for client", self.time - self.epoch);
+				}
+				true
+			}
+			Some(t) if Some(t) == server_t => {
+				if t != self.time {
+					self.time = self.time.max(t);
+					trace!("advancing to {:?} for server", self.time - self.epoch);
+				}
+				true
+			}
+			Some(_) => unreachable!(),
+			None => false,
+		}
+	}
+
+	/// Advance time until both connections are idle
+	pub(super) fn drive(&mut self) {
+		while self.step() {}
+	}
+
+	/// Advance time until both connections are idle, or after 100 steps have been executed
+	///
+	/// Returns true if the amount of steps exceeds the bounds, because the connections never became
+	/// idle
+	pub(super) fn drive_bounded(&mut self) -> bool {
+		for _ in 0..100 {
+			if !self.step() {
+				return false;
+			}
+		}
+
+		true
+	}
+
+	pub(super) fn drive_client(&mut self) {
+		let span = debug_span!("client");
+		let _guard = span.enter();
+		self.client.drive(self.time, self.server.addr);
+		for (packet, buffer) in self.client.outbound.drain(..) {
+			let packet_size = packet_size(&packet, &buffer);
+			if packet_size > self.mtu {
+				info!(packet_size, "dropping packet (max size exceeded)");
+				continue;
+			}
+			if buffer[0] & packet::LONG_HEADER_FORM == 0 {
+				let spin = buffer[0] & packet::SPIN_BIT != 0;
+				self.spins += (spin == self.last_spin) as u64;
+				self.last_spin = spin;
+			}
+			if let Some(socket) = &self.client.socket {
+				socket.send_to(&buffer, packet.remote).unwrap();
+			}
+			if let Err(violation) = self.rules.sent(self.time, self.client.addr, packet.remote, &buffer) {
+				panic!("{violation}");
+			}
+			if self.server.addr == packet.remote {
+				let (marked, arrivals) = self
+					.to_server
+					.transmit(&mut self.rng, self.time, self.latency, buffer.len());
+				let ecn = self
+					.rewrite_ecn
+					.unwrap_or_else(|| set_congestion_experienced(packet.ecn, self.congestion_experienced || marked));
+				for arrival in arrivals {
+					self.rules.received(arrival, self.client.addr, packet.remote, &buffer);
+					self.server.receive(arrival, ecn, &buffer);
+				}
+			}
+		}
+	}
+
+	pub(super) fn drive_server(&mut self) {
+		let span = debug_span!("server");
+		let _guard = span.enter();
+		self.server.drive(self.time, self.client.addr);
+		for (packet, buffer) in self.server.outbound.drain(..) {
+			let packet_size = packet_size(&packet, &buffer);
+			if packet_size > self.mtu {
+				info!(packet_size, "dropping packet (max size exceeded)");
+				continue;
+			}
+			if let Some(socket) = &self.server.socket {
+				socket.send_to(&buffer, packet.remote).unwrap();
+			}
+			if let Err(violation) = self.rules.sent(self.time, self.server.addr, packet.remote, &buffer) {
+				panic!("{violation}");
+			}
+			if self.client.addr == packet.remote {
+				let (marked, arrivals) = self
+					.to_client
+					.transmit(&mut self.rng, self.time, self.latency, buffer.len());
+				let ecn = self
+					.rewrite_ecn
+					.unwrap_or_else(|| set_congestion_experienced(packet.ecn, self.congestion_experienced || marked));
+				for arrival in arrivals {
+					self.rules.received(arrival, self.server.addr, packet.remote, &buffer);
+					self.client.receive(arrival, ecn, &buffer);
+				}
+			}
+		}
+	}
+
+	pub(super) fn connect(&mut self) -> (ConnectionHandle, ConnectionHandle) {
+		self.connect_with(client_config())
+	}
+
+	pub(super) fn connect_with(&mut self, config: client::Config) -> (ConnectionHandle, ConnectionHandle) {
+		info!("connecting");
+		let client_ch = self.begin_connect(config);
+		self.drive();
+		let server_ch = self.server.assert_accept();
+		self.finish_connect(client_ch, server_ch);
+		(client_ch, server_ch)
+	}
+
+	/// Just start connecting the client
+	pub(super) fn begin_connect(&mut self, config: client::Config) -> ConnectionHandle {
+		let span = debug_span!("client");
+		let _guard = span.enter();
+		let (client_ch, client_conn) = self
+			.client
+			.connect(
+				self.time,
+				Dial {
+					config: &config,
+					remote: self.server.addr,
+					server_name: "localhost",
+				},
+			)
+			.unwrap();
+		self.client.connections.insert(client_ch, client_conn);
+		client_ch
+	}
+
+	/// Asserts both sides finished the handshake
+	pub(super) fn finish_connect(&mut self, client_ch: ConnectionHandle, server_ch: ConnectionHandle) {
+		assert_established(self.client_conn_mut(client_ch));
+		assert_established(self.server_conn_mut(server_ch));
+	}
+
+	pub(super) fn client_conn_mut(&mut self, ch: ConnectionHandle) -> &mut Connection {
+		self.client.connections.get_mut(&ch).unwrap()
+	}
+
+	pub(super) fn client_streams(&mut self, ch: ConnectionHandle) -> Streams<'_> {
+		self.client_conn_mut(ch).streams()
+	}
+
+	pub(super) fn client_send(&mut self, ch: ConnectionHandle, s: StreamId) -> send::Stream<'_> {
+		self.client_conn_mut(ch).send_stream(s)
+	}
+
+	pub(super) fn client_recv(&mut self, ch: ConnectionHandle, s: StreamId) -> recv::Stream<'_> {
+		self.client_conn_mut(ch).recv_stream(s)
+	}
+
+	pub(super) fn client_datagrams(&mut self, ch: ConnectionHandle) -> Datagrams<'_> {
+		self.client_conn_mut(ch).datagrams()
+	}
+
+	pub(super) fn server_conn_mut(&mut self, ch: ConnectionHandle) -> &mut Connection {
+		self.server.connections.get_mut(&ch).unwrap()
+	}
+
+	pub(super) fn server_streams(&mut self, ch: ConnectionHandle) -> Streams<'_> {
+		self.server_conn_mut(ch).streams()
+	}
+
+	pub(super) fn server_send(&mut self, ch: ConnectionHandle, s: StreamId) -> send::Stream<'_> {
+		self.server_conn_mut(ch).send_stream(s)
+	}
+
+	pub(super) fn server_recv(&mut self, ch: ConnectionHandle, s: StreamId) -> recv::Stream<'_> {
+		self.server_conn_mut(ch).recv_stream(s)
+	}
+
+	pub(super) fn server_datagrams(&mut self, ch: ConnectionHandle) -> Datagrams<'_> {
+		self.server_conn_mut(ch).datagrams()
+	}
+}
+
+impl Default for Pair {
+	fn default() -> Self {
+		Self::new(Default::default(), server_config())
+	}
+}
+
+pub(super) struct TestEndpoint {
+	pub(super) endpoint: Endpoint,
+	pub(super) addr: SocketAddr,
+	socket: Option<UdpSocket>,
+	/// Each connection's next timer, as of its last poll
+	pub(super) timeouts: BTreeMap<ConnectionHandle, Instant>,
+	pub(super) outbound: VecDeque<(Transmit, Bytes)>,
+	delayed: VecDeque<(Transmit, Bytes)>,
+	/// Datagrams in flight to this endpoint, in arrival order
+	pub(super) inbound: VecDeque<(Instant, Option<EcnCodepoint>, BytesMut)>,
+	accepted: Option<Result<ConnectionHandle, ConnectionError>>,
+	// Ordered, so connections are driven in the same order every run
+	pub(super) connections: BTreeMap<ConnectionHandle, Connection>,
+	conn_events: BTreeMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
+	pub(super) captured_packets: Vec<Vec<u8>>,
+	pub(super) capture_inbound_packets: bool,
+	pub(super) handle_incoming: Box<dyn FnMut(&Incoming) -> IncomingConnectionBehavior>,
+	pub(super) waiting_incoming: Vec<Incoming>,
+	/// Every draining and drained endpoint event, in the order connections raised them
+	pub(super) lifecycle: Vec<(ConnectionHandle, Lifecycle)>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(super) enum Lifecycle {
+	Draining,
+	Drained,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(super) enum IncomingConnectionBehavior {
+	Accept,
+	Reject,
+	Retry,
+	Wait,
+}
+
+pub(super) fn validate_incoming(incoming: &Incoming) -> IncomingConnectionBehavior {
+	if incoming.remote_address_validated() {
+		IncomingConnectionBehavior::Accept
+	} else {
+		IncomingConnectionBehavior::Retry
+	}
+}
+
+impl TestEndpoint {
+	fn new(endpoint: Endpoint, addr: SocketAddr) -> Self {
+		Self {
+			endpoint,
+			addr,
+			socket: None,
+			timeouts: BTreeMap::new(),
+			outbound: VecDeque::new(),
+			delayed: VecDeque::new(),
+			inbound: VecDeque::new(),
+			accepted: None,
+			connections: BTreeMap::new(),
+			conn_events: BTreeMap::new(),
+			captured_packets: Vec::new(),
+			capture_inbound_packets: false,
+			handle_incoming: Box::new(|_| IncomingConnectionBehavior::Accept),
+			waiting_incoming: Vec::new(),
+			lifecycle: Vec::new(),
+		}
+	}
+
+	/// Mirrors the traffic onto a real socket when `SSLKEYLOGFILE` is set, so a capture can be
+	/// decrypted
+	///
+	/// Every pair uses the same ports, so run one test at a time to capture.
+	fn bind(&mut self) {
+		if env::var_os("SSLKEYLOGFILE").is_none() {
+			return;
+		}
+		let socket = UdpSocket::bind(self.addr).expect("failed to bind UDP socket; capture with --test-threads=1");
+		socket.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+		self.socket = Some(socket);
+	}
+
+	/// Queues a datagram that arrives at `at`, behind any that arrive no later
+	fn receive(&mut self, at: Instant, ecn: Option<EcnCodepoint>, datagram: &[u8]) {
+		let index = self.inbound.partition_point(|(arrival, ..)| *arrival <= at);
+		self.inbound.insert(index, (at, ecn, datagram.into()));
+	}
+
+	pub(super) fn drive(&mut self, now: Instant, remote: SocketAddr) {
+		self.drive_incoming(now, remote);
+		self.drive_outgoing(now);
+	}
+
+	pub(super) fn drive_incoming(&mut self, now: Instant, remote: SocketAddr) {
+		if let Some(socket) = &self.socket {
+			loop {
+				let mut buf = [0; 8192];
+				if socket.recv_from(&mut buf).is_err() {
+					break;
+				}
+			}
+		}
+		let buffer_size = self.endpoint.max_udp_payload_size() as usize;
+		let mut buf = Vec::with_capacity(buffer_size);
+
+		while self.inbound.front().is_some_and(|x| x.0 <= now) {
+			let (recv_time, ecn, packet) = self.inbound.pop_front().unwrap();
+			if let Some(event) = self.endpoint.handle(
+				recv_time,
+				Received {
+					remote,
+					local_ip: None,
+					ecn,
+					data: packet,
+					arrival: Some(recv_time),
+				},
+				&mut buf,
+			) {
+				match event {
+					DatagramEvent::NewConnection(incoming) => match (self.handle_incoming)(&incoming) {
+						IncomingConnectionBehavior::Accept => {
+							let _ = self.try_accept(incoming, now);
+						}
+						IncomingConnectionBehavior::Reject => {
+							self.reject(incoming);
+						}
+						IncomingConnectionBehavior::Retry => {
+							self.retry(incoming);
+						}
+						IncomingConnectionBehavior::Wait => {
+							self.waiting_incoming.push(incoming);
+						}
+					},
+					DatagramEvent::ConnectionEvent(ch, event) => {
+						if self.capture_inbound_packets {
+							let packet = self.connections[&ch].decode_packet(&event);
+							self.captured_packets.extend(packet);
+						}
+
+						self.conn_events.entry(ch).or_default().push_back(event);
+					}
+					DatagramEvent::Response(transmit) => {
+						let size = transmit.size;
+						self.outbound.extend(split_transmit(transmit, &buf[..size]));
+						buf.clear();
+					}
+				}
+			}
+		}
+	}
+
+	pub(super) fn drive_outgoing(&mut self, now: Instant) {
+		let buffer_size = self.endpoint.max_udp_payload_size() as usize;
+		let mut buf = Vec::with_capacity(buffer_size);
+
+		loop {
+			let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = vec![];
+			for (&ch, conn) in self.connections.iter_mut() {
+				if self.timeouts.get(&ch).is_some_and(|&x| x <= now) {
+					conn.handle_timeout(now);
+				}
+
+				for event in self.conn_events.remove(&ch).into_iter().flatten() {
+					conn.handle_event(event);
+				}
+
+				while let Some(event) = conn.poll_endpoint_events() {
+					endpoint_events.push((ch, event));
+				}
+				loop {
+					let before = conn.window_state();
+					let Some(transmit) = conn.transmit(now, MAX_DATAGRAMS, &mut buf) else {
+						break;
+					};
+					check_congestion_window(before, conn.window_state());
+					let size = transmit.size;
+					self.outbound.extend(split_transmit(transmit, &buf[..size]));
+					buf.clear();
+				}
+				match conn.poll_timeout() {
+					Some(timeout) => self.timeouts.insert(ch, timeout),
+					None => self.timeouts.remove(&ch),
+				};
+			}
+
+			if endpoint_events.is_empty() {
+				break;
+			}
+
+			for (ch, event) in endpoint_events {
+				if event.is_draining() {
+					self.lifecycle.push((ch, Lifecycle::Draining));
+				}
+				if event.is_drained() {
+					self.lifecycle.push((ch, Lifecycle::Drained));
+				}
+				if let Some(event) = self.handle_event(ch, event)
+					&& let Some(conn) = self.connections.get_mut(&ch)
+				{
+					conn.handle_event(event);
+				}
+			}
+		}
+	}
+
+	pub(super) fn next_wakeup(&self) -> Option<Instant> {
+		let next_timeout = self
+			.timeouts
+			.iter()
+			.filter(|(ch, _)| self.connections.contains_key(ch))
+			.map(|(_, &timeout)| timeout)
+			.min();
+		let next_inbound = self.inbound.front().map(|x| x.0);
+		min_opt(next_timeout, next_inbound)
+	}
+
+	fn is_idle(&self) -> bool {
+		self.connections.values().all(|x| x.is_idle())
+	}
+
+	pub(super) fn delay_outbound(&mut self) {
+		assert!(self.delayed.is_empty());
+		mem::swap(&mut self.delayed, &mut self.outbound);
+	}
+
+	pub(super) fn finish_delay(&mut self) {
+		self.outbound.extend(self.delayed.drain(..));
+	}
+
+	pub(super) fn try_accept(&mut self, incoming: Incoming, now: Instant) -> Result<ConnectionHandle, ConnectionError> {
+		let mut buf = Vec::new();
+		match self.endpoint.accept(incoming, now, &mut buf) {
+			Ok((ch, conn)) => {
+				self.connections.insert(ch, conn);
+				self.accepted = Some(Ok(ch));
+				Ok(ch)
+			}
+			Err(error) => {
+				if let Some(transmit) = error.response {
+					let size = transmit.size;
+					self.outbound.extend(split_transmit(transmit, &buf[..size]));
+				}
+				self.accepted = Some(Err(error.cause.clone()));
+				Err(error.cause)
+			}
+		}
+	}
+
+	pub(super) fn pop_waiting_incoming(&mut self) -> Incoming {
+		let incoming = self.waiting_incoming.pop().unwrap();
+		assert!(self.waiting_incoming.is_empty());
+		incoming
+	}
+
+	pub(super) fn start_split_accept(&mut self, incoming: Incoming, now: Instant) -> Accepting {
+		let mut buf = Vec::new();
+		self.endpoint.start_accept(incoming, now, &mut buf).unwrap()
+	}
+
+	pub(super) fn finish_split_accept(&mut self, accepting: Accepting) -> ConnectionHandle {
+		let mut buf = Vec::new();
+		let (ch, conn) = self
+			.endpoint
+			.finish_accept(accepting.accept(), &mut buf)
+			.expect("split accept unexpectedly failed");
+		self.connections.insert(ch, conn);
+		ch
+	}
+
+	/// Like `finish_split_accept`, but expects the handshake to fail, returning the cause
+	pub(super) fn finish_split_accept_error(&mut self, accepting: Accepting) -> ConnectionError {
+		let mut buf = Vec::new();
+		let Err(error) = self.endpoint.finish_accept(accepting.accept(), &mut buf) else {
+			panic!("split accept unexpectedly succeeded")
+		};
+		error.cause
+	}
+
+	pub(super) fn retry(&mut self, incoming: Incoming) {
+		let mut buf = Vec::new();
+		let transmit = self.endpoint.retry(incoming, &mut buf).unwrap();
+		let size = transmit.size;
+		self.outbound.extend(split_transmit(transmit, &buf[..size]));
+	}
+
+	pub(super) fn reject(&mut self, incoming: Incoming) {
+		let mut buf = Vec::new();
+		let transmit = self.endpoint.refuse(incoming, &mut buf);
+		let size = transmit.size;
+		self.outbound.extend(split_transmit(transmit, &buf[..size]));
+	}
+
+	pub(super) fn assert_accept(&mut self) -> ConnectionHandle {
+		self.accepted
+			.take()
+			.expect("server didn't try connecting")
+			.expect("server experienced error connecting")
+	}
+
+	pub(super) fn assert_accept_error(&mut self) -> ConnectionError {
+		self.accepted
+			.take()
+			.expect("server didn't try connecting")
+			.expect_err("server did unexpectedly connect without error")
+	}
+
+	pub(super) fn assert_no_accept(&self) {
+		assert!(self.accepted.is_none(), "server did unexpectedly connect")
+	}
+}
+
+impl ::std::ops::Deref for TestEndpoint {
+	type Target = Endpoint;
+	fn deref(&self) -> &Endpoint {
+		&self.endpoint
+	}
+}
+
+impl ::std::ops::DerefMut for TestEndpoint {
+	fn deref_mut(&mut self) -> &mut Endpoint {
+		&mut self.endpoint
+	}
+}
+
+/// RFC 9002 §7: "An endpoint MUST NOT send a packet if it would cause bytes_in_flight ... to be
+/// larger than the congestion window, unless the packet is sent on a PTO timer expiration"
+///
+/// A transmit that added bytes in flight must leave them within the window, unless a loss probe
+/// was owed or it carried an MTU or bandwidth probe.
+fn check_congestion_window(before: WindowState, after: WindowState) {
+	if after.in_flight > before.in_flight
+		&& after.in_flight > after.window
+		&& !before.probing
+		&& after.probes == before.probes
+	{
+		panic!(
+			"QUIC rule broken: RFC 9002 §7: bytes in flight stay within the congestion window: {} in flight, from {}, past a window of {}",
+			after.in_flight, before.in_flight, after.window
+		);
+	}
+}
+
+/// Poll the server's next chunk of `s`
+pub(super) fn poll_read(
+	pair: &mut Pair,
+	ch: ConnectionHandle,
+	s: StreamId,
+	waiter: &kio::Waiter,
+) -> Poll<Result<Option<Bytes>, recv::Error>> {
+	let mut recv = pair.server_recv(ch, s);
+	let mut chunks = recv.read().unwrap();
+	let poll = chunks
+		.poll_next(waiter, usize::MAX)
+		.map(|r| r.map(|chunk| chunk.map(|c| c.bytes)));
+	chunks.finalize();
+	poll
+}
+
+/// Polls a wait with a waiter nothing wakes, to read its answer as it stands
+pub(super) fn peek<T>(poll: impl FnOnce(&kio::Waiter) -> Poll<T>) -> Poll<T> {
+	poll(&kio::Waiter::noop())
+}
+
+/// Asserts the connection has its handshake data, is connected and confirmed, and is still alive
+///
+/// Waits count wakes rather than order them, so this checks where the handshake ended, not the
+/// order its steps completed in.
+pub(super) fn assert_established(conn: &mut Connection) {
+	assert!(has_handshake_data(conn));
+	assert!(is_connected(conn));
+	assert!(is_confirmed(conn));
+	assert_matches!(conn.error(), None);
+}
+
+/// How far the connection's handshake got: whether it has its handshake data, is connected, and
+/// is confirmed
+pub(super) fn handshake_progress(conn: &mut Connection) -> (bool, bool, bool) {
+	(has_handshake_data(conn), is_connected(conn), is_confirmed(conn))
+}
+
+/// Whether the connection's handshake data is available
+pub(super) fn has_handshake_data(conn: &mut Connection) -> bool {
+	peek(|waiter| conn.poll_handshake_data(waiter)) == Poll::Ready(Ok(()))
+}
+
+/// Whether the connection completed its handshake
+pub(super) fn is_connected(conn: &mut Connection) -> bool {
+	peek(|waiter| conn.poll_connected(waiter)) == Poll::Ready(Ok(()))
+}
+
+/// Whether the connection's handshake was confirmed
+pub(super) fn is_confirmed(conn: &mut Connection) -> bool {
+	peek(|waiter| conn.poll_handshake_confirmed(waiter)) == Poll::Ready(Ok(()))
+}
+
+/// Logs the test's own events, and the stack's per-packet trace when `RUST_LOG` asks for it.
+///
+/// Formatting every trace event costs more than the simulation it describes, and the runs are
+/// deterministic, so a failure replays with `RUST_LOG=trace` to read it. The per-step side spans
+/// are debug for the same reason: they only label the stack's own events.
+pub(super) fn subscribe() -> tracing::subscriber::DefaultGuard {
+	let filter = tracing_subscriber::EnvFilter::builder()
+		.with_default_directive(tracing::Level::INFO.into())
+		.from_env()
+		.expect("RUST_LOG");
+	let builder = tracing_subscriber::FmtSubscriber::builder()
+		.with_env_filter(filter)
+		.with_writer(|| TestWriter);
+	tracing::subscriber::set_default(builder.finish())
+}
+
+struct TestWriter;
+
+impl Write for TestWriter {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		print!("{}", str::from_utf8(buf).expect("tried to log invalid UTF-8"));
+		Ok(buf.len())
+	}
+	fn flush(&mut self) -> io::Result<()> {
+		io::stdout().flush()
+	}
+}
+
+/// A writer whose output can be read back, e.g. to inspect a qlog trace
+#[cfg(feature = "qlog")]
+#[derive(Clone, Default)]
+pub(super) struct SharedBuffer(pub(super) Arc<Mutex<Vec<u8>>>);
+
+#[cfg(feature = "qlog")]
+impl Write for SharedBuffer {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		self.0.lock().unwrap().extend_from_slice(buf);
+		Ok(buf.len())
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
+	}
+}
+
+pub(super) fn server_config() -> server::Config {
+	let mut config = server::Config::new(Arc::new(server_crypto()));
+	config.transport = transport::Config::default();
+
+	config
+}
+
+pub(super) fn server_config_with_cert(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> server::Config {
+	let mut config = server::Config::new(Arc::new(server_crypto_with_cert(cert, key)));
+	config.transport = transport::Config::default();
+	config.validation_token.sent = 2;
+	config.validation_token.log = Arc::new(SimpleTokenLog::default());
+	config
+}
+
+pub(super) fn server_crypto() -> rustls::ServerConfig {
+	server_crypto_inner(None, None)
+}
+
+pub(super) fn server_crypto_with_alpn(alpn: Vec<Vec<u8>>) -> rustls::ServerConfig {
+	server_crypto_inner(None, Some(alpn))
+}
+
+pub(super) fn server_crypto_with_cert(
+	cert: CertificateDer<'static>,
+	key: PrivateKeyDer<'static>,
+) -> rustls::ServerConfig {
+	server_crypto_inner(Some((cert, key)), None)
+}
+
+fn server_crypto_inner(
+	identity: Option<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
+	alpn: Option<Vec<Vec<u8>>>,
+) -> rustls::ServerConfig {
+	let (cert, key) = identity.unwrap_or_else(|| {
+		(
+			CERTIFIED_KEY.cert.der().clone(),
+			PrivateKeyDer::Pkcs8(CERTIFIED_KEY.signing_key.to_pkcs8().secret_pkcs8_der().to_vec().into()),
+		)
+	});
+
+	let mut config = QuicServerConfig::inner(vec![cert], key).unwrap();
+	if let Some(alpn) = alpn {
+		config.alpn_protocols = alpn;
+	}
+
+	config
+}
+
+pub(super) fn client_config() -> client::Config {
+	let mut cfg = client::Config::new(Arc::new(client_crypto()));
+	cfg.transport = transport::Config::default();
+	cfg
+}
+
+pub(super) fn client_config_with_deterministic_pns() -> client::Config {
+	let mut cfg = client::Config::new(Arc::new(client_crypto()));
+	let transport = transport::Config {
+		deterministic_packet_numbers: true,
+		..transport::Config::default()
+	};
+	cfg.transport = transport;
+	cfg
+}
+
+/// Cubic instead of the production BBR3, for a test that scripts Cubic's packet schedule
+///
+/// At zero RTT the window-derived pacer stops pacing, so a lockstep script sees whole windows
+/// leave at once, while BBR3 paces from its own rate and releases a burst nanoseconds later.
+pub(super) fn cubic_transport() -> transport::Config {
+	transport::Config {
+		congestion: Arc::new(congestion::cubic::Config::default()),
+		..transport::Config::default()
+	}
+}
+
+pub(super) fn client_config_with_certs(certs: Vec<CertificateDer<'static>>) -> client::Config {
+	client::Config::new(Arc::new(client_crypto_inner(Some(certs), None)))
+}
+
+pub(super) fn client_crypto() -> rustls::ClientConfig {
+	client_crypto_inner(None, None)
+}
+
+pub(super) fn client_crypto_with_alpn(protocols: Vec<Vec<u8>>) -> rustls::ClientConfig {
+	client_crypto_inner(None, Some(protocols))
+}
+
+fn client_crypto_inner(
+	certs: Option<Vec<CertificateDer<'static>>>,
+	alpn: Option<Vec<Vec<u8>>>,
+) -> rustls::ClientConfig {
+	let mut roots = RootCertStore::empty();
+	for cert in certs.unwrap_or_else(|| vec![CERTIFIED_KEY.cert.der().clone()]) {
+		roots.add(cert).unwrap();
+	}
+
+	// Packet-layout tests depend on a ClientHello that fits in one Initial.
+	// Integration tests exercise rind's default hybrid key share.
+	let mut provider = rind_rustls::default_provider().unwrap();
+	provider.kx_groups = vec![rind_rustls::kx_group::X25519];
+	let mut inner = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+		.with_protocol_versions(&[&rustls::version::TLS13])
+		.unwrap()
+		.with_root_certificates(roots)
+		.with_no_client_auth();
+	inner.key_log = Arc::new(KeyLogFile::new());
+	if let Some(alpn) = alpn {
+		inner.alpn_protocols = alpn;
+	}
+
+	inner
+}
+
+pub(super) fn min_opt<T: Ord>(x: Option<T>, y: Option<T>) -> Option<T> {
+	match (x, y) {
+		(Some(x), Some(y)) => Some(cmp::min(x, y)),
+		(Some(x), _) => Some(x),
+		(_, Some(y)) => Some(y),
+		_ => None,
+	}
+}
+
+/// The maximum of datagrams TestEndpoint will produce via `poll_transmit`
+const MAX_DATAGRAMS: usize = 10;
+
+fn split_transmit(transmit: Transmit, buffer: &[u8]) -> Vec<(Transmit, Bytes)> {
+	let mut buffer = Bytes::copy_from_slice(buffer);
+	let Some(segment_size) = transmit.segment_size else {
+		return vec![(transmit, buffer)];
+	};
+
+	let mut transmits = Vec::new();
+	while !buffer.is_empty() {
+		let end = segment_size.min(buffer.len());
+
+		let contents = buffer.split_to(end);
+		transmits.push((
+			Transmit {
+				remote: transmit.remote,
+				size: contents.len(),
+				ecn: transmit.ecn,
+				segment_size: None,
+				local_ip: transmit.local_ip,
+			},
+			contents,
+		));
+	}
+
+	transmits
+}
+
+fn packet_size(transmit: &Transmit, buffer: &Bytes) -> usize {
+	if transmit.segment_size.is_some() {
+		panic!("This transmit is meant to be split into multiple packets!");
+	}
+
+	buffer.len()
+}
+
+fn set_congestion_experienced(x: Option<EcnCodepoint>, congestion_experienced: bool) -> Option<EcnCodepoint> {
+	x.map(|codepoint| match congestion_experienced {
+		true => EcnCodepoint::Ce,
+		false => codepoint,
+	})
+}
+
+pub(crate) static CERTIFIED_KEY: LazyLock<rcgen::CertifiedKey<rind_rcgen::KeyPair>> = LazyLock::new(|| {
+	(|| -> std::result::Result<_, rcgen::Error> {
+		let signing_key = rind_rcgen::KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+		let mut params = rcgen::CertificateParams::new(vec!["localhost".into()])?;
+		params.serial_number = Some(1u64.into());
+		let cert = params.self_signed(&signing_key)?;
+		Ok(rcgen::CertifiedKey { cert, signing_key })
+	})()
+	.unwrap()
+});
+
+#[derive(Default)]
+struct SimpleTokenLog(Mutex<HashSet<u128>>);
+
+impl TokenLog for SimpleTokenLog {
+	fn check_and_insert(&self, nonce: u128, _issued: Wall, _lifetime: Duration) -> Result<(), TokenReuseError> {
+		if self.0.lock().unwrap().insert(nonce) {
+			Ok(())
+		} else {
+			Err(TokenReuseError)
+		}
+	}
+}

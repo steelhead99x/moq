@@ -6,7 +6,7 @@
 //! parameter sets on keyframes). These build a synthetic broadcast, export to
 //! TS, and re-parse with the `mpeg2ts` reader.
 
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -16,17 +16,42 @@ use mpeg2ts::pes::{PesPacketReader, ReadPesPacket};
 use mpeg2ts::ts::{ReadTsPacket, TsPacketReader, TsPayload};
 
 use crate::catalog::hang::Container as HangContainer;
+use crate::container::Container as _;
 use crate::container::ts::export::PCR_INTERVAL;
-use crate::container::ts::{Export, catalog as tscat};
-use crate::container::{Frame, Producer};
+use crate::container::ts::{Export, catalog as tscat, stats};
+use crate::container::{Frame, Kind, Producer};
 use moq_net::Timestamp;
+
+/// Open a media-only export on the default catalog stream.
+pub(super) async fn open_export(
+	source: crate::Source,
+	delay: Duration,
+) -> crate::Result<Export<crate::catalog::Consumer>> {
+	let catalog = source.catalog::<()>(Default::default()).await?;
+	Ok(Export::new(source, catalog, delay))
+}
+
+/// Open an export with the MPEG-TS catalog extension and explicit encoding.
+pub(super) async fn open_ts(
+	source: crate::Source,
+	format: crate::catalog::CatalogFormat,
+	delay: Duration,
+) -> crate::Result<Export<crate::catalog::Consumer<tscat::Ext>>> {
+	let catalog = source.catalog::<tscat::Ext>(format).await?;
+	Ok(Export::new(source, catalog, delay))
+}
+
+/// A millisecond track: the frames written here carry timestamps.
+fn timed() -> moq_net::track::Info {
+	moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI)
+}
 
 const SC: &[u8] = &[0, 0, 0, 1];
 // Reusable H.264 parameter-set and slice NALs (NAL type = first byte & 0x1f).
 const SPS: &[u8] = &[0x67, 0x42, 0xc0, 0x1f, 0xde];
 const PPS: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
 // A second, distinct PPS (id 1): broadcast feeds often define more than one.
-const PPS1: &[u8] = &[0x68, 0xce, 0x3c, 0x81];
+const PPS1: &[u8] = &[0x68, 0x4e, 0x3c, 0x80];
 
 // libklvanc public-sample SCTE-35 cue: splice_info_section, table_id 0xFC, 30 bytes.
 const CUE: &[u8] = &[
@@ -61,26 +86,53 @@ fn length_prefixed(nals: &[&[u8]]) -> Bytes {
 /// finished, retained tracks; that means it never reaches a hard end-of-stream,
 /// so we pull until a `next()` blocks (`Pending`, surfaced as a timeout under
 /// paused time) or the stream ends.
+/// A drift budget no test timeline comes close to, so the exporter reads every group.
+///
+/// The media track's full max age, so an exporter started after publishing
+/// can still read every fresh group. These tests write a whole broadcast up front
+/// and only then export it, which the
+/// exporter's default [`Duration::ZERO`] collapses to the
+/// live edge: completeness has to be asked for, exactly as a real recorder does.
+const RECORDING_MAX_AGE: Duration = Duration::from_secs(30);
+/// How long a drain waits for the next frame: past the recording delay, the mux-ahead
+/// window a multiplex rate adds on top of it, and the clip, so the first frame goes out,
+/// and then until output stops.
+const DRAIN: std::time::Duration = RECORDING_MAX_AGE
+	.saturating_mul(3)
+	.saturating_add(std::time::Duration::from_secs(1));
+
 async fn drain(consumer: moq_net::broadcast::Consumer) -> BytesMut {
-	drain_with(Export::new(crate::source::announced(&consumer)).await.unwrap()).await
+	drain_with(
+		open_export(crate::source::announced(&consumer).await, RECORDING_MAX_AGE)
+			.await
+			.unwrap(),
+	)
+	.await
 }
 
 /// `drain` for an exporter built with an explicit catalog extension.
-async fn drain_with<E: tscat::Catalog>(mut exporter: Export<E>) -> BytesMut {
+pub(super) async fn drain_with<S: crate::catalog::Stream>(exporter: Export<S>) -> BytesMut
+where
+	S::Ext: tscat::Catalog,
+{
+	drain_stats(exporter).await.0
+}
+
+/// `drain_with`, also returning the exporter's stats once drained.
+async fn drain_stats<S: crate::catalog::Stream>(exporter: Export<S>) -> (BytesMut, super::stats::Export)
+where
+	S::Ext: tscat::Catalog,
+{
+	let mut exporter = exporter.with_replay();
 	let mut out = BytesMut::new();
 	// `while let Ok` stops on the first timeout (`Pending`: no more output).
-	while let Ok(res) = tokio::time::timeout(std::time::Duration::from_secs(1), exporter.next()).await {
+	while let Ok(res) = kio::clock::timeout(DRAIN, exporter.next()).await {
 		let Some(frame) = res.expect("exporter error") else {
 			break;
 		};
 		out.extend_from_slice(&frame.payload);
 	}
-	out
-}
-
-/// An adaptation-field-only single-packet frame: the exporter's PCR carriage.
-fn is_pcr_frame(frame: &Frame) -> bool {
-	frame.payload.len() == 188 && frame.payload[3] & 0x30 == 0x20
+	(out, exporter.stats())
 }
 
 fn assert_packet_aligned(ts: &[u8]) {
@@ -92,22 +144,170 @@ fn assert_packet_aligned(ts: &[u8]) {
 	);
 }
 
+/// A custom stream need not carry a physical catalog track, and may be non-fused.
+#[tokio::test(start_paused = true)]
+async fn custom_selected_catalog_drives_export_and_follow() {
+	use crate::catalog::{Stream, hang::Catalog};
+	use std::task::Poll;
+
+	struct Once {
+		snapshot: Option<Catalog>,
+		ended: bool,
+	}
+	impl Stream for Once {
+		type Ext = ();
+
+		fn poll_next(&mut self, _: &kio::Waiter) -> Poll<crate::Result<Option<Catalog>>> {
+			assert!(!self.ended, "an ended catalog must not be polled again");
+			let snapshot = self.snapshot.take();
+			self.ended = snapshot.is_none();
+			Poll::Ready(Ok(snapshot))
+		}
+	}
+
+	let origin = crate::source::produce_origin();
+	let mut export: Option<Export<crate::catalog::Select<Once>>> = None;
+	for payload in [b"first".as_slice(), b"next".as_slice()] {
+		let broadcast = origin.route("live", moq_net::origin::RouteOptions::default()).unwrap();
+		let mut snapshot = Catalog::default();
+		let mut producers = Vec::new();
+		for (name, payload) in [("keep", payload), ("drop", b"unselected".as_slice())] {
+			let track = broadcast
+				.broadcast()
+				.create_track(name, hang::container::track_info(hang::catalog::PRIORITY.audio))
+				.unwrap();
+			let mut config = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+			config.description = Some(Bytes::from_static(&[0x11, 0x90]));
+			config.container = Container::Legacy;
+			snapshot.audio.renditions.insert(name.into(), config);
+			let mut producer = Producer::new(track, HangContainer::Legacy(Kind::Data));
+			producer
+				.write(Frame {
+					timestamp: Timestamp::ZERO,
+					duration: None,
+					payload: Bytes::copy_from_slice(payload),
+					keyframe: true,
+				})
+				.unwrap();
+			let producer = producer.finish().unwrap();
+			producers.push(producer);
+		}
+		let stream = Once {
+			snapshot: Some(snapshot),
+			ended: false,
+		}
+		.select(crate::select::Broadcast::default().audio(crate::select::Audio::default().name("keep")));
+		let source = crate::source::resolved(&origin, "live").await;
+		let mut current = match export.take() {
+			None => Export::new(source, stream, RECORDING_MAX_AGE).with_replay(),
+			Some(previous) => previous.follow(source.broadcast(), stream).unwrap(),
+		};
+		let (frames, end) = drain_to_end(&mut current).await;
+		end.unwrap();
+		let bytes: Vec<u8> = frames.iter().flat_map(|frame| frame.payload.iter().copied()).collect();
+		assert_packet_aligned(&bytes);
+		let mut packets = TsPacketReader::new(Cursor::new(&bytes));
+		let mut pmt = false;
+		while let Some(packet) = packets.read_ts_packet().unwrap() {
+			if let Some(TsPayload::Pmt(program)) = packet.payload {
+				pmt = true;
+				assert_eq!(program.es_info.len(), 1);
+			}
+		}
+		assert!(pmt);
+		let mut pes = PesPacketReader::new(TsPacketReader::new(Cursor::new(&bytes)));
+		let packet = pes.read_pes_packet().unwrap().unwrap();
+		assert_eq!(&packet.data[7..], payload);
+		assert!(pes.read_pes_packet().unwrap().is_none());
+		assert!(current.next().await.unwrap().is_none());
+		export = Some(current);
+		drop((broadcast, producers));
+	}
+}
+
+/// A follower built after EOF keeps an explicit non-default encoding without keeping its reader.
+#[tokio::test(start_paused = true)]
+async fn a_follower_keeps_msf_after_catalog_eof() {
+	use crate::catalog::CatalogFormat;
+	use std::task::Poll;
+
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let publish = || {
+		let options = moq_net::origin::RouteOptions::hidden().with_instance(instance.clone(), 0);
+		let broadcast = origin.route("live", options).unwrap();
+		let track = broadcast
+			.broadcast()
+			.create_track(moq_msf::DEFAULT_NAME, hang::Catalog::default_track_info())
+			.unwrap();
+		let msf = moq_msf::Catalog::<()>::new(Vec::new()).to_json().unwrap();
+		let mut group = track.append_group().unwrap();
+		group.write_frame(moq_net::Timestamp::now(), msf).unwrap();
+		group.finish().unwrap();
+		broadcast.announce().unwrap();
+		(broadcast, track)
+	};
+	let (broadcast, mut track) = publish();
+	drop(track.clone().finish().unwrap());
+	let source = crate::source::resolved(&origin, "live").await;
+	let stream = source.catalog::<()>(CatalogFormat::Msf).await.unwrap();
+	let mut export = Export::new(source, stream, std::time::Duration::ZERO);
+	assert!(export.next().await.unwrap().is_none());
+	assert_eq!(export.catalog_format(), CatalogFormat::Msf);
+	// The routed subscription is released when the origin driver observes the local drop.
+	kio::clock::timeout(Duration::from_secs(1), async {
+		while track.subscription().is_some() {
+			track.subscription_changed().await.unwrap();
+		}
+	})
+	.await
+	.expect("EOF must release the first MSF reader");
+	drop((broadcast, track));
+	let mut follower = super::Follower::new(export)
+		.unwrap()
+		.with_follow(Duration::from_secs(1));
+	let (broadcast, track) = publish();
+	// Only the MSF catalog exists, so falling back to the default encoding cannot subscribe.
+	kio::clock::timeout(
+		Duration::from_secs(1),
+		kio::wait(|waiter| {
+			if let Poll::Ready(Err(err)) = follower.poll_next(waiter) {
+				panic!("MSF return failed: {err:?}");
+			}
+			if track.subscription().is_some() {
+				Poll::Ready(())
+			} else {
+				Poll::Pending
+			}
+		}),
+	)
+	.await
+	.expect("MSF catalog resubscribed");
+	assert_eq!(follower.export().catalog_format(), CatalogFormat::Msf);
+	let track = track.finish().unwrap();
+	drop((follower, broadcast, track));
+}
+
 #[tokio::test(start_paused = true)]
 async fn export_aac_roundtrip() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
 	let track = broadcast
-		.create_track(broadcast.unique_name(".aac"), hang::container::track_info())
+		.create_track(
+			broadcast.unique_name(".aac"),
+			hang::container::track_info(hang::catalog::PRIORITY.audio),
+		)
 		.unwrap();
 	let name = track.name().to_string();
 	{
 		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
 		cfg.container = Container::Legacy;
-		catalog.lock().audio.renditions.insert(name.clone(), cfg);
+		catalog.modify().unwrap().audio.renditions.insert(name.clone(), cfg);
 	}
-	let mut producer = Producer::new(track, HangContainer::Legacy);
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
 
 	// The last frame is > 184 bytes to force PES splitting across TS packets.
 	let frames: Vec<Bytes> = vec![
@@ -126,7 +326,7 @@ async fn export_aac_roundtrip() {
 			.unwrap();
 		producer.cut(None).unwrap();
 	}
-	producer.finish().unwrap();
+	let _finished = producer.finish().unwrap();
 
 	// The producers stay alive so the exporter can subscribe to the catalog and
 	// the finished (retained) track; `drain` stops once all frames are emitted.
@@ -169,6 +369,167 @@ async fn export_aac_roundtrip() {
 	}
 }
 
+/// A disabled rendition (catalog `enabled: false`) gets no PMT entry and none of its media
+/// is written.
+#[tokio::test(start_paused = true)]
+async fn export_skips_a_disabled_rendition() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+
+	let mut rendition = |suffix: &str, enabled: bool, payload: &'static [u8]| {
+		let track = broadcast
+			.create_track(
+				broadcast.unique_name(suffix),
+				hang::container::track_info(hang::catalog::PRIORITY.audio),
+			)
+			.unwrap();
+		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
+		cfg.container = Container::Legacy;
+		cfg.enabled = enabled;
+		catalog
+			.modify()
+			.unwrap()
+			.audio
+			.renditions
+			.insert(track.name().to_string(), cfg);
+		let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+		for i in 0..3u64 {
+			producer
+				.write(Frame {
+					timestamp: Timestamp::from_micros(i * 20_000).unwrap(),
+					duration: None,
+					payload: Bytes::from_static(payload),
+					keyframe: true,
+				})
+				.unwrap();
+			producer.cut(None).unwrap();
+		}
+
+		producer.finish().unwrap()
+	};
+	let _on = rendition(".on", true, &[0x01, 0x02, 0x03]);
+	let _off = rendition(".off", false, &[0x0f, 0x0f, 0x0f]);
+
+	let ts = drain(consumer).await;
+	assert_packet_aligned(&ts);
+
+	let mut reader = TsPacketReader::new(Cursor::new(ts.as_ref()));
+	let mut saw_pmt = false;
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		if let Some(TsPayload::Pmt(pmt)) = packet.payload {
+			saw_pmt = true;
+			assert_eq!(pmt.es_info.len(), 1, "only the enabled rendition is declared");
+		}
+	}
+	assert!(saw_pmt, "missing PMT");
+
+	let mut pes = PesPacketReader::new(TsPacketReader::new(Cursor::new(ts.as_ref())));
+	let mut payloads = Vec::new();
+	while let Some(packet) = pes.read_pes_packet().unwrap() {
+		payloads.push(packet.data[7..].to_vec());
+	}
+	assert_eq!(payloads, vec![vec![0x01, 0x02, 0x03]; 3]);
+}
+
+/// AAC frames that run on from each other share a PES, as many as B holds with its header
+/// (ISO 13818-1 2.4.2.3), each frame whole and in order, though none lasts whole microseconds.
+#[tokio::test(start_paused = true)]
+async fn export_packs_aac_frames_up_to_their_buffer() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".aac"),
+			hang::container::track_info(hang::catalog::PRIORITY.audio),
+		)
+		.unwrap();
+	let name = track.name().to_string();
+	{
+		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
+		cfg.container = Container::Legacy;
+		catalog.modify().unwrap().audio.renditions.insert(name.clone(), cfg);
+	}
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	// 1,024 samples at 48 kHz: 21.33 ms each, 307 bytes with ADTS, 11 to B's 3,584.
+	let frames: Vec<Bytes> = (0..48u8).map(|k| Bytes::from(vec![k; 300])).collect();
+	for (i, payload) in frames.iter().enumerate() {
+		producer
+			.write(Frame {
+				timestamp: Timestamp::from_micros(i as u64 * 1_024 * 1_000_000 / 48_000).unwrap(),
+				duration: None,
+				payload: payload.clone(),
+				keyframe: true,
+			})
+			.unwrap();
+		producer.cut(None).unwrap();
+	}
+	let _finished = producer.finish().unwrap();
+	let ts = drain(consumer).await;
+
+	let mut pes = PesPacketReader::new(TsPacketReader::new(Cursor::new(ts.as_ref())));
+	let (mut count, mut recovered) = (0, Vec::new());
+	while let Some(packet) = pes.read_pes_packet().unwrap() {
+		count += 1;
+		assert!(
+			14 + packet.data.len() <= 3_584,
+			"a {}-byte PES overflows B",
+			packet.data.len()
+		);
+		let mut pts = packet.header.pts.expect("PES carried no PTS").as_u64();
+		let mut data = &packet.data[..];
+		while !data.is_empty() {
+			let len = usize::from(data[3] & 3) << 11 | usize::from(data[4]) << 3 | usize::from(data[5] >> 5);
+			recovered.push((pts, data[7..len].to_vec()));
+			data = &data[len..];
+			pts += 1_920;
+		}
+	}
+	assert!(
+		count <= frames.len().div_ceil(11) + 1,
+		"{count} PES for {} frames",
+		frames.len()
+	);
+	assert_eq!(recovered.len(), frames.len());
+	for (i, (pts, raw)) in recovered.iter().enumerate() {
+		assert!(pts.abs_diff(i as u64 * 1_920) <= 1, "frame {i} at {pts}");
+		assert_eq!(raw.as_slice(), frames[i].as_ref(), "frame {i}");
+	}
+}
+
+/// The audio PES timestamps each slice of a stream starts, keyed off the PMT's PID
+/// assignments as they stand at that slice.
+fn audio_pts_by_slice(frames: &[Frame]) -> Vec<Vec<u64>> {
+	let bytes: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let mut reader = TsPacketReader::new(Cursor::new(bytes.as_slice()));
+	let mut audio_pid = None;
+	let mut out = Vec::new();
+	for frame in frames {
+		let mut pts = Vec::new();
+		for _ in 0..frame.payload.len() / 188 {
+			let packet = reader.read_ts_packet().unwrap().expect("a whole packet");
+			match packet.payload {
+				Some(TsPayload::Pmt(pmt)) => {
+					audio_pid = pmt
+						.es_info
+						.iter()
+						.find(|es| es.stream_type == StreamType::AdtsAac)
+						.map(|es| es.elementary_pid);
+				}
+				Some(TsPayload::PesStart(pes)) if Some(packet.header.pid) == audio_pid => {
+					pts.extend(pes.header.pts.map(|pts| pts.as_u64()));
+				}
+				_ => {}
+			}
+		}
+		out.push(pts);
+	}
+	out
+}
+
 /// Collect PES presentation timestamps per elementary stream (video H.264, audio AAC),
 /// keyed off the PMT's PID assignments.
 fn collect_pes_pts(ts: &[u8]) -> (Vec<u64>, Vec<u64>) {
@@ -208,11 +569,14 @@ fn collect_pes_pts(ts: &[u8]) -> (Vec<u64>, Vec<u64>) {
 async fn export_lead_audio() -> BytesMut {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
 	// In-band avc3 video (SPS/PPS inline on keyframes; no out-of-band description).
 	let vtrack = broadcast
-		.create_track(broadcast.unique_name(".avc3"), hang::container::track_info())
+		.create_track(
+			broadcast.unique_name(".avc3"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
 		.unwrap();
 	{
 		let mut cfg = VideoConfig::new(H264 {
@@ -222,19 +586,33 @@ async fn export_lead_audio() -> BytesMut {
 			inline: true,
 		});
 		cfg.container = Container::Legacy;
-		catalog.lock().video.renditions.insert(vtrack.name().to_string(), cfg);
+		catalog
+			.modify()
+			.unwrap()
+			.video
+			.renditions
+			.insert(vtrack.name().to_string(), cfg);
 	}
-	let mut video = Producer::new(vtrack, HangContainer::Legacy);
+	let mut video = Producer::new(vtrack, HangContainer::Legacy(crate::container::Kind::Data));
 
 	let atrack = broadcast
-		.create_track(broadcast.unique_name(".aac"), hang::container::track_info())
+		.create_track(
+			broadcast.unique_name(".aac"),
+			hang::container::track_info(hang::catalog::PRIORITY.audio),
+		)
 		.unwrap();
 	{
 		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
 		cfg.container = Container::Legacy;
-		catalog.lock().audio.renditions.insert(atrack.name().to_string(), cfg);
+		catalog
+			.modify()
+			.unwrap()
+			.audio
+			.renditions
+			.insert(atrack.name().to_string(), cfg);
 	}
-	let mut audio = Producer::new(atrack, HangContainer::Legacy);
+	let mut audio = Producer::new(atrack, HangContainer::Legacy(crate::container::Kind::Data));
 
 	let audio_frame = |ms: u64| Frame {
 		timestamp: Timestamp::from_micros(ms * 1_000).unwrap(),
@@ -262,10 +640,12 @@ async fn export_lead_audio() -> BytesMut {
 		audio.write(audio_frame(ms)).unwrap();
 		audio.cut(None).unwrap();
 	}
-	video.finish().unwrap();
-	audio.finish().unwrap();
+	let _finished = video.finish().unwrap();
+	let _finished = audio.finish().unwrap();
 
-	let exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
+	let exporter = open_export(crate::source::announced(&consumer).await, RECORDING_MAX_AGE)
+		.await
+		.unwrap();
 	// The producers stay alive through the drain so the retained tracks are readable.
 	drain_with(exporter).await
 }
@@ -337,53 +717,6 @@ fn reassemble_video(ts: &[u8], expected_stream_type: StreamType) -> Vec<u8> {
 	reassembled
 }
 
-/// In-band avc3: SPS/PPS are inline in the bitstream. ExportSource strips them
-/// into a synthesized avcC, and the muxer re-injects them on the keyframe.
-#[tokio::test(start_paused = true)]
-async fn export_avc3_in_band_reassembles() {
-	let mut broadcast = moq_net::broadcast::Info::new().produce();
-	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
-
-	let track = broadcast
-		.create_track(broadcast.unique_name(".avc3"), hang::container::track_info())
-		.unwrap();
-	let name = track.name().to_string();
-	{
-		let mut cfg = VideoConfig::new(H264 {
-			profile: 0x64,
-			constraints: 0,
-			level: 0x1f,
-			inline: true,
-		});
-		cfg.container = Container::Legacy;
-		catalog.lock().video.renditions.insert(name.clone(), cfg);
-	}
-	let mut producer = Producer::new(track, HangContainer::Legacy);
-
-	// IDR slice (NAL type 5), padded past 184 bytes to span multiple TS packets.
-	let mut idr = vec![0x65u8];
-	idr.extend(std::iter::repeat_n(0xAB, 300));
-	// Annex-B keyframe: inline SPS + PPS + IDR.
-	producer
-		.write(Frame {
-			timestamp: Timestamp::from_micros(0).unwrap(),
-			duration: None,
-			payload: annexb(&[SPS, PPS, &idr]),
-			keyframe: true,
-		})
-		.unwrap();
-	producer.finish().unwrap();
-
-	// Keep the producers alive (see `export_aac_roundtrip`).
-	let ts = drain(consumer).await;
-	assert_packet_aligned(&ts);
-
-	let reassembled = reassemble_video(&ts, StreamType::H264);
-	// The parameter sets the muxer re-injected, followed by the slice, all Annex-B.
-	assert_eq!(reassembled.as_slice(), annexb(&[SPS, PPS, &idr]).as_ref());
-}
-
 /// In-band avc3 carrying two distinct PPS (a real broadcast trait): both must
 /// survive the round-trip, or slices referencing the dropped one stop decoding
 /// (regression for non-existing PPS 0 referenced).
@@ -391,10 +724,13 @@ async fn export_avc3_in_band_reassembles() {
 async fn export_avc3_preserves_multiple_pps() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
 	let track = broadcast
-		.create_track(broadcast.unique_name(".avc3"), hang::container::track_info())
+		.create_track(
+			broadcast.unique_name(".avc3"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
 		.unwrap();
 	let name = track.name().to_string();
 	{
@@ -405,9 +741,9 @@ async fn export_avc3_preserves_multiple_pps() {
 			inline: true,
 		});
 		cfg.container = Container::Legacy;
-		catalog.lock().video.renditions.insert(name.clone(), cfg);
+		catalog.modify().unwrap().video.renditions.insert(name.clone(), cfg);
 	}
-	let mut producer = Producer::new(track, HangContainer::Legacy);
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
 
 	let mut idr = vec![0x65u8];
 	idr.extend(std::iter::repeat_n(0xAB, 300));
@@ -420,7 +756,7 @@ async fn export_avc3_preserves_multiple_pps() {
 			keyframe: true,
 		})
 		.unwrap();
-	producer.finish().unwrap();
+	let _finished = producer.finish().unwrap();
 
 	// Keep the producers alive (see `export_aac_roundtrip`).
 	let ts = drain(consumer).await;
@@ -439,12 +775,15 @@ async fn export_avc3_preserves_multiple_pps() {
 async fn export_avc1_out_of_band_reassembles() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
 	let avcc = crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap();
 
 	let track = broadcast
-		.create_track(broadcast.unique_name(".avc1"), hang::container::track_info())
+		.create_track(
+			broadcast.unique_name(".avc1"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
 		.unwrap();
 	let name = track.name().to_string();
 	{
@@ -456,9 +795,9 @@ async fn export_avc1_out_of_band_reassembles() {
 		});
 		cfg.container = Container::Legacy;
 		cfg.description = Some(avcc);
-		catalog.lock().video.renditions.insert(name.clone(), cfg);
+		catalog.modify().unwrap().video.renditions.insert(name.clone(), cfg);
 	}
-	let mut producer = Producer::new(track, HangContainer::Legacy);
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
 
 	// IDR slice (NAL type 5), padded past 184 bytes to span multiple TS packets.
 	let mut idr = vec![0x65u8];
@@ -472,7 +811,7 @@ async fn export_avc1_out_of_band_reassembles() {
 			keyframe: true,
 		})
 		.unwrap();
-	producer.finish().unwrap();
+	let _finished = producer.finish().unwrap();
 
 	// Keep the producers alive (see `export_aac_roundtrip`).
 	let ts = drain(consumer).await;
@@ -511,19 +850,22 @@ async fn export_import_h265_keeps_suffix_sei_on_its_picture() {
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
 	let track = broadcast
-		.create_track(broadcast.unique_name(".hev1"), hang::container::track_info())
+		.create_track(
+			broadcast.unique_name(".hev1"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
 		.unwrap();
 	let name = track.name().to_string();
 	{
 		// hev1: the config comes from the SPS the keyframe carries inline.
 		let mut cfg = crate::codec::h265::config(&annexb(&units[0])).unwrap();
 		cfg.container = Container::Legacy;
-		catalog.lock().video.renditions.insert(name.clone(), cfg);
+		catalog.modify().unwrap().video.renditions.insert(name.clone(), cfg);
 	}
-	let mut producer = Producer::new(track, HangContainer::Legacy);
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
 
 	for (i, nals) in units.iter().enumerate() {
 		producer
@@ -535,7 +877,7 @@ async fn export_import_h265_keeps_suffix_sei_on_its_picture() {
 			})
 			.unwrap();
 	}
-	producer.finish().unwrap();
+	let _finished = producer.finish().unwrap();
 
 	// Keep the producers alive (see `export_aac_roundtrip`).
 	let ts = drain(consumer).await;
@@ -550,16 +892,16 @@ async fn export_import_h265_keeps_suffix_sei_on_its_picture() {
 	// Import: the same TS back through the demuxer must rebuild the same access units.
 	let mut imported = moq_net::broadcast::Info::new().produce();
 	let imported_consumer = imported.consume();
-	let import_catalog = crate::catalog::Producer::new(&mut imported).unwrap();
+	let import_catalog = crate::catalog::Producer::new(&mut imported, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(imported, import_catalog.reserve());
 	import.decode(&ts).unwrap();
-	import.finish().unwrap();
+	let _finished = import.finish().unwrap();
 
 	let snapshot = import_catalog.snapshot();
 	let (imported_name, video) = snapshot.video.renditions.iter().next().expect("an H.265 rendition");
 	assert!(video.codec.to_string().starts_with("hev1"), "codec was {}", video.codec);
 
-	let recovered = read_frames(&imported_consumer, imported_name).await;
+	let recovered = read_frames(&imported_consumer, imported_name, Kind::Video).await;
 	assert_eq!(recovered.len(), units.len(), "access unit count");
 	for (i, (got, nals)) in recovered.iter().zip(&units).enumerate() {
 		assert_eq!(got.as_slice(), annexb(nals).as_ref(), "access unit {i}");
@@ -568,19 +910,19 @@ async fn export_import_h265_keeps_suffix_sei_on_its_picture() {
 
 /// A real broadcast contribution feed (Ateme Kyrion, H.264 1080i with ~86 B-frames)
 /// must come out of the exporter with an authored decode timeline. The importer publishes
-/// the reorder depth as the catalog `jitter`, and the exporter sizes its decode-clock reserve
-/// from it, so the video PES carry a DTS that is both strictly increasing and never after the
-/// PTS in decode order. Also assert the reorder was real (non-monotonic PTS in the source).
+/// the reorder depth as the catalog `jitter`, and the exporter authors a decode timeline from it,
+/// so the video PES carry a DTS that is both strictly increasing and never after the PTS in
+/// decode order. Also assert the reorder was real (non-monotonic PTS in the source).
 #[tokio::test(start_paused = true)]
 async fn export_bframe_video_authors_dts() {
 	let data = include_bytes!("test_data/scte35/kyrion_dirtystart.ts");
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 	import.decode(&BytesMut::from(&data[..])).unwrap();
-	import.finish().unwrap();
+	let _finished = import.finish().unwrap();
 
 	// `import` and `catalog` stay alive: retained tracks the exporter subscribes to.
 	let ts = drain(consumer).await;
@@ -624,13 +966,458 @@ async fn export_bframe_video_authors_dts() {
 	// The exporter authored a decode timeline (the decode clock trails the PTS).
 	assert!(authored > 0, "no DTS authored for a B-frame stream");
 	// Strictly increasing (removes the `+igndts` requirement) and never after presentation
-	// (the catalog jitter sized the reserve to the reorder depth).
+	// (the catalog jitter bounds how far ahead the decode clock looks).
 	for (i, win) in effective.windows(2).enumerate() {
 		assert!(win[1] > win[0], "DTS not strictly increasing at frame {i}: {win:?}");
 	}
 	for (i, (&d, &p)) in effective.iter().zip(pts.iter()).enumerate() {
 		assert!(d <= p, "DTS {d} after PTS {p} at frame {i}");
 	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn export_trims_leading_pictures_after_each_delivery_break() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let track = broadcast
+		.create_track("video", hang::container::track_info(hang::catalog::PRIORITY.video))
+		.unwrap();
+	catalog.modify().unwrap().video.renditions.insert(
+		"video".into(),
+		VideoConfig::new(H264 {
+			profile: 0x42,
+			constraints: 0xc0,
+			level: 0x1f,
+			inline: true,
+		}),
+	);
+	let format = HangContainer::Legacy(Kind::Video);
+	for (sequence, stamps) in [
+		(10, vec![100, 80, 90, 110]),
+		(11, vec![200, 180, 190, 210]),
+		(13, vec![400, 380, 390, 410]),
+	] {
+		let mut group = track.create_group(moq_net::group::Info { sequence }).unwrap();
+		let frames: Vec<_> = stamps
+			.into_iter()
+			.enumerate()
+			.map(|(index, ms)| Frame {
+				timestamp: Timestamp::from_millis(ms).unwrap(),
+				duration: None,
+				keyframe: index == 0,
+				payload: if index == 0 {
+					annexb(&[SPS, PPS, &[0x65, 0xab, 0xcd]])
+				} else {
+					annexb(&[&[0x41, 0xab, 0xcd]])
+				},
+			})
+			.collect();
+		format.write(&mut group, &frames).unwrap();
+		group.finish().unwrap();
+	}
+	let _track = track.finish().unwrap();
+	let mut export = open_export(crate::source::announced(&consumer).await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	let bytes: Vec<u8> = drain_frames(&mut export)
+		.await
+		.iter()
+		.flat_map(|frame| frame.payload.iter().copied())
+		.collect();
+	let (video, _) = collect_pes_pts(&bytes);
+	let expected: Vec<_> = [100, 110, 200, 180, 190, 210, 400, 410]
+		.into_iter()
+		.map(|ms| ms * 90)
+		.collect();
+	assert_eq!(
+		video, expected,
+		"continuous leading pictures survive; only join and later-hole orphans are trimmed"
+	);
+	let stats = export.stats().release;
+	assert_eq!(
+		(stats.dropped, stats.trimmed),
+		(2, 2),
+		"the join's orphans precede the output; the hole's are lost in it"
+	);
+}
+
+/// A frame dropped for missing its deadline takes the leading pictures of the keyframe the
+/// track resumes at with it, though nothing was lost upstream.
+#[tokio::test(start_paused = true)]
+async fn export_trims_leading_pictures_after_a_late_drop() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let track = broadcast
+		.create_track("video", hang::container::track_info(hang::catalog::PRIORITY.video))
+		.unwrap();
+	catalog.modify().unwrap().video.renditions.insert(
+		"video".into(),
+		VideoConfig::new(H264 {
+			profile: 0x42,
+			constraints: 0xc0,
+			level: 0x1f,
+			inline: true,
+		}),
+	);
+	let mut video = Producer::new(track, HangContainer::Legacy(Kind::Video));
+	let mut export = open_export(crate::source::announced(&consumer).await, Duration::from_millis(500))
+		.await
+		.unwrap();
+	let start = kio::clock::now();
+	let mut out = Vec::new();
+	// (arrival, PTS) in milliseconds, in decode order. The second group acquires the clock.
+	// Its 160 ms picture stalls past its deadline, before the next group exists for the
+	// source to skip to. That group arrives on time with its 1920 and 1960 ms leading pictures.
+	for (at, pts, keyframe) in [
+		(0, 0, true),
+		(40, 40, false),
+		(80, 80, true),
+		(120, 120, false),
+		(1000, 160, false),
+		(2000, 2000, true),
+		(2000, 1920, false),
+		(2000, 1960, false),
+		(2040, 2040, false),
+		(2080, 2080, true),
+		(2080, 2060, false),
+		(2120, 2120, false),
+	] {
+		kio::clock::sleep_until(start.saturating_add(Duration::from_millis(at))).await;
+		// Finding the source empty dates the next frame's arrival.
+		out.extend(poll_frames(&mut export));
+		video
+			.write(Frame {
+				timestamp: Timestamp::from_millis(pts).unwrap(),
+				duration: None,
+				keyframe,
+				payload: if keyframe {
+					annexb(&[SPS, PPS, &[0x65, 0xab, 0xcd]])
+				} else {
+					annexb(&[&[0x41, 0xab, 0xcd]])
+				},
+			})
+			.unwrap();
+		out.extend(poll_frames(&mut export));
+	}
+	let _finished = video.finish().unwrap();
+	out.extend(drain_frames(&mut export).await);
+	let bytes: Vec<u8> = out.iter().flat_map(|frame| frame.payload.iter().copied()).collect();
+	let (pts, _) = collect_pes_pts(&bytes);
+	let expected: Vec<_> = [0, 40, 80, 120, 2000, 2040, 2080, 2060, 2120]
+		.into_iter()
+		.map(|ms| ms * 90)
+		.collect();
+	assert_eq!(pts, expected, "only the resumed keyframe's leading pictures go");
+	assert_eq!(export.dropped(), 3, "the late picture and the two it orphaned");
+}
+
+/// MPEG-2 video carried whole resumes after a late picture at its next sequence header, not
+/// at the next picture, which references the dropped one.
+#[tokio::test(start_paused = true)]
+async fn export_resumes_whole_mpeg2_video_at_a_sequence_header() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	let mut aac = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+	aac.description = Some(Bytes::from_static(&[0x11, 0x90]));
+	aac.container = Container::Legacy;
+	let track = broadcast
+		.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+		.unwrap();
+	catalog.modify().unwrap().audio.renditions.insert("audio".into(), aac);
+	let mut audio = Producer::new(track, HangContainer::Legacy(Kind::Audio));
+	let track = broadcast
+		.create_track("video.ts", hang::container::track_info(hang::catalog::PRIORITY.video))
+		.unwrap();
+	let mut entry = tscat::Track::new(PLACED_PID);
+	entry.pes_packet = Some(tscat::PesPacket::new(0x02));
+	catalog
+		.modify()
+		.unwrap()
+		.ext
+		.mpegts
+		.tracks
+		.insert("video.ts".into(), entry);
+	let mut video = Producer::new(track, HangContainer::Legacy(Kind::Data));
+	let mut export = open_ts(
+		crate::source::announced(&consumer).await,
+		crate::catalog::CatalogFormat::Hang,
+		Duration::from_millis(500),
+	)
+	.await
+	.unwrap();
+
+	// (arrival, PTS) in milliseconds, and whether a sequence header opens a group. The 120 ms
+	// picture stalls past its deadline; the two pictures after it still reference it.
+	let pictures = [
+		(0, 0, true),
+		(40, 40, false),
+		(80, 80, false),
+		(1000, 120, false),
+		(2000, 2000, false),
+		(2040, 2040, false),
+		(2080, 2080, true),
+		(2120, 2120, false),
+	];
+	let start = kio::clock::now();
+	let (mut out, mut sample) = (Vec::new(), 0);
+	for (index, (at, pts, sequence)) in pictures.into_iter().enumerate() {
+		// The audio arrives on time throughout, so only the video is late.
+		while sample * AUDIO_US <= at * 1_000 {
+			kio::clock::sleep_until(start.saturating_add(Duration::from_micros(sample * AUDIO_US))).await;
+			out.extend(poll_frames(&mut export));
+			audio
+				.write(Frame {
+					timestamp: Timestamp::from_micros(sample * AUDIO_US).unwrap(),
+					duration: None,
+					payload: Bytes::from(vec![sample as u8; 180]),
+					keyframe: sample.is_multiple_of(AUDIO_GROUP),
+				})
+				.unwrap();
+			sample += 1;
+		}
+		kio::clock::sleep_until(start.saturating_add(Duration::from_millis(at))).await;
+		out.extend(poll_frames(&mut export));
+		let mut payload = if sequence { vec![0, 0, 1, 0xb3] } else { Vec::new() };
+		payload.extend_from_slice(&[0, 0, 1, 0x00, index as u8]);
+		video
+			.write(Frame {
+				timestamp: Timestamp::from_millis(pts).unwrap(),
+				duration: None,
+				keyframe: sequence,
+				payload: Bytes::from(pes_with(0xe0, 0x80, 0x80, &pes_clock(2, pts * 90), 0, &payload)),
+			})
+			.unwrap();
+		out.extend(poll_frames(&mut export));
+	}
+	let _finished = audio.finish().unwrap();
+	let _finished = video.finish().unwrap();
+	out.extend(drain_frames(&mut export).await);
+
+	// Each picture's last byte is its index.
+	let sent: Vec<u8> = placed_out(&out).iter().map(|pes| *pes.bytes.last().unwrap()).collect();
+	assert_eq!(sent, [0, 1, 2, 6, 7]);
+}
+
+/// `(PTS, DTS)` of every video PES start, in transport (decode) order. Read raw, so a capture
+/// that starts before its PMT still counts.
+fn video_pes_timing(ts: &[u8]) -> Vec<(u64, u64)> {
+	let stamp = |b: &[u8]| {
+		u64::from((b[0] >> 1) & 7) << 30
+			| u64::from(b[1]) << 22
+			| u64::from(b[2] >> 1) << 15
+			| u64::from(b[3]) << 7
+			| u64::from(b[4] >> 1)
+	};
+	let mut out = Vec::new();
+	for packet in ts.as_chunks::<188>().0 {
+		if packet[1] & 0x40 == 0 || packet[3] & 0x10 == 0 {
+			continue;
+		}
+		let start = 4 + if packet[3] & 0x20 != 0 {
+			usize::from(packet[4]) + 1
+		} else {
+			0
+		};
+		let Some(pes) = packet.get(start..).filter(|pes| pes.len() >= 19) else {
+			continue;
+		};
+		if pes[..3] != [0, 0, 1] || !(0xe0..=0xef).contains(&pes[3]) || pes[7] & 0x80 == 0 {
+			continue;
+		}
+		let pts = stamp(&pes[9..14]);
+		let dts = if pes[7] & 0x40 != 0 { stamp(&pes[14..19]) } else { pts };
+		out.push((pts, dts));
+	}
+	out
+}
+
+/// The export decodes a broadcast feed exactly where its encoder did. The Kyrion capture is
+/// field-coded 1080i, two fields a frame, with B-frames: the decode clock steps a field at a
+/// time, so a held-back picture count would decode it half as early as a frame-coded stream,
+/// and its leading pictures would bunch one tick apart.
+#[tokio::test(start_paused = true)]
+async fn export_decodes_where_the_source_did() {
+	let data = include_bytes!("test_data/scte35/kyrion_dirtystart.ts");
+	let source: std::collections::BTreeMap<u64, u64> = video_pes_timing(data).into_iter().collect();
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
+	import.decode(&BytesMut::from(&data[..])).unwrap();
+	let _finished = import.finish().unwrap();
+	let ts = drain(consumer).await;
+
+	let exported = video_pes_timing(&ts);
+	assert!(
+		exported.len() > 100,
+		"expected the full feed, got {} frames",
+		exported.len()
+	);
+	// The capture ends mid-reorder, so the last frame's slot is one the encoder filled with a
+	// picture past the end. Timestamps cross MoQ in microseconds, so each is within a tick.
+	for (i, &(pts, dts)) in exported[..exported.len() - 1].iter().enumerate() {
+		let (_, &want) = source
+			.range(pts - 1..=pts + 1)
+			.next()
+			.unwrap_or_else(|| panic!("frame {i} presented at {pts} is not in the source"));
+		assert!(
+			dts.abs_diff(want) <= 2,
+			"frame {i} decodes at {dts}, the source at {want}"
+		);
+	}
+}
+
+/// A broadcast of one H.264 rendition declaring `reorder`, with a group of `stamps` (ms, in
+/// decode order) for each entry, exported as a recording.
+/// The producers stay alive with the export, so it reads the retained tracks.
+async fn export_declared(reorder: u8, groups: &[&[u64]]) -> (Export<crate::catalog::Consumer>, impl Sized) {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let track = broadcast
+		.create_track("video", hang::container::track_info(hang::catalog::PRIORITY.video))
+		.unwrap();
+	let mut config = VideoConfig::new(H264 {
+		profile: 0x64,
+		constraints: 0,
+		level: 0x1f,
+		inline: true,
+	});
+	config.reorder = Some(reorder);
+	catalog
+		.modify()
+		.unwrap()
+		.video
+		.renditions
+		.insert("video".into(), config);
+	let format = HangContainer::Legacy(Kind::Video);
+	for (sequence, stamps) in groups.iter().enumerate() {
+		let mut group = track
+			.create_group(moq_net::group::Info {
+				sequence: sequence as u64,
+			})
+			.unwrap();
+		let frames: Vec<_> = stamps
+			.iter()
+			.enumerate()
+			.map(|(index, &ms)| Frame {
+				timestamp: Timestamp::from_millis(ms).unwrap(),
+				duration: None,
+				keyframe: index == 0,
+				payload: if index == 0 {
+					annexb(&[SPS, PPS, &[0x65, 0xab, 0xcd]])
+				} else {
+					annexb(&[&[0x41, 0xab, 0xcd]])
+				},
+			})
+			.collect();
+		format.write(&mut group, &frames).unwrap();
+		group.finish().unwrap();
+	}
+	let track = track.finish().unwrap();
+	let export = open_export(crate::source::announced(&consumer).await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	(export, (broadcast, catalog, track))
+}
+
+/// A rendition that declares its reorder depth decodes each group from that group's frames: its
+/// first frames a tick apart below its earliest presentation, wrapping the 33-bit DTS below the
+/// timeline's zero, and the rest at its presentation slots.
+#[tokio::test(start_paused = true)]
+async fn export_declared_reorder_decodes_each_group_from_its_frames() {
+	let (mut export, _keep) = export_declared(2, &[&[0, 160, 80, 40, 120], &[400, 560, 480, 440, 520]]).await;
+	let bytes: Vec<u8> = drain_frames(&mut export)
+		.await
+		.iter()
+		.flat_map(|frame| frame.payload.iter().copied())
+		.collect();
+	let wrap = 1 << 33;
+	let ms = |ms: u64| ms * 90;
+	assert_eq!(
+		video_pes_timing(&bytes),
+		[
+			(ms(0), wrap - 2),
+			(ms(160), wrap - 1),
+			(ms(80), 0),
+			(ms(40), ms(40)),
+			(ms(120), ms(80)),
+			(ms(400), ms(400) - 2),
+			(ms(560), ms(400) - 1),
+			(ms(480), ms(400)),
+			(ms(440), ms(440)),
+			(ms(520), ms(480)),
+		]
+	);
+}
+
+/// Open-GOP leading pictures an export trims, because it started at their group, still take
+/// their slots: the group's other frames decode where they do on an export that read the group
+/// before and kept them.
+#[tokio::test(start_paused = true)]
+async fn trimmed_leading_pictures_keep_their_slots() {
+	async fn timing(groups: &[&[u64]]) -> Vec<(u64, u64)> {
+		let (mut export, _keep) = export_declared(2, groups).await;
+		let bytes: Vec<u8> = drain_frames(&mut export)
+			.await
+			.iter()
+			.flat_map(|frame| frame.payload.iter().copied())
+			.collect();
+		video_pes_timing(&bytes)
+	}
+	let open: &[u64] = &[400, 320, 360, 560, 480, 440, 520];
+	let kept = timing(&[&[0, 160, 80, 40, 120], open]).await;
+	let joined = timing(&[open]).await;
+	let ms = |ms: u64| ms * 90;
+	assert_eq!(
+		kept[5..],
+		[
+			(ms(400), ms(320) - 2),
+			(ms(320), ms(320) - 1),
+			(ms(360), ms(320)),
+			(ms(560), ms(360)),
+			(ms(480), ms(400)),
+			(ms(440), ms(440)),
+			(ms(520), ms(480)),
+		]
+	);
+	let shared: Vec<_> = kept[5..]
+		.iter()
+		.filter(|(pts, _)| ![ms(320), ms(360)].contains(pts))
+		.collect();
+	assert_eq!(joined.iter().collect::<Vec<_>>(), shared);
+}
+
+/// A declared depth of zero decodes every frame at its presentation. A regression proves a
+/// timeline step and starts a new clock period instead of inferring a decode delay.
+#[tokio::test(start_paused = true)]
+async fn export_declared_zero_reorder_decodes_at_presentation() {
+	let (mut export, _keep) = export_declared(0, &[&[0, 40, 80, 120]]).await;
+	let bytes: Vec<u8> = drain_frames(&mut export)
+		.await
+		.iter()
+		.flat_map(|frame| frame.payload.iter().copied())
+		.collect();
+	let timing = video_pes_timing(&bytes);
+	assert_eq!(timing.len(), 4);
+	assert!(timing.iter().all(|(pts, dts)| pts == dts), "{timing:?}");
+
+	let (mut export, _keep) = export_declared(0, &[&[0, 80, 40, 120, 80, 160], &[200, 240]]).await;
+	let frames = drain_frames(&mut export).await;
+	let bytes: Vec<u8> = frames.iter().flat_map(|frame| frame.payload.iter().copied()).collect();
+	let timing = video_pes_timing(&bytes);
+	assert_eq!(timing, [0, 80, 40, 120, 80, 160, 200, 240].map(|ms| (ms * 90, ms * 90)));
+	assert_eq!(count_discontinuity(&frames), 2, "each step opens a clock period");
 }
 
 /// #2937: the PCR must be a uniform bounded-interval ramp, not a sample of the
@@ -644,10 +1431,10 @@ async fn export_pcr_is_a_uniform_ramp() {
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 	import.decode(&BytesMut::from(&data[..])).unwrap();
-	import.finish().unwrap();
+	let _finished = import.finish().unwrap();
 
 	let ts = drain(consumer).await;
 	assert_packet_aligned(&ts);
@@ -695,39 +1482,55 @@ async fn export_pcr_is_a_uniform_ramp() {
 	}
 }
 
-/// A timeline that starts inside the decode-clock reserve backs the PCR off
-/// through the 33-bit wrap instead of saturating at zero: the grid step stays
-/// uniform from the very first slot (saturation would emit 0 then 2234, and a
-/// large catalog jitter would freeze several leading PCRs at zero).
+/// A timeline that starts in its first slot backs the PCR off through the 33-bit
+/// wrap instead of saturating at zero: the grid step stays uniform from the very
+/// first slot (saturation would emit 0 then 0 again).
 #[tokio::test(start_paused = true)]
-async fn export_pcr_wraps_below_the_reserve_at_start() {
+async fn export_pcr_wraps_below_zero_at_start() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
 	let track = broadcast
-		.create_track(broadcast.unique_name(".aac"), hang::container::track_info())
+		.create_track(
+			broadcast.unique_name(".aac"),
+			hang::container::track_info(hang::catalog::PRIORITY.audio),
+		)
 		.unwrap();
 	{
 		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
 		cfg.container = Container::Legacy;
-		catalog.lock().audio.renditions.insert(track.name().to_string(), cfg);
+		catalog
+			.modify()
+			.unwrap()
+			.audio
+			.renditions
+			.insert(track.name().to_string(), cfg);
 	}
-	let mut producer = Producer::new(track, HangContainer::Legacy);
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	// One group, so the exporter joining at the live edge reads it from the frame decoding in
+	// slot 0: audio goes out no earlier than its own slot.
 	for i in 0..4u64 {
 		producer
 			.write(Frame {
 				timestamp: Timestamp::from_micros(i * 20_000).unwrap(),
 				duration: None,
 				payload: Bytes::from_static(&[0x01, 0x02, 0x03, 0x04]),
-				keyframe: true,
+				keyframe: i == 0,
 			})
 			.unwrap();
 	}
-	producer.finish().unwrap();
+	let _finished = producer.finish().unwrap();
 
-	let mut exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
-	let frames = drain_frames(&mut exporter).await;
+	let mut exporter = open_export(crate::source::announced(&consumer).await, RECORDING_MAX_AGE)
+		.await
+		.unwrap();
+	// Every slot up to the last decode time, the clock laying them out at theirs.
+	let mut frames = Vec::new();
+	while let Ok(Ok(Some(frame))) = kio::clock::timeout(DRAIN, exporter.next()).await {
+		frames.push(frame);
+	}
 
 	// A slot's clock packets lead the frame carrying that slot's bytes, and the
 	// frame is stamped at the slot boundary so the caller's pacer delivers the
@@ -755,39 +1558,39 @@ async fn export_pcr_wraps_below_the_reserve_at_start() {
 			head = Some(base);
 		}
 		// The frame is paced at the slot its last leading clock asserts (plus the
-		// reserve), which is the newest slot that has begun by then.
+		// slot of slack), which is the newest slot that has begun by then.
 		let Some(base) = head else { continue };
 		let slot_ticks = frame.timestamp.as_micros() / 25_000 * 25_000 * 90 / 1_000;
 		assert_eq!(
 			base,
-			(slot_ticks as u64).wrapping_sub(16) & WIRE,
+			(slot_ticks as u64).wrapping_sub(2250) & WIRE,
 			"pacing off value, at {i}"
 		);
 	}
 
 	const WIRE: u64 = (1 << 33) - 1;
 	assert!(pcrs.len() >= 2, "expected at least two grid slots, got {pcrs:?}");
-	// Slot 0 minus the 16-tick default reserve, mod 2^33.
-	assert_eq!(pcrs[0], WIRE - 15, "slot 0 backs off through the wrap: {pcrs:?}");
+	// Slot 0 minus one 2250-tick slot, mod 2^33.
+	assert_eq!(pcrs[0], WIRE - 2249, "slot 0 backs off through the wrap: {pcrs:?}");
 	// Every step is exactly one 25 ms slot (2250 ticks) in the circular clock.
 	for (i, w) in pcrs.windows(2).enumerate() {
 		assert_eq!(w[1].wrapping_sub(w[0]) & WIRE, 2250, "step off the grid at {i}: {w:?}");
 	}
 }
 
-/// The clock backs off by the largest reserve of any track, not just the PCR
-/// track's: a second rendition with a deeper reorder (catalog `jitter`) authors
-/// its DTS further behind the PTS, and a clock respecting only the PCR track's
-/// reserve would run ahead of those frames' decode times.
+/// Every rendition decodes after the clock, not just the PCR track, whatever `jitter` each
+/// declares.
 #[tokio::test(start_paused = true)]
-async fn export_pcr_respects_every_renditions_reserve() {
+async fn export_pcr_respects_every_rendition() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
 	let avcc = crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap();
 	let mut make = |name: &str, jitter: Option<Duration>| {
-		let track = broadcast.create_track(name, hang::container::track_info()).unwrap();
+		let track = broadcast
+			.create_track(name, hang::container::track_info(hang::catalog::PRIORITY.video))
+			.unwrap();
 		let mut cfg = VideoConfig::new(H264 {
 			profile: 0x42,
 			constraints: 0xc0,
@@ -797,11 +1600,10 @@ async fn export_pcr_respects_every_renditions_reserve() {
 		cfg.container = Container::Legacy;
 		cfg.description = Some(avcc.clone());
 		cfg.jitter = jitter;
-		catalog.lock().video.renditions.insert(name.to_string(), cfg);
-		Producer::new(track, HangContainer::Legacy)
+		catalog.modify().unwrap().video.renditions.insert(name.to_string(), cfg);
+		Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data))
 	};
-	// "a" gets the lowest PID and so carries the PCR, with the tiny default
-	// reserve; "b" declares a 100 ms reorder depth.
+	// "a" gets the lowest PID and so carries the PCR; "b" declares a 100 ms `jitter`.
 	let mut a = make("a.avc1", None);
 	let mut b = make("b.avc1", Some(Duration::from_millis(100)));
 
@@ -819,8 +1621,8 @@ async fn export_pcr_respects_every_renditions_reserve() {
 				.unwrap();
 		}
 	}
-	a.finish().unwrap();
-	b.finish().unwrap();
+	let _finished = a.finish().unwrap();
+	let _finished = b.finish().unwrap();
 
 	let ts = drain(consumer).await;
 	assert_packet_aligned(&ts);
@@ -838,8 +1640,10 @@ async fn export_pcr_respects_every_renditions_reserve() {
 			units += 1;
 			let pts = pes.header.pts.expect("PES carried no PTS").as_u64();
 			let decode = pes.header.dts.map(|t| t.as_u64()).unwrap_or(pts);
+			// The clock starts a delay ahead of the timeline, so it may sit below zero.
 			if let Some(pcr) = last_pcr {
-				assert!(decode >= pcr, "unit decodes at {decode}, before the clock at {pcr}");
+				let ahead = decode.wrapping_sub(pcr) & ((1 << 33) - 1);
+				assert!(ahead < 1 << 32, "unit decodes at {decode}, before the clock at {pcr}");
 			}
 		}
 	}
@@ -854,11 +1658,14 @@ async fn export_pcr_respects_every_renditions_reserve() {
 async fn export_pcr_backfills_a_coarse_cadence() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
 	let avcc = crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap();
 	let track = broadcast
-		.create_track(broadcast.unique_name(".avc1"), hang::container::track_info())
+		.create_track(
+			broadcast.unique_name(".avc1"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
 		.unwrap();
 	{
 		let mut cfg = VideoConfig::new(H264 {
@@ -869,9 +1676,14 @@ async fn export_pcr_backfills_a_coarse_cadence() {
 		});
 		cfg.container = Container::Legacy;
 		cfg.description = Some(avcc);
-		catalog.lock().video.renditions.insert(track.name().to_string(), cfg);
+		catalog
+			.modify()
+			.unwrap()
+			.video
+			.renditions
+			.insert(track.name().to_string(), cfg);
 	}
-	let mut producer = Producer::new(track, HangContainer::Legacy);
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
 
 	let idr = [0x65u8; 32];
 	for i in 0..10u64 {
@@ -884,7 +1696,7 @@ async fn export_pcr_backfills_a_coarse_cadence() {
 			})
 			.unwrap();
 	}
-	producer.finish().unwrap();
+	let _finished = producer.finish().unwrap();
 
 	let ts = drain(consumer).await;
 	assert_packet_aligned(&ts);
@@ -904,8 +1716,23 @@ async fn export_pcr_backfills_a_coarse_cadence() {
 		pcrs.len()
 	);
 	for (i, w) in pcrs.windows(2).enumerate() {
-		assert_eq!(w[1] - w[0], 2250, "PCR interval off the grid at {i}: {w:?}");
+		let step = w[1].wrapping_sub(w[0]) & ((1 << 33) - 1);
+		assert_eq!(step, 2250, "PCR interval off the grid at {i}: {w:?}");
 	}
+}
+
+/// A 32 kb/s 48 kHz 2/0 AC-3 sync frame: 128 bytes, 1,536 samples (32 ms).
+fn ac3_sync() -> Vec<u8> {
+	let mut sync = vec![0x0b, 0x77, 0x00, 0x00, 0x00, 0x40, 0x40];
+	sync.resize(128, 0x00);
+	sync
+}
+
+/// [`ac3_sync`] with its body filled with `k + 1`, so frames tell apart.
+fn ac3_frame(k: u8) -> Vec<u8> {
+	let mut frame = ac3_sync();
+	frame[7..].fill(k + 1);
+	frame
 }
 
 /// Full SCTE-35 round-trip: import `bbb.ts` (real H.264 + AAC) into a broadcast
@@ -918,15 +1745,20 @@ async fn export_scte35_roundtrip() {
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog =
-		crate::catalog::Producer::with_catalog(&mut broadcast, crate::catalog::hang::Catalog::<tscat::Ext>::default())
-			.unwrap();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	// Reserve before the hand-written track below, so its catalog edit is withheld and the
+	// import still places the clock, keeping bbb's PTS that track is stamped against.
+	let reserved = catalog.reserve();
 
 	// Create and write the SCTE-35 cue track BEFORE moving `broadcast` into
 	// `Import` (which consumes it); the producer stays alive so the exporter can
 	// subscribe to the retained track.
 	let scte = broadcast
-		.unique_track(".scte35", hang::container::track_info())
+		.unique_track(".scte35", hang::container::track_info(hang::catalog::PRIORITY.video))
 		.unwrap();
 	let scte_name = scte.name().to_string();
 	{
@@ -934,10 +1766,17 @@ async fn export_scte35_roundtrip() {
 			pid: 0x102,
 			descriptors: Vec::new(),
 			verbatim: Some(tscat::Verbatim::new(0x86, tscat::Framing::Section)),
+			pes_packet: None,
 		};
-		catalog.lock().mpegts.tracks.insert(scte_name.clone(), track);
+		catalog
+			.modify()
+			.unwrap()
+			.ext
+			.mpegts
+			.tracks
+			.insert(scte_name.clone(), track);
 	}
-	let mut scte_producer = Producer::new(scte, HangContainer::Legacy);
+	let mut scte_producer = Producer::new(scte, HangContainer::Legacy(crate::container::Kind::Data));
 	// bbb's first video keyframe is at 1.4 s; stamp the cue just after it so it survives
 	// the tune-in alignment (a cue before the first keyframe is dropped with the lead).
 	scte_producer
@@ -949,19 +1788,23 @@ async fn export_scte35_roundtrip() {
 		})
 		.unwrap();
 	scte_producer.cut(None).unwrap();
-	scte_producer.finish().unwrap();
+	let _finished = scte_producer.finish().unwrap();
 
 	// Now add the real video/audio by importing bbb.ts (this moves `broadcast`).
-	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
+	let mut import = crate::container::ts::Import::new(broadcast, reserved);
 	import.decode(&BytesMut::from(&data[..])).unwrap();
-	import.finish().unwrap();
+	let _finished = import.finish().unwrap();
 
 	// `import`, `catalog`, and `scte_producer` stay alive: retained tracks. The
 	// exporter must carry the extension to see the mpegts section.
 	let ts = drain_with(
-		Export::with_ts(crate::source::announced(&consumer), crate::catalog::CatalogFormat::Hang)
-			.await
-			.unwrap(),
+		open_ts(
+			crate::source::announced(&consumer).await,
+			crate::catalog::CatalogFormat::Hang,
+			RECORDING_MAX_AGE,
+		)
+		.await
+		.unwrap(),
 	)
 	.await;
 	assert_packet_aligned(&ts);
@@ -991,22 +1834,38 @@ async fn export_scte35_roundtrip() {
 	// Re-import the exported TS and read the .scte35 frame back.
 	let mut broadcast2 = moq_net::broadcast::Info::new().produce();
 	let consumer2 = broadcast2.consume();
-	let catalog2 =
-		crate::catalog::Producer::with_catalog(&mut broadcast2, crate::catalog::hang::Catalog::<tscat::Ext>::default())
-			.unwrap();
+	let catalog2 = crate::catalog::Producer::new(
+		&mut broadcast2,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
 	let mut import2 = crate::container::ts::Import::new(broadcast2, catalog2.reserve());
 	import2.decode(&BytesMut::from(ts.as_ref())).unwrap();
-	import2.finish().unwrap();
+	let _finished = import2.finish().unwrap();
 
 	let snapshot = catalog2.snapshot();
-	let verbatim = snapshot.mpegts.tracks.values().filter(|t| t.verbatim.is_some()).count();
+	let verbatim = snapshot
+		.ext
+		.mpegts
+		.tracks
+		.values()
+		.filter(|t| t.verbatim.is_some())
+		.count();
 	assert_eq!(verbatim, 1, "round-trip lost the SCTE-35 track");
 	let name = scte_track(&snapshot).expect("a scte35 track");
 
-	let track = consumer2.track(&name).unwrap().subscribe(None).await.unwrap();
-	let mut scte_reader = crate::container::Consumer::new(track, HangContainer::Legacy);
+	let track = consumer2
+		.track(&name)
+		.unwrap()
+		.subscribe(
+			moq_net::track::Subscription::default()
+				.with_delay(moq_net::track::Delay::default().with_max(RECORDING_MAX_AGE)),
+		)
+		.await
+		.unwrap();
+	let mut scte_reader = crate::container::Consumer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
 	let frame = scte_reader
-		.read()
+		.read_frame()
 		.await
 		.unwrap()
 		.expect("no SCTE-35 frame after round-trip");
@@ -1017,163 +1876,470 @@ async fn export_scte35_roundtrip() {
 	);
 }
 
-/// PES-framed verbatim round-trip: import `bbb.ts` (real H.264 + AAC, whose video
-/// supplies the media clock the exporter needs) alongside a private PES-framed
-/// stream (stream_type 0x06) carried verbatim, export to TS, then re-import and
-/// assert the PID, framing, stream_id, and payload all survive. Exercises the
-/// exporter's PES re-emit path; `private_pes_carried_verbatim` only covers import.
+/// An opaque PMT byte is signalling, not a codec the exporter must recognize.
 #[tokio::test(start_paused = true)]
-async fn export_pes_verbatim_roundtrip() {
+async fn export_unknown_pes_stream_type() {
+	assert_unknown_stream_type(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn export_unknown_section_stream_type() {
+	assert_unknown_stream_type(false).await;
+}
+
+/// Export a track of stream type 0x99, carried as whole PES packets or as sections.
+async fn assert_unknown_stream_type(pes: bool) {
+	const PID: u16 = 0x104;
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	let reserved = catalog.reserve();
+	let track = broadcast
+		.unique_track(".opaque", hang::container::track_info(hang::catalog::PRIORITY.video))
+		.unwrap();
+	let mut entry = tscat::Track::new(PID);
+	let payload = match pes {
+		true => {
+			entry.pes_packet = Some(tscat::PesPacket::new(0x99));
+			Bytes::from(pes_with(0xbd, 0x84, 0x00, &[], 0, b"opaque"))
+		}
+		false => {
+			entry.verbatim = Some(tscat::Verbatim::new(0x99, tscat::Framing::Section));
+			Bytes::from_static(CUE)
+		}
+	};
+	catalog
+		.modify()
+		.unwrap()
+		.ext
+		.mpegts
+		.tracks
+		.insert(track.name().into(), entry);
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	producer
+		.write(Frame {
+			timestamp: Timestamp::from_millis(1410).unwrap(),
+			duration: None,
+			payload,
+			keyframe: true,
+		})
+		.unwrap();
+	let _finished = producer.finish().unwrap();
+
+	// Import real media to supply the program clock without interpreting the opaque track.
+	let mut import = crate::container::ts::Import::new(broadcast, reserved);
+	import
+		.decode(&BytesMut::from(&include_bytes!("test_data/bbb.ts")[..]))
+		.unwrap();
+	let _finished = import.finish().unwrap();
+	let ts = drain_with(
+		open_ts(
+			crate::source::announced(&consumer).await,
+			crate::catalog::CatalogFormat::Hang,
+			RECORDING_MAX_AGE,
+		)
+		.await
+		.unwrap(),
+	)
+	.await;
+	assert_packet_aligned(&ts);
+	let packet = ts
+		.as_chunks::<188>()
+		.0
+		.iter()
+		.find(|packet| packet[1] & 0x40 != 0 && packet[1] & 0x1f == 0x10 && packet[2] == 0)
+		.expect("PMT on PID 0x1000");
+	let payload = 4 + if packet[3] & 0x20 != 0 {
+		1 + usize::from(packet[4])
+	} else {
+		0
+	};
+	let start = payload + 1 + usize::from(packet[payload]);
+	let length = 3 + (usize::from(packet[start + 1] & 0x0f) << 8 | usize::from(packet[start + 2]));
+	let section = &packet[start..start + length];
+	assert!(super::psi::crc_ok(section));
+	let pmt = super::psi::Pmt::parse(section).unwrap();
+	assert_eq!(
+		pmt.streams
+			.iter()
+			.find(|stream| stream.pid.as_u16() == PID)
+			.unwrap()
+			.stream_type,
+		0x99
+	);
+	assert!(
+		ts.as_chunks::<188>().0.iter().any(|packet| {
+			(u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2])) == PID && packet[3] & 0x10 != 0
+		}),
+		"opaque payload must also be emitted"
+	);
+}
+
+/// Whole-PES round-trip: import `bbb.ts` (real H.264 + AAC, whose video supplies the media
+/// clock the exporter needs) alongside a `pesPacket` track (stream_type 0x06), export to TS,
+/// then re-import and assert the PID, stream type, and every PES byte survive.
+#[tokio::test(start_paused = true)]
+async fn export_pes_packet_roundtrip() {
 	const DATA_PID: u16 = 0x104;
-	const STREAM_ID: u8 = 0xc0;
-	const PAYLOAD: &[u8] = &[0xde, 0xad, 0xbe, 0xef, 0x01, 0x02];
+	let pes = pes_with(0xbd, 0x84, 0x00, &[], 0, &[0xde, 0xad, 0xbe, 0xef, 0x01, 0x02]);
 
 	let data = include_bytes!("test_data/bbb.ts");
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog =
-		crate::catalog::Producer::with_catalog(&mut broadcast, crate::catalog::hang::Catalog::<tscat::Ext>::default())
-			.unwrap();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	// Reserve before the hand-written track below, so its catalog edit is withheld and the
+	// import still places the clock, keeping bbb's PTS that track is stamped against.
+	let reserved = catalog.reserve();
 
-	// Build the verbatim PES track BEFORE moving `broadcast` into `Import`; the
+	// Build the PES track BEFORE moving `broadcast` into `Import`; the
 	// producer stays alive so the exporter can subscribe to the retained track.
-	let data_track = broadcast.unique_track(".data", hang::container::track_info()).unwrap();
+	let data_track = broadcast
+		.unique_track(".data", hang::container::track_info(hang::catalog::PRIORITY.video))
+		.unwrap();
 	let data_name = data_track.name().to_string();
 	{
-		let mut verbatim = tscat::Verbatim::new(0x06, tscat::Framing::Pes);
-		verbatim.stream_id = Some(STREAM_ID);
 		let mut track = tscat::Track::new(DATA_PID);
-		track.verbatim = Some(verbatim);
-		catalog.lock().mpegts.tracks.insert(data_name.clone(), track);
+		track.pes_packet = Some(tscat::PesPacket::new(0x06));
+		catalog
+			.modify()
+			.unwrap()
+			.ext
+			.mpegts
+			.tracks
+			.insert(data_name.clone(), track);
 	}
-	let mut data_producer = Producer::new(data_track, HangContainer::Legacy);
+	let mut data_producer = Producer::new(data_track, HangContainer::Legacy(crate::container::Kind::Data));
 	// bbb's first video keyframe is at 1.4 s; stamp the PES just after it so it survives
 	// the tune-in alignment (content before the first keyframe is dropped with the lead).
 	data_producer
 		.write(Frame {
 			timestamp: Timestamp::from_millis(1410).unwrap(),
 			duration: None,
-			payload: Bytes::from_static(PAYLOAD),
+			payload: Bytes::from(pes.clone()),
 			keyframe: true,
 		})
 		.unwrap();
 	data_producer.cut(None).unwrap();
-	data_producer.finish().unwrap();
+	let _finished = data_producer.finish().unwrap();
 
 	// Real video/audio supplies the media clock (moves `broadcast`).
-	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
+	let mut import = crate::container::ts::Import::new(broadcast, reserved);
 	import.decode(&BytesMut::from(&data[..])).unwrap();
-	import.finish().unwrap();
+	let _finished = import.finish().unwrap();
 
 	// `import`, `catalog`, and `data_producer` stay alive: retained tracks.
 	let ts = drain_with(
-		Export::with_ts(crate::source::announced(&consumer), crate::catalog::CatalogFormat::Hang)
-			.await
-			.unwrap(),
+		open_ts(
+			crate::source::announced(&consumer).await,
+			crate::catalog::CatalogFormat::Hang,
+			RECORDING_MAX_AGE,
+		)
+		.await
+		.unwrap(),
 	)
 	.await;
 	assert_packet_aligned(&ts);
 
-	// Re-import the exported TS and recover the verbatim PES stream.
+	// Re-import the exported TS and recover the PES stream.
 	let mut broadcast2 = moq_net::broadcast::Info::new().produce();
 	let consumer2 = broadcast2.consume();
-	let catalog2 =
-		crate::catalog::Producer::with_catalog(&mut broadcast2, crate::catalog::hang::Catalog::<tscat::Ext>::default())
-			.unwrap();
+	let catalog2 = crate::catalog::Producer::new(
+		&mut broadcast2,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
 	let mut import2 = crate::container::ts::Import::new(broadcast2, catalog2.reserve());
 	import2.decode(&BytesMut::from(ts.as_ref())).unwrap();
-	import2.finish().unwrap();
+	let _finished = import2.finish().unwrap();
 
 	let snapshot = catalog2.snapshot();
 	let (name, track) = snapshot
+		.ext
 		.mpegts
 		.tracks
 		.iter()
-		.find(|(_, t)| t.verbatim.as_ref().is_some_and(|v| v.stream_type == 0x06))
-		.expect("verbatim PES survived the round-trip");
+		.find(|(_, t)| t.pes_packet.as_ref().is_some_and(|p| p.stream_type == 0x06))
+		.expect("the PES track survived the round-trip");
 	assert_eq!(track.pid, DATA_PID, "PES PID preserved");
-	let verbatim = track.verbatim.as_ref().unwrap();
-	assert_eq!(verbatim.framing, tscat::Framing::Pes, "PES framing preserved");
-	assert_eq!(verbatim.stream_id, Some(STREAM_ID), "PES stream_id preserved");
 	let name = name.clone();
 
-	let track = consumer2.track(&name).unwrap().subscribe(None).await.unwrap();
-	let mut reader = crate::container::Consumer::new(track, HangContainer::Legacy);
+	let track = consumer2
+		.track(&name)
+		.unwrap()
+		.subscribe(
+			moq_net::track::Subscription::default()
+				.with_delay(moq_net::track::Delay::default().with_max(RECORDING_MAX_AGE)),
+		)
+		.await
+		.unwrap();
+	let mut reader = crate::container::Consumer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
 	let frame = reader
-		.read()
+		.read_frame()
 		.await
 		.unwrap()
-		.expect("no verbatim PES frame after round-trip");
-	assert_eq!(
-		frame.payload.as_ref(),
-		PAYLOAD,
-		"verbatim PES payload round-trips byte-for-byte"
-	);
+		.expect("no PES frame after round-trip");
+	assert_eq!(frame.payload.as_ref(), &pes[..], "the PES round-trips byte-for-byte");
 }
 
-// SCTE-35 cues are clocked on video, so the exporter rejects a cue program with no video
-// track rather than emitting cues pinned to zero.
+/// Audio and opaque data use the same program clock; a data-only program has its own PCR PID.
 #[tokio::test(start_paused = true)]
-async fn scte35_without_video_export_is_rejected() {
-	let mut broadcast = moq_net::broadcast::Info::new().produce();
-	let consumer = broadcast.consume();
-	let mut catalog =
-		crate::catalog::Producer::with_catalog(&mut broadcast, crate::catalog::hang::Catalog::<tscat::Ext>::default())
+async fn programs_without_video_roundtrip_opaque_tracks() {
+	use super::fixture::{Flags, MS, Mux};
+	const DATA: u16 = 0x100;
+	const AUDIO: u16 = 0x101;
+	const CLOCK: u16 = 0x1ff;
+	for audio in [false, true] {
+		for pes in [false, true] {
+			let mut mux = Mux::default();
+			let mut streams = vec![(if pes { 0x06 } else { 0x05 }, DATA)];
+			if audio {
+				streams.push((0x04, AUDIO));
+			}
+			mux.pat(&[(1, 0x20)]).pmt(0x20, 1, CLOCK, &streams, 0);
+			let opaque = if pes {
+				pes_with(0xbd, 0x84, 0, &[], 0, b"opaque data")
+			} else {
+				CUE.to_vec()
+			};
+			for i in 0..8 {
+				let ticks = 1_000 * MS + i * 72 * MS;
+				mux.packet(CLOCK, Flags::pcr(ticks));
+				if audio {
+					let mut frame = vec![0xff, 0xf5, 0x18, 0xc0];
+					frame.resize(72, 0xaa);
+					let pts = ticks / 300 + 9_000;
+					let field = [
+						0x21 | ((pts >> 29) & 0x0e) as u8,
+						(pts >> 22) as u8,
+						1 | ((pts >> 14) & 0xfe) as u8,
+						(pts >> 7) as u8,
+						1 | ((pts << 1) & 0xfe) as u8,
+					];
+					mux.whole(AUDIO, &pes_with(0xc0, 0x80, 0x80, &field, 0, &frame));
+				}
+				if pes {
+					mux.whole(DATA, &opaque);
+				} else {
+					mux.section(DATA, &opaque);
+				}
+			}
+			mux.packet(CLOCK, Flags::pcr(1_000 * MS + 8 * 72 * MS));
+			let mut broadcast = moq_net::broadcast::Info::new().produce();
+			let consumer = broadcast.consume();
+			let catalog = crate::catalog::Producer::new(
+				&mut broadcast,
+				crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+			)
 			.unwrap();
-
-	// A SCTE-35 cue track and nothing else.
-	let scte = broadcast
-		.unique_track(".scte35", hang::container::track_info())
-		.unwrap();
-	let scte_name = scte.name().to_string();
-	{
-		let track = tscat::Track {
-			pid: 0x102,
-			descriptors: Vec::new(),
-			verbatim: Some(tscat::Verbatim::new(0x86, tscat::Framing::Section)),
-		};
-		catalog.lock().mpegts.tracks.insert(scte_name, track);
-	}
-	let mut producer = Producer::new(scte, HangContainer::Legacy);
-	producer
-		.write(Frame {
-			timestamp: Timestamp::from_millis(0).unwrap(),
-			duration: None,
-			payload: Bytes::from_static(CUE),
-			keyframe: true,
-		})
-		.unwrap();
-	producer.cut(None).unwrap();
-	producer.finish().unwrap();
-
-	let mut exporter = Export::with_ts(crate::source::announced(&consumer), crate::catalog::CatalogFormat::Hang)
-		.await
-		.unwrap();
-	let err = loop {
-		match tokio::time::timeout(std::time::Duration::from_secs(1), exporter.next()).await {
-			Ok(Ok(Some(_))) => continue,
-			Ok(Ok(None)) => panic!("export completed; a cue program without video must be rejected"),
-			Ok(Err(e)) => break e,
-			Err(_) => panic!("export neither errored nor completed"),
+			let mut import = super::Import::new(broadcast, catalog.reserve());
+			import.decode(&mux.bytes()).unwrap();
+			let _finished = import.finish().unwrap();
+			let original = catalog
+				.snapshot()
+				.ext
+				.mpegts
+				.tracks
+				.into_iter()
+				.find(|(_, t)| t.pid == DATA)
+				.unwrap()
+				.0;
+			assert_eq!(
+				read_frames(&consumer, &original, Kind::Data).await,
+				vec![opaque.clone(); 8]
+			);
+			let output = drain_with(
+				open_ts(
+					crate::source::announced(&consumer).await,
+					crate::catalog::CatalogFormat::Hang,
+					RECORDING_MAX_AGE,
+				)
+				.await
+				.unwrap(),
+			)
+			.await;
+			assert_packet_aligned(&output);
+			let tables: Vec<u8> = output
+				.as_chunks::<188>()
+				.0
+				.iter()
+				.filter(|packet| {
+					let pid = u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+					pid == 0 || pid == 0x20
+				})
+				.flatten()
+				.copied()
+				.collect();
+			let mut reader = TsPacketReader::new(Cursor::new(tables));
+			let mut pmt = None;
+			while let Some(packet) = reader.read_ts_packet().unwrap() {
+				if let Some(TsPayload::Pmt(table)) = packet.payload {
+					pmt = Some(table);
+				}
+			}
+			let pmt = pmt.unwrap();
+			let clock = pmt.pcr_pid.unwrap().as_u16();
+			assert_ne!(clock, DATA);
+			if audio {
+				assert_eq!(clock, AUDIO);
+			} else {
+				assert!(pmt.es_info.iter().all(|es| es.elementary_pid.as_u16() != clock));
+			}
+			let mut clocks = Vec::new();
+			for packet in output.as_chunks::<188>().0 {
+				let pid = u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+				if pid == clock {
+					if !audio {
+						assert_eq!(packet[3] & 0x30, 0x20);
+					}
+					if let Some(ticks) = super::import::pcr(packet) {
+						clocks.push(ticks);
+					}
+				}
+			}
+			assert!(clocks.len() > 1);
+			assert!(
+				clocks
+					.windows(2)
+					.all(|p| p[1] - p[0] <= PCR_INTERVAL.as_nanos() as u64 * 27 / 1_000)
+			);
+			let mut broadcast2 = moq_net::broadcast::Info::new().produce();
+			let consumer2 = broadcast2.consume();
+			let catalog2 = crate::catalog::Producer::new(
+				&mut broadcast2,
+				crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+			)
+			.unwrap();
+			let mut import2 = super::Import::new(broadcast2, catalog2.reserve());
+			import2.decode(&output).unwrap();
+			let _finished = import2.finish().unwrap();
+			let restored = catalog2
+				.snapshot()
+				.ext
+				.mpegts
+				.tracks
+				.into_iter()
+				.find(|(_, t)| t.pid == DATA)
+				.unwrap()
+				.0;
+			let track = consumer2
+				.track(&restored)
+				.unwrap()
+				.subscribe(
+					moq_net::track::Subscription::default()
+						.with_delay(moq_net::track::Delay::default().with_max(RECORDING_MAX_AGE)),
+				)
+				.await
+				.unwrap();
+			let mut reader = crate::container::Consumer::new(track, HangContainer::Legacy(Kind::Data));
+			let packets = output.as_chunks::<188>().0;
+			let samples: Vec<_> = packets
+				.iter()
+				.enumerate()
+				.filter_map(|(index, packet)| super::import::pcr(packet).map(|ticks| (index as u64 * 188 + 10, ticks)))
+				.collect();
+			let mut count = 0;
+			for (index, packet) in packets.iter().enumerate() {
+				let pid = u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+				if pid != DATA || packet[1] & 0x40 == 0 {
+					continue;
+				}
+				let payload = 4 + if packet[3] & 0x20 != 0 {
+					1 + usize::from(packet[4])
+				} else {
+					0
+				};
+				let at = (index * 188 + payload + if pes { 0 } else { 1 + usize::from(packet[payload]) }) as u64;
+				let before = samples
+					.partition_point(|(offset, _)| *offset <= at)
+					.saturating_sub(1)
+					.min(samples.len() - 2);
+				let ((a, ta), (b, tb)) = (samples[before], samples[before + 1]);
+				let expected = (ta + (at - a) * (tb - ta) / (b - a)) / 27;
+				let frame = reader.read_frame().await.unwrap().unwrap();
+				assert_eq!(frame.payload.as_ref(), &opaque, "audio={audio}, pes={pes}");
+				assert_eq!(frame.timestamp.as_micros(), u128::from(expected));
+				count += 1;
+			}
+			assert_eq!(count, 8);
+			assert!(reader.read_frame().await.unwrap().is_none());
 		}
-	};
-	assert!(
-		err.to_string().contains("requires a video track"),
-		"expected a video-required rejection, got: {err}"
-	);
+	}
 }
 
 /// Subscribe to a track and read every retained frame payload it holds.
-async fn read_frames(consumer: &moq_net::broadcast::Consumer, name: &str) -> Vec<Vec<u8>> {
-	let track = consumer.track(name).unwrap().subscribe(None).await.unwrap();
-	let mut reader = crate::container::Consumer::new(track, HangContainer::Legacy);
+async fn read_frames(consumer: &moq_net::broadcast::Consumer, name: &str, kind: Kind) -> Vec<Vec<u8>> {
+	let track = consumer
+		.track(name)
+		.unwrap()
+		.subscribe(
+			moq_net::track::Subscription::default()
+				.with_delay(moq_net::track::Delay::default().with_max(RECORDING_MAX_AGE)),
+		)
+		.await
+		.unwrap();
+	let mut reader = crate::container::Consumer::new(track, HangContainer::Legacy(kind));
 	let mut frames = Vec::new();
-	while let Ok(res) = tokio::time::timeout(std::time::Duration::from_millis(50), reader.read()).await {
+	while let Ok(res) = kio::clock::timeout(Duration::from_millis(50), reader.read_frame()).await {
 		let Some(frame) = res.unwrap() else { break };
 		frames.push(frame.payload.to_vec());
 	}
 	frames
+}
+
+/// The import counts what each rendition writes and the export what it reads: both agree with
+/// the frames a subscriber reads back, and only video counts keyframes.
+#[tokio::test(start_paused = true)]
+async fn stats_count_what_the_import_writes_and_the_export_reads() {
+	let data = include_bytes!("test_data/bbb_cbr.ts");
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
+	import.decode(&BytesMut::from(&data[..])).unwrap();
+	let _finished = import.finish().unwrap();
+
+	let snapshot = catalog.snapshot();
+	let sent = catalog.stats();
+	let video = snapshot.video.renditions.keys().map(|name| (name, Kind::Video));
+	let audio = snapshot.audio.renditions.keys().map(|name| (name, Kind::Audio));
+	let renditions: Vec<_> = video.chain(audio).collect();
+	assert_eq!(
+		renditions.len(),
+		2,
+		"the clip carries one video and one audio rendition"
+	);
+	assert_eq!(sent.len(), renditions.len(), "a report per rendition: {sent:?}");
+	for (name, kind) in renditions {
+		let frames = read_frames(&consumer, name, kind).await;
+		let report = &sent[name];
+		assert!(!frames.is_empty(), "{name} carries frames");
+		assert_eq!(report.frames, frames.len() as u64, "{name} frames");
+		assert_eq!(
+			report.bytes,
+			frames.iter().map(Vec::len).sum::<usize>() as u64,
+			"{name} bytes"
+		);
+		assert_eq!(report.keyframes > 0, kind == Kind::Video, "{name} keyframes");
+	}
+
+	let source = crate::source::announced(&consumer).await;
+	drain_with(open_export(source.clone(), RECORDING_MAX_AGE).await.unwrap()).await;
+	let received = source.stats();
+	for (name, report) in &sent {
+		assert_eq!(received[name].frames, report.frames, "{name} frames read");
+		assert_eq!(received[name].bytes, report.bytes, "{name} bytes read");
+		assert!(received[name].arrival.is_some(), "{name} records its newest arrival");
+	}
 }
 
 /// Both real Kyrion MP2 programs must survive TS -> MoQ -> TS byte-for-byte, and
@@ -1187,16 +2353,16 @@ async fn mp2_kyrion_roundtrip_byte_exact() {
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 	import.decode(&BytesMut::from(&data[..])).unwrap();
-	import.finish().unwrap();
+	let _finished = import.finish().unwrap();
 
 	let names: Vec<String> = catalog.snapshot().audio.renditions.keys().cloned().collect();
 	assert_eq!(names.len(), 2, "both Kyrion MP2 programs");
 	let mut ingested = Vec::new();
 	for name in &names {
-		let frames = read_frames(&consumer, name).await;
+		let frames = read_frames(&consumer, name, Kind::Audio).await;
 		assert!(!frames.is_empty(), "{name}: no MP2 frames");
 		assert!(
 			frames.iter().all(|f| f[0] == 0xFF && f[1] & 0xE0 == 0xE0),
@@ -1223,16 +2389,16 @@ async fn mp2_kyrion_roundtrip_byte_exact() {
 
 	let mut broadcast2 = moq_net::broadcast::Info::new().produce();
 	let consumer2 = broadcast2.consume();
-	let catalog2 = crate::catalog::Producer::new(&mut broadcast2).unwrap();
+	let catalog2 = crate::catalog::Producer::new(&mut broadcast2, crate::catalog::Config::default()).unwrap();
 	let mut import2 = crate::container::ts::Import::new(broadcast2, catalog2.reserve());
 	import2.decode(&BytesMut::from(ts.as_ref())).unwrap();
-	import2.finish().unwrap();
+	let _finished = import2.finish().unwrap();
 
 	let names2: Vec<String> = catalog2.snapshot().audio.renditions.keys().cloned().collect();
 	assert_eq!(names2.len(), 2, "round-trip lost an MP2 track");
 	let mut roundtripped = Vec::new();
 	for name in &names2 {
-		roundtripped.push(read_frames(&consumer2, name).await);
+		roundtripped.push(read_frames(&consumer2, name, Kind::Audio).await);
 	}
 
 	// Keyframe alignment drops the MP2 ahead of the first video keyframe (the dirty-start
@@ -1256,10 +2422,10 @@ async fn ac3_roundtrip_byte_exact() {
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 	import.decode(&BytesMut::from(&data[..])).unwrap();
-	import.finish().unwrap();
+	let _finished = import.finish().unwrap();
 
 	let name = catalog
 		.snapshot()
@@ -1269,7 +2435,7 @@ async fn ac3_roundtrip_byte_exact() {
 		.next()
 		.expect("an AC-3 track")
 		.clone();
-	let ingested = read_frames(&consumer, &name).await;
+	let ingested = read_frames(&consumer, &name, Kind::Audio).await;
 	assert!(!ingested.is_empty(), "no AC-3 frames");
 	assert!(
 		ingested.iter().all(|f| f[0] == 0x0B && f[1] == 0x77),
@@ -1300,10 +2466,10 @@ async fn ac3_roundtrip_byte_exact() {
 
 	let mut broadcast2 = moq_net::broadcast::Info::new().produce();
 	let consumer2 = broadcast2.consume();
-	let catalog2 = crate::catalog::Producer::new(&mut broadcast2).unwrap();
+	let catalog2 = crate::catalog::Producer::new(&mut broadcast2, crate::catalog::Config::default()).unwrap();
 	let mut import2 = crate::container::ts::Import::new(broadcast2, catalog2.reserve());
 	import2.decode(&BytesMut::from(ts.as_ref())).unwrap();
-	import2.finish().unwrap();
+	let _finished = import2.finish().unwrap();
 
 	let name2 = catalog2
 		.snapshot()
@@ -1313,8 +2479,432 @@ async fn ac3_roundtrip_byte_exact() {
 		.next()
 		.expect("round-trip lost the AC-3 track")
 		.clone();
-	let roundtripped = read_frames(&consumer2, &name2).await;
+	let roundtripped = read_frames(&consumer2, &name2, Kind::Audio).await;
 	assert_eq!(roundtripped, ingested, "AC-3 frames must survive byte-for-byte");
+}
+
+/// The first ADTS frame of the first AAC PES: its header and raw data block.
+fn first_adts_frame(ts: &[u8]) -> (super::adts::Header, Vec<u8>) {
+	let mut pes = PesPacketReader::new(TsPacketReader::new(Cursor::new(ts)));
+	let packet = pes.read_pes_packet().unwrap().expect("an AAC PES");
+	let header = super::adts::Header::parse(&packet.data).unwrap();
+	(header, packet.data[header.header_len..header.frame_len].to_vec())
+}
+
+/// ffmpeg's quad AAC fixture has no channelConfiguration, so its layout rides in a program
+/// config element. Import moves it into the description and export puts it back: channel_config
+/// 0 in ADTS and the element leading the first raw data block, exactly as ffmpeg wrote it.
+#[tokio::test(start_paused = true)]
+async fn aac_program_config_roundtrip() {
+	let data = include_bytes!("test_data/aac_quad.ts");
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
+	import.decode(&BytesMut::from(&data[..])).unwrap();
+	let _finished = import.finish().unwrap();
+
+	let snapshot = catalog.snapshot();
+	let (name, audio) = snapshot.audio.renditions.iter().next().expect("an AAC track");
+	assert_eq!(audio.channel_count, 4);
+	let ingested = read_frames(&consumer, name, Kind::Audio).await;
+	assert!(!ingested.is_empty(), "no AAC frames");
+
+	let ts = drain(consumer).await;
+	assert_packet_aligned(&ts);
+
+	let (header, block) = first_adts_frame(&ts);
+	assert_eq!(header.channel_config, 0, "the layout is not a channelConfiguration");
+	assert_eq!(
+		block,
+		first_adts_frame(data).1,
+		"the first raw data block, element and all"
+	);
+
+	let mut broadcast2 = moq_net::broadcast::Info::new().produce();
+	let consumer2 = broadcast2.consume();
+	let catalog2 = crate::catalog::Producer::new(&mut broadcast2, crate::catalog::Config::default()).unwrap();
+	let mut import2 = crate::container::ts::Import::new(broadcast2, catalog2.reserve());
+	import2.decode(&BytesMut::from(ts.as_ref())).unwrap();
+	let _finished = import2.finish().unwrap();
+
+	let snapshot2 = catalog2.snapshot();
+	let (name2, audio2) = snapshot2
+		.audio
+		.renditions
+		.iter()
+		.next()
+		.expect("round-trip lost the AAC track");
+	assert_eq!(audio2.channel_count, 4);
+	assert_eq!(audio2.description, audio.description);
+	let roundtripped = read_frames(&consumer2, name2, Kind::Audio).await;
+	assert_eq!(roundtripped, ingested, "the element leaves the frames on import");
+}
+
+/// For each AAC PES, whether it follows a PAT and whether a program config element leads its
+/// first raw data block.
+fn aac_program_configs(ts: &[u8]) -> Vec<(bool, bool)> {
+	let mut reader = TsPacketReader::new(Cursor::new(ts));
+	let mut out = Vec::new();
+	let mut after_pat = false;
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		match packet.payload {
+			Some(TsPayload::Pat(_)) => after_pat = true,
+			Some(TsPayload::PesStart(pes)) => {
+				let header = super::adts::Header::parse(&pes.data).unwrap();
+				assert_eq!(header.channel_config, 0);
+				// ID_PCE in the first three bits of the raw data block.
+				out.push((std::mem::take(&mut after_pat), pes.data[header.header_len] >> 5 == 5));
+			}
+			_ => {}
+		}
+	}
+	out
+}
+
+/// A receiver tunes in at a PAT/PMT, so the program config element follows each one rather
+/// than riding the first frame only, including after a marker restarts the program clock. The
+/// output cut at a later PAT imports as the same quad track.
+#[tokio::test(start_paused = true)]
+async fn aac_program_config_follows_each_table() {
+	let mut quad = vec![0x11, 0x80, 0x04, 0xC4, 0x04, 0x00, 0x21, 0x10, 0x0C];
+	quad.extend_from_slice(b"Lavc63.1.101");
+	let payload = Bytes::from_static(&[0x20; 10]);
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let track = broadcast
+		.create_track("a.aac", hang::container::track_info(hang::catalog::PRIORITY.audio))
+		.unwrap();
+	let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 4);
+	cfg.container = Container::Legacy;
+	cfg.description = Some(Bytes::from(quad.clone()));
+	catalog
+		.modify()
+		.unwrap()
+		.audio
+		.renditions
+		.insert("a.aac".to_string(), cfg);
+	let mut producer = Producer::new(track, HangContainer::Legacy(Kind::Audio));
+	let mut export = open_export(crate::source::announced(&consumer).await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+
+	let write = |producer: &mut Producer<HangContainer>, ms: std::ops::Range<u64>| {
+		for ms in ms.step_by(100) {
+			producer
+				.write(Frame {
+					timestamp: Timestamp::from_millis(ms).unwrap(),
+					duration: None,
+					payload: payload.clone(),
+					keyframe: true,
+				})
+				.unwrap();
+			producer.cut(None).unwrap();
+		}
+	};
+	write(&mut producer, 0..2_000);
+	producer.discontinuity().unwrap();
+	write(&mut producer, 2_000..3_000);
+	let _finished = producer.finish().unwrap();
+	let frames = drain_frames(&mut export).await;
+	let ts: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	assert_packet_aligned(&ts);
+
+	let units = aac_program_configs(&ts);
+	assert_eq!(units.len(), 30);
+	for (i, (after_pat, pce)) in units.iter().enumerate() {
+		assert_eq!(
+			after_pat, pce,
+			"unit {i}: the element rides with the tables, and only there"
+		);
+	}
+	assert!(units[20].1, "the restarted clock re-sends the element");
+
+	// Join at the second PAT.
+	let pats: Vec<usize> = ts
+		.chunks(188)
+		.enumerate()
+		.filter(|(_, p)| p[1] & 0x1f == 0 && p[2] == 0)
+		.map(|(i, _)| i * 188)
+		.collect();
+	assert!(pats.len() > 2, "PAT on its cadence");
+	let mut joined = moq_net::broadcast::Info::new().produce();
+	let joined_consumer = joined.consume();
+	let joined_catalog = crate::catalog::Producer::new(&mut joined, crate::catalog::Config::default()).unwrap();
+	let mut import = crate::container::ts::Import::new(joined, joined_catalog.reserve());
+	import.decode(&BytesMut::from(&ts[pats[1]..])).unwrap();
+	let _finished = import.finish().unwrap();
+
+	let snapshot = joined_catalog.snapshot();
+	let (name, audio) = snapshot
+		.audio
+		.renditions
+		.iter()
+		.next()
+		.expect("the late join lost the AAC track");
+	assert_eq!(audio.channel_count, 4);
+	assert_eq!(audio.description.as_deref(), Some(quad.as_slice()));
+	let imported = read_frames(&joined_consumer, name, Kind::Audio).await;
+	assert!(!imported.is_empty());
+	assert!(
+		imported.iter().all(|frame| frame[..] == payload[..]),
+		"the repeated element leaves every frame"
+	);
+}
+
+/// AAC frames that run on share a PES, but every PID's frame repeating the program config
+/// element after the tables starts one, whichever PID's frame the tables rode on.
+#[tokio::test(start_paused = true)]
+async fn aac_program_config_leads_a_packed_pes() {
+	let mut quad = vec![0x11, 0x80, 0x04, 0xC4, 0x04, 0x00, 0x21, 0x10, 0x0C];
+	quad.extend_from_slice(b"Lavc63.1.101");
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	// Offset, so the tables ride one PID's frame while the other's PES is open.
+	let mut producers = Vec::new();
+	for (name, bytes, offset) in [("a.aac", 10, 0), ("b.aac", 40, 7_000)] {
+		let track = broadcast
+			.create_track(name, hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 4);
+		cfg.container = Container::Legacy;
+		cfg.description = Some(Bytes::from(quad.clone()));
+		catalog.modify().unwrap().audio.renditions.insert(name.to_string(), cfg);
+		producers.push((Producer::new(track, HangContainer::Legacy(Kind::Audio)), bytes, offset));
+	}
+	// 1,024 samples at 48 kHz: 21.33 ms each, so the 500 ms table cadence lands mid-PES.
+	for (producer, bytes, offset) in &mut producers {
+		for i in 0..96u64 {
+			producer
+				.write(Frame {
+					timestamp: Timestamp::from_micros(*offset + i * 1_024 * 1_000_000 / 48_000).unwrap(),
+					duration: None,
+					payload: Bytes::from(vec![0x20; *bytes]),
+					keyframe: true,
+				})
+				.unwrap();
+			producer.cut(None).unwrap();
+		}
+		producer.end_with(None).unwrap();
+	}
+	let ts = drain(consumer).await;
+
+	// Each PID's PESs, and each PES's frames: whether the element leads its raw data block.
+	let mut pes: std::collections::HashMap<u16, Vec<Vec<u8>>> = Default::default();
+	let mut reader = TsPacketReader::new(Cursor::new(ts.as_ref()));
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		let pid = packet.header.pid.as_u16();
+		match packet.payload {
+			Some(TsPayload::PesStart(start)) => pes.entry(pid).or_default().push(start.data.to_vec()),
+			Some(TsPayload::PesContinuation(rest)) => {
+				pes.get_mut(&pid).unwrap().last_mut().unwrap().extend_from_slice(&rest)
+			}
+			_ => {}
+		}
+	}
+	assert_eq!(pes.len(), 2);
+	for (pid, pes) in pes {
+		let frames: Vec<Vec<bool>> = pes
+			.iter()
+			.map(|data| {
+				let (mut data, mut frames) = (&data[..], Vec::new());
+				while !data.is_empty() {
+					let header = super::adts::Header::parse(data).unwrap();
+					// ID_PCE in the first three bits of the raw data block.
+					frames.push(data[header.header_len] >> 5 == 5);
+					data = &data[header.frame_len..];
+				}
+				frames
+			})
+			.collect();
+		assert_eq!(frames.iter().map(Vec::len).sum::<usize>(), 96, "PID {pid}");
+		assert!(frames.len() < 96, "PID {pid}: the frames share PESs");
+		assert!(
+			frames.iter().filter(|frames| frames[0]).count() > 2,
+			"PID {pid}: the element repeats after the tables"
+		);
+		assert!(
+			frames.iter().all(|frames| !frames[1..].contains(&true)),
+			"PID {pid}: a PES carries the element after older raw blocks: {frames:?}"
+		);
+	}
+}
+
+/// A stream added mid-stream revises the tables off their cadence, and a receiver tunes in
+/// there too: each AAC PID's next PES after any PAT leads with its program config element, the
+/// one already open when the revision came included.
+#[tokio::test(start_paused = true)]
+async fn aac_program_config_follows_a_revision() {
+	let mut quad = vec![0x11, 0x80, 0x04, 0xC4, 0x04, 0x00, 0x21, 0x10, 0x0C];
+	quad.extend_from_slice(b"Lavc63.1.101");
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let mut add = |name: &str| {
+		let track = broadcast
+			.create_track(name, hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 4);
+		cfg.container = Container::Legacy;
+		cfg.description = Some(Bytes::from(quad.clone()));
+		catalog.modify().unwrap().audio.renditions.insert(name.to_string(), cfg);
+		Producer::new(track, HangContainer::Legacy(Kind::Audio))
+	};
+	// 1,024 samples at 48 kHz, so the frames run on and share PESs, a few to each so one starts
+	// between the revision and the next repeat.
+	let write = |producer: &mut Producer<HangContainer>, offset: u64, frames: std::ops::Range<u64>| {
+		for i in frames {
+			producer
+				.write(Frame {
+					timestamp: Timestamp::from_micros(offset + i * 1_024 * 1_000_000 / 48_000).unwrap(),
+					duration: None,
+					payload: Bytes::from(vec![0x20; 400]),
+					keyframe: true,
+				})
+				.unwrap();
+			producer.cut(None).unwrap();
+		}
+	};
+	let mut a = add("a.aac");
+	let mut export = open_export(crate::source::announced(&consumer).await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	write(&mut a, 0, 0..58);
+	let mut frames = poll_frames(&mut export);
+	// The second stream joins 1.25 s in, halfway between table repeats.
+	let mut b = add("b.aac");
+	frames.extend(poll_frames(&mut export));
+	write(&mut a, 0, 58..96);
+	write(&mut b, 1_250_000, 0..40);
+	let _finished = a.finish().unwrap();
+	let _finished = b.finish().unwrap();
+	catalog.finish().unwrap();
+	frames.extend(drain_frames(&mut export).await);
+	let ts: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+
+	// Whether each PES start, per PID, is the first on its PID since a PAT, and leads with the element.
+	let mut tuned: std::collections::HashSet<u16> = Default::default();
+	let mut starts: Vec<(u16, bool, bool)> = Vec::new();
+	let mut reader = TsPacketReader::new(Cursor::new(&ts[..]));
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		let pid = packet.header.pid.as_u16();
+		match packet.payload {
+			Some(TsPayload::Pat(_)) => tuned.clear(),
+			Some(TsPayload::PesStart(pes)) => {
+				let header = super::adts::Header::parse(&pes.data).unwrap();
+				// ID_PCE in the first three bits of the raw data block.
+				starts.push((pid, tuned.insert(pid), pes.data[header.header_len] >> 5 == 5));
+			}
+			_ => {}
+		}
+	}
+	assert_eq!(
+		starts
+			.iter()
+			.map(|(pid, ..)| pid)
+			.collect::<std::collections::HashSet<_>>()
+			.len(),
+		2
+	);
+	for (i, (pid, first, pce)) in starts.iter().enumerate() {
+		assert!(
+			!first || *pce,
+			"PES {i} on PID {pid}: the first since a PAT lacks the element"
+		);
+	}
+}
+
+/// GStreamer 1.28 `fdkaacenc` output, 48 kHz stereo, remuxed to FLV by ffmpeg 9.0.1. Its
+/// AudioSpecificConfig signals SBR (and PS for v2) explicitly: object type 5 or 29 over an LC core
+/// at 24 kHz, stereo for v1 and mono for v2. ADTS has two bits for the object type, so export
+/// labels the LC core at its own rate and layout and leaves SBR and PS to implicit signaling, the
+/// header ffmpeg's ADTS muxer writes too. ffprobe reads the result back as HE-AAC or HE-AACv2 at
+/// 48 kHz stereo, like the source.
+#[tokio::test(start_paused = true)]
+async fn aac_explicit_sbr_exports_its_lc_core() {
+	let fixtures: [(&[u8], u8); 2] = [
+		(include_bytes!("test_data/he_aac.flv"), 2),
+		(include_bytes!("test_data/he_aac_v2.flv"), 1),
+	];
+	for (data, channel_config) in fixtures {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let mut import = crate::container::flv::Import::new(broadcast, catalog.reserve());
+		import.decode(data).unwrap();
+		let _finished = import.finish().unwrap();
+
+		let snapshot = catalog.snapshot();
+		let (name, _) = snapshot.audio.renditions.iter().next().expect("an AAC track");
+		let ingested = read_frames(&consumer, name, Kind::Audio).await;
+		assert!(!ingested.is_empty(), "no AAC frames");
+
+		let ts = drain(consumer).await;
+		assert_packet_aligned(&ts);
+
+		let (header, block) = first_adts_frame(&ts);
+		assert_eq!(header.object_type, 2, "the LC core, not a masked SBR or PS");
+		assert_eq!(header.sample_rate, 24_000, "the core rate, not the output rate");
+		assert_eq!(header.channel_config, channel_config);
+		assert_eq!(block, ingested[0], "the raw data block is untouched");
+	}
+}
+
+/// A description-less catalog selects ADTS, so raw AAC is refused before it can be mislabeled.
+#[tokio::test(start_paused = true)]
+async fn description_less_aac_refuses_raw_payloads() {
+	for (profile, channel_count, refusal) in [(2, 7, "ADTS header truncated"), (5, 2, "ADTS header truncated")] {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+
+		let track = broadcast
+			.create_track(
+				broadcast.unique_name(".aac"),
+				hang::container::track_info(hang::catalog::PRIORITY.audio),
+			)
+			.unwrap();
+		let mut cfg = AudioConfig::new(AAC { profile }, 48_000, channel_count);
+		cfg.container = Container::Legacy;
+		catalog
+			.modify()
+			.unwrap()
+			.audio
+			.renditions
+			.insert(track.name().to_string(), cfg);
+
+		let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+		producer
+			.write(Frame {
+				timestamp: Timestamp::from_millis(0).unwrap(),
+				duration: None,
+				payload: Bytes::from_static(&[0x01, 0x02]),
+				keyframe: true,
+			})
+			.unwrap();
+		let _finished = producer.finish().unwrap();
+
+		let mut exporter = open_export(crate::source::announced(&consumer).await, std::time::Duration::ZERO)
+			.await
+			.unwrap();
+		let err = loop {
+			match kio::clock::timeout(DRAIN, exporter.next()).await {
+				Ok(Ok(Some(_))) => continue,
+				Ok(Ok(None)) => panic!("export completed; expected a refusal naming {refusal}"),
+				Ok(Err(e)) => break e,
+				Err(_) => panic!("export neither errored nor completed"),
+			}
+		};
+		assert!(err.to_string().contains(refusal), "expected {refusal}, got: {err}");
+	}
 }
 
 /// The ffmpeg E-AC-3 fixture must survive TS -> MoQ -> TS byte-for-byte in an
@@ -1326,10 +2916,10 @@ async fn eac3_roundtrip_byte_exact() {
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 	import.decode(&BytesMut::from(&data[..])).unwrap();
-	import.finish().unwrap();
+	let _finished = import.finish().unwrap();
 
 	let name = catalog
 		.snapshot()
@@ -1339,7 +2929,7 @@ async fn eac3_roundtrip_byte_exact() {
 		.next()
 		.expect("an E-AC-3 track")
 		.clone();
-	let ingested = read_frames(&consumer, &name).await;
+	let ingested = read_frames(&consumer, &name, Kind::Audio).await;
 	assert!(!ingested.is_empty(), "no E-AC-3 frames");
 	assert!(
 		ingested.iter().all(|f| f[0] == 0x0B && f[1] == 0x77),
@@ -1373,10 +2963,10 @@ async fn eac3_roundtrip_byte_exact() {
 
 	let mut broadcast2 = moq_net::broadcast::Info::new().produce();
 	let consumer2 = broadcast2.consume();
-	let catalog2 = crate::catalog::Producer::new(&mut broadcast2).unwrap();
+	let catalog2 = crate::catalog::Producer::new(&mut broadcast2, crate::catalog::Config::default()).unwrap();
 	let mut import2 = crate::container::ts::Import::new(broadcast2, catalog2.reserve());
 	import2.decode(&BytesMut::from(ts.as_ref())).unwrap();
-	import2.finish().unwrap();
+	let _finished = import2.finish().unwrap();
 
 	let name2 = catalog2
 		.snapshot()
@@ -1386,7 +2976,7 @@ async fn eac3_roundtrip_byte_exact() {
 		.next()
 		.expect("round-trip lost the E-AC-3 track")
 		.clone();
-	let roundtripped = read_frames(&consumer2, &name2).await;
+	let roundtripped = read_frames(&consumer2, &name2, Kind::Audio).await;
 	assert_eq!(roundtripped, ingested, "E-AC-3 frames must survive byte-for-byte");
 }
 
@@ -1397,7 +2987,7 @@ async fn read_audio_by_codec(
 ) -> std::collections::BTreeMap<String, Vec<Vec<u8>>> {
 	let mut out = std::collections::BTreeMap::new();
 	for (name, config) in &catalog.snapshot().audio.renditions {
-		out.insert(config.codec.to_string(), read_frames(consumer, name).await);
+		out.insert(config.codec.to_string(), read_frames(consumer, name, Kind::Audio).await);
 	}
 	out
 }
@@ -1413,10 +3003,10 @@ async fn kyrion_ac3_mp2_roundtrip_byte_exact() {
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 	import.decode(&BytesMut::from(&data[..])).unwrap();
-	import.finish().unwrap();
+	let _finished = import.finish().unwrap();
 
 	let ingested = read_audio_by_codec(&consumer, &catalog).await;
 	assert_eq!(
@@ -1461,10 +3051,10 @@ async fn kyrion_ac3_mp2_roundtrip_byte_exact() {
 
 	let mut broadcast2 = moq_net::broadcast::Info::new().produce();
 	let consumer2 = broadcast2.consume();
-	let catalog2 = crate::catalog::Producer::new(&mut broadcast2).unwrap();
+	let catalog2 = crate::catalog::Producer::new(&mut broadcast2, crate::catalog::Config::default()).unwrap();
 	let mut import2 = crate::container::ts::Import::new(broadcast2, catalog2.reserve());
 	import2.decode(&BytesMut::from(ts.as_ref())).unwrap();
-	import2.finish().unwrap();
+	let _finished = import2.finish().unwrap();
 
 	let roundtripped = read_audio_by_codec(&consumer2, &catalog2).await;
 	assert_eq!(roundtripped, ingested, "both audio streams survive byte-for-byte");
@@ -1473,7 +3063,8 @@ async fn kyrion_ac3_mp2_roundtrip_byte_exact() {
 /// Find the SCTE-35 verbatim stream (stream_type 0x86) in a catalog snapshot. A
 /// clip may carry other undecoded streams verbatim, so select by type, not order.
 fn scte_track(snap: &crate::catalog::hang::Catalog<tscat::Ext>) -> Option<String> {
-	snap.mpegts
+	snap.ext
+		.mpegts
 		.tracks
 		.iter()
 		.find(|(_, t)| t.verbatim.as_ref().is_some_and(|v| v.stream_type == 0x86))
@@ -1482,10 +3073,18 @@ fn scte_track(snap: &crate::catalog::hang::Catalog<tscat::Ext>) -> Option<String
 
 /// Subscribe to a cue track and read every retained `splice_info_section` it holds.
 async fn read_cues(consumer: &moq_net::broadcast::Consumer, name: &str) -> Vec<(Vec<u8>, Timestamp)> {
-	let track = consumer.track(name).unwrap().subscribe(None).await.unwrap();
-	let mut reader = crate::container::Consumer::new(track, HangContainer::Legacy);
+	let track = consumer
+		.track(name)
+		.unwrap()
+		.subscribe(
+			moq_net::track::Subscription::default()
+				.with_delay(moq_net::track::Delay::default().with_max(RECORDING_MAX_AGE)),
+		)
+		.await
+		.unwrap();
+	let mut reader = crate::container::Consumer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
 	let mut cues = Vec::new();
-	while let Ok(res) = tokio::time::timeout(std::time::Duration::from_millis(50), reader.read()).await {
+	while let Ok(res) = kio::clock::timeout(Duration::from_millis(50), reader.read_frame()).await {
 		let Some(frame) = res.unwrap() else { break };
 		cues.push((frame.payload.to_vec(), frame.timestamp));
 	}
@@ -1550,14 +3149,14 @@ async fn scte35_fixtures_survive_roundtrip() {
 		// Ingest the fixture.
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let consumer = broadcast.consume();
-		let catalog = crate::catalog::Producer::with_catalog(
+		let catalog = crate::catalog::Producer::new(
 			&mut broadcast,
-			crate::catalog::hang::Catalog::<tscat::Ext>::default(),
+			crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
 		)
 		.unwrap();
 		let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 		import.decode(&BytesMut::from(&data[..])).unwrap();
-		import.finish().unwrap();
+		let _finished = import.finish().unwrap();
 
 		let snap = catalog.snapshot();
 		assert!(!snap.video.renditions.is_empty(), "{source}: video track from the clip");
@@ -1592,28 +3191,32 @@ async fn scte35_fixtures_survive_roundtrip() {
 		}
 		assert!(
 			ingested.iter().all(|(_, ts)| *ts != Timestamp::ZERO),
-			"{source}: cues stamped with the video PTS, not zero"
+			"{source}: cues stamped with their PCR placement"
 		);
 
 		// Export and re-ingest.
 		let ts = drain_with(
-			Export::with_ts(crate::source::announced(&consumer), crate::catalog::CatalogFormat::Hang)
-				.await
-				.unwrap(),
+			open_ts(
+				crate::source::announced(&consumer).await,
+				crate::catalog::CatalogFormat::Hang,
+				RECORDING_MAX_AGE,
+			)
+			.await
+			.unwrap(),
 		)
 		.await;
 		assert_packet_aligned(&ts);
 
 		let mut broadcast2 = moq_net::broadcast::Info::new().produce();
 		let consumer2 = broadcast2.consume();
-		let catalog2 = crate::catalog::Producer::with_catalog(
+		let catalog2 = crate::catalog::Producer::new(
 			&mut broadcast2,
-			crate::catalog::hang::Catalog::<tscat::Ext>::default(),
+			crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
 		)
 		.unwrap();
 		let mut import2 = crate::container::ts::Import::new(broadcast2, catalog2.reserve());
 		import2.decode(&BytesMut::from(ts.as_ref())).unwrap();
-		import2.finish().unwrap();
+		let _finished = import2.finish().unwrap();
 		let name2 = scte_track(&catalog2.snapshot()).expect("a scte35 track");
 		let roundtripped = read_cues(&consumer2, &name2).await;
 
@@ -1626,24 +3229,68 @@ async fn scte35_fixtures_survive_roundtrip() {
 	}
 }
 
-/// Build a PSI section: `table_id`, the 12-bit `section_length` (covering `body` plus a
-/// 4-byte CRC), then `body` and a dummy CRC. The reassembler carries it verbatim and
-/// never validates the CRC, so the bytes only need a self-consistent length.
-fn make_section(table_id: u8, body: &[u8]) -> Vec<u8> {
-	let section_length = body.len() + 4;
+/// Build a well-formed long-form section: the full generic header (extension,
+/// current version, `number` of `last`), then `body` and a valid CRC-32/MPEG-2.
+/// The SI store buffers a sub-table until its generation completes, so the header
+/// fields must be coherent.
+fn make_long_section(table_id: u8, ext: u16, version: u8, number: u8, last: u8, body: &[u8]) -> Vec<u8> {
+	let section_length = 5 + body.len() + 4;
 	let mut s = vec![
 		table_id,
 		0xb0 | ((section_length >> 8) as u8 & 0x0f),
 		(section_length & 0xff) as u8,
+		(ext >> 8) as u8,
+		(ext & 0xff) as u8,
+		0xc0 | (version << 1) | 0x01,
+		number,
+		last,
 	];
 	s.extend_from_slice(body);
-	s.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+	let crc = crc::Crc::<u32>::new(&crc::CRC_32_MPEG_2).checksum(&s);
+	s.extend_from_slice(&crc.to_be_bytes());
 	s
+}
+
+/// The newest snapshot group of an SI track: its sequence, and its frames' payloads.
+///
+/// An SI track keeps the default zero max age: a superseded snapshot is stale at once, so only
+/// the newest is served. Its groups are appended from sequence 0, so the sequence counts the
+/// cuts before it, and a test checks an earlier revision's snapshot right after cutting it.
+async fn newest_si_group(consumer: &moq_net::broadcast::Consumer, name: &str) -> (u64, Vec<Bytes>) {
+	let mut track = consumer.track(name).unwrap().subscribe(None).await.unwrap();
+	let mut group = track.recv_group().await.unwrap().expect("a snapshot group");
+	let mut frames = Vec::new();
+	while let Some(frame) = kio::wait(|waiter| group.poll_read_frame(waiter)).await.unwrap() {
+		frames.push(frame.payload);
+	}
+	(group.sequence, frames)
+}
+
+/// The newest snapshot of an SI track, reduced to its sections.
+async fn read_si_sections(consumer: &moq_net::broadcast::Consumer, name: &str) -> Vec<Bytes> {
+	let (_, frames) = newest_si_group(consumer, name).await;
+	frames
+		.iter()
+		.flat_map(crate::container::ts::si::split_sections)
+		.collect()
 }
 
 /// Wrap a complete section in one PUSI TS packet on `pid` (pointer_field 0), padded to 188.
 fn si_packet(pid: u16, section: &[u8]) -> Vec<u8> {
-	let mut p = vec![0x47, 0x40 | ((pid >> 8) as u8 & 0x1f), (pid & 0xff) as u8, 0x10, 0x00];
+	si_packet_cc(pid, section, 0)
+}
+
+/// [`si_packet`] with an explicit continuity counter. A repetition must vary the
+/// counter to reach the SI store at all: a byte-identical packet is dropped as a TS
+/// duplicate before reassembly.
+fn si_packet_cc(pid: u16, section: &[u8], cc: u8) -> Vec<u8> {
+	let mut p = vec![
+		0x47,
+		0x40 | ((pid >> 8) as u8 & 0x1f),
+		(pid & 0xff) as u8,
+		0x10 | (cc & 0x0f),
+		0x00,
+	];
 	p.extend_from_slice(section);
 	assert!(p.len() <= 188, "section overflows one TS packet");
 	p.resize(188, 0xff);
@@ -1714,87 +3361,139 @@ fn parse_sdt_service(sec: &[u8]) -> (u8, String, String) {
 #[tokio::test(start_paused = true)]
 async fn service_layer_survives_roundtrip() {
 	let data = include_bytes!("test_data/bbb.ts");
-	let nit = make_section(0x40, &[0x12, 0x34, 0xff, 0x01]);
+	let nit = make_long_section(0x40, 0x1234, 1, 0, 0, &[0xff, 0x01]);
 
-	// Prepend a synthetic NIT Actual packet (0x0010); prepend keeps bbb's alignment.
-	// Twice, because real SI repeats every few seconds: the repetition must collapse
-	// into the same single section rather than accumulating a duplicate.
-	let mut input = si_packet(0x0010, &nit);
+	// Append a synthetic NIT Actual packet (0x0010), past bbb's PCRs: SI before the
+	// program clock can place it is dropped, which is where bbb's own SDT sits, so it is
+	// repeated there too. The NIT goes twice, because real SI repeats every few seconds:
+	// the repetition must collapse into the same single committed section rather than
+	// cutting a second group. Each repeat advances the continuity counter so it reaches
+	// the store (an identical packet would be dropped as a TS duplicate before reassembly).
+	let mut input = data.to_vec();
 	input.extend_from_slice(&si_packet(0x0010, &nit));
-	input.extend_from_slice(&data[..]);
+	input.extend_from_slice(&si_packet_cc(0x0010, &nit, 1));
+	let mut sdt = data[..188].to_vec();
+	sdt[3] = (sdt[3] & 0xf0) | ((sdt[3] + 1) & 0x0f);
+	input.extend_from_slice(&sdt);
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let catalog =
-		crate::catalog::Producer::with_catalog(&mut broadcast, crate::catalog::hang::Catalog::<tscat::Ext>::default())
-			.unwrap();
+	let catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 	import.decode(&BytesMut::from(&input[..])).unwrap();
-	import.finish().unwrap();
+	let _finished = import.finish().unwrap();
 
 	let snapshot = catalog.snapshot();
-	let program = snapshot.mpegts.program.clone().expect("a program record");
+	let program = snapshot.ext.mpegts.program.clone().expect("a program record");
 	assert_eq!(program.transport_stream_id, 1, "TSID captured from the PAT");
 	assert_eq!(program.program_number, 1, "program number captured from the PAT");
 	assert_eq!(program.pmt_pid, 0x1000, "original PMT PID captured from the PAT");
-	let si = snapshot.mpegts.si.clone();
-	let entry = |pid: u16| si.get(&pid).expect("an SI entry for the PID");
+	let si = snapshot.ext.mpegts.si.clone();
+	let entry = |pid: u16, table_id: u8| {
+		si.get(&pid)
+			.and_then(|tables| tables.get(&table_id))
+			.expect("an SI entry for the (PID, table_id)")
+	};
 
-	assert_eq!(entry(0x0011).sections.len(), 1, "bbb.ts carries one SDT section");
-	let sdt = entry(0x0011).sections[0].clone();
-	assert_eq!(sdt.first(), Some(&0x42), "SDT Actual (table_id 0x42)");
+	let sdt_entry = entry(0x0011, 0x42);
 	assert_eq!(
-		entry(0x0011).interval,
-		Some(std::time::Duration::from_secs(2)),
+		sdt_entry.interval,
+		Some(Duration::from_secs(2)),
 		"the DVB SDT interval was filled in"
 	);
+	let sdt_sections = read_si_sections(&consumer, &sdt_entry.track).await;
+	assert_eq!(sdt_sections.len(), 1, "bbb.ts carries one SDT section");
+	let sdt = sdt_sections[0].clone();
+	assert_eq!(sdt.first(), Some(&0x42), "SDT Actual (table_id 0x42)");
 	let (service_type, provider, name) = parse_sdt_service(&sdt);
 	assert_eq!(
 		(service_type, provider.as_str(), name.as_str()),
 		(0x01, "FFmpeg", "Service01")
 	);
+
+	let nit_entry = entry(0x0010, 0x40);
 	assert_eq!(
-		entry(0x0010).sections,
-		vec![Bytes::from(make_section(0x40, &[0x12, 0x34, 0xff, 0x01]))],
-		"the repeated NIT deduped to one section"
+		nit_entry.interval,
+		Some(Duration::from_secs(10)),
+		"the DVB NIT interval was filled in"
+	);
+	let (nit_sequence, nit_frames) = newest_si_group(&consumer, &nit_entry.track).await;
+	assert_eq!(
+		nit_sequence, 0,
+		"the repeated NIT committed once; a repetition cuts no group"
+	);
+	assert_eq!(
+		nit_frames,
+		vec![Bytes::from(nit.clone())],
+		"the NIT snapshot is the section, byte-for-byte"
 	);
 
 	// `import` and `catalog` stay alive: retained tracks the exporter subscribes to.
 	let ts = drain_with(
-		Export::with_ts(crate::source::announced(&consumer), crate::catalog::CatalogFormat::Hang)
-			.await
-			.unwrap(),
+		open_ts(
+			crate::source::announced(&consumer).await,
+			crate::catalog::CatalogFormat::Hang,
+			RECORDING_MAX_AGE,
+		)
+		.await
+		.unwrap(),
 	)
 	.await;
 	assert_packet_aligned(&ts);
 
-	// The rebuilt PAT preserves the transport/service identity and PMT PID.
+	// The rebuilt PAT preserves the transport/service identity and PMT PID, and points at the
+	// carried NIT through the network entry.
 	let mut reader = TsPacketReader::new(Cursor::new(ts.as_ref()));
 	let mut checked_pat = false;
 	while let Some(packet) = reader.read_ts_packet().unwrap() {
 		if let Some(TsPayload::Pat(pat)) = packet.payload {
 			assert_eq!(pat.transport_stream_id, 1, "TSID preserved in the rebuilt PAT");
-			assert_eq!(pat.table.len(), 1);
-			assert_eq!(pat.table[0].program_num, 1, "service number preserved");
-			assert_eq!(pat.table[0].program_map_pid.as_u16(), 0x1000, "PMT PID preserved");
+			let table: Vec<_> = pat
+				.table
+				.iter()
+				.map(|entry| (entry.program_num, entry.program_map_pid.as_u16()))
+				.collect();
+			assert_eq!(table, [(0, 0x0010), (1, 0x1000)], "network entry, then the service");
 			checked_pat = true;
 			break;
 		}
 	}
 	assert!(checked_pat, "missing PAT");
 
-	// Re-import: the SDT and NIT must come back byte-for-byte.
+	// The SDT and NIT go out byte-for-byte.
+	assert_eq!(ts_sections(&ts, 0x0011), vec![sdt], "the SDT survived byte-for-byte");
+	assert_eq!(
+		ts_sections(&ts, 0x0010),
+		vec![Bytes::from(nit)],
+		"the NIT survived byte-for-byte"
+	);
+
+	// Re-import: the identity comes back.
 	let mut broadcast2 = moq_net::broadcast::Info::new().produce();
-	let _consumer2 = broadcast2.consume();
-	let catalog2 =
-		crate::catalog::Producer::with_catalog(&mut broadcast2, crate::catalog::hang::Catalog::<tscat::Ext>::default())
-			.unwrap();
+	let catalog2 = crate::catalog::Producer::new(
+		&mut broadcast2,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
 	let mut import2 = crate::container::ts::Import::new(broadcast2, catalog2.reserve());
 	import2.decode(&BytesMut::from(ts.as_ref())).unwrap();
-	import2.finish().unwrap();
+	let import2 = import2.finish().unwrap();
+	// Its row, if any, is the SI track's, never an unclaimed PID's.
+	if let Some(nit) = import2.stats().streams.get(&0x0010) {
+		assert_eq!(
+			(nit.track.as_str(), nit.refused),
+			(".si", 0),
+			"the network entry names captured SI, not a PID to count: {nit:?}"
+		);
+	}
 
 	let snapshot2 = catalog2.snapshot();
 	let program2 = snapshot2
+		.ext
 		.mpegts
 		.program
 		.clone()
@@ -1808,7 +3507,228 @@ async fn service_layer_survives_roundtrip() {
 		"program number survived"
 	);
 	assert_eq!(program2.pmt_pid, program.pmt_pid, "PMT PID survived");
-	assert_eq!(snapshot2.mpegts.si, si, "every SI PID survived byte-for-byte");
+}
+
+/// An export leads with its PAT and PMT, then a PCR interval on the clock they name, before
+/// its SI: a re-import places every SI table's first emission instead of dropping it until it
+/// repeats, padded or not, and every PES with it.
+#[tokio::test(start_paused = true)]
+async fn a_reimport_keeps_the_first_si() {
+	let data = include_bytes!("test_data/bbb.ts");
+	let nit = make_long_section(0x40, 0x1234, 1, 0, 0, &[0xf0, 0x00]);
+	// Past bbb's PCRs, where its import keeps SI: bbb's own SDT precedes them.
+	let mut input = data.to_vec();
+	input.extend_from_slice(&si_packet(0x0010, &nit));
+	let mut sdt = data[..188].to_vec();
+	sdt[3] = (sdt[3] & 0xf0) | ((sdt[3] + 1) & 0x0f);
+	input.extend_from_slice(&sdt);
+	let sdt = ts_sections(&sdt, 0x0011);
+
+	// Each export reads an import of its own.
+	for rate in [None, Some(5_000_000)] {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		let catalog = crate::catalog::Producer::new(
+			&mut broadcast,
+			crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+		)
+		.unwrap();
+		let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
+		import.decode(&BytesMut::from(&input[..])).unwrap();
+		let import = import.finish().unwrap();
+		let units = |stats: super::stats::Snapshot| {
+			stats
+				.streams
+				.iter()
+				.filter(|(_, stream)| stream.units > 0)
+				.map(|(pid, stream)| (*pid, stream.units))
+				.collect::<Vec<_>>()
+		};
+		let imported = units(import.stats());
+
+		let mut export = open_ts(
+			crate::source::announced(&consumer).await,
+			crate::catalog::CatalogFormat::Hang,
+			RECORDING_MAX_AGE,
+		)
+		.await
+		.unwrap();
+		if let Some(rate) = rate {
+			export = export.with_mux_rate(rate);
+		}
+		let ts = drain_with(export).await;
+		assert_packet_aligned(&ts);
+
+		// No SI goes out before the PMT and two PCRs after it.
+		let packets = ts.as_chunks::<188>().0;
+		let pid = |packet: &[u8; 188]| u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+		let pmt = packets.iter().position(|packet| pid(packet) == 0x1000).expect("a PMT");
+		let clock = packets
+			.iter()
+			.enumerate()
+			.skip(pmt)
+			.filter(|(_, packet)| super::import::pcr(packet).is_some())
+			.nth(1)
+			.expect("two PCRs after the PMT")
+			.0;
+		let first = packets
+			.iter()
+			.position(|packet| [0x0010, 0x0011].contains(&pid(packet)))
+			.expect("SI");
+		assert!(
+			first > clock,
+			"{rate:?}: SI at packet {first}, the PMT at {pmt} and its second PCR at {clock}"
+		);
+
+		let mut broadcast2 = moq_net::broadcast::Info::new().produce();
+		let consumer2 = broadcast2.consume();
+		let catalog2 = crate::catalog::Producer::new(
+			&mut broadcast2,
+			crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+		)
+		.unwrap();
+		let mut import2 = crate::container::ts::Import::new(broadcast2, catalog2.reserve());
+		import2.decode(&BytesMut::from(ts.as_ref())).unwrap();
+		let import2 = import2.finish().unwrap();
+		let stats = import2.stats();
+		for (pid, stream) in &stats.streams {
+			assert_eq!(
+				stream.unplaced, 0,
+				"{rate:?}: PID {pid:#x} dropped what it could not place"
+			);
+		}
+		assert_eq!(units(stats), imported, "{rate:?}: every PES");
+
+		let si = catalog2.snapshot().ext.mpegts.si;
+		assert_eq!(
+			read_si_sections(&consumer2, &si[&0x0010][&0x40].track).await,
+			vec![Bytes::from(nit.clone())],
+			"{rate:?}: the NIT"
+		);
+		assert_eq!(
+			read_si_sections(&consumer2, &si[&0x0011][&0x42].track).await,
+			sdt,
+			"{rate:?}: the SDT"
+		);
+	}
+}
+
+/// A gap longer than a skip after the first frame still leaves the opening's PCR interval
+/// whole: the first SI follows two PCRs a reader can measure, and a re-import places it
+/// instead of dropping it until it repeats, padded or not.
+#[tokio::test(start_paused = true)]
+async fn a_reimport_keeps_the_first_si_across_a_gap() {
+	for rate in [None, Some(5_000_000)] {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		let mut catalog = crate::catalog::Producer::new(
+			&mut broadcast,
+			crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+		)
+		.unwrap();
+
+		let avcc = crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap();
+		let track = broadcast
+			.create_track(
+				broadcast.unique_name(".avc1"),
+				hang::container::track_info(hang::catalog::PRIORITY.video),
+			)
+			.unwrap();
+		let name = track.name().to_string();
+		let mut sdt_track = broadcast.create_track("0x0011-0x42.si", timed()).unwrap();
+		sdt_track
+			.write_frame(
+				Timestamp::ZERO,
+				Bytes::from(make_long_section(0x42, 1, 0, 0, 0, &[0xaa; 8])),
+			)
+			.unwrap();
+		{
+			let mut guard = catalog.modify().unwrap();
+			let mut cfg = VideoConfig::new(H264 {
+				profile: 0x64,
+				constraints: 0,
+				level: 0x1f,
+				inline: false,
+			});
+			cfg.container = Container::Legacy;
+			cfg.description = Some(avcc);
+			guard.video.renditions.insert(name.clone(), cfg);
+			guard.ext.mpegts.si.entry(0x0011).or_default().insert(
+				0x42,
+				tscat::SiEntry {
+					track: "0x0011-0x42.si".to_string(),
+					interval: Some(Duration::from_secs(2)),
+					..Default::default()
+				},
+			);
+		}
+
+		// Five seconds between frames, past the second a skip keeps before what comes next.
+		let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+		for (sec, slice) in [(0, 0x65u8), (5, 0x41)] {
+			producer
+				.write(Frame {
+					timestamp: Timestamp::from_micros(sec * 1_000_000).unwrap(),
+					duration: None,
+					payload: length_prefixed(&[&[slice; 300]]),
+					keyframe: sec == 0,
+				})
+				.unwrap();
+		}
+		let _finished = producer.finish().unwrap();
+
+		// No delay: each frame settles the slots before it, so the gap is skipped at once.
+		let mut export = open_ts(
+			crate::source::announced(&consumer).await,
+			crate::catalog::CatalogFormat::Hang,
+			std::time::Duration::ZERO,
+		)
+		.await
+		.unwrap()
+		.with_replay();
+		if let Some(rate) = rate {
+			export = export.with_mux_rate(rate);
+		}
+		let mut ts = BytesMut::new();
+		while let Ok(frame) = kio::clock::timeout(DRAIN, export.next()).await {
+			let Some(frame) = frame.expect("exporter error") else {
+				break;
+			};
+			ts.extend_from_slice(&frame.payload);
+		}
+		assert_packet_aligned(&ts);
+
+		// The two PCRs between the PMT and the first SI step forward by at most a valid interval.
+		let packets = ts.as_chunks::<188>().0;
+		let pid = |packet: &[u8; 188]| u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+		let pmt = packets.iter().position(|packet| pid(packet) == 0x1000).expect("a PMT");
+		let first = packets.iter().position(|packet| pid(packet) == 0x0011).expect("SI");
+		let pcrs: Vec<u64> = packets[pmt..first].iter().filter_map(super::import::pcr).collect();
+		let [.., before, last] = pcrs[..] else {
+			panic!("{rate:?}: {} PCRs between the PMT and the first SI", pcrs.len());
+		};
+		let step = (last + super::mux_rate::PCR_WRAP - before) % super::mux_rate::PCR_WRAP;
+		assert!(
+			(1..=super::mux_rate::MAX_INTERVAL).contains(&step),
+			"{rate:?}: the PCR steps {before} to {last} before the first SI"
+		);
+
+		let mut broadcast2 = moq_net::broadcast::Info::new().produce();
+		let catalog2 = crate::catalog::Producer::new(
+			&mut broadcast2,
+			crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+		)
+		.unwrap();
+		let mut import = crate::container::ts::Import::new(broadcast2, catalog2.reserve());
+		import.decode(&BytesMut::from(ts.as_ref())).unwrap();
+		let import = import.finish().unwrap();
+		for (pid, stream) in &import.stats().streams {
+			assert_eq!(
+				stream.unplaced, 0,
+				"{rate:?}: PID {pid:#x} dropped what it could not place"
+			);
+		}
+	}
 }
 
 /// Each SI PID must be re-emitted on its own interval, independently of the PSI cadence
@@ -1820,17 +3740,39 @@ async fn service_layer_survives_roundtrip() {
 async fn si_pids_are_re_emitted_on_their_own_interval() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog =
-		crate::catalog::Producer::with_catalog(&mut broadcast, crate::catalog::hang::Catalog::<tscat::Ext>::default())
-			.unwrap();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
 
 	let avcc = crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap();
 	let track = broadcast
-		.create_track(broadcast.unique_name(".avc1"), hang::container::track_info())
+		.create_track(
+			broadcast.unique_name(".avc1"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
 		.unwrap();
 	let name = track.name().to_string();
+
+	// SI snapshot tracks, one group each: an SDT (2s) and a NIT (10s).
+	let mut sdt_track = broadcast.create_track("0x0011-0x42.si", timed()).unwrap();
+	sdt_track
+		.write_frame(
+			Timestamp::ZERO,
+			Bytes::from(make_long_section(0x42, 1, 0, 0, 0, &[0xaa; 8])),
+		)
+		.unwrap();
+	let mut nit_track = broadcast.create_track("0x0010-0x40.si", timed()).unwrap();
+	nit_track
+		.write_frame(
+			Timestamp::ZERO,
+			Bytes::from(make_long_section(0x40, 1, 0, 0, 0, &[0xbb; 8])),
+		)
+		.unwrap();
+
 	{
-		let mut guard = catalog.lock();
+		let mut guard = catalog.modify().unwrap();
 		let mut cfg = VideoConfig::new(H264 {
 			profile: 0x64,
 			constraints: 0,
@@ -1842,18 +3784,18 @@ async fn si_pids_are_re_emitted_on_their_own_interval() {
 		guard.video.renditions.insert(name.clone(), cfg);
 
 		// SDT every 2s, NIT every 10s: the DVB maxima import fills in.
-		guard.mpegts.si.insert(
-			0x0011,
-			tscat::Si {
-				sections: vec![Bytes::from(make_section(0x42, &[0xaa; 8]))],
+		guard.ext.mpegts.si.entry(0x0011).or_default().insert(
+			0x42,
+			tscat::SiEntry {
+				track: "0x0011-0x42.si".to_string(),
 				interval: Some(Duration::from_secs(2)),
 				..Default::default()
 			},
 		);
-		guard.mpegts.si.insert(
-			0x0010,
-			tscat::Si {
-				sections: vec![Bytes::from(make_section(0x40, &[0xbb; 8]))],
+		guard.ext.mpegts.si.entry(0x0010).or_default().insert(
+			0x40,
+			tscat::SiEntry {
+				track: "0x0010-0x40.si".to_string(),
 				interval: Some(Duration::from_secs(10)),
 				..Default::default()
 			},
@@ -1861,7 +3803,7 @@ async fn si_pids_are_re_emitted_on_their_own_interval() {
 	}
 
 	// One keyframe per second across 12s, so the PSI fires on every one of the 13.
-	let mut producer = Producer::new(track, HangContainer::Legacy);
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
 	let mut idr = vec![0x65u8];
 	idr.extend(std::iter::repeat_n(0xAB, 300));
 	for sec in 0..=12u64 {
@@ -1875,18 +3817,24 @@ async fn si_pids_are_re_emitted_on_their_own_interval() {
 			.unwrap();
 		producer.cut(None).unwrap();
 	}
-	producer.finish().unwrap();
+	let _finished = producer.finish().unwrap();
 
 	let ts = drain_with(
-		Export::with_ts(crate::source::announced(&consumer), crate::catalog::CatalogFormat::Hang)
-			.await
-			.unwrap(),
+		open_ts(
+			crate::source::announced(&consumer).await,
+			crate::catalog::CatalogFormat::Hang,
+			RECORDING_MAX_AGE,
+		)
+		.await
+		.unwrap(),
 	)
 	.await;
 	assert_packet_aligned(&ts);
 
 	let count = |pid: u16| {
-		ts.chunks_exact(188)
+		ts.as_chunks::<188>()
+			.0
+			.iter()
 			.filter(|p| ((((p[1] & 0x1f) as u16) << 8) | p[2] as u16) == pid)
 			.count()
 	};
@@ -1900,33 +3848,1411 @@ async fn si_pids_are_re_emitted_on_their_own_interval() {
 	assert_eq!(count(0x0010), 2, "NIT re-emitted on its 10s interval");
 }
 
+/// The catalog form every published moq-cli through 0.11 writes carries the SI
+/// sections inline under the PID, with no snapshot track. Export must carry them
+/// the same way it carries a track's snapshot, on the PID's interval, or every one
+/// of those publishers loses its service layer (and, before the inline form was
+/// read at all, the whole export).
+#[tokio::test(start_paused = true)]
+async fn inline_si_form_is_re_emitted() {
+	use base64::Engine;
+
+	let broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+
+	let avcc = crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap();
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".avc1"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
+		.unwrap();
+	let name = track.name().to_string();
+
+	// Hand-written rather than produced, since nothing writes this form any more.
+	let mut catalog = crate::catalog::hang::Catalog::<tscat::Ext>::default();
+	let mut cfg = VideoConfig::new(H264 {
+		profile: 0x64,
+		constraints: 0,
+		level: 0x1f,
+		inline: false,
+	});
+	cfg.container = Container::Legacy;
+	cfg.description = Some(avcc);
+	catalog.video.renditions.insert(name.clone(), cfg);
+	let mut json = serde_json::to_value(&catalog).unwrap();
+	let sdt = make_long_section(0x42, 1, 0, 0, 0, &[0xaa; 8]);
+	let inline = base64::engine::general_purpose::STANDARD.encode(&sdt);
+	json["mpegts"] = serde_json::json!({"si": {"17": {"interval": 2000, "sections": [inline]}}});
+	// Held open: dropping the producer ends the track before export subscribes.
+	let mut catalog_track = broadcast
+		.create_track(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info())
+		.unwrap();
+	catalog_track
+		.write_frame(Timestamp::ZERO, Bytes::from(serde_json::to_vec(&json).unwrap()))
+		.unwrap();
+
+	// One keyframe per second across 12s, as in the snapshot-track test above.
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	let mut idr = vec![0x65u8];
+	idr.extend(std::iter::repeat_n(0xAB, 300));
+	for sec in 0..=12u64 {
+		producer
+			.write(Frame {
+				timestamp: Timestamp::from_micros(sec * 1_000_000).unwrap(),
+				duration: None,
+				payload: length_prefixed(&[&idr]),
+				keyframe: true,
+			})
+			.unwrap();
+		producer.cut(None).unwrap();
+	}
+	let _finished = producer.finish().unwrap();
+
+	let ts = drain_with(
+		open_ts(
+			crate::source::announced(&consumer).await,
+			crate::catalog::CatalogFormat::Hang,
+			RECORDING_MAX_AGE,
+		)
+		.await
+		.unwrap(),
+	)
+	.await;
+	assert_packet_aligned(&ts);
+
+	let count = |pid: u16| {
+		ts.as_chunks::<188>()
+			.0
+			.iter()
+			.filter(|p| ((((p[1] & 0x1f) as u16) << 8) | p[2] as u16) == pid)
+			.count()
+	};
+	assert_eq!(count(0x0000), 13, "PAT on every frame");
+	// SDT at 0,2,4,6,8,10,12s, byte-for-byte the inline section.
+	assert_eq!(count(0x0011), 7, "inline SDT re-emitted on its 2s interval");
+	let packet = ts
+		.as_chunks::<188>()
+		.0
+		.iter()
+		.find(|p| ((((p[1] & 0x1f) as u16) << 8) | p[2] as u16) == 0x0011)
+		.unwrap();
+	// The section is stuffed to the packet's tail, byte-for-byte the inline one.
+	assert_eq!(
+		&packet[188 - sdt.len()..],
+		&sdt[..],
+		"the inline SDT rides its PID: {packet:02x?}"
+	);
+}
+
+/// Count payload-bearing TS packets on `pid`, excluding its standalone clock packets.
+fn count_pid(frames: &[Frame], pid: u16) -> usize {
+	frames
+		.iter()
+		.flat_map(|f| f.payload.as_chunks::<188>().0.iter())
+		.filter(|p| p[3] & 0x10 != 0 && ((((p[1] & 0x1f) as u16) << 8) | p[2] as u16) == pid)
+		.count()
+}
+
+/// Count the TS packets whose adaptation field sets `discontinuity_indicator`.
+pub(super) fn count_discontinuity(frames: &[Frame]) -> usize {
+	frames
+		.iter()
+		.flat_map(|f| f.payload.as_chunks::<188>().0.iter())
+		.filter(|p| p[3] & 0x20 != 0 && p[4] > 0 && p[5] & 0x80 != 0)
+		.count()
+}
+
+/// An SI PID that equals the PMT PID would interleave tables with the program map.
+#[tokio::test(start_paused = true)]
+async fn export_rejects_si_pid_on_the_pmt() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".aac"),
+			hang::container::track_info(hang::catalog::PRIORITY.audio),
+		)
+		.unwrap();
+	let name = track.name().to_string();
+	{
+		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
+		cfg.container = Container::Legacy;
+		let mut guard = catalog.modify().unwrap();
+		guard.audio.renditions.insert(name, cfg);
+		guard.ext.mpegts.program = Some(tscat::Program {
+			transport_stream_id: 1,
+			program_number: 1,
+			pmt_pid: 0x1000,
+			..Default::default()
+		});
+		guard.ext.mpegts.si.entry(0x1000).or_default().insert(
+			0x42,
+			tscat::SiEntry {
+				track: "si".to_string(),
+				interval: Some(Duration::from_secs(2)),
+				..Default::default()
+			},
+		);
+	}
+	let _producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+
+	let mut exporter = open_ts(
+		crate::source::announced(&consumer).await,
+		crate::catalog::CatalogFormat::Hang,
+		RECORDING_MAX_AGE,
+	)
+	.await
+	.unwrap();
+	let err = exporter
+		.next()
+		.await
+		.expect_err("an SI PID on the PMT must fail the export");
+	assert!(
+		err.to_string().contains("mpegts.si PID"),
+		"expected a PID collision, got {err}"
+	);
+}
+
+/// An SI PID that equals an elementary-stream PID would interleave tables with media.
+#[tokio::test(start_paused = true)]
+async fn export_rejects_si_pid_on_an_elementary_stream() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".aac"),
+			hang::container::track_info(hang::catalog::PRIORITY.audio),
+		)
+		.unwrap();
+	let name = track.name().to_string();
+	{
+		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
+		cfg.container = Container::Legacy;
+		let mut guard = catalog.modify().unwrap();
+		guard.audio.renditions.insert(name.clone(), cfg);
+		guard.ext.mpegts.tracks.insert(name, tscat::Track::new(0x101));
+		guard.ext.mpegts.si.entry(0x101).or_default().insert(
+			0x42,
+			tscat::SiEntry {
+				track: "si".to_string(),
+				interval: Some(Duration::from_secs(2)),
+				..Default::default()
+			},
+		);
+	}
+	let _producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+
+	let mut exporter = open_ts(
+		crate::source::announced(&consumer).await,
+		crate::catalog::CatalogFormat::Hang,
+		RECORDING_MAX_AGE,
+	)
+	.await
+	.unwrap();
+	let err = exporter
+		.next()
+		.await
+		.expect_err("an SI PID on an elementary stream must fail the export");
+	assert!(
+		err.to_string().contains("mpegts.si PID"),
+		"expected a PID collision, got {err}"
+	);
+}
+
+/// A `mpegts`-extension exporter over an announced broadcast.
+async fn export_of(consumer: &moq_net::broadcast::Consumer) -> Export<crate::catalog::Consumer<tscat::Ext>> {
+	open_ts(
+		crate::source::announced(consumer).await,
+		crate::catalog::CatalogFormat::Hang,
+		RECORDING_MAX_AGE,
+	)
+	.await
+	.unwrap()
+	.with_replay()
+}
+
+fn publish_sdt(
+	broadcast: &mut moq_net::broadcast::Producer,
+	catalog: &mut crate::catalog::Producer<tscat::Ext>,
+) -> moq_net::track::Producer {
+	let mut track = broadcast.create_track("0x0011-0x42.si", timed()).unwrap();
+	track
+		.write_frame(
+			Timestamp::ZERO,
+			Bytes::from(make_long_section(0x42, 1, 0, 0, 0, &[0xaa; 8])),
+		)
+		.unwrap();
+	catalog
+		.modify()
+		.unwrap()
+		.ext
+		.mpegts
+		.si
+		.entry(0x0011)
+		.or_default()
+		.insert(
+			0x42,
+			tscat::SiEntry {
+				track: track.name().to_string(),
+				interval: Some(Duration::from_secs(2)),
+				..Default::default()
+			},
+		);
+	track
+}
+
+/// A declared marker restarts the program clock and table cadence. An audio-only
+/// program is the worst case: the PSI has no keyframe to recover at, and the PCR-only
+/// packet is the only adaptation field it ever writes.
+#[tokio::test(start_paused = true)]
+async fn discontinuity_re_emits_tables_and_resumes_the_clock() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".aac"),
+			hang::container::track_info(hang::catalog::PRIORITY.audio),
+		)
+		.unwrap();
+	let name = track.name().to_string();
+	{
+		let mut guard = catalog.modify().unwrap();
+		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
+		cfg.container = Container::Legacy;
+		guard.audio.renditions.insert(name, cfg);
+	}
+	let _sdt = publish_sdt(&mut broadcast, &mut catalog);
+
+	// 100ms frames in one-second groups.
+	let write = |producer: &mut Producer<HangContainer>, count: u64, offset: u64| {
+		for i in 0..count {
+			producer
+				.write(Frame {
+					timestamp: Timestamp::from_micros(offset + i * 100_000).unwrap(),
+					duration: None,
+					payload: Bytes::from_iter((0..180u16).map(|b| (b ^ i as u16) as u8)),
+					keyframe: i % 10 == 0,
+				})
+				.unwrap();
+			if i % 10 == 9 {
+				producer.cut(None).unwrap();
+			}
+		}
+	};
+
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Audio));
+	let mut export = export_of(&consumer).await;
+
+	// A ten-minute offset exercises the long rewind from the controlled stimulus
+	// campaign. Drain five seconds before restarting at zero.
+	write(&mut producer, 50, 600_000_000);
+	let before = drain_frames(&mut export).await;
+	assert_eq!(export.discontinuity(), 0, "no rewind yet");
+	assert_eq!(count_pid(&before, 0x0000), 10, "PAT on its 500ms cadence");
+	assert_eq!(count_pid(&before, 0x0011), 3, "SDT at 0, 2 and 4s");
+
+	// A forward marker must flush the last old frame instead of discarding it.
+	producer.discontinuity().unwrap();
+	write(&mut producer, 20, 605_000_000);
+	producer.cut(None).unwrap();
+	let marked = drain_frames(&mut export).await;
+	let tail: Vec<_> = before
+		.iter()
+		.chain(&marked)
+		.flat_map(|f| f.payload.iter().copied())
+		.collect();
+	let (_, audio_pts) = collect_pes_pts(&tail);
+	// The carried tail may precede the refreshed PMT, so inspect all PES starts.
+	let mut reader = TsPacketReader::new(Cursor::new(tail));
+	let mut preserved = false;
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		if let Some(TsPayload::PesStart(pes)) = packet.payload {
+			preserved |= pes.header.pts.unwrap().as_u64() == 604_900_000 * 90 / 1000;
+		}
+	}
+	assert!(preserved, "forward marker discarded the pre-boundary tail");
+	assert!(!audio_pts.is_empty());
+	assert_eq!(export.discontinuity(), 1, "the marker was observed");
+
+	let resume = marked.iter().position(|f| f.timestamp.as_micros() >= 605_000_000);
+	let resume = resume.unwrap_or_else(|| {
+		panic!(
+			"resumed media missing, marked timestamps {:?}",
+			marked.iter().map(|f| f.timestamp.as_micros()).collect::<Vec<_>>()
+		)
+	});
+	assert_eq!(
+		marked[resume].payload[3] & 0x30,
+		0x20,
+		"the new timeline leads with its clock"
+	);
+	let pcrs = collect_pcrs(&marked[resume..]);
+	assert!(!pcrs.is_empty(), "clock resumed promptly");
+	for pair in pcrs.windows(2) {
+		assert_eq!(pair[1].1.wrapping_sub(pair[0].1) & ((1 << 33) - 1), 2250);
+	}
+
+	// Tables come back on cadence rather than waiting for the old 10-minute clock.
+	assert!(
+		count_pid(&marked[resume..], 0x0000) >= 1,
+		"PAT re-emitted after the marker"
+	);
+	assert_eq!(count_discontinuity(&before), 0);
+	assert_eq!(count_discontinuity(&marked), 1, "the break is flagged exactly once");
+}
+
+/// The counter-case, and why the fix keys on the discontinuity counter rather than on a
+/// backwards slot: video is emitted in decode order, so a reordered (B-frame) PTS steps
+/// backwards constantly. Re-emitting on every backwards step was measured at 25x the
+/// intended PSI rate, and none of those steps is a rewind.
+#[tokio::test(start_paused = true)]
+async fn reordered_video_keeps_the_table_cadence() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+
+	let avcc = crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap();
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".avc1"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
+		.unwrap();
+	let name = track.name().to_string();
+	{
+		let mut guard = catalog.modify().unwrap();
+		let mut cfg = VideoConfig::new(H264 {
+			profile: 0x64,
+			constraints: 0,
+			level: 0x1f,
+			inline: false,
+		});
+		cfg.container = Container::Legacy;
+		cfg.description = Some(avcc);
+		guard.video.renditions.insert(name, cfg);
+	}
+	let _sdt = publish_sdt(&mut broadcast, &mut catalog);
+
+	// One group, one keyframe: the PSI has no keyframe boundary to hide behind, so what
+	// is counted below is the interval cadence alone. 125 frames at 40ms displayed,
+	// emitted in decode order as IPBB quads, so every fourth timestamp jumps 120ms ahead
+	// and the next two step back behind it.
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	let mut idr = vec![0x65u8];
+	idr.extend(std::iter::repeat_n(0xAB, 300));
+	let mut slice = vec![0x41u8];
+	slice.extend(std::iter::repeat_n(0xCD, 200));
+	for quad in 0..32u64 {
+		for offset in [0, 3, 1, 2] {
+			let index = quad * 4 + offset;
+			if index >= 125 {
+				continue;
+			}
+			let keyframe = index == 0;
+			producer
+				.write(Frame {
+					timestamp: Timestamp::from_micros(index * 40_000).unwrap(),
+					duration: None,
+					payload: length_prefixed(&[if keyframe { idr.as_slice() } else { slice.as_slice() }]),
+					keyframe,
+				})
+				.unwrap();
+		}
+	}
+
+	let mut export = export_of(&consumer).await;
+	let out = drain_frames(&mut export).await;
+
+	// 125 frames span 0..4.96s: ten 500ms slots and three 2s slots, one emission each.
+	assert_eq!(export.discontinuity(), 0, "a reorder is not a rewind");
+	assert_eq!(count_pid(&out, 0x0000), 10, "PAT once per 500ms slot, not per reorder");
+	assert_eq!(count_pid(&out, 0x0011), 3, "SDT once per 2s slot, not per reorder");
+	// The SPS declares no reorder depth, so the first B-frame grows the reorder delay. It is
+	// read a delay ahead of the first PCR, so the clock starts on the grown delay and never
+	// steps back.
+	assert_eq!(count_discontinuity(&out), 0, "a reorder does not restart the clock");
+}
+
+/// A program with more than one track marks the break once, not once per track. A
+/// declared marker joins every rendition; no track is fenced across it.
+#[tokio::test(start_paused = true)]
+async fn discontinuity_flags_the_break_once_across_tracks() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+
+	let avcc = crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap();
+	let video_track = broadcast
+		.create_track(
+			broadcast.unique_name(".avc1"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
+		.unwrap();
+	let audio_track = broadcast
+		.create_track(
+			broadcast.unique_name(".aac"),
+			hang::container::track_info(hang::catalog::PRIORITY.audio),
+		)
+		.unwrap();
+	{
+		let mut guard = catalog.modify().unwrap();
+		let mut video = VideoConfig::new(H264 {
+			profile: 0x64,
+			constraints: 0,
+			level: 0x1f,
+			inline: false,
+		});
+		video.container = Container::Legacy;
+		video.description = Some(avcc);
+		guard.video.renditions.insert(video_track.name().to_string(), video);
+
+		let mut audio = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+
+		audio.description = Some(Bytes::from_static(&[0x11, 0x90]));
+		audio.container = Container::Legacy;
+		guard.audio.renditions.insert(audio_track.name().to_string(), audio);
+	}
+
+	let mut idr = vec![0x65u8];
+	idr.extend(std::iter::repeat_n(0xAB, 300));
+	let mut video = Producer::new(video_track, HangContainer::Legacy(crate::container::Kind::Video));
+	let mut audio = Producer::new(audio_track, HangContainer::Legacy(crate::container::Kind::Audio));
+
+	// One keyframe-led second per group on video, 100ms audio frames alongside it, a minute
+	// in so a frame can go out the whole recording delay ahead of it.
+	const MINUTE: u64 = 60_000_000;
+	let write = |video: &mut Producer<HangContainer>, audio: &mut Producer<HangContainer>, start: u64, seconds: u64| {
+		for sec in start..start + seconds {
+			video
+				.write(Frame {
+					timestamp: Timestamp::from_micros(MINUTE + sec * 1_000_000).unwrap(),
+					duration: None,
+					payload: length_prefixed(&[idr.as_slice()]),
+					keyframe: true,
+				})
+				.unwrap();
+			video.cut(None).unwrap();
+			for tenth in 0..10u64 {
+				audio
+					.write(Frame {
+						timestamp: Timestamp::from_micros(MINUTE + sec * 1_000_000 + tenth * 100_000).unwrap(),
+						duration: None,
+						payload: Bytes::from_iter((0..180u16).map(|b| (b ^ tenth as u16) as u8)),
+						keyframe: tenth == 0,
+					})
+					.unwrap();
+			}
+			audio.cut(None).unwrap();
+		}
+	};
+
+	let mut export = export_of(&consumer).await;
+	write(&mut video, &mut audio, 0, 4);
+	let before = drain_frames(&mut export).await;
+	assert_eq!(export.discontinuity(), 0);
+	assert_eq!(count_discontinuity(&before), 0);
+
+	// Independent counters can differ before the shared rewind. Forward markers
+	// affect only video; audio must not be fenced out of a continuous timeline.
+	for _ in 0..3 {
+		video.discontinuity().unwrap();
+	}
+	video
+		.write(Frame {
+			timestamp: Timestamp::from_micros(MINUTE + 4_000_000).unwrap(),
+			duration: None,
+			payload: length_prefixed(&[idr.as_slice()]),
+			keyframe: true,
+		})
+		.unwrap();
+	video.cut(None).unwrap();
+	video
+		.write(Frame {
+			timestamp: Timestamp::from_micros(MINUTE + 4_100_000).unwrap(),
+			duration: None,
+			payload: length_prefixed(&[idr.as_slice()]),
+			keyframe: true,
+		})
+		.unwrap();
+	video.cut(None).unwrap();
+	// Audio stays quiet through the marker, so video waits for it and then goes
+	// out around it once the wait lapses. The rewind restarts that wait for the new
+	// generation, so it lapses twice.
+	let mut marked = drain_frames(&mut export).await;
+	for _ in 0..2 {
+		kio::clock::sleep(RECORDING_MAX_AGE).await;
+		marked.extend(drain_frames(&mut export).await);
+	}
+	assert_eq!(export.discontinuity(), 1, "local marker counts are not program epochs");
+	let epoch = export.discontinuity();
+
+	// Both tracks declare the same break and continue forward. Neither is fenced.
+	video.discontinuity().unwrap();
+	audio.discontinuity().unwrap();
+	write(&mut video, &mut audio, 5, 2);
+	// #3533: a content join on a continuous timeline, audio stepping only a sub-frame
+	// (already re-anchored forward), arriving live behind the break.
+	write(&mut video, &mut audio, 7, 2);
+	let after = drain_frames(&mut export).await;
+
+	assert_eq!(
+		export.discontinuity(),
+		epoch + 1,
+		"one break, however many tracks saw it"
+	);
+	assert_eq!(
+		after[0].payload[3] & 0x30,
+		0x20,
+		"the new timeline leads with its clock"
+	);
+	assert_eq!(count_discontinuity(&after), 1, "the break is flagged exactly once");
+	let bytes: Vec<_> = after.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	// The old generation's last frame spreads up to its decode time, so its tail leads
+	// `after`; read from the new generation's tables.
+	let tables = bytes.chunks(188).position(|p| p[1] & 0x1f == 0 && p[2] == 0).unwrap() * 188;
+	let bytes = bytes[tables..].to_vec();
+	let (video_pts, audio_pts) = collect_pes_pts(&bytes);
+	assert!(!video_pts.is_empty(), "video resumed");
+	assert!(!audio_pts.is_empty(), "audio resumed");
+	let mut reader = TsPacketReader::new(Cursor::new(bytes));
+	let mut video_pid = None;
+	let mut video_frames = 0;
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		match packet.payload {
+			Some(TsPayload::Pmt(pmt)) => {
+				video_pid = pmt
+					.es_info
+					.iter()
+					.find(|es| es.stream_type == StreamType::H264)
+					.map(|es| es.elementary_pid.as_u16());
+			}
+			Some(TsPayload::PesStart(pes)) if Some(packet.header.pid.as_u16()) == video_pid => {
+				let pts = pes.header.pts.unwrap().as_u64();
+				assert!(
+					pes.header.dts.is_none_or(|dts| dts.as_u64() <= pts),
+					"DTS retained the old epoch"
+				);
+				video_frames += 1;
+			}
+			_ => {}
+		}
+	}
+	assert!(video_frames > 0);
+	video_pid.expect("video PID in PMT");
+
+	// Both tracks keep emitting across the join; no fence.
+	let joined = Timestamp::from_micros(MINUTE + 7_000_000).unwrap();
+	assert!(
+		video_timing(&after, joined..).len() >= 2,
+		"video was not fenced across the join"
+	);
+	let mut counters = std::collections::HashMap::new();
+	for frame in before.iter().chain(&marked).chain(&after) {
+		for packet in frame.payload.as_chunks::<188>().0.iter() {
+			let pid = u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+			let cc = packet[3] & 15;
+			if let Some(prev) = counters.insert(pid, cc) {
+				let expected = (prev + u8::from(packet[3] & 0x10 != 0)) & 15;
+				assert_eq!(cc, expected, "counter gap on PID {pid}");
+			}
+		}
+	}
+}
+
 /// A DVB SI section larger than one TS packet must be reassembled and captured verbatim.
 /// `si_packet` only covers a single-packet section; a real SDT with several services (or a
 /// NIT) spans packets, exercising the `SectionReassembler` PUSI + continuity path that
-/// feeds `service.sdt`. The body is arbitrary here (capture is verbatim, not parsed).
-#[test]
-fn multi_packet_si_section_is_captured() {
+/// feeds the SI store. The body is arbitrary here (capture is verbatim, not parsed).
+#[tokio::test(start_paused = true)]
+async fn multi_packet_si_section_is_captured() {
 	// 400-byte body forces the SDT Actual across three TS packets (183 + 184 + rest).
 	let body: Vec<u8> = (0..400u16).map(|i| i as u8).collect();
-	let sdt = make_section(0x42, &body);
+	let sdt = make_long_section(0x42, 1, 0, 0, 0, &body);
 	let input = si_packets_multi(0x0011, &sdt);
 	assert!(input.len() > 188, "the SDT must span more than one TS packet");
 
-	let mut broadcast = moq_net::broadcast::Info::new().produce();
-	let _consumer = broadcast.consume();
-	let catalog =
-		crate::catalog::Producer::with_catalog(&mut broadcast, crate::catalog::hang::Catalog::<tscat::Ext>::default())
-			.unwrap();
-	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
-	import.decode(&BytesMut::from(&input[..])).unwrap();
-	import.finish().unwrap();
+	let mut rig = si_rig();
+	rig.import.decode(&BytesMut::from(&input[..])).unwrap();
+	let _finished = rig.import.finish().unwrap();
 
-	let si = catalog.snapshot().mpegts.si.clone();
+	let si = rig.catalog.snapshot().ext.mpegts.si.clone();
+	let entry = si
+		.get(&0x0011)
+		.and_then(|tables| tables.get(&0x42))
+		.expect("an SDT entry");
 	assert_eq!(
-		si.get(&0x0011).expect("an SDT entry").sections,
+		read_si_sections(&rig.consumer, &entry.track).await,
 		vec![Bytes::from(sdt)],
 		"the multi-packet SDT was reassembled and captured byte-for-byte"
 	);
+}
+
+/// Import rig for SI-only fixtures: importer, catalog, and a consumer, all kept
+/// alive so the SI tracks stay readable after `finish`.
+struct SiRig {
+	import: crate::container::ts::Import<tscat::Ext>,
+	catalog: crate::catalog::Producer<tscat::Ext>,
+	consumer: moq_net::broadcast::Consumer,
+}
+
+fn si_rig() -> SiRig {
+	let mut rig = si_import();
+	rig.import.decode(&BytesMut::from(&si_clock(1)[..])).unwrap();
+	rig
+}
+
+/// A rig with no input decoded yet.
+fn si_import() -> SiRig {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	let import = crate::container::ts::Import::new(broadcast, catalog.reserve());
+	SiRig {
+		import,
+		catalog,
+		consumer,
+	}
+}
+
+/// A program clock for SI-only input to be placed by: a PAT, a PMT for `program` with no
+/// streams, and one PCR interval.
+fn si_clock(program: u16) -> Vec<u8> {
+	use super::fixture::{Flags, MS, Mux};
+	let mut mux = Mux::default();
+	mux.pat(&[(program, 0x20)]).pmt(0x20, program, 0x1ff, &[], 0);
+	mux.packet(0x1ff, Flags::pcr(0)).packet(0x1ff, Flags::pcr(40 * MS));
+	mux.out
+}
+
+/// #2881: a multi-section table revised one section at a time must never publish a
+/// torn set. The store buffers the incoming generation and commits it atomically,
+/// so every snapshot group holds a single version.
+#[tokio::test(start_paused = true)]
+async fn torn_transition_is_never_published() {
+	let sdt = |version: u8, number: u8, fill: u8| make_long_section(0x42, 1, version, number, 1, &[fill; 4]);
+	let mut rig = si_rig();
+
+	// Version 5 arrives complete in one batch.
+	let mut input = si_packet(0x0011, &sdt(5, 0, 0xaa));
+	input.extend_from_slice(&si_packet_cc(0x0011, &sdt(5, 1, 0xab), 1));
+	rig.import.decode(&BytesMut::from(&input[..])).unwrap();
+	let si = rig.catalog.snapshot().ext.mpegts.si.clone();
+	let track = &si[&0x0011][&0x42].track;
+	// A superseded snapshot is stale at once, so each batch's newest is read before the next.
+	let mut snapshots = vec![newest_si_group(&rig.consumer, track).await];
+	// Version 6 arrives torn across two batches; the intermediate state (section 0
+	// at v6, section 1 still v5) must never hit the track.
+	rig.import
+		.decode(&BytesMut::from(&si_packet_cc(0x0011, &sdt(6, 0, 0xba), 2)[..]))
+		.unwrap();
+	snapshots.push(newest_si_group(&rig.consumer, track).await);
+	rig.import
+		.decode(&BytesMut::from(&si_packet_cc(0x0011, &sdt(6, 1, 0xbb), 3)[..]))
+		.unwrap();
+	let _finished = rig.import.finish().unwrap();
+	snapshots.push(newest_si_group(&rig.consumer, track).await);
+
+	for (sequence, frames) in &snapshots {
+		let versions: Vec<u8> = frames
+			.iter()
+			.flat_map(crate::container::ts::si::split_sections)
+			.map(|section| (section[5] >> 1) & 0x1f)
+			.collect();
+		assert!(
+			versions.windows(2).all(|w| w[0] == w[1]),
+			"group {sequence} mixes versions: {versions:?}"
+		);
+	}
+	assert_eq!(
+		read_si_sections(&rig.consumer, track).await,
+		vec![Bytes::from(sdt(6, 0, 0xba)), Bytes::from(sdt(6, 1, 0xbb))],
+		"the newest snapshot is version 6, complete"
+	);
+}
+
+/// EIT rides per-table entries (#2800): now/next (0x4E) and schedule (0x50) each
+/// get their own track and their own cadence, and the schedule's deliberately
+/// sparse section numbering (segments skip unused numbers) commits on cycle wrap
+/// rather than waiting for a contiguity that never comes.
+#[tokio::test(start_paused = true)]
+async fn eit_now_next_and_schedule_are_captured() {
+	// Body layout past the generic header: TSID(2), ONID(2), then filler.
+	let pf0 = make_long_section(0x4E, 1, 0, 0, 1, &[0x00, 0x01, 0x00, 0x02, 0x01, 0x4E, 0xaa]);
+	let pf1 = make_long_section(0x4E, 1, 0, 1, 1, &[0x00, 0x01, 0x00, 0x02, 0x01, 0x4E, 0xbb]);
+	let sc0 = make_long_section(0x50, 1, 0, 0, 8, &[0x00, 0x01, 0x00, 0x02, 0x08, 0x50, 0xcc]);
+	let sc8 = make_long_section(0x50, 1, 0, 8, 8, &[0x00, 0x01, 0x00, 0x02, 0x08, 0x50, 0xdd]);
+
+	let mut input = Vec::new();
+	for (cc, section) in [&pf0, &pf1, &sc0, &sc8, &sc0].into_iter().enumerate() {
+		input.extend_from_slice(&si_packet_cc(0x0012, section, cc as u8));
+	}
+	let mut rig = si_rig();
+	rig.import.decode(&BytesMut::from(&input[..])).unwrap();
+	let _finished = rig.import.finish().unwrap();
+
+	let si = rig.catalog.snapshot().ext.mpegts.si.clone();
+	let eit = si.get(&0x0012).expect("EIT entries");
+
+	let pf = eit.get(&0x4E).expect("a now/next entry");
+	assert_eq!(pf.interval, Some(Duration::from_secs(2)), "now/next actual: 2s");
+	assert_eq!(
+		read_si_sections(&rig.consumer, &pf.track).await,
+		vec![Bytes::from(pf0), Bytes::from(pf1)],
+		"now/next committed on contiguity"
+	);
+
+	let sched = eit.get(&0x50).expect("a schedule entry");
+	assert_eq!(sched.interval, Some(Duration::from_secs(10)), "schedule actual: 10s");
+	assert_eq!(
+		read_si_sections(&rig.consumer, &sched.track).await,
+		vec![Bytes::from(sc0), Bytes::from(sc8)],
+		"the sparse schedule committed on cycle wrap"
+	);
+}
+
+/// [`si_rig`] importing only `program`.
+fn si_rig_selecting(program: u16) -> SiRig {
+	let SiRig {
+		import,
+		catalog,
+		consumer,
+	} = si_import();
+	let mut import = import.with_program(program);
+	import.decode(&BytesMut::from(&si_clock(program)[..])).unwrap();
+	SiRig {
+		import,
+		catalog,
+		consumer,
+	}
+}
+
+/// An SDT service loop entry for `service`, running, with a service_descriptor naming it.
+fn sdt_service_entry(service: u16, name: &[u8]) -> Vec<u8> {
+	let mut descriptor = vec![0x48, 0, 0x01, 1, b'P', name.len() as u8];
+	descriptor.extend_from_slice(name);
+	descriptor[1] = (descriptor.len() - 2) as u8;
+	let mut entry = service.to_be_bytes().to_vec();
+	entry.push(0xfd);
+	entry.extend_from_slice(&[0x80, descriptor.len() as u8]);
+	entry.extend_from_slice(&descriptor);
+	entry
+}
+
+/// SDT actual section `number` of `last` for TSID 1 on ONID 2, listing `services`.
+fn sdt_actual(version: u8, number: u8, last: u8, services: &[(u16, &[u8])]) -> Vec<u8> {
+	let mut body = vec![0x00, 0x02, 0xff];
+	for &(service, name) in services {
+		body.extend(sdt_service_entry(service, name));
+	}
+	make_long_section(0x42, 1, version, number, last, &body)
+}
+
+/// EIT present/following actual section `number` of 1 for `service` on TSID 1, ONID 2.
+fn eit_pf(service: u16, number: u8) -> Bytes {
+	let body = [0x00, 0x01, 0x00, 0x02, 0x01, 0x4E, service as u8, number];
+	Bytes::from(make_long_section(0x4E, service, 0, number, 1, &body))
+}
+
+fn nit() -> Bytes {
+	Bytes::from(make_long_section(0x40, 1, 0, 0, 0, &[0xbb; 4]))
+}
+
+/// SI for services 1 and 2: an SDT listing service 1 in section 0 and service 2 in
+/// section 1, EIT present/following for each, and a NIT.
+fn two_service_si() -> Vec<u8> {
+	let mut out = si_packet(0x0011, &sdt_actual(0, 0, 1, &[(1, b"One")]));
+	out.extend(si_packet_cc(0x0011, &sdt_actual(0, 1, 1, &[(2, b"Two")]), 1));
+	for (cc, section) in [eit_pf(1, 0), eit_pf(1, 1), eit_pf(2, 0), eit_pf(2, 1)]
+		.iter()
+		.enumerate()
+	{
+		out.extend(si_packet_cc(0x0012, section, cc as u8));
+	}
+	out.extend(si_packet(0x0010, &nit()));
+	out
+}
+
+/// `section` is one whole SDT actual for TSID 1 on ONID 2 at `version`, listing only
+/// `service` named `name`, under a valid CRC.
+fn assert_sdt_lists_only(section: &[u8], version: u8, service: u16, name: &[u8]) {
+	let crc = crc::Crc::<u32>::new(&crc::CRC_32_MPEG_2);
+	assert_eq!(crc.checksum(section), 0, "a valid CRC-32/MPEG-2");
+	let section_length = (usize::from(section[1] & 0x0f) << 8) | usize::from(section[2]);
+	assert_eq!(section.len(), 3 + section_length, "section_length covers the section");
+	assert_eq!(section[0], 0x42, "SDT actual");
+	assert_eq!(
+		u16::from_be_bytes([section[3], section[4]]),
+		1,
+		"transport_stream_id kept"
+	);
+	assert_eq!((section[5] >> 1) & 0x1f, version, "version_number kept");
+	assert_eq!((section[6], section[7]), (0, 0), "section 0 of 0");
+	assert_eq!(
+		u16::from_be_bytes([section[8], section[9]]),
+		2,
+		"original_network_id kept"
+	);
+	assert_eq!(
+		&section[11..section.len() - 4],
+		&sdt_service_entry(service, name)[..],
+		"the service loop holds the selected service alone"
+	);
+}
+
+/// A selected program's SI describes its own service alone: one SDT actual section
+/// listing it, wherever it sat in the source, and only its own EIT. Network-wide
+/// tables pass through.
+#[tokio::test(start_paused = true)]
+async fn a_selected_program_carries_only_its_own_si() {
+	for (program, name) in [(1u16, &b"One"[..]), (2, b"Two")] {
+		let mut input = crate::container::ts::import::test::two_programs();
+		input.extend(two_service_si());
+		let mut rig = si_rig_selecting(program);
+		rig.import.decode(&BytesMut::from(&input[..])).unwrap();
+		let _finished = rig.import.finish().unwrap();
+
+		let si = rig.catalog.snapshot().ext.mpegts.si.clone();
+		let sdt = read_si_sections(&rig.consumer, &si[&0x0011][&0x42].track).await;
+		assert_eq!(sdt.len(), 1, "program {program}: one SDT actual section");
+		assert_sdt_lists_only(&sdt[0], 0, program, name);
+		assert_eq!(
+			read_si_sections(&rig.consumer, &si[&0x0012][&0x4E].track).await,
+			vec![eit_pf(program, 0), eit_pf(program, 1)],
+			"program {program}: only its own EIT"
+		);
+		assert_eq!(
+			read_si_sections(&rig.consumer, &si[&0x0010][&0x40].track).await,
+			vec![nit()],
+			"the NIT passes through"
+		);
+	}
+}
+
+/// Without a selection nothing is filtered by program: every section is kept verbatim.
+#[tokio::test(start_paused = true)]
+async fn an_unselected_import_keeps_every_service() {
+	let mut rig = si_rig();
+	rig.import.decode(&BytesMut::from(&two_service_si()[..])).unwrap();
+	let _finished = rig.import.finish().unwrap();
+
+	let si = rig.catalog.snapshot().ext.mpegts.si.clone();
+	assert_eq!(
+		read_si_sections(&rig.consumer, &si[&0x0011][&0x42].track).await,
+		vec![
+			Bytes::from(sdt_actual(0, 0, 1, &[(1, b"One")])),
+			Bytes::from(sdt_actual(0, 1, 1, &[(2, b"Two")])),
+		],
+		"the SDT verbatim"
+	);
+	assert_eq!(
+		read_si_sections(&rig.consumer, &si[&0x0012][&0x4E].track).await,
+		vec![eit_pf(1, 0), eit_pf(1, 1), eit_pf(2, 0), eit_pf(2, 1)],
+		"every service's EIT"
+	);
+}
+
+/// A selected service the SDT does not list gets no SDT actual rather than a
+/// fabricated one, and a table filtered to nothing gets no catalog entry.
+#[tokio::test(start_paused = true)]
+async fn a_selection_missing_from_the_sdt_carries_none() {
+	let mut rig = si_rig_selecting(3);
+	rig.import.decode(&BytesMut::from(&two_service_si()[..])).unwrap();
+	let _finished = rig.import.finish().unwrap();
+
+	let si = rig.catalog.snapshot().ext.mpegts.si.clone();
+	assert!(si.contains_key(&0x0010), "the NIT was captured (control)");
+	assert!(!si.contains_key(&0x0011), "no SDT entry: {si:?}");
+	assert!(!si.contains_key(&0x0012), "no EIT entry: {si:?}");
+}
+
+/// An SDT revision that drops the selected service retires the SDT captured before
+/// it, catalog entry and all; a later revision listing it again is captured normally.
+/// Driven on the capture itself so each revision cuts without waiting out the debounce.
+#[tokio::test(start_paused = true)]
+async fn an_sdt_revision_dropping_the_service_retires_it() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	let mut capture = crate::container::ts::si::Capture::new(broadcast, catalog.clone());
+	capture.select(1);
+	// One PCR interval, so the program clock places SI.
+	capture.pcr(0, 0);
+	capture.pcr(40 * 27_000, 10);
+	let mut revise = |version: u8, services: &[(u16, &[u8])]| {
+		assert!(capture.section(0x0011, sdt_actual(version, 0, 0, services).into(), 10));
+		capture.flush(Timestamp::ZERO, true).unwrap();
+		catalog
+			.snapshot()
+			.ext
+			.mpegts
+			.si
+			.get(&0x0011)
+			.map(|tables| tables[&0x42].track.clone())
+	};
+
+	// A superseded snapshot is stale at once, so each revision's is read before the next.
+	let track = revise(0, &[(1, b"One"), (2, b"Two")]).expect("the SDT is advertised");
+	let mut groups = vec![newest_si_group(&consumer, &track).await];
+	assert_eq!(revise(1, &[(2, b"Two")]), None, "the revision retired the SDT entry");
+	groups.push(newest_si_group(&consumer, &track).await);
+	assert_eq!(
+		revise(2, &[(1, b"One"), (2, b"Two")]),
+		Some(track.clone()),
+		"listed again, on the same track"
+	);
+	capture.finish(Timestamp::ZERO).unwrap();
+	groups.push(newest_si_group(&consumer, &track).await);
+
+	let sequences: Vec<u64> = groups.iter().map(|(sequence, _)| *sequence).collect();
+	assert_eq!(sequences, [0, 1, 2], "one snapshot per revision");
+	assert_sdt_lists_only(&groups[0].1[0], 0, 1, b"One");
+	assert!(groups[1].1.is_empty(), "the retiring snapshot carries no SDT");
+	assert_sdt_lists_only(&groups[2].1[0], 2, 1, b"One");
+}
+
+/// A corrupted SDT actual is not rebuilt under a fresh, valid CRC: the section is
+/// dropped and the last good snapshot stays in force, rather than the corruption
+/// reading as a revision (or as the service leaving). An intact revision after it
+/// is captured normally.
+#[tokio::test(start_paused = true)]
+async fn a_corrupt_sdt_keeps_the_last_good_snapshot() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	let mut capture = crate::container::ts::si::Capture::new(broadcast, catalog.clone());
+	capture.select(1);
+	// One PCR interval, so the program clock places SI.
+	capture.pcr(0, 0);
+	capture.pcr(40 * 27_000, 10);
+	let mut feed = |section: Vec<u8>| {
+		assert!(capture.section(0x0011, section.into(), 10));
+		capture.flush(Timestamp::ZERO, true).unwrap();
+		catalog
+			.snapshot()
+			.ext
+			.mpegts
+			.si
+			.get(&0x0011)
+			.map(|tables| tables[&0x42].track.clone())
+	};
+
+	let track = feed(sdt_actual(0, 0, 0, &[(1, b"One")])).expect("the SDT is advertised");
+	// A superseded snapshot is stale at once, so the first is read before the next revision.
+	let first = newest_si_group(&consumer, &track).await;
+	// One unflagged bit flip turns the service name "One" into "Nne" under the source CRC.
+	let mut corrupt = sdt_actual(1, 0, 0, &[(1, b"One")]);
+	let name = corrupt.len() - 4 - 3;
+	corrupt[name] ^= 0x01;
+	assert_eq!(feed(corrupt), Some(track.clone()), "the corrupt revision kept the SDT");
+	assert_eq!(feed(sdt_actual(2, 0, 0, &[(1, b"Uno")])), Some(track.clone()));
+	capture.finish(Timestamp::ZERO).unwrap();
+	let last = newest_si_group(&consumer, &track).await;
+
+	assert_eq!((first.0, last.0), (0, 1), "no snapshot for the corrupt revision");
+	assert_sdt_lists_only(&first.1[0], 0, 1, b"One");
+	assert_sdt_lists_only(&last.1[0], 2, 1, b"Uno");
+}
+
+/// A multi-section SDT revision with the selected service's section corrupt does not
+/// commit as complete-as-observed when the other section repeats: that would read as
+/// the service leaving. The revision commits once the section arrives intact.
+#[tokio::test(start_paused = true)]
+async fn a_partial_sdt_revision_keeps_the_last_good_snapshot() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	let mut capture = crate::container::ts::si::Capture::new(broadcast, catalog.clone());
+	capture.select(1);
+	// One PCR interval, so the program clock places SI.
+	capture.pcr(0, 0);
+	capture.pcr(40 * 27_000, 10);
+	let mut feed = |section: Vec<u8>| {
+		assert!(capture.section(0x0011, section.into(), 10));
+		capture.flush(Timestamp::ZERO, true).unwrap();
+		catalog
+			.snapshot()
+			.ext
+			.mpegts
+			.si
+			.get(&0x0011)
+			.map(|tables| tables[&0x42].track.clone())
+	};
+
+	feed(sdt_actual(0, 0, 1, &[(1, b"One")]));
+	let track = feed(sdt_actual(0, 1, 1, &[(2, b"Two")])).expect("the SDT is advertised");
+	// A superseded snapshot is stale at once, so the first is read before the next revision.
+	let first = newest_si_group(&consumer, &track).await;
+	let mut corrupt = sdt_actual(1, 0, 1, &[(1, b"One")]);
+	let name = corrupt.len() - 4 - 3;
+	corrupt[name] ^= 0x01;
+	assert_eq!(feed(corrupt), Some(track.clone()));
+	assert_eq!(feed(sdt_actual(1, 1, 1, &[(2, b"Two")])), Some(track.clone()));
+	assert_eq!(
+		feed(sdt_actual(1, 1, 1, &[(2, b"Two")])),
+		Some(track.clone()),
+		"the repeated section did not commit the partial revision"
+	);
+	assert_eq!(feed(sdt_actual(1, 0, 1, &[(1, b"Uno")])), Some(track.clone()));
+	capture.finish(Timestamp::ZERO).unwrap();
+	let last = newest_si_group(&consumer, &track).await;
+
+	assert_eq!((first.0, last.0), (0, 1), "no snapshot for the partial revision");
+	assert_sdt_lists_only(&first.1[0], 0, 1, b"One");
+	assert_sdt_lists_only(&last.1[0], 1, 1, b"Uno");
+}
+
+/// A selection filters EIT schedule actual (0x50..=0x5F) by service, as it does
+/// present/following.
+#[tokio::test(start_paused = true)]
+async fn a_selection_filters_eit_schedule() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	let mut capture = crate::container::ts::si::Capture::new(broadcast, catalog.clone());
+	capture.select(1);
+	// One PCR interval, so the program clock places SI.
+	capture.pcr(0, 0);
+	capture.pcr(40 * 27_000, 10);
+	let schedule = |service: u16| {
+		let body = [0x00, 0x01, 0x00, 0x02, 0x00, 0x50, service as u8];
+		make_long_section(0x50, service, 0, 0, 0, &body)
+	};
+	for service in [1, 2] {
+		assert!(capture.section(0x0012, schedule(service).into(), 10));
+	}
+	capture.finish(Timestamp::ZERO).unwrap();
+
+	let si = catalog.snapshot().ext.mpegts.si.clone();
+	assert_eq!(
+		read_si_sections(&consumer, &si[&0x0012][&0x50].track).await,
+		vec![Bytes::from(schedule(1))],
+		"only the selected service's schedule"
+	);
+}
+
+/// A selected program's reduced SI survives export: the TS parses, and importing it
+/// again finds the same single-service SDT and the same EIT.
+#[tokio::test(start_paused = true)]
+async fn a_selected_programs_si_survives_export() {
+	let mut input = crate::container::ts::import::test::two_programs();
+	input.extend(two_service_si());
+	let mut rig = si_rig_selecting(2);
+	rig.import.decode(&BytesMut::from(&input[..])).unwrap();
+	let _finished = rig.import.finish().unwrap();
+
+	let ts = drain_with(
+		open_ts(
+			crate::source::announced(&rig.consumer).await,
+			crate::catalog::CatalogFormat::Hang,
+			RECORDING_MAX_AGE,
+		)
+		.await
+		.unwrap(),
+	)
+	.await;
+	assert_packet_aligned(&ts);
+	let mut reader = TsPacketReader::new(Cursor::new(ts.as_ref()));
+	while reader.read_ts_packet().unwrap().is_some() {}
+
+	let sdt = ts_sections(&ts, 0x0011);
+	assert_eq!(sdt.len(), 1, "one SDT actual section");
+	assert_sdt_lists_only(&sdt[0], 0, 2, b"Two");
+	assert_eq!(
+		ts_sections(&ts, 0x0012),
+		vec![eit_pf(2, 0), eit_pf(2, 1)],
+		"only program 2's EIT"
+	);
+}
+
+/// The sections `ts` carries on `pid`, each whole in one packet, read off the wire.
+fn ts_sections(ts: &[u8], pid: u16) -> Vec<Bytes> {
+	ts.chunks(188)
+		.filter(|p| (u16::from(p[1] & 0x1f) << 8 | u16::from(p[2])) == pid && p[1] & 0x40 != 0)
+		.map(|p| {
+			let pointer = if p[3] & 0x20 != 0 { 5 + usize::from(p[4]) } else { 4 };
+			let start = pointer + 1 + usize::from(p[pointer]);
+			let len = 3 + (usize::from(p[start + 1] & 0x0f) << 8 | usize::from(p[start + 2]));
+			Bytes::copy_from_slice(&p[start..start + len])
+		})
+		.collect()
+}
+
+/// #2842: SDT other sections from two networks that reuse a transport_stream_id
+/// must not collide. The identity reads original_network_id (bytes 8..10) for
+/// table_id 0x46, so both survive as separate sub-tables; a revision within one
+/// network still replaces in place.
+#[tokio::test(start_paused = true)]
+async fn sdt_other_networks_do_not_collide() {
+	// Same TSID (the extension), different ONID leading the body.
+	let net1 = make_long_section(0x46, 7, 0, 0, 0, &[0x00, 0x01, 0xaa]);
+	let net2 = make_long_section(0x46, 7, 0, 0, 0, &[0x00, 0x02, 0xbb]);
+	let net1v2 = make_long_section(0x46, 7, 1, 0, 0, &[0x00, 0x01, 0xcc]);
+
+	let mut input = si_packet(0x0011, &net1);
+	input.extend_from_slice(&si_packet_cc(0x0011, &net2, 1));
+	input.extend_from_slice(&si_packet_cc(0x0011, &net1v2, 2));
+	let mut rig = si_rig();
+	rig.import.decode(&BytesMut::from(&input[..])).unwrap();
+	let _finished = rig.import.finish().unwrap();
+
+	let si = rig.catalog.snapshot().ext.mpegts.si.clone();
+	let entry = &si[&0x0011][&0x46];
+	assert_eq!(
+		read_si_sections(&rig.consumer, &entry.track).await,
+		vec![Bytes::from(net1v2), Bytes::from(net2)],
+		"both networks survive; the revision replaced only its own network"
+	);
+}
+
+/// A next-version section (current_next_indicator clear) describes a future state
+/// and is dropped: only what is currently in force is carried. The current NIT is
+/// the positive control proving the pipeline ran; a lone dropped packet would pass
+/// vacuously, since sync lock needs a second packet before anything routes.
+#[tokio::test(start_paused = true)]
+async fn next_version_sections_are_dropped() {
+	let mut next = make_long_section(0x42, 1, 3, 0, 0, &[0xaa; 4]);
+	next[5] &= !0x01;
+	let nit = make_long_section(0x40, 1, 0, 0, 0, &[0xbb; 4]);
+
+	let mut input = si_packet(0x0011, &next);
+	input.extend_from_slice(&si_packet_cc(0x0011, &next, 1));
+	input.extend_from_slice(&si_packet(0x0010, &nit));
+	input.extend_from_slice(&si_packet_cc(0x0010, &nit, 1));
+	let mut rig = si_rig();
+	rig.import.decode(&BytesMut::from(&input[..])).unwrap();
+	let _finished = rig.import.finish().unwrap();
+
+	let si = rig.catalog.snapshot().ext.mpegts.si.clone();
+	assert!(si.contains_key(&0x0010), "the current NIT was captured (control)");
+	assert!(!si.contains_key(&0x0011), "a next-version section creates no entry");
+}
+
+/// TDT/TOT (0x0014) is proxied as a latest-value slot (#2914): each tick replaces
+/// the last, so the newest snapshot is the source's most recent time, never an
+/// accumulation of stale ones. The SDT is the positive control proving the
+/// pipeline ran.
+#[tokio::test(start_paused = true)]
+async fn tdt_round_trips_as_latest_value() {
+	let tick = |mjd: u8| make_short_section(0x70, &[0xc0, mjd, 0x12, 0x34, 0x56]);
+	let sdt = make_long_section(0x42, 1, 0, 0, 0, &[0xaa; 4]);
+
+	let mut rig = si_rig();
+	let mut input = si_packet(0x0014, &tick(1));
+	input.extend_from_slice(&si_packet_cc(0x0014, &tick(1), 1));
+	input.extend_from_slice(&si_packet(0x0011, &sdt));
+	input.extend_from_slice(&si_packet_cc(0x0011, &sdt, 1));
+	rig.import.decode(&BytesMut::from(&input[..])).unwrap();
+	// The clock ticks: the new section replaces the old slot.
+	rig.import
+		.decode(&BytesMut::from(&si_packet_cc(0x0014, &tick(2), 2)[..]))
+		.unwrap();
+	let _finished = rig.import.finish().unwrap();
+
+	let si = rig.catalog.snapshot().ext.mpegts.si.clone();
+	assert!(si.contains_key(&0x0011), "the SDT was captured (control)");
+	let entry = si
+		.get(&0x0014)
+		.and_then(|tables| tables.get(&0x70))
+		.expect("a TDT entry");
+	assert_eq!(entry.interval, Some(Duration::from_secs(30)), "the TDT/TOT 30s maximum");
+	assert_eq!(
+		read_si_sections(&rig.consumer, &entry.track).await,
+		vec![Bytes::from(tick(2))],
+		"the newest snapshot is the latest tick alone"
+	);
+	let (sequence, _) = newest_si_group(&rig.consumer, &entry.track).await;
+	assert_eq!(sequence, 1, "one group per tick, no accumulation");
+}
+
+/// Build a well-formed short-form section (syntax indicator clear): header + body,
+/// no extension, versioning, or CRC.
+fn make_short_section(table_id: u8, body: &[u8]) -> Vec<u8> {
+	let mut s = vec![
+		table_id,
+		0x30 | ((body.len() >> 8) as u8 & 0x0f),
+		(body.len() & 0xff) as u8,
+	];
+	s.extend_from_slice(body);
+	s
+}
+
+/// Aborting the importer must remove the advertised SI entries from the catalog:
+/// a map naming aborted tracks would strand every later exporter on subscriptions
+/// that can never deliver.
+#[tokio::test(start_paused = true)]
+async fn abort_removes_si_catalog_entries() {
+	let sdt = make_long_section(0x42, 1, 0, 0, 0, &[0xaa; 4]);
+	// Twice: sync lock needs a second packet before the first routes at all.
+	let mut input = si_packet(0x0011, &sdt);
+	input.extend_from_slice(&si_packet_cc(0x0011, &sdt, 1));
+	let mut rig = si_rig();
+	rig.import.decode(&BytesMut::from(&input[..])).unwrap();
+	assert!(
+		!rig.catalog.snapshot().ext.mpegts.si.is_empty(),
+		"the SDT entry was advertised"
+	);
+
+	rig.import.abort(moq_net::Error::Cancel);
+	assert!(
+		rig.catalog.snapshot().ext.mpegts.si.is_empty(),
+		"abort removed the advertised entries"
+	);
+}
+
+/// A byte-identical short-form repetition is not a change: the latest-value slot
+/// only cuts a group when the bytes actually differ.
+#[tokio::test(start_paused = true)]
+async fn short_form_repetition_cuts_no_group() {
+	let tdt = make_short_section(0x70, &[0xc0, 0x79, 0x12, 0x34, 0x56]);
+
+	let mut rig = si_rig();
+	let mut input = si_packet(0x0014, &tdt);
+	input.extend_from_slice(&si_packet_cc(0x0014, &tdt, 1));
+	rig.import.decode(&BytesMut::from(&input[..])).unwrap();
+	rig.import
+		.decode(&BytesMut::from(&si_packet_cc(0x0014, &tdt, 2)[..]))
+		.unwrap();
+	let _finished = rig.import.finish().unwrap();
+
+	let si = rig.catalog.snapshot().ext.mpegts.si.clone();
+	let (sequence, _) = newest_si_group(&rig.consumer, &si[&0x0014][&0x70].track).await;
+	assert_eq!(sequence, 0, "a repetition cut no further group");
+}
+
+/// SI never gates output: an advertised entry whose track resolves but never
+/// delivers a snapshot (a stale announce) must not hold the programme dark.
+/// Media flows immediately and the entry simply emits nothing.
+#[tokio::test(start_paused = true)]
+async fn stale_si_entry_does_not_block_output() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+
+	// A track that exists (the subscription resolves) but never produces a group.
+	let ghost = broadcast.create_track("ghost.si", timed()).unwrap();
+
+	let avcc = crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap();
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".avc1"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
+		.unwrap();
+	let name = track.name().to_string();
+	{
+		let mut guard = catalog.modify().unwrap();
+		let mut cfg = VideoConfig::new(H264 {
+			profile: 0x64,
+			constraints: 0,
+			level: 0x1f,
+			inline: false,
+		});
+		cfg.container = Container::Legacy;
+		cfg.description = Some(avcc);
+		guard.video.renditions.insert(name.clone(), cfg);
+		guard.ext.mpegts.si.entry(0x0011).or_default().insert(
+			0x42,
+			tscat::SiEntry {
+				track: "ghost.si".to_string(),
+				interval: Some(Duration::from_secs(2)),
+				..Default::default()
+			},
+		);
+	}
+
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	let mut idr = vec![0x65u8];
+	idr.extend(std::iter::repeat_n(0xAB, 64));
+	producer
+		.write(Frame {
+			timestamp: Timestamp::ZERO,
+			duration: None,
+			payload: length_prefixed(&[&idr]),
+			keyframe: true,
+		})
+		.unwrap();
+	producer.cut(None).unwrap();
+	let _finished = producer.finish().unwrap();
+
+	let mut exporter = open_ts(
+		crate::source::announced(&consumer).await,
+		crate::catalog::CatalogFormat::Hang,
+		std::time::Duration::ZERO,
+	)
+	.await
+	.unwrap();
+	// The timeout distinguishes "produced output promptly" from "held dark";
+	// under paused time a wedged exporter would hit it instantly.
+	let frame = kio::clock::timeout(DRAIN, exporter.next())
+		.await
+		.expect("a stale SI entry must not hold output dark")
+		.unwrap()
+		.expect("a muxed frame");
+	assert!(!frame.payload.is_empty());
+	assert!(
+		!frame
+			.payload
+			.as_chunks::<188>()
+			.0
+			.iter()
+			.any(|p| ((((p[1] & 0x1f) as u16) << 8) | p[2] as u16) == 0x0011),
+		"nothing was emitted for the undelivered entry"
+	);
+	drop(ghost);
 }
 
 /// A raw Opus packet: a one-byte TOC (config 1 = SILK NB 20 ms, stereo, code 0) plus
@@ -1968,18 +5294,21 @@ fn strip_opus_control(mut data: &[u8]) -> Vec<Vec<u8>> {
 async fn export_opus_roundtrip() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
 	let track = broadcast
-		.create_track(broadcast.unique_name(".opus"), hang::container::track_info())
+		.create_track(
+			broadcast.unique_name(".opus"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
 		.unwrap();
 	let name = track.name().to_string();
 	{
 		let mut cfg = AudioConfig::new(AudioCodec::Opus, 48_000, 2);
 		cfg.container = Container::Legacy;
-		catalog.lock().audio.renditions.insert(name.clone(), cfg);
+		catalog.modify().unwrap().audio.renditions.insert(name.clone(), cfg);
 	}
-	let mut producer = Producer::new(track, HangContainer::Legacy);
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
 
 	// The last packet is > 184 bytes to force PES splitting across TS packets.
 	let packets: Vec<Bytes> = vec![opus_packet(0x01, 4), opus_packet(0x10, 8), opus_packet(0x20, 200)];
@@ -1994,7 +5323,7 @@ async fn export_opus_roundtrip() {
 			.unwrap();
 		producer.cut(None).unwrap();
 	}
-	producer.finish().unwrap();
+	let _finished = producer.finish().unwrap();
 
 	let ts = drain(consumer).await;
 	assert_packet_aligned(&ts);
@@ -2045,18 +5374,21 @@ async fn export_opus_roundtrip() {
 async fn opus_export_import_roundtrip() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
 	let track = broadcast
-		.create_track(broadcast.unique_name(".opus"), hang::container::track_info())
+		.create_track(
+			broadcast.unique_name(".opus"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
 		.unwrap();
 	let name = track.name().to_string();
 	{
 		let mut cfg = AudioConfig::new(AudioCodec::Opus, 48_000, 2);
 		cfg.container = Container::Legacy;
-		catalog.lock().audio.renditions.insert(name.clone(), cfg);
+		catalog.modify().unwrap().audio.renditions.insert(name.clone(), cfg);
 	}
-	let mut producer = Producer::new(track, HangContainer::Legacy);
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
 
 	let packets: Vec<Bytes> = (0..4).map(|i| opus_packet(0x40 + i as u8, 24)).collect();
 	for (i, payload) in packets.iter().enumerate() {
@@ -2070,17 +5402,17 @@ async fn opus_export_import_roundtrip() {
 			.unwrap();
 		producer.cut(None).unwrap();
 	}
-	producer.finish().unwrap();
+	let _finished = producer.finish().unwrap();
 
 	let ts = drain(consumer).await;
 
 	// Re-import the TS we just produced.
 	let mut imported = moq_net::broadcast::Info::new().produce();
 	let imported_consumer = imported.consume();
-	let import_catalog = crate::catalog::Producer::new(&mut imported).unwrap();
+	let import_catalog = crate::catalog::Producer::new(&mut imported, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(imported, import_catalog.reserve());
 	import.decode(&ts).unwrap();
-	import.finish().unwrap();
+	let _finished = import.finish().unwrap();
 
 	let snapshot = import_catalog.snapshot();
 	assert_eq!(snapshot.audio.renditions.len(), 1, "expected one Opus track");
@@ -2090,11 +5422,187 @@ async fn opus_export_import_roundtrip() {
 	assert_eq!(audio.channel_count, 2);
 
 	// The imported packets must match what we published.
-	let recovered = read_frames(&imported_consumer, opus_name).await;
+	let recovered = read_frames(&imported_consumer, opus_name, Kind::Audio).await;
 	assert_eq!(recovered.len(), packets.len(), "frame count");
 	for (orig, got) in packets.iter().zip(&recovered) {
 		assert_eq!(got.as_slice(), orig.as_ref(), "Opus packet survived the round-trip");
 	}
+}
+
+/// An OpusHead for `channels` channels. `pre_skip` is libopus's usual 6.5 ms, so the
+/// bytes are a real head rather than a channel count with the magic glued on.
+fn opus_head(channels: u32, mapping: Option<crate::codec::opus::Mapping>) -> Bytes {
+	let mut config = crate::codec::opus::Config::new(48_000, channels);
+	config.pre_skip = 312;
+	config.mapping = mapping;
+	config.encode().expect("a real OpusHead")
+}
+
+fn opus_mapping(family: u8, streams: u8, coupled: u8, table: &[u8]) -> crate::codec::opus::Mapping {
+	crate::codec::opus::Mapping::new(crate::codec::opus::mapping::Config {
+		family,
+		streams,
+		coupled,
+		table,
+	})
+	.expect("mapping")
+}
+
+/// Publish one Opus frame and export it. `Err` is the exporter's refusal.
+async fn export_opus_track(channel_count: u32, description: Option<Bytes>) -> Result<BytesMut, String> {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".opus"),
+			hang::container::track_info(hang::catalog::PRIORITY.audio),
+		)
+		.unwrap();
+	let mut cfg = AudioConfig::new(AudioCodec::Opus, 48_000, channel_count);
+	cfg.container = Container::Legacy;
+	cfg.description = description;
+	catalog
+		.modify()
+		.unwrap()
+		.audio
+		.renditions
+		.insert(track.name().to_string(), cfg);
+
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	producer
+		.write(Frame {
+			timestamp: Timestamp::ZERO,
+			duration: None,
+			payload: opus_packet(0x01, 8),
+			keyframe: true,
+		})
+		.unwrap();
+	let _finished = producer.finish().unwrap();
+
+	let mut exporter = open_export(crate::source::announced(&consumer).await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	let mut out = BytesMut::new();
+	loop {
+		match kio::clock::timeout(DRAIN, exporter.next()).await {
+			Ok(Ok(Some(frame))) => out.extend_from_slice(&frame.payload),
+			Ok(Ok(None)) => return Ok(out),
+			Ok(Err(err)) => return Err(err.to_string()),
+			Err(_) => return Ok(out),
+		}
+	}
+}
+
+/// The plain `channel_config_code` on the first PMT.
+fn opus_config_code(ts: &[u8]) -> u8 {
+	let mut reader = TsPacketReader::new(Cursor::new(ts));
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		if let Some(TsPayload::Pmt(pmt)) = packet.payload {
+			let ext = pmt.es_info[0]
+				.descriptors
+				.iter()
+				.find(|d| d.tag == 0x7f)
+				.expect("extension descriptor");
+			assert_eq!(ext.data[0], 0x80, "extension_descriptor_tag");
+			return ext.data[1];
+		}
+	}
+	panic!("missing PMT");
+}
+
+/// Channel count ffprobe reads from the descriptor. ffmpeg's demuxer is what a plain
+/// code has to agree with; a clamped or guessed code shows up here as the wrong count.
+fn ffprobe_opus_channels(ts: &[u8]) -> u32 {
+	let mut child = std::process::Command::new("ffprobe")
+		.args([
+			"-v",
+			"error",
+			"-select_streams",
+			"a:0",
+			"-show_entries",
+			"stream=codec_name,channels",
+			"-of",
+			"csv=p=0",
+			"-i",
+			"pipe:0",
+		])
+		.stdin(std::process::Stdio::piped())
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped())
+		.spawn()
+		.expect("ffprobe is in the dev shell");
+	child.stdin.take().unwrap().write_all(ts).unwrap();
+	let output = child.wait_with_output().unwrap();
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	assert!(output.status.success(), "ffprobe failed: {stderr} stdout={stdout}");
+	let line = stdout.lines().next().unwrap_or("").trim();
+	let (codec, channels) = line.split_once(',').unwrap_or_else(|| panic!("ffprobe: {line}"));
+	assert_eq!(codec, "opus", "ffprobe: {line} ({stderr})");
+	channels
+		.trim()
+		.parse()
+		.unwrap_or_else(|_| panic!("ffprobe channels in {line}"))
+}
+
+/// A head the extension descriptor can name keeps the plain channel code, and
+/// ffprobe reads that count. A family 255 or ambisonic head, a family 1 table that
+/// is not Vorbis, a head that contradicts the catalog, or more than stereo with no
+/// head is refused rather than labeled with a clamped count.
+#[tokio::test(start_paused = true)]
+async fn opus_export_refuses_a_head_it_cannot_label() {
+	for channels in 1..=2 {
+		let ts = export_opus_track(channels, Some(opus_head(channels, None)))
+			.await
+			.expect("family 0");
+		assert_eq!(opus_config_code(&ts), channels as u8);
+		assert_eq!(ffprobe_opus_channels(&ts), channels);
+		let ts = export_opus_track(channels, None).await.expect("no head");
+		assert_eq!(opus_config_code(&ts), channels as u8);
+		assert_eq!(ffprobe_opus_channels(&ts), channels);
+	}
+	for channels in 1..=8u32 {
+		let mapping = crate::codec::opus::Mapping::vorbis(channels as u8).unwrap();
+		let ts = export_opus_track(channels, Some(opus_head(channels, Some(mapping))))
+			.await
+			.unwrap_or_else(|err| panic!("{channels} channel Vorbis head: {err}"));
+		assert_eq!(opus_config_code(&ts), channels as u8, "{channels} channels");
+		assert_eq!(ffprobe_opus_channels(&ts), channels, "{channels} channels");
+	}
+
+	// 5.1 with the center and LFE swapped, still four streams and two coupled.
+	let swapped = opus_mapping(1, 4, 2, &[0, 4, 1, 2, 5, 3]);
+	// The uncoupled identity table ffmpeg writes as `0x80 | channels`, which its demuxer does not read.
+	let identity = opus_mapping(1, 6, 0, &[0, 1, 2, 3, 4, 5]);
+	let ambisonic = opus_mapping(2, 4, 0, &[0, 1, 2, 3]);
+	let family_255 = opus_mapping(255, 2, 0, &[0, 1]);
+	let wide = opus_mapping(255, 9, 0, &[0, 1, 2, 3, 4, 5, 6, 7, 8]);
+
+	// A zero channel count never reaches the exporter: the catalog refuses it.
+	let refused: [(u32, Option<Bytes>, &str); 8] = [
+		(6, None, "no OpusHead"),
+		(9, None, "no OpusHead"),
+		(6, Some(opus_head(6, Some(swapped))), "not the Vorbis layout"),
+		(6, Some(opus_head(6, Some(identity))), "not the Vorbis layout"),
+		(4, Some(opus_head(4, Some(ambisonic))), "not the Vorbis layout"),
+		(2, Some(opus_head(2, Some(family_255))), "not the Vorbis layout"),
+		(9, Some(opus_head(9, Some(wide))), "not the Vorbis layout"),
+		(6, Some(opus_head(2, None)), "catalog declares"),
+	];
+	for (channels, description, needle) in refused {
+		let err = export_opus_track(channels, description)
+			.await
+			.expect_err("a guessed channel_config_code");
+		assert!(err.contains(needle), "expected {needle} in {err}");
+	}
+
+	let err = export_opus_track(2, Some(Bytes::from_static(b"not-an-opus-head")))
+		.await
+		.expect_err("a head that does not parse");
+	assert!(err.contains("cannot read the OpusHead"), "{err}");
 }
 
 // Two exporters of one broadcast, started at different times, must render the same packets
@@ -2118,18 +5626,51 @@ const JOIN: u64 = 75;
 /// Produce one broadcast and export it twice, the second exporter joining partway in, and
 /// return what each rendered.
 ///
-/// Both exporters are drained after every write, so neither skips a group and the two see the
-/// same arrival order. That isolates the question under test (does the *rendering* depend on
-/// when the process started) from the separate question of whether two legs received the same
-/// groups in the same order.
-async fn export_twice(with_video: bool) -> (Vec<Frame>, Vec<Frame>) {
+/// Media drains after each write so neither exporter skips a group. Clock-table revisions
+/// arrive between the two drains, before their stamped media position: each leg sees the same
+/// snapshot at a different media position. The SDT's unchanged repeats and TDT/TOT revisions
+/// must still land on the same frames.
+/// The zero-delay exports request no superseded history; queued bursts need an explicit
+/// delay budget, as in `queued_clock_revisions_follow_the_exporters_freshness_budgets`.
+async fn export_twice(with_video: bool, late_clock: bool) -> (Vec<Frame>, Vec<Frame>) {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	let _sdt = publish_sdt(&mut broadcast, &mut catalog);
+	let mut clocks = [0x70, 0x73].map(|table_id| {
+		let mut track = broadcast.create_track(format!("clock-{table_id}"), timed()).unwrap();
+		track
+			.write_frame(Timestamp::ZERO, Bytes::from(make_short_section(table_id, &[0; 5])))
+			.unwrap();
+		catalog
+			.modify()
+			.unwrap()
+			.ext
+			.mpegts
+			.si
+			.entry(0x0014)
+			.or_default()
+			.insert(
+				table_id,
+				tscat::SiEntry {
+					track: track.name().to_string(),
+					interval: Some(Duration::from_secs(30)),
+					..Default::default()
+				},
+			);
+		(table_id, track)
+	});
 
 	let mut video = with_video.then(|| {
 		let track = broadcast
-			.create_track(broadcast.unique_name(".avc1"), hang::container::track_info())
+			.create_track(
+				broadcast.unique_name(".avc1"),
+				hang::container::track_info(hang::catalog::PRIORITY.video),
+			)
 			.unwrap();
 		// Out-of-band parameter sets (avc1), so the export source takes the catalog
 		// description as-is instead of parsing them out of the bitstream.
@@ -2142,22 +5683,43 @@ async fn export_twice(with_video: bool) -> (Vec<Frame>, Vec<Frame>) {
 		cfg.container = Container::Legacy;
 		cfg.description =
 			Some(crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap());
-		catalog.lock().video.renditions.insert(track.name().to_string(), cfg);
-		Producer::new(track, HangContainer::Legacy)
+		catalog
+			.modify()
+			.unwrap()
+			.video
+			.renditions
+			.insert(track.name().to_string(), cfg);
+		Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data))
 	});
 
 	let mut audio = {
 		let track = broadcast
-			.create_track(broadcast.unique_name(".aac"), hang::container::track_info())
+			.create_track(
+				broadcast.unique_name(".aac"),
+				hang::container::track_info(hang::catalog::PRIORITY.audio),
+			)
 			.unwrap();
 		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
 		cfg.container = Container::Legacy;
-		catalog.lock().audio.renditions.insert(track.name().to_string(), cfg);
-		Producer::new(track, HangContainer::Legacy)
+		catalog
+			.modify()
+			.unwrap()
+			.audio
+			.renditions
+			.insert(track.name().to_string(), cfg);
+		Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data))
 	};
 
-	let source = crate::source::announced(&consumer);
-	let mut a = Export::new(source.clone()).await.unwrap();
+	let source = crate::source::announced(&consumer).await;
+	let export = || {
+		open_ts(
+			source.clone(),
+			crate::catalog::CatalogFormat::Hang,
+			std::time::Duration::ZERO,
+		)
+	};
+	let mut a = export().await.unwrap();
 	let mut b = None;
 	let (mut out_a, mut out_b) = (Vec::new(), Vec::new());
 
@@ -2193,11 +5755,27 @@ async fn export_twice(with_video: bool) -> (Vec<Frame>, Vec<Frame>) {
 		}
 
 		out_a.extend(drain_frames(&mut a).await);
+		if if late_clock { tick == 100 } else { tick % 30 == 10 } {
+			for (table_id, track) in &mut clocks {
+				track
+					.write_frame(
+						Timestamp::from_micros(if late_clock {
+							(tick - 5) * VIDEO_US
+						} else {
+							(tick + 5) * VIDEO_US + 1_000
+						})
+						.unwrap(),
+						Bytes::from(make_short_section(*table_id, &[tick as u8; 5])),
+					)
+					.unwrap();
+			}
+		}
+
 		if let Some(b) = b.as_mut() {
 			out_b.extend(drain_frames(b).await);
 		}
 		if tick + 1 == JOIN {
-			b = Some(Export::new(source.clone()).await.unwrap());
+			b = Some(export().await.unwrap());
 		}
 	}
 
@@ -2206,12 +5784,25 @@ async fn export_twice(with_video: bool) -> (Vec<Frame>, Vec<Frame>) {
 
 /// Pull every frame an exporter can render right now, like `drain` but keeping the frames
 /// whole (this compares them one by one, not as one byte stream).
-async fn drain_frames<E: tscat::Catalog>(export: &mut Export<E>) -> Vec<Frame> {
+async fn drain_frames<S: crate::catalog::Stream>(export: &mut Export<S>) -> Vec<Frame>
+where
+	S::Ext: tscat::Catalog,
+{
 	let mut out = Vec::new();
-	while let Ok(res) = tokio::time::timeout(Duration::from_secs(1), export.next()).await {
-		match res.expect("exporter error") {
-			Some(frame) => out.push(frame),
-			None => break,
+	loop {
+		out.extend(poll_frames(export));
+		// Run the paused clock only as far as the next frame due, so a test that writes
+		// more afterwards is still on time for it.
+		if let Some(deadline) = export.next_due() {
+			kio::clock::sleep_until(deadline).await;
+			continue;
+		}
+		match kio::clock::timeout(Duration::from_millis(10), export.next()).await {
+			Ok(Ok(Some(frame))) => out.push(frame),
+			Ok(Ok(None)) => break,
+			Err(_) if export.next_due().is_none() => break,
+			Err(_) => {}
+			Ok(Err(err)) => panic!("exporter error: {err}"),
 		}
 	}
 	out
@@ -2258,7 +5849,7 @@ fn assert_only_continuity_differs(a: &[Frame], b: &[Frame], from: Timestamp) {
 
 #[tokio::test(start_paused = true)]
 async fn late_join_matches_a_running_exporter() {
-	let (a, b) = export_twice(true).await;
+	let (a, b) = export_twice(true, false).await;
 
 	// Skip to the joiner's second keyframe: its first group covers tune-in, where the two legs
 	// legitimately differ because only the joiner has to lead with the program tables.
@@ -2272,27 +5863,1483 @@ async fn late_join_matches_a_running_exporter() {
 /// timeline on its own.
 #[tokio::test(start_paused = true)]
 async fn late_join_matches_a_running_exporter_without_video() {
-	let (a, b) = export_twice(false).await;
+	let (a, b) = export_twice(false, false).await;
 
-	// The joiner leads with its own PCR and a PAT/PMT-carrying tune-in frame so a receiver
-	// can start; the running exporter has no reason to repeat those there. From the first
-	// timestamp after the tune-in frame the two are rendering the same stream. (The joiner's
-	// leading PCR is stamped at a slot boundary at or before the tune-in frame, so comparing
-	// strictly after the tune-in excludes both.)
-	let tune_in = b.iter().find(|f| !is_pcr_frame(f)).expect("a tune-in frame").timestamp;
-	let from = b.iter().map(|f| f.timestamp).filter(|&t| t > tune_in).min().unwrap();
+	// The joiner's first frame leads with PAT/PMT, while the running exporter has no
+	// reason to repeat them there, and its SDT waits for a PCR interval after them. They can
+	// spread over several PCR slices, so compare from the next PAT/PMT refresh past that SDT,
+	// which both exporters anchor to the media grid.
+	let sdt = b
+		.iter()
+		.find(|frame| count_pid(std::slice::from_ref(*frame), 0x0011) > 0)
+		.expect("the joiner's SDT")
+		.timestamp;
+	let from = b
+		.iter()
+		.find(|frame| frame.timestamp > sdt && count_pid(std::slice::from_ref(*frame), 0) > 0)
+		.expect("a periodic PAT/PMT refresh")
+		.timestamp;
 	assert_only_continuity_differs(&a, &b, from);
+}
+
+/// A revision missing its stamped slot cannot be reconstructed there. It goes out at the
+/// next grid slot each leg can still serve, and byte identity returns after both emit it.
+#[tokio::test(start_paused = true)]
+async fn a_late_clock_revision_remains_visible_between_exports() {
+	let (a, b) = export_twice(true, true).await;
+	let revision = make_short_section(0x70, &[100; 5]);
+	let at = |frames: &[Frame]| {
+		frames
+			.iter()
+			.find(|frame| frame.payload.windows(revision.len()).any(|w| w == revision))
+			.unwrap()
+			.timestamp
+	};
+	// This fixture sends each PES in the PCR slice before its decode boundary.
+	// Pin both decisions to the media grid, including the late leg's next slot.
+	assert_eq!(Duration::from(at(&b)) + PCR_INTERVAL, Duration::from_secs(4));
+	assert_eq!(Duration::from(at(&a)) + PCR_INTERVAL, Duration::from_secs(5));
+	assert_only_continuity_differs(&a, &b, Timestamp::from_millis(5_250).unwrap());
+}
+
+// The interleave is a function of the media, not of arrival (moq-dev/moq#2829): each frame
+// goes out a fixed delay after its decode time, in `(DTS, PID)` order, and one that arrives
+// past that deadline is dropped.
+
+/// A video and an audio rendition written frame by frame, on the late-join fixture's
+/// cadence, so a test decides exactly what each exporter has seen when it polls.
+struct Interleave {
+	_broadcast: moq_net::broadcast::Producer,
+	_catalog: crate::catalog::Producer,
+	video: Producer<HangContainer>,
+	audio: Producer<HangContainer>,
+	source: crate::Source,
+	/// The next audio frame to write.
+	audio_index: u64,
+	/// Audio frames per group.
+	audio_group: u64,
+	/// The paused clock's instant at media time zero, set by the first [`Self::at`].
+	start: Option<kio::clock::Instant>,
+}
+
+impl Interleave {
+	async fn new() -> Self {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+
+		let track = broadcast
+			.create_track(
+				broadcast.unique_name(".avc1"),
+				hang::container::track_info(hang::catalog::PRIORITY.video),
+			)
+			.unwrap();
+		let mut cfg = VideoConfig::new(H264 {
+			profile: 0x42,
+			constraints: 0xc0,
+			level: 0x1f,
+			inline: false,
+		});
+		cfg.container = Container::Legacy;
+		cfg.description =
+			Some(crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap());
+		catalog
+			.modify()
+			.unwrap()
+			.video
+			.renditions
+			.insert(track.name().to_string(), cfg);
+		let video = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Video));
+
+		let track = broadcast
+			.create_track(
+				broadcast.unique_name(".aac"),
+				hang::container::track_info(hang::catalog::PRIORITY.audio),
+			)
+			.unwrap();
+		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
+		cfg.container = Container::Legacy;
+		catalog
+			.modify()
+			.unwrap()
+			.audio
+			.renditions
+			.insert(track.name().to_string(), cfg);
+		let audio = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Audio));
+
+		Self {
+			source: crate::source::announced(&consumer).await,
+			_broadcast: broadcast,
+			_catalog: catalog,
+			video,
+			audio,
+			audio_index: 0,
+			audio_group: AUDIO_GROUP,
+			start: None,
+		}
+	}
+
+	/// An exporter with its subscriptions resolved, so later polls need no runtime.
+	async fn export(&self, delay: Duration) -> Export<crate::catalog::Consumer> {
+		let mut export = open_export(self.source.clone(), delay).await.unwrap();
+		assert!(drain_frames(&mut export).await.is_empty());
+		export
+	}
+
+	/// Run the paused clock to `micros` of media time, as a live source would.
+	async fn at(&mut self, micros: u64) {
+		let start = *self.start.get_or_insert_with(kio::clock::now);
+		kio::clock::sleep_until(start.saturating_add(Duration::from_micros(micros))).await;
+	}
+
+	fn video(&mut self, tick: u64) {
+		let keyframe = tick.is_multiple_of(GOP);
+		let slice = if keyframe {
+			vec![0x65u8; 3_000]
+		} else {
+			vec![0x41u8; 400]
+		};
+		self.video
+			.write(Frame {
+				timestamp: Timestamp::from_micros(tick * VIDEO_US).unwrap(),
+				duration: None,
+				payload: length_prefixed(&[&slice]),
+				keyframe,
+			})
+			.unwrap();
+	}
+
+	/// Write every audio frame that starts before `until` microseconds, one at a time,
+	/// polling `export` after each.
+	fn audio_until(&mut self, until: u64, export: &mut Export<crate::catalog::Consumer>, out: &mut Vec<Frame>) {
+		while self.audio_index * AUDIO_US < until {
+			self.audio_frame();
+			out.extend(poll_frames(export));
+		}
+	}
+
+	/// Write the next audio frame.
+	fn audio_frame(&mut self) {
+		let index = self.audio_index;
+		self.audio
+			.write(Frame {
+				timestamp: Timestamp::from_micros(index * AUDIO_US).unwrap(),
+				duration: None,
+				payload: Bytes::from_iter((0..180u16).map(|i| (i ^ index as u16) as u8)),
+				keyframe: index.is_multiple_of(self.audio_group),
+			})
+			.unwrap();
+		self.audio_index += 1;
+	}
+
+	fn finish(&mut self) {
+		self.video.end_with(None).unwrap();
+		self.audio.end_with(None).unwrap();
+	}
+}
+
+/// Pull every frame an exporter can render without letting time pass.
+fn poll_frames<S: crate::catalog::Stream>(export: &mut Export<S>) -> Vec<Frame>
+where
+	S::Ext: tscat::Catalog,
+{
+	let waiter = kio::Waiter::noop();
+	let mut out = Vec::new();
+	while let std::task::Poll::Ready(frame) = export.poll_next(&waiter) {
+		match frame.expect("exporter error") {
+			Some(frame) => out.push(frame),
+			None => break,
+		}
+	}
+	out
+}
+
+/// Every PES start's decode time (its DTS, else its PTS) in the order the stream carries
+/// them, across PIDs.
+fn pes_decode_in_order(frames: &[Frame]) -> Vec<u64> {
+	let bytes: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let mut reader = TsPacketReader::new(Cursor::new(bytes));
+	let mut out = Vec::new();
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		if let Some(TsPayload::PesStart(pes)) = packet.payload
+			&& let Some(pts) = pes.header.pts
+		{
+			out.push(pes.header.dts.unwrap_or(pts).as_u64());
+		}
+	}
+	out
+}
+
+/// How many access units the stream carries: one a PES, or each ADTS frame of an AAC PES.
+fn access_units(frames: &[Frame]) -> usize {
+	let bytes: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let mut reader = PesPacketReader::new(TsPacketReader::new(Cursor::new(bytes)));
+	let mut units = 0;
+	while let Some(pes) = reader.read_pes_packet().unwrap() {
+		let mut data = &pes.data[..];
+		if !(data.len() > 6 && data[0] == 0xff && data[1] & 0xf0 == 0xf0) {
+			units += 1;
+			continue;
+		}
+		while data.len() > 6 {
+			let len = usize::from(data[3] & 3) << 11 | usize::from(data[4]) << 3 | usize::from(data[5] >> 5);
+			data = &data[len.clamp(7, data.len())..];
+			units += 1;
+		}
+	}
+	units
+}
+
+/// Whether every PES start decodes no earlier than those ahead of it, up to one grid slot:
+/// a slot spreads each PID's packets among the others, so units sharing one may swap.
+fn in_decode_order(decode: &[u64]) -> bool {
+	let slot = PCR_INTERVAL.as_micros() as u64 * 90 / 1_000;
+	let mut high = 0;
+	decode.iter().all(|&d| {
+		high = high.max(d);
+		d + slot >= high
+	})
+}
+
+/// Every PES unit, each PID in its own decode order, finishes arriving before it decodes, on
+/// the clock a receiver recovers from the PCRs. Returns how many units were judged.
+pub(super) fn assert_on_time(frames: &[Frame]) -> usize {
+	const WRAP: i128 = 1 << 33;
+	let ts: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	// PCRs unwrapped from the first, which a start a window before the timeline may wrap.
+	let mut pcrs: Vec<(usize, f64, bool)> = Vec::new();
+	for (at, base, _) in collect_pcrs(frames) {
+		let discontinuity = ts[at * 188 + 5] & 0x80 != 0;
+		let base = base as i128;
+		let value = match pcrs.last() {
+			Some(&(_, last, _)) => last + ((base - last as i128).rem_euclid(WRAP)) as f64,
+			None => base as f64,
+		};
+		pcrs.push((at, value, discontinuity));
+	}
+	let first = pcrs.first().map_or(0.0, |&(_, value, _)| value);
+	let time = |at: usize| {
+		let k = pcrs.partition_point(|&(index, _, _)| index < at).checked_sub(1)?;
+		let (&(a, ta, _), &(b, tb, discontinuity)) = (pcrs.get(k)?, pcrs.get(k + 1)?);
+		// A flagged jump starts after the preceding slot's bytes finished. Spreading it
+		// over those bytes would make media delivered on the old clock look late.
+		let span = if discontinuity {
+			PCR_INTERVAL.as_secs_f64() * 90_000.0
+		} else {
+			tb - ta
+		};
+		Some(ta + span * (at - a) as f64 / (b - a) as f64)
+	};
+	// Each PES: its PID, DTS (else PTS) on the PCRs' unwrapped scale, and its last packet.
+	let mut units: Vec<(u16, f64, usize)> = Vec::new();
+	for (at, packet) in ts.chunks(188).enumerate() {
+		let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
+		if pid == 0x1fff || packet[3] & 0x10 == 0 {
+			continue;
+		}
+		let start = 4 + if packet[3] & 0x20 != 0 {
+			usize::from(packet[4]) + 1
+		} else {
+			0
+		};
+		let pes = &packet[start.min(188)..];
+		if packet[1] & 0x40 != 0 && pes.len() >= 14 && pes[..3] == [0, 0, 1] && pes[7] & 0x80 != 0 {
+			let stamp = |b: &[u8]| {
+				i128::from((b[0] >> 1) & 7) << 30
+					| i128::from(b[1]) << 22
+					| i128::from(b[2] >> 1) << 15
+					| i128::from(b[3]) << 7
+					| i128::from(b[4] >> 1)
+			};
+			let decode = if pes[7] & 0x40 != 0 {
+				stamp(&pes[14..19])
+			} else {
+				stamp(&pes[9..14])
+			};
+			let decode = first + ((decode - first as i128).rem_euclid(WRAP)) as f64;
+			units.push((pid, decode, at));
+		} else if let Some(unit) = units.iter_mut().rev().find(|unit| unit.0 == pid) {
+			unit.2 = at;
+		}
+	}
+	let mut last: std::collections::HashMap<u16, f64> = std::collections::HashMap::new();
+	let mut judged = 0;
+	for &(pid, decode, end) in &units {
+		if let Some(previous) = last.insert(pid, decode) {
+			assert!(
+				decode >= previous,
+				"PID {pid} decodes at {decode} after a unit at {previous}"
+			);
+		}
+		let Some(arrived) = time(end + 1) else { continue };
+		assert!(
+			arrived <= decode,
+			"PID {pid}: the unit decoding at {decode} finishes arriving at {arrived:.1}"
+		);
+		judged += 1;
+	}
+	judged
+}
+
+/// Audio lagging video by up to a frame, on a live clock: each video frame lands before
+/// the audio that precedes it. Returns the decode order the exporter emitted.
+async fn lagging_audio(delay: Duration) -> Vec<Frame> {
+	let mut rig = Interleave::new().await;
+	let mut export = rig.export(delay).await;
+	let mut out = Vec::new();
+	for tick in 0..TICKS / 2 {
+		rig.at(tick * VIDEO_US).await;
+		rig.video(tick);
+		out.extend(poll_frames(&mut export));
+		rig.audio_until(tick * VIDEO_US, &mut export, &mut out);
+	}
+	rig.finish();
+	out.extend(drain_frames(&mut export).await);
+	assert_eq!(export.dropped(), 0, "every frame arrived inside its deadline");
+	out
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_audio_still_arrives_on_time() {
+	let frames = lagging_audio(Duration::from_millis(500)).await;
+	// 75 video frames, and the audio packed several frames a PES.
+	assert!(assert_on_time(&frames) > 80, "too little output to judge");
+}
+
+/// A zero delay holds nothing, so the interleave stays in arrival order.
+#[tokio::test(start_paused = true)]
+async fn zero_delay_keeps_arrival_order() {
+	let decode = pes_decode_in_order(&lagging_audio(Duration::ZERO).await);
+	assert!(
+		!in_decode_order(&decode),
+		"video should have led the audio that arrived after it"
+	);
+}
+
+/// Two exporters that see the same frames arrive with different skew, every frame inside
+/// its deadline in both, render the same bytes: one polls after every frame (video ahead
+/// of its audio), the other only once each tick's frames have all landed.
+#[tokio::test(start_paused = true)]
+async fn arrival_order_does_not_change_the_output() {
+	let mut rig = Interleave::new().await;
+	let delay = Duration::from_millis(500);
+	let (mut eager, mut batched) = (rig.export(delay).await, rig.export(delay).await);
+	let (mut out_eager, mut out_batched) = (Vec::new(), Vec::new());
+	for tick in 0..TICKS / 2 {
+		rig.at(tick * VIDEO_US).await;
+		rig.video(tick);
+		out_eager.extend(poll_frames(&mut eager));
+		rig.audio_until(tick * VIDEO_US, &mut eager, &mut out_eager);
+		out_batched.extend(poll_frames(&mut batched));
+	}
+	rig.finish();
+	out_eager.extend(drain_frames(&mut eager).await);
+	out_batched.extend(drain_frames(&mut batched).await);
+
+	let eager: Vec<u8> = out_eager.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let batched: Vec<u8> = out_batched.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	assert!(eager.len() > 100 * 188, "too little output to compare: {}", eager.len());
+	assert!(eager == batched, "arrival order changed the rendering");
+}
+
+/// Audio that arrives past its deadline is dropped and counted, and everything else still
+/// goes out on time.
+#[tokio::test(start_paused = true)]
+async fn a_late_frame_is_dropped_and_the_rest_keep_their_order() {
+	let delay = Duration::from_millis(100);
+	let mut rig = Interleave::new().await;
+	let mut export = rig.export(delay).await;
+	let mut out = Vec::new();
+	for tick in 0..TICKS / 2 {
+		rig.at(tick * VIDEO_US).await;
+		rig.video(tick);
+		out.extend(poll_frames(&mut export));
+		// Audio stalls for 400ms, then its backlog lands at once.
+		if !(20..30).contains(&tick) {
+			rig.audio_until(tick * VIDEO_US, &mut export, &mut out);
+		}
+	}
+	rig.finish();
+	out.extend(drain_frames(&mut export).await);
+
+	let written = rig.audio_index + TICKS / 2;
+	assert!(export.dropped() > 0, "the stalled audio missed its deadline");
+	assert_eq!(
+		access_units(&out) as u64,
+		written - export.dropped(),
+		"only the late frames were dropped"
+	);
+	assert_on_time(&out);
+}
+
+/// Audio dropped for leading the first keyframe does not stall the interleave.
+#[tokio::test(start_paused = true)]
+async fn tune_in_does_not_wait_on_dropped_audio() {
+	let delay = Duration::from_millis(500);
+	let mut rig = Interleave::new().await;
+	let mut export = rig.export(delay).await;
+	let mut out = Vec::new();
+	rig.audio_until(3 * GOP * VIDEO_US, &mut export, &mut out);
+	// Under a delay's worth of the group, read at once: the whole group would leave its
+	// keyframe stale, and the audio would wait on the next.
+	for tick in GOP..GOP + 6 {
+		rig.video(tick);
+	}
+	out.extend(poll_frames(&mut export));
+	// Past the audio's deadline, a delay on from the video's since audio is not sent ahead,
+	// and far enough on that a later frame settles its slot.
+	tokio::time::advance(2 * delay + Duration::from_micros(4 * VIDEO_US)).await;
+	out.extend(poll_frames(&mut export));
+	assert!(!out.is_empty(), "the tune-in waited on audio it had dropped");
+}
+
+/// A join whose first group the publisher cuts short (moq-dev/moq#5565) starts on it all the
+/// same: what arrived of it goes out from its keyframe, ahead of the hole, then the rest is
+/// intact. A path narrower than the media cuts every group, so waiting for a whole one might
+/// never start the export.
+#[tokio::test(start_paused = true)]
+async fn a_start_group_cut_short_goes_out() {
+	use crate::container::Container as _;
+
+	let delay = Duration::from_secs(1);
+	let mut rig = Interleave::new().await;
+	let mut export = rig.export(delay).await;
+	let track = rig.video.track().clone();
+	let wire = HangContainer::Legacy(crate::container::Kind::Video);
+	let picture = |tick: u64| {
+		let keyframe = tick.is_multiple_of(GOP);
+		let slice = vec![if keyframe { 0x65u8 } else { 0x41 }; 400];
+		Frame {
+			timestamp: Timestamp::from_micros(tick * VIDEO_US).unwrap(),
+			duration: None,
+			payload: length_prefixed(&[&slice]),
+			keyframe,
+		}
+	};
+	let mut out = Vec::new();
+
+	// The first group delivers five pictures before the next group lands and the publisher
+	// resets it.
+	let mut cut = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+	for tick in 0..5 {
+		rig.at(tick * VIDEO_US).await;
+		wire.write(&mut cut, &[picture(tick)]).unwrap();
+		out.extend(poll_frames(&mut export));
+		rig.audio_until(tick * VIDEO_US, &mut export, &mut out);
+	}
+	let mut group = track.create_group(moq_net::group::Info { sequence: 1 }).unwrap();
+	wire.write(&mut group, &[picture(GOP)]).unwrap();
+	cut.abort(moq_net::Error::Old).unwrap();
+	for tick in 5..GOP {
+		rig.at(tick * VIDEO_US).await;
+		out.extend(poll_frames(&mut export));
+		rig.audio_until(tick * VIDEO_US, &mut export, &mut out);
+	}
+	for tick in GOP + 1..4 * GOP {
+		rig.at(tick * VIDEO_US).await;
+		if tick.is_multiple_of(GOP) {
+			group.finish().unwrap();
+			group = track
+				.create_group(moq_net::group::Info { sequence: tick / GOP })
+				.unwrap();
+		}
+		wire.write(&mut group, &[picture(tick)]).unwrap();
+		out.extend(poll_frames(&mut export));
+		rig.audio_until(tick * VIDEO_US, &mut export, &mut out);
+	}
+	group.finish().unwrap();
+	rig.finish();
+	out.extend(drain_frames(&mut export).await);
+
+	let ts: Vec<u8> = out.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let (video, audio) = collect_pes_pts(&ts);
+	let pts = |tick: u64| tick * VIDEO_US * 90 / 1_000;
+	assert_eq!(
+		video,
+		(0..5).chain(GOP..4 * GOP).map(pts).collect::<Vec<_>>(),
+		"the export starts on the cut-off group, then resumes at the next"
+	);
+	assert!(
+		audio.iter().all(|&p| p >= pts(0)),
+		"no audio leads the keyframe the export starts at: {audio:?}"
+	);
+	let stats = export.stats().release;
+	assert_eq!(stats.dropped, 0, "nothing that went out lost a frame");
+	assert_eq!(stats.gaps, 1, "the cut is counted");
+	assert_eq!(stats.trimmed, 0, "nothing of the cut-off start is trimmed");
+}
+
+/// Audio released while the video's start moves to its next group is dropped ahead of the
+/// keyframe, and its track has still sent nothing: audio that then misses its deadline is
+/// trimmed with it, not counted as lost from the output.
+#[tokio::test(start_paused = true)]
+async fn audio_dropped_ahead_of_a_moved_start_is_not_started() {
+	let delay = Duration::from_millis(100);
+	let mut rig = Interleave::new().await;
+	rig.audio_group = 1;
+	// Join 160 ms into the first group, older than the delay, so the start moves to the next.
+	let join = 4;
+	for tick in 0..join {
+		rig.at(tick * VIDEO_US).await;
+		rig.video(tick);
+		while rig.audio_index * AUDIO_US < (tick + 1) * VIDEO_US {
+			rig.audio_frame();
+		}
+	}
+	let mut export = open_export(rig.source.clone(), delay).await.unwrap();
+	let mut out = Vec::new();
+	for tick in join..3 * GOP {
+		rig.at(tick * VIDEO_US).await;
+		rig.video(tick);
+		out.extend(poll_frames(&mut export));
+		// The audio flows long enough for some of it to go out and be dropped ahead of the
+		// keyframe, then stalls past its deadline.
+		if !(6..10).contains(&tick) {
+			rig.audio_until((tick + 1) * VIDEO_US, &mut export, &mut out);
+		}
+	}
+	rig.finish();
+	out.extend(drain_frames(&mut export).await);
+
+	let ts: Vec<u8> = out.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let (video, audio) = collect_pes_pts(&ts);
+	let pts = |tick: u64| tick * VIDEO_US * 90 / 1_000;
+	assert_eq!(video.first(), Some(&pts(GOP)), "the export starts at the next group");
+	assert!(
+		audio.iter().all(|&p| p >= pts(GOP)),
+		"no audio leads the keyframe: {audio:?}"
+	);
+	let stats = export.stats().release;
+	assert_eq!(stats.dropped, 0, "nothing was lost from the output");
+	assert!(stats.trimmed > 0);
+}
+
+/// A joiner's start group older than the delay goes stale at acquisition and is dropped
+/// whole, so the video holds nothing until its next keyframe lands. The audio due meanwhile
+/// presents after the dropped keyframe but before the next one, and is dropped rather than
+/// leading it.
+#[tokio::test(start_paused = true)]
+async fn a_stale_start_group_holds_the_audio_behind_the_next_keyframe() {
+	let delay = Duration::from_millis(100);
+	let mut rig = Interleave::new().await;
+	// A group per audio frame, so the joiner's audio starts at the live edge, fresher than the
+	// video's start group.
+	rig.audio_group = 1;
+	// Join 160 ms into the first group: older than the delay, with most of it still to come.
+	let join = 4;
+	for tick in 0..join {
+		rig.at(tick * VIDEO_US).await;
+		rig.video(tick);
+		while rig.audio_index * AUDIO_US < (tick + 1) * VIDEO_US {
+			rig.audio_frame();
+		}
+	}
+	let mut export = open_export(rig.source.clone(), delay).await.unwrap();
+	let mut out = Vec::new();
+	for tick in join..3 * GOP {
+		rig.at(tick * VIDEO_US).await;
+		rig.video(tick);
+		out.extend(poll_frames(&mut export));
+		rig.audio_until((tick + 1) * VIDEO_US, &mut export, &mut out);
+	}
+	rig.finish();
+	out.extend(drain_frames(&mut export).await);
+
+	let ts: Vec<u8> = out.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let (video, audio) = collect_pes_pts(&ts);
+	let pts = |tick: u64| tick * VIDEO_US * 90 / 1_000;
+	assert_eq!(video.first(), Some(&pts(GOP)), "the stale start group is dropped");
+	assert!(
+		audio.iter().all(|&p| p >= pts(GOP)),
+		"no audio leads the keyframe the export starts at: {audio:?}"
+	);
+	let stats = export.stats().release;
+	assert_eq!(stats.dropped, 0, "nothing was lost from the output");
+	assert!(stats.trimmed > 0);
+}
+
+/// A section lost before the cycle wraps commits an observed subset; the next
+/// cycle must *converge* to the full set rather than flip-flop between subsets.
+/// The repetition fast-path skips sections already active, so without the
+/// same-version merge in `commit` the stragglers would replace the subset instead
+/// of completing it, oscillating forever.
+#[tokio::test(start_paused = true)]
+async fn lost_dense_section_recovers_on_the_next_cycle() {
+	let sdt = |number: u8, fill: u8| make_long_section(0x42, 1, 0, number, 2, &[fill; 4]);
+	let s0 = sdt(0, 0xa0);
+	let s1 = sdt(1, 0xa1);
+	let s2 = sdt(2, 0xa2);
+
+	// Cycle 1 loses section 1; the repeat of section 0 wraps and commits {0, 2}.
+	let mut input = si_packet(0x0011, &s0);
+	input.extend_from_slice(&si_packet_cc(0x0011, &s2, 1));
+	input.extend_from_slice(&si_packet_cc(0x0011, &s0, 2));
+	// Cycle 2 supplies section 1; sections 0 and 2 short-circuit as repetitions,
+	// so the wrap carries only the straggler, which must merge, not replace.
+	input.extend_from_slice(&si_packet_cc(0x0011, &s1, 3));
+	input.extend_from_slice(&si_packet_cc(0x0011, &s1, 4));
+	let mut rig = si_rig();
+	rig.import.decode(&BytesMut::from(&input[..])).unwrap();
+	let _finished = rig.import.finish().unwrap();
+
+	let si = rig.catalog.snapshot().ext.mpegts.si.clone();
+	assert_eq!(
+		read_si_sections(&rig.consumer, &si[&0x0011][&0x42].track).await,
+		vec![Bytes::from(s0), Bytes::from(s1), Bytes::from(s2)],
+		"the lost section joined the committed generation instead of replacing it"
+	);
+}
+
+/// A catalog update that keeps the `(PID, table_id)` key but repoints it at a new
+/// track (a restarted publisher) must rebuild the subscription: staying attached
+/// to the old track would repeat its stale sections forever.
+#[tokio::test(start_paused = true)]
+async fn repointed_si_entry_resubscribes() {
+	let sdt_a = make_long_section(0x42, 1, 0, 0, 0, &[0xaa; 8]);
+	let sdt_b = make_long_section(0x42, 1, 1, 0, 0, &[0xbb; 8]);
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+
+	let mut track_a = broadcast.create_track("a.si", timed()).unwrap();
+	track_a
+		.write_frame(Timestamp::ZERO, Bytes::from(sdt_a.clone()))
+		.unwrap();
+	let mut track_b = broadcast.create_track("b.si", timed()).unwrap();
+	track_b
+		.write_frame(Timestamp::ZERO, Bytes::from(sdt_b.clone()))
+		.unwrap();
+
+	let avcc = crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap();
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".avc1"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
+		.unwrap();
+	let name = track.name().to_string();
+	{
+		let mut guard = catalog.modify().unwrap();
+		let mut cfg = VideoConfig::new(H264 {
+			profile: 0x64,
+			constraints: 0,
+			level: 0x1f,
+			inline: false,
+		});
+		cfg.container = Container::Legacy;
+		cfg.description = Some(avcc);
+		guard.video.renditions.insert(name.clone(), cfg);
+		guard.ext.mpegts.si.entry(0x0011).or_default().insert(
+			0x42,
+			tscat::SiEntry {
+				track: "a.si".to_string(),
+				interval: Some(Duration::from_secs(2)),
+				..Default::default()
+			},
+		);
+	}
+
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	let mut idr = vec![0x65u8];
+	idr.extend(std::iter::repeat_n(0xAB, 64));
+	let write_key = |producer: &mut Producer<HangContainer>, sec: u64| {
+		producer
+			.write(Frame {
+				// A minute in, so a frame can go out the whole recording delay ahead of it.
+				timestamp: Timestamp::from_micros((60 + sec) * 1_000_000).unwrap(),
+				duration: None,
+				payload: length_prefixed(&[&idr]),
+				keyframe: true,
+			})
+			.unwrap();
+		producer.cut(None).unwrap();
+	};
+
+	// Writes both GOPs up front and only then reads, so it needs a replay window:
+	// the real-time default would take the live edge and skip the first.
+	let mut exporter = open_ts(
+		crate::source::announced(&consumer).await,
+		crate::catalog::CatalogFormat::Hang,
+		RECORDING_MAX_AGE,
+	)
+	.await
+	.unwrap();
+	let mut before = BytesMut::new();
+	write_key(&mut producer, 0);
+	write_key(&mut producer, 1);
+	for frame in drain_frames(&mut exporter).await {
+		before.extend_from_slice(&frame.payload);
+	}
+
+	// Repoint the entry at the replacement track.
+	catalog
+		.modify()
+		.unwrap()
+		.ext
+		.mpegts
+		.si
+		.get_mut(&0x0011)
+		.unwrap()
+		.insert(
+			0x42,
+			tscat::SiEntry {
+				track: "b.si".to_string(),
+				interval: Some(Duration::from_secs(2)),
+				..Default::default()
+			},
+		);
+
+	// The repointed entry resubscribes through the origin, whose driver mints and
+	// splices the new track between polls: give it the scheduler before the frames
+	// that should carry the new sections, or the exporter drains them all first.
+	let mut after = BytesMut::new();
+	write_key(&mut producer, 2);
+	let frame = kio::clock::timeout(DRAIN, exporter.next())
+		.await
+		.expect("a frame after the switch")
+		.unwrap()
+		.unwrap();
+	after.extend_from_slice(&frame.payload);
+	for _ in 0..100 {
+		tokio::task::yield_now().await;
+	}
+	write_key(&mut producer, 3);
+	write_key(&mut producer, 4);
+	let _finished = producer.finish().unwrap();
+	while let Ok(res) = kio::clock::timeout(DRAIN, exporter.next()).await {
+		let Some(frame) = res.unwrap() else { break };
+		after.extend_from_slice(&frame.payload);
+	}
+
+	let contains = |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
+	assert!(
+		contains(&before, &sdt_a),
+		"the original track's SDT was emitted (control)"
+	);
+	assert!(
+		contains(&after, &sdt_b),
+		"the replacement track's SDT is emitted after the repoint"
+	);
+}
+
+/// An SI revision that lands after the final media frame still reaches the TS:
+/// emission rides media frames, so end of stream flushes every entry's current
+/// sections in one trailing frame before yielding `None`.
+#[tokio::test(start_paused = true)]
+async fn si_revision_after_final_media_frame_is_flushed() {
+	let sdt_v1 = make_long_section(0x42, 1, 0, 0, 0, &[0xaa; 8]);
+	let sdt_v2 = make_long_section(0x42, 1, 1, 0, 0, &[0xbb; 8]);
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+
+	let mut si_track = broadcast.create_track("0x0011-0x42.si", timed()).unwrap();
+	si_track
+		.write_frame(Timestamp::ZERO, Bytes::from(sdt_v1.clone()))
+		.unwrap();
+
+	let avcc = crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap();
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".avc1"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
+		.unwrap();
+	let name = track.name().to_string();
+	{
+		let mut guard = catalog.modify().unwrap();
+		let mut cfg = VideoConfig::new(H264 {
+			profile: 0x64,
+			constraints: 0,
+			level: 0x1f,
+			inline: false,
+		});
+		cfg.container = Container::Legacy;
+		cfg.description = Some(avcc);
+		guard.video.renditions.insert(name.clone(), cfg);
+		guard.ext.mpegts.si.entry(0x0011).or_default().insert(
+			0x42,
+			tscat::SiEntry {
+				track: "0x0011-0x42.si".to_string(),
+				interval: Some(Duration::from_secs(2)),
+				..Default::default()
+			},
+		);
+	}
+
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	let mut idr = vec![0x65u8];
+	idr.extend(std::iter::repeat_n(0xAB, 64));
+	producer
+		.write(Frame {
+			timestamp: Timestamp::ZERO,
+			duration: None,
+			payload: length_prefixed(&[&idr]),
+			keyframe: true,
+		})
+		.unwrap();
+	producer.cut(None).unwrap();
+	let _finished = producer.finish().unwrap();
+
+	let mut exporter = open_ts(
+		crate::source::announced(&consumer).await,
+		crate::catalog::CatalogFormat::Hang,
+		std::time::Duration::ZERO,
+	)
+	.await
+	.unwrap();
+	// v1 goes out with the media frame's slices, once the export's PCR interval is out.
+	let contains = |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
+	loop {
+		let frame = kio::clock::timeout(DRAIN, exporter.next())
+			.await
+			.expect("v1 goes out (control)")
+			.unwrap()
+			.expect("v1 goes out (control)");
+		if contains(&frame.payload, &sdt_v1) {
+			break;
+		}
+	}
+
+	// The revision lands after the last media frame; only the trailing flush can
+	// carry it. Closing the catalog lets the exporter reach end of stream.
+	si_track
+		.write_frame(Timestamp::ZERO, Bytes::from(sdt_v2.clone()))
+		.unwrap();
+	catalog.finish().unwrap();
+
+	let tail = kio::clock::timeout(DRAIN, exporter.next())
+		.await
+		.expect("a trailing SI frame rather than an immediate end")
+		.unwrap()
+		.expect("the trailing SI frame");
+	assert_packet_aligned(&tail.payload);
+	assert!(
+		contains(&tail.payload, &sdt_v2),
+		"the trailing flush carries the revision"
+	);
+	let end = kio::clock::timeout(DRAIN, exporter.next())
+		.await
+		.expect("the stream ends after the flush")
+		.unwrap();
+	assert!(end.is_none(), "end of stream after the trailing flush");
+}
+
+/// A broadcast with one avc1 video track and one SI entry, for driving SI emission
+/// frame by frame: `media(millis, pid)` writes one video frame and reports how
+/// many packets of `pid` ride the output it produced.
+struct SiCadenceRig {
+	started: bool,
+	producer: Producer<HangContainer>,
+	si_track: moq_net::track::Producer,
+	exporter: Export<crate::catalog::Consumer<tscat::Ext>>,
+	catalog: crate::catalog::Producer<tscat::Ext>,
+	/// Held so the SI track stays routable.
+	_broadcast: moq_net::broadcast::Producer,
+}
+
+async fn si_cadence_rig((pid, table_id): (u16, u8), interval: Duration, info: moq_net::track::Info) -> SiCadenceRig {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+
+	let si_name = format!("{pid:#06x}-{table_id:#04x}.si");
+	let si_track = broadcast.create_track(si_name.as_str(), info).unwrap();
+
+	let avcc = crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap();
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".avc1"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
+		.unwrap();
+	let name = track.name().to_string();
+	{
+		let mut guard = catalog.modify().unwrap();
+		let mut cfg = VideoConfig::new(H264 {
+			profile: 0x64,
+			constraints: 0,
+			level: 0x1f,
+			inline: false,
+		});
+		cfg.container = Container::Legacy;
+		cfg.description = Some(avcc);
+		guard.video.renditions.insert(name, cfg);
+		guard.ext.mpegts.si.entry(pid).or_default().insert(
+			table_id,
+			tscat::SiEntry {
+				track: si_name,
+				interval: Some(interval),
+				..Default::default()
+			},
+		);
+	}
+
+	let producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	let exporter = open_ts(
+		crate::source::announced(&consumer).await,
+		crate::catalog::CatalogFormat::Hang,
+		std::time::Duration::ZERO,
+	)
+	.await
+	.unwrap();
+	SiCadenceRig {
+		started: false,
+		producer,
+		si_track,
+		exporter,
+		catalog,
+		_broadcast: broadcast,
+	}
+}
+
+impl SiCadenceRig {
+	async fn media_frames(&mut self, millis: u64) -> Vec<Frame> {
+		// Reordered pictures stay in one group; a newer group going backwards is a rewind.
+		let mut nal = vec![if self.started { 0x41u8 } else { 0x65u8 }];
+		nal.extend(std::iter::repeat_n(0xAB, 64));
+		self.producer
+			.write(Frame {
+				timestamp: Timestamp::from_millis(millis).unwrap(),
+				duration: None,
+				payload: length_prefixed(&[&nal]),
+				keyframe: !self.started,
+			})
+			.unwrap();
+		self.started = true;
+
+		let frames = drain_frames(&mut self.exporter).await;
+		for frame in &frames {
+			assert_packet_aligned(&frame.payload);
+		}
+		frames
+	}
+
+	async fn media(&mut self, millis: u64, pid: u16) -> usize {
+		count_pid(&self.media_frames(millis).await, pid)
+	}
+}
+
+/// #2934: a revised SI snapshot goes out on the revision floor instead of waiting
+/// out the repetition interval (here the floor has long elapsed, so it rides the
+/// very next frame). For a clock table (TDT/TOT) the old interval-grid hold
+/// delivered the asserted time up to a whole 30 s slot late, and a source ticking
+/// slower than the grid had its stale value re-sent, stepping receivers backwards.
+#[tokio::test(start_paused = true)]
+async fn si_revision_does_not_wait_for_the_interval() {
+	let tick = |mjd: u8| make_short_section(0x70, &[0xc0, mjd, 0x12, 0x34, 0x56]);
+	let mut rig = si_cadence_rig((0x0014, 0x70), Duration::from_secs(30), timed()).await;
+
+	rig.si_track.write_frame(Timestamp::ZERO, Bytes::from(tick(1))).unwrap();
+	assert_eq!(rig.media(0, 0x0014).await, 0, "the first frame stays buffered");
+	assert_eq!(
+		rig.media(1_000, 0x0014).await,
+		1,
+		"the next frame lets the lead emission out"
+	);
+	assert_eq!(rig.media(2_000, 0x0014).await, 0, "unchanged: still held");
+
+	// The clock ticks. Nothing about the 30 s interval has elapsed, but the value
+	// changed: it must go out with the very next frame, which spreads from the slot
+	// after the frame before it.
+	rig.si_track.write_frame(Timestamp::ZERO, Bytes::from(tick(2))).unwrap();
+	assert_eq!(rig.media(3_000, 0x0014).await, 1, "the revision rides the next frame");
+	assert_eq!(rig.media(4_000, 0x0014).await, 0, "and only that one");
+}
+
+/// #3948: an unchanged snapshot repeats on the absolute media-time grid, like the
+/// PSI, so exporters that started at different moments repeat it at the same
+/// instants. A revision still goes out on its floor between grid slots (#2934).
+#[tokio::test(start_paused = true)]
+async fn si_repeats_ride_the_media_grid() {
+	let sdt_v1 = make_long_section(0x42, 1, 0, 0, 0, &[0xaa; 8]);
+	let sdt_v2 = make_long_section(0x42, 1, 1, 0, 0, &[0xbb; 8]);
+	let mut rig = si_cadence_rig((0x0011, 0x42), Duration::from_secs(2), timed()).await;
+
+	// The lead emission lands wherever this exporter joined.
+	rig.si_track.write_frame(Timestamp::ZERO, Bytes::from(sdt_v1)).unwrap();
+	assert_eq!(rig.media(1_500, 0x0011).await, 0, "the first frame stays buffered");
+	assert_eq!(
+		rig.media(1_900, 0x0011).await,
+		1,
+		"the next frame lets the lead emission out"
+	);
+	// The 2s boundary is 0.5s after the lead: the grid, not a floor from the join.
+	assert_eq!(rig.media(2_000, 0x0011).await, 1, "the repeat rides the 2s frame");
+	assert_eq!(rig.media(2_500, 0x0011).await, 0, "and only that one");
+
+	// A revision lands mid-slot: it waits only for the 1s revision floor.
+	rig.si_track.write_frame(Timestamp::ZERO, Bytes::from(sdt_v2)).unwrap();
+	assert_eq!(rig.media(2_900, 0x0011).await, 0, "within the floor of the repeat");
+	assert_eq!(
+		rig.media(3_000, 0x0011).await,
+		1,
+		"the revision rides the frame where its floor lapses"
+	);
+	assert_eq!(rig.media(3_500, 0x0011).await, 0, "and only that one");
+
+	// Repeats stay on the grid after it.
+	assert_eq!(rig.media(4_000, 0x0011).await, 1, "the 4s repeat");
+	assert_eq!(rig.media(5_000, 0x0011).await, 0, "nothing until the next grid slot");
+	assert_eq!(rig.media(5_900, 0x0011).await, 0, "nothing between grid slots");
+	assert_eq!(rig.media(6_000, 0x0011).await, 1, "the 6s repeat");
+	assert_eq!(rig.media(6_100, 0x0011).await, 0, "and only that one");
+}
+
+/// A clock table (TDT/TOT) never repeats an unchanged snapshot: a repeat re-asserts
+/// a time already sent and steps a receiver backwards (#2934). Every new value is a
+/// revision, so it still goes out promptly.
+#[tokio::test(start_paused = true)]
+async fn si_clock_tables_do_not_repeat_unchanged() {
+	let tick = |mjd: u8| make_short_section(0x70, &[0xc0, mjd, 0x12, 0x34, 0x56]);
+	let mut rig = si_cadence_rig((0x0014, 0x70), Duration::from_secs(2), timed()).await;
+
+	rig.si_track.write_frame(Timestamp::ZERO, Bytes::from(tick(1))).unwrap();
+	assert_eq!(rig.media(0, 0x0014).await, 0, "the first frame stays buffered");
+	assert_eq!(
+		rig.media(1_000, 0x0014).await,
+		1,
+		"the next frame lets the lead emission out"
+	);
+	let mut repeats = 0;
+	for millis in (2_000..=9_000).step_by(1_000) {
+		repeats += rig.media(millis, 0x0014).await;
+	}
+	assert_eq!(repeats, 0, "an unchanged time is never re-sent");
+
+	rig.si_track.write_frame(Timestamp::ZERO, Bytes::from(tick(2))).unwrap();
+	assert_eq!(rig.media(10_000, 0x0014).await, 1, "the new time rides the next frame");
+	assert_eq!(rig.media(11_000, 0x0014).await, 0, "and only that one");
+}
+
+/// Several complete snapshots can arrive before the media they describe. Reading one
+/// revision ahead preserves each stamped slot without replacing an earlier one with a
+/// future clock value, and a stamp between grid boundaries rounds up rather than down.
+#[tokio::test(start_paused = true)]
+async fn clock_revisions_wait_for_their_stamped_grid_slots() {
+	for table_id in [0x70, 0x73] {
+		let section = |value| make_short_section(table_id, &[value; 5]);
+		let mut rig = si_cadence_rig((0x0014, table_id), Duration::from_secs(30), timed()).await;
+		rig.si_track
+			.write_frame(Timestamp::ZERO, Bytes::from(section(0)))
+			.unwrap();
+		rig.media(0, 0x0014).await;
+		assert_eq!(rig.media(1_000, 0x0014).await, 1);
+		for (millis, value) in [(2_501, 1), (3_500, 2)] {
+			rig.si_track
+				.write_frame(Timestamp::from_millis(millis).unwrap(), Bytes::from(section(value)))
+				.unwrap();
+			assert!(
+				drain_frames(&mut rig.exporter).await.is_empty(),
+				"SI alone cannot advance media"
+			);
+		}
+		for millis in [1_500, 2_500, 2_999] {
+			assert_eq!(rig.media(millis, 0x0014).await, 0, "future revision at {millis}");
+		}
+		for (millis, value) in [(3_000, 1), (4_000, 2)] {
+			let mut frames = rig.media_frames(millis).await;
+			// A 1ms media step need not close a 25ms PCR slice. Collect that slice
+			// independently of which read returns it. SI rides the media PES, whose
+			// delivery precedes its decode time.
+			frames.extend(rig.media_frames(millis + 40).await);
+			assert_eq!(count_pid(&frames, 0x0014), 1, "revision at {millis}");
+			assert!(
+				frames
+					.iter()
+					.any(|frame| frame.payload.windows(section(value).len()).any(|w| w == section(value)))
+			);
+		}
+		assert_eq!(rig.media(5_000, 0x0014).await, 0, "unchanged clocks never repeat");
+		// End of stream cannot move a future clock value ahead of its media position,
+		// or repeat the value already emitted at 4s.
+		rig.si_track
+			.write_frame(Timestamp::from_millis(6_500).unwrap(), Bytes::from(section(3)))
+			.unwrap();
+		let _finished = rig.producer.finish().unwrap();
+		let _si_track = rig.si_track.finish().unwrap();
+		rig.catalog.finish().unwrap();
+		assert_eq!(count_pid(&drain_frames(&mut rig.exporter).await, 0x0014), 0);
+	}
+}
+
+/// A whole burst arrives without polling between writes. The contract: every clock revision
+/// that stays within the export's delay and the publisher's max age reaches its stamped slot,
+/// and a superseded revision outside either bound may be skipped. With a budget longer than
+/// the burst, both subscriptions keep later revisions while holding the first. Controls below
+/// the burst's span pin which superseded revisions each bound skips today: neither an
+/// unlimited publisher nor a generous reader overrides the other, and the newest always lands.
+#[tokio::test(start_paused = true)]
+async fn queued_clock_revisions_follow_the_exporters_freshness_budgets() {
+	for table_id in [0x70, 0x73] {
+		for (max_age, delay, omitted) in [
+			(None, Duration::ZERO, 2),
+			(None, Duration::from_millis(500), 1),
+			(None, Duration::from_secs(6), 0),
+			(Some(Duration::from_secs(6)), Duration::from_secs(6), 0),
+			(Some(Duration::from_millis(500)), Duration::from_secs(6), 1),
+		] {
+			let section = |value| make_short_section(table_id, &[value; 5]);
+			let mut rig = si_cadence_rig(
+				(0x0014, table_id),
+				Duration::from_secs(30),
+				super::si::track_info(max_age),
+			)
+			.await;
+			rig.catalog
+				.modify()
+				.unwrap()
+				.video
+				.renditions
+				.values_mut()
+				.next()
+				.unwrap()
+				.reorder = Some(0);
+			rig.exporter = open_ts(
+				crate::source::announced(&rig._broadcast.consume()).await,
+				crate::catalog::CatalogFormat::Hang,
+				delay,
+			)
+			.await
+			.unwrap()
+			.with_replay();
+			rig.si_track.write_frame(Timestamp::ZERO, section(0)).unwrap();
+			let mut joining = open_ts(
+				crate::source::announced(&rig._broadcast.consume()).await,
+				crate::catalog::CatalogFormat::Hang,
+				delay,
+			)
+			.await
+			.unwrap()
+			.with_replay();
+			let (mut initial, mut initial_b) = tokio::join!(rig.media_frames(0), drain_frames(&mut joining));
+			let (a, b) = tokio::join!(rig.media_frames(1_000), drain_frames(&mut joining));
+			initial.extend(a);
+			initial_b.extend(b);
+			assert_eq!(count_pid(&initial, 0x0014), 1, "the running export acquired SI");
+			assert_eq!(count_pid(&initial_b, 0x0014), 1, "the joining export acquired SI");
+
+			for (millis, value) in [(2_501, 1), (3_500, 2), (4_501, 3)] {
+				rig.si_track
+					.write_frame(Timestamp::from_millis(millis).unwrap(), section(value))
+					.unwrap();
+			}
+			let (mut a, mut b) = (Vec::new(), Vec::new());
+			for millis in (1_040..=5_520).step_by(40) {
+				let (next_a, next_b) = tokio::join!(rig.media_frames(millis), drain_frames(&mut joining));
+				a.extend(next_a);
+				b.extend(next_b);
+			}
+			for (leg, frames) in [("running", a), ("joining", b)] {
+				let emitted: Vec<_> = frames
+					.iter()
+					.flat_map(|frame| {
+						// SI leads the PES it describes. Video's send-ahead can put that PES
+						// on an earlier PCR slice, so check its media slot from the wire's PTS.
+						let pts = video_pes_timing(&frame.payload).first().map(|(pts, _)| *pts);
+						ts_sections(&frame.payload, 0x0014)
+							.into_iter()
+							.map(move |section| (pts.expect("SI must lead a media PES"), section))
+					})
+					.collect();
+				let mut expected = vec![
+					(3 * 90_000, Bytes::from(section(1))),
+					(4 * 90_000, Bytes::from(section(2))),
+					(5 * 90_000, Bytes::from(section(3))),
+				];
+				expected.drain(..omitted);
+				assert_eq!(
+					emitted, expected,
+					"{leg}, table={table_id:#x}, delay={delay:?}, max_age={max_age:?}"
+				);
+			}
+		}
+	}
+}
+
+/// A reordered (B-frame) timestamp below the emission anchor earns no credit:
+/// `si_due` saturates elapsed time, so a revision arriving there is deferred, the
+/// anchor never moves backwards, and neither revisions nor repeats can fire early
+/// off the reorder span.
+#[tokio::test(start_paused = true)]
+async fn si_reordered_frames_earn_no_emission_credit() {
+	let section = |version: u8| make_long_section(0x42, 1, version, 0, 0, &[version; 8]);
+	let mut rig = si_cadence_rig((0x0011, 0x42), Duration::from_secs(10), timed()).await;
+
+	rig.si_track
+		.write_frame(Timestamp::ZERO, Bytes::from(section(0)))
+		.unwrap();
+	assert_eq!(rig.media(1_000, 0x0011).await, 0, "the first frame stays buffered");
+
+	rig.si_track
+		.write_frame(Timestamp::ZERO, Bytes::from(section(1)))
+		.unwrap();
+	assert_eq!(
+		rig.media(2_500, 0x0011).await,
+		2,
+		"the lead emission and the revision riding the 2.5s frame"
+	);
+
+	// The next revision arrives on a frame stepping back behind the 2.5s anchor,
+	// like a B-frame emitted in decode order: no elapsed time, no emission.
+	rig.si_track
+		.write_frame(Timestamp::ZERO, Bytes::from(section(2)))
+		.unwrap();
+	assert_eq!(rig.media(2_400, 0x0011).await, 0, "a reordered frame earns no credit");
+
+	// The floor measures from the 2.5s anchor: not due at 3.4s, due at 3.5s. Since the reorder,
+	// each frame waits for one read past its reorder span before its DTS is known, so count
+	// across the reads that let each frame out.
+	let early = rig.media(3_400, 0x0011).await + rig.media(3_500, 0x0011).await + rig.media(3_600, 0x0011).await;
+	assert_eq!(early, 0, "not due within the floor");
+	let floor = rig.media(3_700, 0x0011).await + rig.media(3_800, 0x0011).await;
+	assert_eq!(floor, 1, "the deferred revision rides the frame at the floor");
+	let later = rig.media(3_900, 0x0011).await + rig.media(4_000, 0x0011).await;
+	assert_eq!(later, 0, "and only that one");
+	assert_eq!(rig.exporter.discontinuity(), 0, "B-frame reordering is not a rewind");
+}
+
+/// The emission anchor never moves backwards, even where a zero-interval entry
+/// emits on a reordered (B-frame) timestamp below it: a catalog update can raise
+/// the interval afterwards, and a regressed anchor would then sit in an earlier
+/// grid slot and repeat early. (Non-zero intervals cannot regress the anchor on
+/// their own, since only a timestamp past it is due; the zero-to-nonzero
+/// transition is the one reachable path.)
+#[tokio::test(start_paused = true)]
+async fn si_anchor_survives_a_zero_interval_reorder() {
+	let section = |version: u8| make_long_section(0x42, 1, version, 0, 0, &[version; 8]);
+	// Zero interval: the table rides every frame, whatever its timestamp.
+	let mut rig = si_cadence_rig((0x0011, 0x42), Duration::ZERO, timed()).await;
+
+	rig.si_track
+		.write_frame(Timestamp::ZERO, Bytes::from(section(0)))
+		.unwrap();
+	assert_eq!(rig.media(1_000, 0x0011).await, 0, "the first frame stays buffered");
+	assert_eq!(
+		rig.media(3_000, 0x0011).await,
+		2,
+		"the 1s emission, and the anchor advancing to 3s"
+	);
+	// A reordered frame steps back behind the anchor, into the previous 1s slot;
+	// zero interval still emits. It waits for a read past its reorder span, which lets it out.
+	assert_eq!(rig.media(2_900, 0x0011).await, 0, "the reordered frame waits");
+	let reordered = rig.media(3_100, 0x0011).await;
+
+	// The catalog raises the interval to 1s. The grid slot must be the 3s anchor's,
+	// not the reordered 2.9s emission's.
+	rig.catalog
+		.modify()
+		.unwrap()
+		.ext
+		.mpegts
+		.si
+		.get_mut(&0x0011)
+		.unwrap()
+		.get_mut(&0x42)
+		.unwrap()
+		.interval = Some(Duration::from_secs(1));
+	// The decode clock catches up on the reorder over the next frames, so count the
+	// emissions across them rather than per frame.
+	let held = reordered + rig.media(3_400, 0x0011).await + rig.media(3_900, 0x0011).await;
+	assert_eq!(held, 1, "only the reordered emission, still in the anchor's slot");
+	let due = rig.media(4_000, 0x0011).await
+		+ rig.media(4_100, 0x0011).await
+		+ rig.media(4_200, 0x0011).await
+		+ rig.media(4_300, 0x0011).await;
+	assert_eq!(due, 1, "the 4s table, once");
+	assert_eq!(rig.exporter.discontinuity(), 0, "B-frame reordering is not a rewind");
+}
+
+/// A publisher revising its snapshot before every frame must not drive the mux at
+/// that rate: revisions coalesce onto the revision floor, newest snapshot wins.
+/// The import side debounces its own cuts, but export consumes any catalog-named
+/// snapshot track, so the bound has to hold here too.
+#[tokio::test(start_paused = true)]
+async fn si_rapid_revisions_are_rate_bounded() {
+	for (pid, table_id) in [(0x0011, 0x42), (0x0014, 0x70), (0x0014, 0x73)] {
+		let section = |version: u8| {
+			if table_id == 0x42 {
+				make_long_section(table_id, 1, version, 0, 0, &[version; 8])
+			} else {
+				make_short_section(table_id, &[version; 5])
+			}
+		};
+		let mut rig = si_cadence_rig((pid, table_id), Duration::from_secs(30), timed()).await;
+
+		let mut emitted = 0;
+		for i in 0..13u8 {
+			rig.si_track
+				.write_frame(Timestamp::ZERO, Bytes::from(section(i)))
+				.unwrap();
+			let frames = rig.media_frames(u64::from(i) * 250).await;
+			let count = count_pid(&frames, pid);
+			emitted += count;
+			if i == 4 {
+				// The 1s floor lapses here, and the emission carries the newest revision.
+				assert_eq!(count, 1, "the 1s emission");
+				let needle = section(4);
+				assert!(
+					frames
+						.iter()
+						.any(|f| f.payload.windows(needle.len()).any(|w| w == needle)),
+					"the floored emission carries the newest revision"
+				);
+			}
+		}
+		emitted += rig.media(3_250, pid).await;
+		assert_eq!(emitted, 4, "lead plus one per second, not one per revision");
+	}
+}
+
+/// Two captures overlapping on one broadcast (a supervisor restarting its
+/// importer before the old one is dropped) contend for the same `(PID, table_id)`
+/// key: the newer one wins the catalog mapping under a fallback track name, and
+/// the older one's teardown must not strip it, since the survivor never
+/// re-advertises.
+#[tokio::test(start_paused = true)]
+async fn overlapping_capture_teardown_keeps_the_survivors_mapping() {
+	let sdt = make_long_section(0x42, 1, 0, 0, 0, &[0xaa; 4]);
+	let mut input = si_clock(1);
+	input.extend_from_slice(&si_packet(0x0011, &sdt));
+	input.extend_from_slice(&si_packet_cc(0x0011, &sdt, 1));
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let _consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	let mut old = crate::container::ts::Import::new(broadcast.clone(), catalog.reserve());
+	old.decode(&BytesMut::from(&input[..])).unwrap();
+
+	// The replacement importer captures the same table; its deterministic track
+	// name is taken, so it advertises under a fallback name, overwriting the key.
+	let mut new = crate::container::ts::Import::new(broadcast, catalog.reserve());
+	new.decode(&BytesMut::from(&input[..])).unwrap();
+	let survivor = catalog.snapshot().ext.mpegts.si[&0x0011][&0x42].track.clone();
+	assert_ne!(survivor, "0x0011-0x42.si", "the replacement fell back to a unique name");
+
+	drop(old);
+	assert_eq!(
+		catalog.snapshot().ext.mpegts.si[&0x0011][&0x42].track,
+		survivor,
+		"the old capture's teardown left the survivor's mapping in place"
+	);
+}
+
+/// A contiguous commit replaces even a same-version active generation: versions
+/// are five bits, so a reception gap can bring the same value back with fewer
+/// sections, and merging would resurrect the removed one forever.
+#[tokio::test(start_paused = true)]
+async fn contiguous_same_version_commit_replaces_stale_sections() {
+	let sdt = |number: u8, last: u8, fill: u8| make_long_section(0x42, 1, 0, number, last, &[fill; 4]);
+
+	// Three sections at v0, committed contiguously.
+	let mut input = si_packet(0x0011, &sdt(0, 2, 0xa0));
+	input.extend_from_slice(&si_packet_cc(0x0011, &sdt(1, 2, 0xa1), 1));
+	input.extend_from_slice(&si_packet_cc(0x0011, &sdt(2, 2, 0xa2), 2));
+	// After a gap the table comes back at v0 again (wrapped), now two sections.
+	let b0 = sdt(0, 1, 0xb0);
+	let b1 = sdt(1, 1, 0xb1);
+	input.extend_from_slice(&si_packet_cc(0x0011, &b0, 3));
+	input.extend_from_slice(&si_packet_cc(0x0011, &b1, 4));
+	let mut rig = si_rig();
+	rig.import.decode(&BytesMut::from(&input[..])).unwrap();
+	let _finished = rig.import.finish().unwrap();
+
+	let si = rig.catalog.snapshot().ext.mpegts.si.clone();
+	assert_eq!(
+		read_si_sections(&rig.consumer, &si[&0x0011][&0x42].track).await,
+		vec![Bytes::from(b0), Bytes::from(b1)],
+		"the complete new generation retired the stale third section"
+	);
+}
+
+/// The cut debounce runs on the host clock, so a revision publishes even when no
+/// media ever advances a PTS (an audio-only or SI-only input). The paused tokio
+/// clock steps over the debounce window; media timestamps stay pinned at zero
+/// throughout, which is exactly the case a media-clock debounce wedges on.
+#[tokio::test(start_paused = true)]
+async fn debounce_opens_without_a_media_clock() {
+	let sdt = |version: u8, fill: u8| make_long_section(0x42, 1, version, 0, 0, &[fill; 4]);
+	let mut rig = si_rig();
+
+	let mut input = si_packet(0x0011, &sdt(0, 0xaa));
+	input.extend_from_slice(&si_packet_cc(0x0011, &sdt(0, 0xaa), 1));
+	rig.import.decode(&BytesMut::from(&input[..])).unwrap();
+
+	let name = rig.catalog.snapshot().ext.mpegts.si[&0x0011][&0x42].track.clone();
+	let mut track = rig.consumer.track(&name).unwrap().subscribe(None).await.unwrap();
+	assert_eq!(
+		track.largest().await.map(|position| position.group),
+		Some(0),
+		"the first snapshot cut immediately"
+	);
+
+	// A revision inside the window is coalesced...
+	rig.import
+		.decode(&BytesMut::from(&si_packet_cc(0x0011, &sdt(1, 0xbb), 2)[..]))
+		.unwrap();
+	assert!(
+		track.poll_largest(&kio::Waiter::noop()).is_pending(),
+		"a revision inside the window is held"
+	);
+
+	// ...and publishes once the window passes on the host clock, no finish, no PTS.
+	tokio::time::advance(Duration::from_millis(1200)).await;
+	rig.import
+		.decode(&BytesMut::from(&si_packet_cc(0x0011, &sdt(1, 0xbb), 3)[..]))
+		.unwrap();
+	assert_eq!(
+		track.largest().await.map(|position| position.group),
+		Some(1),
+		"the held revision cut after the window"
+	);
 }
 
 /// Every PCR packet in transport order: its packet index in the stream, its value
 /// (90 kHz), and the media timestamp of the frame carrying it.
+/// [`collect_pcrs`] up to the last packet that carries media: past it, the clock runs on alone
+/// to the last decode time, the media having gone out up to a delay ahead of it.
+fn media_pcrs(frames: &[Frame]) -> Vec<(usize, u64, u128)> {
+	let last = frames
+		.iter()
+		.flat_map(|frame| frame.payload.chunks(188))
+		.enumerate()
+		.filter(|(_, packet)| packet[3] & 0x10 != 0 && (packet[1] & 0x1f, packet[2]) != (0x1f, 0xff))
+		.map(|(at, _)| at)
+		.last()
+		.unwrap_or_default();
+	let mut pcrs = collect_pcrs(frames);
+	// The clock packet after the last media closes its slot.
+	let end = pcrs.partition_point(|&(at, ..)| at < last) + 1;
+	pcrs.truncate(end);
+	pcrs
+}
+
 fn collect_pcrs(frames: &[Frame]) -> Vec<(usize, u64, u128)> {
 	let mut at = 0;
 	let mut pcrs = Vec::new();
 	for frame in frames {
 		for packet in frame.payload.chunks(188) {
-			// adaptation-field-only packets (adaptation_field_control == 0b10) are the clock.
-			if packet[3] & 0x30 == 0x20 && packet[5] & 0x10 != 0 {
+			// A clock packet, or the clock PID's packet that carries the slot's PCR.
+			if packet[3] & 0x20 != 0 && packet[4] > 0 && packet[5] & 0x10 != 0 {
 				let base = (u64::from(packet[6]) << 25)
 					| (u64::from(packet[7]) << 17)
 					| (u64::from(packet[8]) << 9)
@@ -2311,10 +7358,13 @@ fn collect_pcrs(frames: &[Frame]) -> Vec<(usize, u64, u128)> {
 async fn export_cbr_video() -> Vec<Frame> {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
 	let track = broadcast
-		.create_track(broadcast.unique_name(".h264"), hang::container::track_info())
+		.create_track(
+			broadcast.unique_name(".h264"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
 		.unwrap();
 	{
 		let mut cfg = VideoConfig::new(H264 {
@@ -2324,9 +7374,14 @@ async fn export_cbr_video() -> Vec<Frame> {
 			inline: true,
 		});
 		cfg.container = Container::Legacy;
-		catalog.lock().video.renditions.insert(track.name().to_string(), cfg);
+		catalog
+			.modify()
+			.unwrap()
+			.video
+			.renditions
+			.insert(track.name().to_string(), cfg);
 	}
-	let mut video = Producer::new(track, HangContainer::Legacy);
+	let mut video = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
 	for i in 0..100u64 {
 		let keyframe = i % 25 == 0;
 		let mut nal = vec![if keyframe { 0x65u8 } else { 0x41 }];
@@ -2336,7 +7391,8 @@ async fn export_cbr_video() -> Vec<Frame> {
 		}
 		video
 			.write(Frame {
-				timestamp: Timestamp::from_micros(i * 40_000).unwrap(),
+				// A minute in, so a frame can go out the whole delay ahead of it.
+				timestamp: Timestamp::from_micros(60_000_000 + i * 40_000).unwrap(),
 				duration: None,
 				payload: if keyframe {
 					annexb(&[SPS, PPS, &nal])
@@ -2347,10 +7403,125 @@ async fn export_cbr_video() -> Vec<Frame> {
 			})
 			.unwrap();
 	}
-	video.finish().unwrap();
+	let _finished = video.finish().unwrap();
 
-	let mut exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
+	let mut exporter = open_export(crate::source::announced(&consumer).await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_mux_rate(20_000_000)
+		.with_replay();
 	drain_frames(&mut exporter).await
+}
+
+/// A frame whose DTS sits on a PCR slot boundary still arrives in time to decode. A source
+/// publishing its own 25 fps timestamps puts every fifth frame there, and an unpadded slot's
+/// last packet is timed right up to the boundary. A receiver still has to drain that packet
+/// into the decoder buffer, at the level's Rbx (16.8 Mb/s for level 3.1), so the frame has to
+/// finish one packet's drain before it decodes.
+#[tokio::test(start_paused = true)]
+async fn a_frame_on_a_slot_boundary_finishes_before_it_decodes() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".h264"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
+		.unwrap();
+	{
+		let mut cfg = VideoConfig::new(H264 {
+			profile: 0x42,
+			constraints: 0xc0,
+			level: 0x1f,
+			inline: true,
+		});
+		cfg.container = Container::Legacy;
+		// Each DTS is an earlier frame's PTS.
+		cfg.jitter = Some(Duration::from_millis(80));
+		catalog
+			.modify()
+			.unwrap()
+			.video
+			.renditions
+			.insert(track.name().to_string(), cfg);
+	}
+	let mut video = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	for i in 0..50u64 {
+		let keyframe = i % 25 == 0;
+		let mut nal = vec![if keyframe { 0x65u8 } else { 0x41 }];
+		nal.extend(std::iter::repeat_n(0xAB, 2_000));
+		if keyframe && i > 0 {
+			video.cut(None).unwrap();
+		}
+		video
+			.write(Frame {
+				// ffmpeg's 1.4 s start, on a slot boundary like every fifth frame after it.
+				timestamp: Timestamp::from_micros(1_400_000 + i * 40_000).unwrap(),
+				duration: None,
+				payload: if keyframe {
+					annexb(&[SPS, PPS, &nal])
+				} else {
+					annexb(&[&nal])
+				},
+				keyframe,
+			})
+			.unwrap();
+	}
+	let _finished = video.finish().unwrap();
+
+	let mut exporter = open_export(crate::source::announced(&consumer).await, std::time::Duration::ZERO)
+		.await
+		.unwrap();
+	let frames = drain_frames(&mut exporter).await;
+	let ts: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let packets: Vec<&[u8]> = ts.chunks(188).collect();
+	let pcrs: Vec<(usize, f64)> = collect_pcrs(&frames)
+		.into_iter()
+		.map(|(at, base, _)| (at, base as f64))
+		.collect();
+	// The time a receiver assigns the start of packet `at`, interpolated between PCRs.
+	let time = |at: usize| {
+		let k = pcrs.partition_point(|&(index, _)| index <= at).checked_sub(1)?;
+		let (&(a, ta), &(b, tb)) = (pcrs.get(k)?, pcrs.get(k + 1)?);
+		Some(ta + (tb - ta) * (at - a) as f64 / (b - a) as f64)
+	};
+
+	// Each video PES: its DTS (else PTS), and the packet it ends on.
+	let mut units: Vec<(u64, usize)> = Vec::new();
+	let mut video_pid = None;
+	let mut reader = TsPacketReader::new(Cursor::new(ts.clone()));
+	let mut at = 0;
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		let pid = packet.header.pid.as_u16();
+		match packet.payload {
+			Some(TsPayload::Pmt(pmt)) => video_pid = pmt.es_info.first().map(|es| es.elementary_pid.as_u16()),
+			Some(TsPayload::PesStart(pes)) if Some(pid) == video_pid => {
+				let decode = pes.header.dts.or(pes.header.pts).unwrap().as_u64();
+				units.push((decode, at));
+			}
+			Some(TsPayload::PesContinuation(_)) if Some(pid) == video_pid => units.last_mut().unwrap().1 = at,
+			_ => {}
+		}
+		at += 1;
+	}
+	assert_eq!(packets.len(), at);
+
+	// One packet at 16.8 Mb/s is 89.5 us, a little over 8 ticks of 90 kHz.
+	let drain = 188.0 * 8.0 / 16_800_000.0 * 90_000.0;
+	let mut on_boundary = 0;
+	for &(decode, last) in &units {
+		let Some(end) = time(last + 1) else { continue };
+		on_boundary += usize::from(decode % 2_250 == 0);
+		assert!(
+			decode as f64 - end >= drain,
+			"the unit decoding at {decode} finishes at {end:.1}, less than a packet's drain before it"
+		);
+	}
+	assert!(
+		on_boundary >= 5,
+		"too few units on a slot boundary to judge: {on_boundary}"
+	);
 }
 
 /// #3334: the clock a receiver recovers from *byte position* has to agree with the
@@ -2363,14 +7534,16 @@ async fn export_cbr_video() -> Vec<Frame> {
 #[tokio::test(start_paused = true)]
 async fn pcr_rides_the_bytes_it_labels() {
 	let frames = export_cbr_video().await;
-	let pcrs = collect_pcrs(&frames);
+	let pcrs = media_pcrs(&frames);
 	assert!(pcrs.len() > 100, "expected the full feed, got {} PCRs", pcrs.len());
 
-	// Every step is one grid slot, so every gap should carry the same span of media
-	// and therefore a comparable number of packets.
+	// Every step is one grid slot, to within the packet a PCR's byte position rounds it by
+	// (75 us at 20 Mb/s), so every gap should carry the same span of media and therefore a
+	// comparable number of packets.
 	let step = PCR_INTERVAL.as_micros() as u64 * 90 / 1_000;
 	for (i, w) in pcrs.windows(2).enumerate() {
-		assert_eq!(w[1].1.wrapping_sub(w[0].1) & ((1 << 33) - 1), step, "value step at {i}");
+		let value = w[1].1.wrapping_sub(w[0].1) & ((1 << 33) - 1);
+		assert!(value.abs_diff(step) <= 7, "value step at {i}: {value}");
 	}
 
 	let gaps: Vec<usize> = pcrs.windows(2).map(|w| w[1].0 - w[0].0).collect();
@@ -2410,28 +7583,72 @@ async fn pcr_stamps_step_by_the_grid() {
 	);
 }
 
+/// #2984: a TS byte stream carries no per-frame timing, so the slices have to go out at the
+/// times they assert, not as fast as frames arrive. With a delay the export hands each slice
+/// over at its time on its own clock, however the frames arrive: here a second at a time.
+#[tokio::test(start_paused = true)]
+async fn slices_go_out_on_the_clock() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let mut audio = aac_rendition(&mut broadcast, &mut catalog, "a.aac");
+	let mut export = open_export(crate::source::announced(&consumer).await, Duration::from_millis(1_500))
+		.await
+		.unwrap();
+	let writer = tokio::spawn(async move {
+		for second in 0..4 {
+			for ms in (0..1_000).step_by(20) {
+				write_aac(&mut audio, second * 1_000 + ms);
+			}
+			kio::clock::sleep(Duration::from_secs(1)).await;
+		}
+		let _finished = audio.finish().unwrap();
+		(broadcast, catalog)
+	});
+	let mut handed = Vec::new();
+	while let Ok(Ok(Some(_))) = kio::clock::timeout(Duration::from_secs(5), export.next()).await {
+		handed.push(kio::clock::now());
+	}
+	writer.await.unwrap();
+	assert!(handed.len() > 100, "too few slices to judge: {}", handed.len());
+	// Each slice follows the last by a slot, give or take the clock steering toward the
+	// source's, through to the end of the broadcast.
+	for w in handed.windows(2) {
+		let step = w[1] - w[0];
+		assert!(
+			step.abs_diff(PCR_INTERVAL) < Duration::from_micros(100),
+			"a slice went out {step:?} after the last"
+		);
+	}
+}
+
 /// The same positional property on a real reordered (B-frame) capture with a second
 /// rendition, where the exporter has no uniform cadence to lean on: frames arrive in
 /// decode order, and the two tracks advance the media clock at different rates. The
-/// clock still lands among the bytes it labels rather than clustering, though the
-/// gaps are no longer uniform: a span is however long it took the next timestamp to
-/// arrive, which for interleaved tracks is nothing like the media a frame's bytes
-/// represent. Evening that out needs the muxer to hold a byte buffer and drain it at
-/// a measured rate, which this does not do.
+/// clock still lands among the bytes it labels rather than clustering.
 #[tokio::test(start_paused = true)]
 async fn pcr_stays_among_the_bytes_across_reordered_tracks() {
 	let data = include_bytes!("test_data/scte35/kyrion_dirtystart.ts");
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 	import.decode(&BytesMut::from(&data[..])).unwrap();
-	import.finish().unwrap();
+	let _finished = import.finish().unwrap();
 
-	let mut exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
+	let mut exporter = open_export(crate::source::announced(&consumer).await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_mux_rate(20_000_000);
 	let frames = drain_frames(&mut exporter).await;
-	let pcrs = collect_pcrs(&frames);
-	assert!(pcrs.len() > 50, "expected the full feed, got {} PCRs", pcrs.len());
+	let pcrs = media_pcrs(&frames);
+	assert_eq!(exporter.dropped(), 0, "expected the full feed");
+	// The joiner reads the newest group, 400 ms of video sent at most its 375 ms reach early.
+	assert!(
+		pcrs.len() > 15,
+		"expected a clock across the group, got {} PCRs",
+		pcrs.len()
+	);
 
 	let gaps: Vec<usize> = pcrs.windows(2).map(|w| w[1].0 - w[0].0).collect();
 	assert_eq!(
@@ -2440,8 +7657,7 @@ async fn pcr_stays_among_the_bytes_across_reordered_tracks() {
 		"no clock packet may sit adjacent to the previous one: {gaps:?}"
 	);
 
-	// Stamps still step by exactly one slot, apart from the first interval, which
-	// covers the leading span rather than a whole slot.
+	// Stamps step by exactly one slot.
 	let interval = PCR_INTERVAL.as_micros() as i128;
 	let off = pcrs
 		.windows(2)
@@ -2471,6 +7687,10 @@ async fn payload_less_clock_packets_repeat_the_counter() {
 		let pid = u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
 		let cc = packet[3] & 0x0f;
 		let payload = packet[3] & 0x10 != 0;
+		// A null packet's counter is undefined.
+		if pid == 0x1fff {
+			continue;
+		}
 		if let Some(&prev) = last.get(&pid) {
 			if payload && cc != (prev + 1) & 0x0f {
 				discontinuities += 1;
@@ -2484,4 +7704,4847 @@ async fn payload_less_clock_packets_repeat_the_counter() {
 	}
 	assert_eq!(advanced, 0, "payload-less packets must repeat the counter");
 	assert_eq!(discontinuities, 0, "the counter must be continuous on every PID");
+}
+
+/// What a constant-rate receiver would measure of `ts`: the packets between its
+/// first and last clock packet over the PCR ticks they span, how much of that was
+/// null stuffing, and the widest PCR gap.
+/// A heavy passage whose frames outrun the multiplex rate for longer than the delay, after a
+/// light one with room to spare, fits when its units go out as early as the receiver's
+/// buffers admit. Sent as late as the rate allows, the light passage's spare slots go out
+/// empty and the heavy one misses its deadlines.
+#[tokio::test(start_paused = true)]
+async fn a_heavy_passage_fills_the_slots_before_it() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".avc1"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
+		.unwrap();
+	{
+		// Level 4.0: a 25 Mbit CPB, room for the whole passage sent early.
+		let mut cfg = VideoConfig::new(H264 {
+			profile: 0x42,
+			constraints: 0xc0,
+			level: 40,
+			inline: false,
+		});
+		cfg.container = Container::Legacy;
+		cfg.description =
+			Some(crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap());
+		catalog
+			.modify()
+			.unwrap()
+			.video
+			.renditions
+			.insert(track.name().to_string(), cfg);
+	}
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	// 2 Mb/s carries 32 media packets a 25 ms slot, 51 a 40 ms frame. Two seconds of light
+	// frames, then 0.8 s of frames half as big again as the rate carries, then light again.
+	for i in 0..100u64 {
+		let size = match i {
+			50..70 => 77 * 184,
+			_ => 1_000,
+		};
+		producer
+			.write(Frame {
+				timestamp: Timestamp::from_millis(10_000 + i * 40).unwrap(),
+				duration: None,
+				payload: length_prefixed(&[&vec![if i == 0 { 0x65 } else { 0x41 }; size]]),
+				keyframe: i == 0,
+			})
+			.unwrap();
+	}
+	let _finished = producer.finish().unwrap();
+
+	let mut export = open_export(crate::source::announced(&consumer).await, Duration::from_millis(500))
+		.await
+		.unwrap()
+		.with_mux_rate(2_000_000)
+		.with_replay();
+	let frames = drain_frames(&mut export).await;
+	let ts: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	assert_eq!(video_pes_timing(&ts).len(), 100, "every frame went out");
+}
+
+/// Every PCR in `ts`: its packet index and value in system clock ticks, unwrapped.
+fn pcr_positions(ts: &[u8]) -> Vec<(usize, u64)> {
+	const WRAP: u64 = (1 << 33) * 300;
+	let mut out: Vec<(usize, u64)> = Vec::new();
+	for (index, packet) in ts.chunks(188).enumerate() {
+		if packet[3] & 0x20 != 0 && packet[4] >= 7 && packet[5] & 0x10 != 0 {
+			let base = (u64::from(packet[6]) << 25)
+				| (u64::from(packet[7]) << 17)
+				| (u64::from(packet[8]) << 9)
+				| (u64::from(packet[9]) << 1)
+				| (u64::from(packet[10]) >> 7);
+			let mut pcr = base * 300 + ((u64::from(packet[10] & 1) << 8) | u64::from(packet[11]));
+			if let Some(&(_, last)) = out.last() {
+				pcr = last + (pcr + WRAP - last % WRAP) % WRAP;
+			}
+			out.push((index, pcr));
+		}
+	}
+	out
+}
+
+struct Clocked {
+	packets: usize,
+	ticks: u64,
+	nulls: usize,
+	max_gap: u64,
+}
+
+impl Clocked {
+	fn of(ts: &[u8]) -> Self {
+		const WRAP: u64 = (1 << 33) * 300;
+		let mut first = None;
+		let mut last = None;
+		let mut nulls = 0;
+		let mut max_gap = 0;
+		let mut span = 0;
+		for (index, packet) in ts.chunks(188).enumerate() {
+			let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
+			if pid == 0x1fff {
+				nulls += 1;
+			}
+			if packet[3] & 0x20 != 0 && packet[4] >= 7 && packet[5] & 0x10 != 0 {
+				let base = (u64::from(packet[6]) << 25)
+					| (u64::from(packet[7]) << 17)
+					| (u64::from(packet[8]) << 9)
+					| (u64::from(packet[9]) << 1)
+					| (u64::from(packet[10]) >> 7);
+				let ticks = base * 300 + ((u64::from(packet[10] & 1) << 8) | u64::from(packet[11]));
+				// The exporter backs the clock off through the 33-bit wrap at the start.
+				if let Some(prev) = last.replace((index, ticks)) {
+					let gap = (ticks + WRAP - prev.1) % WRAP;
+					max_gap = max_gap.max(gap);
+					span += gap;
+				}
+				first.get_or_insert(index);
+			}
+		}
+		let (first, last) = (first.expect("no PCR"), last.expect("no PCR"));
+		Self {
+			packets: last.0 - first,
+			ticks: span,
+			nulls,
+			max_gap,
+		}
+	}
+
+	/// The multiplex rate in bits per second.
+	fn rate(&self) -> u64 {
+		(self.packets as u128 * 188 * 8 * 27_000_000 / u128::from(self.ticks)) as u64
+	}
+}
+
+/// Import a fixture into a broadcast whose catalog carries the `mpegts` section,
+/// then export it. The producers live until the export drains.
+async fn export_fixture(data: &[u8], mux_rate: Option<u64>) -> BytesMut {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
+	import.decode(data).unwrap();
+	let _finished = import.finish().unwrap();
+
+	let mut export = export_of(&consumer).await;
+	if let Some(mux_rate) = mux_rate {
+		export = export.with_mux_rate(mux_rate);
+	}
+	let ts = drain_with(export).await;
+	assert_packet_aligned(&ts);
+	ts
+}
+
+/// `bbb_cbr.ts` is a 400 kb/s multiplex carrying 167 kb/s of media, which import
+/// records as such, so export pads the media back to the recorded rate.
+#[tokio::test(start_paused = true)]
+async fn export_pads_to_the_recorded_mux_rate() {
+	let ts = export_fixture(include_bytes!("test_data/bbb_cbr.ts"), None).await;
+	let clocked = Clocked::of(&ts);
+	assert!(clocked.nulls > 0, "no null stuffing was emitted");
+	let rate = clocked.rate();
+	assert!(
+		rate.abs_diff(400_000) * 100 <= 400_000,
+		"output runs at {rate} b/s, not the recorded 400 kb/s"
+	);
+	assert!(
+		clocked.max_gap <= 40 * 27_000,
+		"PCR gap of {} ticks exceeds 40 ms",
+		clocked.max_gap
+	);
+}
+
+/// The builder override wins over the catalog's recorded rate.
+#[tokio::test(start_paused = true)]
+async fn export_mux_rate_override_beats_the_catalog() {
+	let ts = export_fixture(include_bytes!("test_data/bbb_cbr.ts"), Some(1_000_000)).await;
+	let rate = Clocked::of(&ts).rate();
+	assert!(
+		rate.abs_diff(1_000_000) * 100 <= 1_000_000,
+		"output runs at {rate} b/s, not the 1 Mb/s override"
+	);
+}
+
+/// Zero and absurd override rates are refused, leaving the output unpadded: zero
+/// pads nothing, and an unbounded rate would allocate unbounded nulls per slot.
+/// An explicit override wins even when refused, so the catalog rate is not used.
+#[tokio::test(start_paused = true)]
+async fn export_mux_rate_override_is_bounded() {
+	for rate in [0, i64::MAX as u64] {
+		let ts = export_fixture(include_bytes!("test_data/bbb_cbr.ts"), Some(rate)).await;
+		assert_eq!(
+			Clocked::of(&ts).nulls,
+			0,
+			"null packets in an export with a refused override rate {rate}"
+		);
+	}
+}
+
+/// An absurd catalog multiplex rate is refused, not padded to: the catalog is
+/// untrusted input, and padding to it would allocate unbounded nulls per slot.
+#[tokio::test(start_paused = true)]
+async fn export_refuses_an_absurd_catalog_mux_rate() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".aac"),
+			hang::container::track_info(hang::catalog::PRIORITY.audio),
+		)
+		.unwrap();
+	let name = track.name().to_string();
+	catalog.modify().unwrap().audio.renditions.insert(name.clone(), {
+		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
+		cfg.container = Container::Legacy;
+		cfg
+	});
+	catalog.modify().unwrap().ext.mpegts.mux_rate = Some(i64::MAX as u64);
+
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	// Ten seconds of small frames: the media alone never approaches the refused rate.
+	for i in 0..500u64 {
+		producer
+			.write(Frame {
+				timestamp: Timestamp::from_micros(i * 20_000).unwrap(),
+				duration: None,
+				payload: Bytes::from(vec![i as u8; 16]),
+				keyframe: i % 50 == 0,
+			})
+			.unwrap();
+	}
+	let _finished = producer.finish().unwrap();
+
+	let ts = drain_with(export_of(&consumer).await).await;
+	assert_packet_aligned(&ts);
+	assert_eq!(
+		Clocked::of(&ts).nulls,
+		0,
+		"null packets in an export with a refused catalog mux rate"
+	);
+}
+
+/// A VBR source records no rate, and without one nothing is padded.
+#[tokio::test(start_paused = true)]
+async fn export_without_a_mux_rate_is_unpadded() {
+	let ts = export_fixture(include_bytes!("test_data/scte35/bbb5s.ts"), None).await;
+	assert_eq!(Clocked::of(&ts).nulls, 0, "null packets in an unpadded export");
+}
+
+/// 1 Mb/s is 16.62 packets per 25 ms slot. The fractional remainder carries across slots
+/// instead of rounding each one, and each PCR is the time of its own byte at the rate, so
+/// every PCR is within a system clock tick of its byte position: far inside the ±500 ns
+/// PCR accuracy a TR 101 290 probe holds it to. Also the override supplying a rate to a
+/// catalog that has none.
+#[tokio::test(start_paused = true)]
+async fn export_pcr_is_its_byte_position_at_the_rate() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".aac"),
+			hang::container::track_info(hang::catalog::PRIORITY.audio),
+		)
+		.unwrap();
+	let name = track.name().to_string();
+	{
+		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
+		cfg.container = Container::Legacy;
+		catalog.modify().unwrap().audio.renditions.insert(name.clone(), cfg);
+	}
+	let mut producer = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	// Ten seconds of small frames: a few kb/s of media under a 1 Mb/s rate.
+	for i in 0..500u64 {
+		producer
+			.write(Frame {
+				timestamp: Timestamp::from_micros(i * 20_000).unwrap(),
+				duration: None,
+				payload: Bytes::from(vec![i as u8; 16]),
+				keyframe: i % 50 == 0,
+			})
+			.unwrap();
+	}
+	let _finished = producer.finish().unwrap();
+
+	let export = open_export(crate::source::announced(&consumer).await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_mux_rate(1_000_000);
+	let ts = drain_with(export).await;
+	assert_packet_aligned(&ts);
+
+	let clocked = Clocked::of(&ts);
+	assert!(clocked.nulls > 0, "no null stuffing was emitted");
+	let pcrs = pcr_positions(&ts);
+	assert!(pcrs.len() > 300, "expected a long run of slots, got {}", pcrs.len());
+	let (first, base) = pcrs[0];
+	for &(index, pcr) in &pcrs {
+		let at = (index - first) as u128 * 188 * 8 * 27_000_000 / 1_000_000;
+		let off = (u128::from(pcr - base)).abs_diff(at);
+		assert!(
+			off <= 1,
+			"the PCR at packet {index} is {off} ticks off its byte position"
+		);
+	}
+}
+
+// The decode clock follows the stream's reordering: its delay comes from the depth the SPS
+// declares and the reordering muxed so far, its lookahead also from the catalog `jitter`, and it
+// keeps following all three after the program tables are written.
+
+/// Display offsets within a group, in decode order: a closed GOP with one B-frame per reference.
+/// A B-frame lands one frame below the high-water mark.
+const IPB: [u64; GOP as usize] = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13];
+/// A three-B pyramid: the outer B-frames sit under the middle one, so one lands three frames
+/// below the high-water mark while the SPS can declare a depth of two.
+const PYRAMID: [u64; GOP as usize] = [0, 4, 2, 1, 3, 8, 6, 5, 7, 12, 10, 9, 11, 14, 13];
+/// Where the [`Reordered`] timeline starts, in frames: whole groups, and far enough in that
+/// the PCR's back-off never wraps below zero.
+const REORDERED_BASE: u64 = 20 * GOP;
+/// One 25 fps frame in 90 kHz ticks.
+const FRAME_TICKS: u64 = 3_600;
+
+/// The start of video frame `frame` of a [`Reordered`] broadcast, in display order.
+fn reordered_at(frame: u64) -> Timestamp {
+	Timestamp::from_micros((REORDERED_BASE + frame) * VIDEO_US).unwrap()
+}
+
+/// A reordered H.264 rendition and an AAC one, on the late-join fixture's cadence.
+struct Reordered {
+	_broadcast: moq_net::broadcast::Producer,
+	catalog: crate::catalog::Producer,
+	video: Producer<HangContainer>,
+	audio: Producer<HangContainer>,
+	source: crate::Source,
+	name: String,
+	/// Groups laid out as [`PYRAMID`]; every other group is [`IPB`].
+	pyramid: &'static [u64],
+	audio_index: u64,
+}
+
+impl Reordered {
+	async fn new(sps: &'static [u8], pps: &'static [u8], pyramid: &'static [u64]) -> Self {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+
+		let track = broadcast
+			.create_track(
+				broadcast.unique_name(".avc1"),
+				hang::container::track_info(hang::catalog::PRIORITY.video),
+			)
+			.unwrap();
+		let name = track.name().to_string();
+		let mut cfg = VideoConfig::new(H264 {
+			profile: sps[1],
+			constraints: sps[2],
+			level: sps[3],
+			inline: false,
+		});
+		cfg.container = Container::Legacy;
+		cfg.description =
+			Some(crate::codec::h264::build_avcc(&[Bytes::from_static(sps)], &[Bytes::from_static(pps)]).unwrap());
+		catalog.modify().unwrap().video.renditions.insert(name.clone(), cfg);
+		let video = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Video));
+
+		let track = broadcast
+			.create_track(
+				broadcast.unique_name(".aac"),
+				hang::container::track_info(hang::catalog::PRIORITY.audio),
+			)
+			.unwrap();
+		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
+		cfg.container = Container::Legacy;
+		catalog
+			.modify()
+			.unwrap()
+			.audio
+			.renditions
+			.insert(track.name().to_string(), cfg);
+		let audio = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Audio));
+
+		Self {
+			source: crate::source::announced(&consumer).await,
+			_broadcast: broadcast,
+			catalog,
+			video,
+			audio,
+			name,
+			pyramid,
+			audio_index: 0,
+		}
+	}
+
+	/// An exporter with its subscriptions resolved, so later polls need no runtime.
+	async fn export(&self, max_age: Duration) -> Export<crate::catalog::Consumer> {
+		let mut export = open_export(self.source.clone(), max_age).await.unwrap();
+		assert!(drain_frames(&mut export).await.is_empty());
+		export
+	}
+
+	/// Write the video frame `tick`-th in decode order.
+	fn video(&mut self, tick: u64) {
+		let (group, at) = (tick / GOP, (tick % GOP) as usize);
+		let layout = if self.pyramid.contains(&group) { &PYRAMID } else { &IPB };
+		let keyframe = at == 0;
+		let slice = if keyframe {
+			vec![0x65u8; 3_000]
+		} else {
+			vec![0x41u8; 400]
+		};
+		self.video
+			.write(Frame {
+				timestamp: reordered_at(group * GOP + layout[at]),
+				duration: None,
+				payload: length_prefixed(&[&slice]),
+				keyframe,
+			})
+			.unwrap();
+	}
+
+	/// Write the next audio frame if it starts before video frame `frame`.
+	fn audio_before(&mut self, frame: u64) -> bool {
+		let index = self.audio_index;
+		let timestamp = Timestamp::from_micros(REORDERED_BASE * VIDEO_US + index * AUDIO_US).unwrap();
+		if timestamp >= reordered_at(frame) {
+			return false;
+		}
+		self.audio
+			.write(Frame {
+				timestamp,
+				duration: None,
+				payload: Bytes::from_iter((0..180u16).map(|i| (i ^ index as u16) as u8)),
+				keyframe: index.is_multiple_of(AUDIO_GROUP),
+			})
+			.unwrap();
+		self.audio_index += 1;
+		true
+	}
+
+	fn publish_jitter(&mut self, jitter: Duration) {
+		let mut catalog = self.catalog.modify().unwrap();
+		catalog.video.renditions.get_mut(&self.name).unwrap().jitter = Some(jitter);
+	}
+
+	fn finish(&mut self) {
+		self.video.end_with(None).unwrap();
+		self.audio.end_with(None).unwrap();
+	}
+}
+
+/// Export a [`Reordered`] broadcast twice, like [`export_twice`]: the second exporter joins at
+/// [`JOIN`]. Ticks run on the paused clock as a live source's would, and both exporters hold
+/// frames for a fixed delay. `jitter` is published at its tick when given.
+async fn export_reordered(
+	sps: &'static [u8],
+	pps: &'static [u8],
+	pyramid: &'static [u64],
+	jitter: Option<(u64, Duration)>,
+	rate: Option<u64>,
+) -> (Vec<Frame>, Vec<Frame>) {
+	let delay = Duration::from_millis(500);
+	let mut rig = Reordered::new(sps, pps, pyramid).await;
+	let padded = |export: Export<crate::catalog::Consumer>| match rate {
+		Some(rate) => export.with_mux_rate(rate),
+		None => export,
+	};
+	let mut a = padded(rig.export(delay).await);
+	let start = kio::clock::now();
+	let mut b = None;
+	let (mut out_a, mut out_b) = (Vec::new(), Vec::new());
+	for tick in 0..TICKS {
+		kio::clock::sleep_until(start.saturating_add(Duration::from_micros(tick * VIDEO_US))).await;
+		if let Some((at, jitter)) = jitter
+			&& at == tick
+		{
+			rig.publish_jitter(jitter);
+		}
+		rig.video(tick);
+		while rig.audio_before(tick + 1) {}
+
+		out_a.extend(poll_frames(&mut a));
+		if let Some(b) = b.as_mut() {
+			out_b.extend(poll_frames(b));
+		}
+		if tick + 1 == JOIN {
+			b = Some(padded(open_export(rig.source.clone(), delay).await.unwrap()));
+		}
+	}
+	rig.finish();
+	let mut b = b.unwrap();
+	// Side by side: one left unread while the other drains would be a blocked sink.
+	while let Some(deadline) = [a.next_due(), b.next_due()].into_iter().flatten().min() {
+		kio::clock::sleep_until(deadline).await;
+		out_a.extend(poll_frames(&mut a));
+		out_b.extend(poll_frames(&mut b));
+	}
+	out_a.extend(drain_frames(&mut a).await);
+	out_b.extend(drain_frames(&mut b).await);
+	(out_a, out_b)
+}
+
+/// `(PTS, DTS)` of every video PES start presented within `range`, in transport order.
+fn video_timing(frames: &[Frame], range: impl std::ops::RangeBounds<Timestamp>) -> Vec<(u64, Option<u64>)> {
+	let bytes: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let mut reader = TsPacketReader::new(Cursor::new(bytes));
+	let mut out = Vec::new();
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		if let Some(TsPayload::PesStart(pes)) = packet.payload
+			&& (mpeg2ts::es::StreamId::VIDEO_MIN..=mpeg2ts::es::StreamId::VIDEO_MAX)
+				.contains(&pes.header.stream_id.as_u8())
+		{
+			let pts = pes.header.pts.expect("video PES carried no PTS").as_u64();
+			if range.contains(&Timestamp::from_micros(pts * 1_000 / 90).unwrap()) {
+				out.push((pts, pes.header.dts.map(|t| t.as_u64())));
+			}
+		}
+	}
+	out
+}
+
+/// Every video frame decodes at or before it is presented.
+fn assert_decodes_before_presenting(timing: &[(u64, Option<u64>)]) {
+	assert!(timing.len() > 20, "too few video frames to judge: {}", timing.len());
+	for (i, &(pts, dts)) in timing.iter().enumerate() {
+		let dts = dts.unwrap_or(pts);
+		assert!(dts <= pts, "frame {i} decodes at {dts}, after it is presented at {pts}");
+	}
+}
+
+/// In transport order, every PES unit decodes at or after the last PCR preceding it, and the
+/// clock only steps back where a PCR signals a new time base.
+fn assert_decodes_after_the_clock(frames: &[Frame]) {
+	let bytes: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let mut reader = TsPacketReader::new(Cursor::new(bytes));
+	let mut last_pcr = None;
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		if let Some(af) = packet.adaptation_field.as_ref()
+			&& let Some(pcr) = af.pcr
+		{
+			let pcr = pcr.as_u64() / 300;
+			if let Some(last) = last_pcr {
+				assert!(
+					pcr > last || af.discontinuity_indicator,
+					"the clock steps back from {last} to {pcr} without a discontinuity"
+				);
+			}
+			last_pcr = Some(pcr);
+		}
+		if let Some(TsPayload::PesStart(pes)) = packet.payload
+			&& let Some(pcr) = last_pcr
+		{
+			let pts = pes.header.pts.expect("PES carried no PTS").as_u64();
+			let decode = pes.header.dts.map(|t| t.as_u64()).unwrap_or(pts);
+			assert!(decode >= pcr, "unit decodes at {decode}, before the clock at {pcr}");
+		}
+	}
+}
+
+/// With no `jitter`, an SPS that declares its reorder depth at a fixed frame rate sizes the
+/// reorder delay from the first keyframe: every B-frame decodes at or before it is presented
+/// from the start, and an exporter whose B-frames arrive behind the audio covering them renders
+/// the same bytes as one that sees each tick whole.
+#[tokio::test(start_paused = true)]
+async fn declared_reorder_sizes_the_decode_clock_from_the_first_frame() {
+	// Leave room for replay send-ahead before the logical clock's zero origin.
+	tokio::time::advance(Duration::from_secs(1)).await;
+	let mut rig = Reordered::new(
+		crate::codec::h264::fixtures::SPS_IPB,
+		crate::codec::h264::fixtures::PPS,
+		&[],
+	)
+	.await;
+	let max_age = Duration::from_millis(500);
+	// Written as fast as it is read, so the broadcast is all there at once.
+	let (mut late, mut whole) = (
+		rig.export(max_age).await.with_replay(),
+		rig.export(max_age).await.with_replay(),
+	);
+	let (mut out_late, mut out_whole) = (Vec::new(), Vec::new());
+	for tick in 0..TICKS / 2 {
+		while rig.audio_before(tick + 2) {
+			out_late.extend(poll_frames(&mut late));
+		}
+		rig.video(tick);
+		out_late.extend(poll_frames(&mut late));
+		out_whole.extend(poll_frames(&mut whole));
+	}
+	rig.finish();
+	out_late.extend(drain_frames(&mut late).await);
+	out_whole.extend(drain_frames(&mut whole).await);
+
+	let late: Vec<u8> = out_late.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let whole: Vec<u8> = out_whole.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	assert!(late.len() > 100 * 188, "too little output to compare: {}", late.len());
+	assert!(late == whole, "arrival order changed the rendering");
+
+	let timing = video_timing(&out_late, ..);
+	assert_decodes_before_presenting(&timing);
+	// Depth 1 at 25 fps: every frame decodes one period after the last, in the slot of the
+	// next presentation time a period early.
+	let (pts, dts) = timing[1];
+	assert_eq!(
+		pts,
+		(REORDERED_BASE + 2) * FRAME_TICKS,
+		"the first P-frame follows the keyframe"
+	);
+	assert_eq!(
+		dts,
+		Some(REORDERED_BASE * FRAME_TICKS),
+		"the first P-frame already runs on the declared depth"
+	);
+	let decode: Vec<u64> = timing.iter().map(|&(pts, dts)| dts.unwrap_or(pts)).collect();
+	for (i, step) in decode.windows(2).map(|w| w[1] - w[0]).enumerate() {
+		assert_eq!(
+			step, FRAME_TICKS,
+			"frame {i} does not decode one period after the last: {decode:?}"
+		);
+	}
+	assert_decodes_after_the_clock(&out_late);
+}
+
+/// Reordered video (each pyramid in decode order: PTS 0, 160, 80, 40, 120 ms) loses nothing on
+/// a clean path. The deadline is on decode time, so no B-frame is stranded behind its
+/// reference or sent ahead of it, and every unit arrives before it decodes.
+#[tokio::test(start_paused = true)]
+async fn reordered_video_loses_nothing_on_a_clean_path() {
+	let delay = Duration::from_millis(500);
+	let mut rig = Reordered::new(SPS, PPS, &[0, 1, 2, 3, 4]).await;
+	let mut export = rig.export(delay).await;
+	let start = kio::clock::now();
+	let mut out = Vec::new();
+	for tick in 0..TICKS / 2 {
+		kio::clock::sleep_until(start.saturating_add(Duration::from_micros(tick * VIDEO_US))).await;
+		rig.video(tick);
+		while rig.audio_before(tick + 1) {}
+		out.extend(poll_frames(&mut export));
+	}
+	rig.finish();
+	out.extend(drain_frames(&mut export).await);
+
+	assert_eq!(export.dropped(), 0, "a clean path drops nothing");
+	assert_eq!(
+		video_timing(&out, ..).len() as u64,
+		TICKS / 2,
+		"every video frame went out"
+	);
+	// The SPS declares no reorder depth, but the first pyramid is read a delay ahead of
+	// the first PCR, so the reorder delay it grows never steps the clock back.
+	assert_eq!(
+		count_discontinuity(&out),
+		0,
+		"the reorder delay settled before the clock started"
+	);
+	assert_on_time(&out);
+}
+
+/// Padded video whose HRD declares a longer buffer delay than the export's fails with its
+/// first picture, naming the delay it needs, rather than once the source fills its CPB and a
+/// picture misses its deadline. At that delay it runs.
+#[tokio::test(start_paused = true)]
+async fn padded_video_needs_the_delay_its_hrd_declares() {
+	use crate::codec::h264::fixtures::{PPS, SPS_HRD};
+
+	let waiter = kio::Waiter::noop();
+	for (delay, refused) in [(Duration::from_millis(500), true), (Duration::from_secs(1), false)] {
+		let mut rig = Reordered::new(SPS_HRD, PPS, &[]).await;
+		let mut export = rig.export(delay).await.with_mux_rate(2_000_000);
+		let start = kio::clock::now();
+		let mut out = Vec::new();
+		let mut failed = None;
+		'run: for tick in 0..TICKS / 2 {
+			kio::clock::sleep_until(start.saturating_add(Duration::from_micros(tick * VIDEO_US))).await;
+			rig.video(tick);
+			while rig.audio_before(tick + 1) {}
+			while let std::task::Poll::Ready(frame) = export.poll_next(&waiter) {
+				match frame {
+					Ok(Some(frame)) => out.push(frame),
+					Ok(None) => break,
+					Err(err) => {
+						failed = Some(err.to_string());
+						break 'run;
+					}
+				}
+			}
+		}
+		if refused {
+			let err = failed.expect("a 500 ms delay cannot send a 1 s CPB far enough ahead");
+			assert!(err.contains("raise the delay to 1s"), "{err}");
+			continue;
+		}
+		assert_eq!(failed, None, "a 1 s delay sends a 1 s CPB far enough ahead");
+		rig.finish();
+		out.extend(drain_frames(&mut export).await);
+		assert_eq!(export.dropped(), 0, "a clean path drops nothing");
+		assert_eq!(
+			video_timing(&out, ..).len() as u64,
+			TICKS / 2,
+			"every video frame went out"
+		);
+		assert_on_time(&out);
+	}
+}
+
+/// Two exporters of a broadcast padded to a multiplex rate, one joining a second late, lay the
+/// same packets once the joiner's first group is out: how many packets a slot carries, the PCR
+/// it opens with and which units ride it are functions of the media, not of when either
+/// started. The continuity counter is the one exception ([`assert_only_continuity_differs`]).
+#[tokio::test(start_paused = true)]
+async fn late_join_at_a_rate_matches_a_running_exporter() {
+	let (runner, joiner) = export_reordered(SPS, PPS, &[], None, Some(2_000_000)).await;
+	let keyframes: Vec<Timestamp> = joiner.iter().filter(|f| f.keyframe).map(|f| f.timestamp).collect();
+	assert!(keyframes.len() > 2, "too few keyframes to judge: {keyframes:?}");
+	assert_only_continuity_differs(&runner, &joiner, keyframes[1]);
+}
+
+/// With nothing declared, the reorder delay grows to the deepest reordering muxed so far. This
+/// is the one path where it depends on when an exporter joined: a joiner that has muxed only
+/// shallow groups runs a shallower clock than a runner that saw a deep one before the join,
+/// until the deep structure recurs. From then on the two render the same bytes.
+#[tokio::test(start_paused = true)]
+async fn undeclared_reorder_converges_after_its_deepest_reorder() {
+	// The runner sees a pyramid in group 2; the joiner, arriving at group 5, first in group 7.
+	// Group 9 repeats it on the settled delay.
+	let (runner, joiner) = export_reordered(SPS, PPS, &[2, 7, 9], None, None).await;
+	let keyframes: Vec<Timestamp> = joiner.iter().filter(|f| f.keyframe).map(|f| f.timestamp).collect();
+	let deepest = reordered_at(8 * GOP);
+	assert!(
+		keyframes[1] < deepest,
+		"the joiner must render shallow groups before the deep one"
+	);
+
+	assert_ne!(
+		video_timing(&runner, keyframes[1]..deepest),
+		video_timing(&joiner, keyframes[1]..deepest),
+		"a joiner that has not muxed the deepest reordering runs the runner's clock"
+	);
+	assert_only_continuity_differs(&runner, &joiner, deepest);
+
+	for frames in [&runner, &joiner] {
+		assert_decodes_before_presenting(&video_timing(frames, deepest..));
+		// Growth steps the reserve up mid-stream; the clock must still never overtake a decode.
+		assert_decodes_after_the_clock(frames);
+	}
+}
+
+/// A `jitter` bounds how far ahead the decode clock looks, not how early it decodes: published
+/// after the program tables, it leaves the encoder's spacing alone, and the running exporter
+/// renders what a joiner that found it in its first catalog renders.
+#[tokio::test(start_paused = true)]
+async fn jitter_published_after_the_tables_keeps_the_encoders_clock() {
+	let jitter = Duration::from_millis(80);
+	let (runner, joiner) = export_reordered(SPS, PPS, &[], Some((2 * GOP, jitter)), None).await;
+	let keyframes: Vec<Timestamp> = joiner.iter().filter(|f| f.keyframe).map(|f| f.timestamp).collect();
+	assert_only_continuity_differs(&runner, &joiner, keyframes[1]);
+
+	// One B-frame per reference: every frame decodes a period after the last, a period early.
+	let timing = video_timing(&runner, reordered_at(3 * GOP)..);
+	assert_decodes_before_presenting(&timing);
+	let decode: Vec<u64> = timing.iter().map(|&(pts, dts)| dts.unwrap_or(pts)).collect();
+	for (i, step) in decode.windows(2).map(|w| w[1] - w[0]).enumerate() {
+		assert_eq!(step, FRAME_TICKS, "frame {i} does not decode one period after the last");
+	}
+	for (pts, dts) in timing
+		.into_iter()
+		.filter(|(pts, _)| (pts / FRAME_TICKS).is_multiple_of(GOP))
+	{
+		assert_eq!(dts, Some(pts - FRAME_TICKS), "a keyframe decodes a period early");
+	}
+	assert_decodes_after_the_clock(&runner);
+}
+
+/// Only skipped schedule slots flag the PCR, keeping the program and release clock.
+/// Short holes keep the grid continuous; long ones exceed the scheduler's backfill window.
+#[tokio::test(start_paused = true)]
+async fn a_skipped_group_flags_the_clock() {
+	let cases = [Duration::ZERO, Duration::from_millis(500)]
+		.into_iter()
+		.flat_map(|delay| [None, Some(1_000_000)].map(|rate| (delay, rate)));
+	for (delay, rate) in cases {
+		for missing in [0, 1, 60u64] {
+			println!("delay {delay:?}, mux rate {rate:?}, missing {missing} groups per hole");
+			let mut broadcast = moq_net::broadcast::Info::new().produce();
+			let consumer = broadcast.consume();
+			let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+			let track = broadcast
+				.create_track("a.aac", hang::container::track_info(hang::catalog::PRIORITY.audio))
+				.unwrap();
+			{
+				let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+				cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
+				cfg.container = Container::Legacy;
+				catalog
+					.modify()
+					.unwrap()
+					.audio
+					.renditions
+					.insert("a.aac".to_string(), cfg);
+			}
+
+			let mut export = open_export(crate::source::announced(&consumer).await, delay)
+				.await
+				.unwrap();
+			if let Some(rate) = rate {
+				export = export.with_mux_rate(rate);
+			}
+			let start = kio::clock::now();
+			let mut out = Vec::new();
+			// 100 ms groups of five 20 ms frames, a minute in, with two short or long holes.
+			for sequence in 0..80 + 2 * missing {
+				kio::clock::sleep_until(start.saturating_add(Duration::from_millis(sequence * 100))).await;
+				if !(20..20 + missing).contains(&sequence) && !(40 + missing..40 + 2 * missing).contains(&sequence) {
+					let mut group = track.create_group(moq_net::group::Info { sequence }).unwrap();
+					for k in 0..5u64 {
+						let frame = Frame {
+							timestamp: Timestamp::from_millis(60_000 + sequence * 100 + k * 20).unwrap(),
+							duration: None,
+							payload: Bytes::from_static(&[0x21, 0x10, 0x04, 0x60]),
+							keyframe: k == 0,
+						};
+						HangContainer::Legacy(crate::container::Kind::Audio)
+							.write(&mut group, &[frame])
+							.unwrap();
+					}
+					group.finish().unwrap();
+				}
+				out.extend(poll_frames(&mut export));
+			}
+			let _track = track.finish().unwrap();
+			out.extend(drain_frames(&mut export).await);
+
+			assert_eq!(export.discontinuity(), 0, "a skipped group is not a new program clock");
+			assert_skip_discontinuity(&out, 2 * usize::from(missing == 60 && delay.is_zero()));
+			let ts: Vec<u8> = out.iter().flat_map(|f| f.payload.iter().copied()).collect();
+			for pair in out.windows(2) {
+				let jumped = pair[1].timestamp.as_micros() > pair[0].timestamp.as_micros() + 25_000;
+				assert_eq!(count_discontinuity(&pair[1..]), usize::from(jumped));
+			}
+			// Each flag lands right before the audio that resumes after its hole.
+			let resumes: Vec<u64> = [20 + missing, 40 + 2 * missing]
+				.into_iter()
+				.filter(|_| missing == 60 && delay.is_zero())
+				.map(|sequence| (60_000 + sequence * 100) * 90)
+				.collect();
+			let mut reader = TsPacketReader::new(Cursor::new(&ts));
+			let (mut flagged, mut after) = (false, Vec::new());
+			while let Some(packet) = reader.read_ts_packet().unwrap() {
+				flagged |= packet
+					.adaptation_field
+					.is_some_and(|field| field.discontinuity_indicator);
+				if let Some(TsPayload::PesStart(pes)) = packet.payload
+					&& std::mem::take(&mut flagged)
+				{
+					after.extend(pes.header.pts.map(|pts| pts.as_u64()));
+				}
+			}
+			assert_eq!(after, resumes, "the first PES after each flag resumes its hole");
+			let (_, audio) = collect_pes_pts(&ts);
+			assert!(
+				audio.iter().any(|&pts| pts >= (60_000 + (70 + 2 * missing) * 100) * 90),
+				"the audio after the skip went out"
+			);
+			assert_on_time(&out);
+		}
+	}
+}
+
+/// A same-program clock jump flags only its first PCR.
+fn assert_skip_discontinuity(frames: &[Frame], count: usize) {
+	assert_eq!(
+		count_discontinuity(frames),
+		count,
+		"only one PCR per clock jump is flagged"
+	);
+	assert!(
+		pats(frames).iter().all(|&(version, _)| version == 0),
+		"the PAT keeps its version"
+	);
+	assert!(
+		pmts(frames).iter().all(|(version, _)| *version == 0),
+		"the PMT keeps its version"
+	);
+	let mut health = super::health::Health::default();
+	let mut continuity = super::health::Multiplex::default();
+	let ts: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let mut reader = TsPacketReader::new(Cursor::new(&ts));
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		if let Some(TsPayload::Pmt(pmt)) = packet.payload {
+			health.pcr_pid(pmt.pcr_pid.map(|pid| pid.as_u16()));
+			break;
+		}
+	}
+	let start = kio::clock::Instant::now();
+	let mut count = 0;
+	for packet in ts.as_chunks::<188>().0 {
+		if packet[3] & 0x20 != 0 && packet[4] > 0 && packet[5] & 0x80 != 0 {
+			assert_ne!(packet[5] & 0x10, 0, "a clock jump flags only a PCR packet");
+		}
+		let continuation = continuity.packet(packet);
+		// Feed the PCR samples as a uniform synthetic stream to grade their values.
+		// VBR packet density cannot supply a constant byte rate for health extrapolation.
+		if super::import::pcr(packet).is_some() {
+			count += 1;
+			health.packet(packet, continuation, super::health::At { count, arrival: start });
+		}
+	}
+
+	let mut stats = stats::Snapshot::default();
+	health.errors().report(&mut stats);
+	assert_eq!(stats.pcr_discontinuity_indicator_error, 0, "no unflagged PCR jump");
+	assert_eq!(stats.pcr_repetition_error, 0, "no unflagged gap after the flagged PCR");
+}
+
+/// Timestamps restarting within one broadcast are a publisher bug, since a name always
+/// means the same content: the export fails rather than rewind its clock.
+#[tokio::test(start_paused = true)]
+async fn a_timeline_restarting_at_zero_fails_the_export() {
+	use crate::container::Container as _;
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let track = broadcast
+		.create_track("a.aac", hang::container::track_info(hang::catalog::PRIORITY.audio))
+		.unwrap();
+	{
+		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
+		cfg.container = Container::Legacy;
+		catalog
+			.modify()
+			.unwrap()
+			.audio
+			.renditions
+			.insert("a.aac".to_string(), cfg);
+	}
+
+	let mut export = open_export(crate::source::announced(&consumer).await, Duration::from_millis(500))
+		.await
+		.unwrap();
+	let start = kio::clock::now();
+	// One-second groups of 20 ms frames for 10 s, then a group back at zero. The track refuses
+	// a group whose first frame rewinds, so that group opens at the previous start.
+	for sequence in 0..11u64 {
+		kio::clock::sleep_until(start.saturating_add(Duration::from_secs(sequence))).await;
+		let base = if sequence < 10 { sequence * 1_000 } else { 0 };
+		let mut group = track.create_group(moq_net::group::Info { sequence }).unwrap();
+		for k in 0..50u64 {
+			let millis = if sequence == 10 && k == 0 { 9_000 } else { base + k * 20 };
+			let frame = Frame {
+				timestamp: Timestamp::from_millis(millis).unwrap(),
+				duration: None,
+				payload: Bytes::from_static(&[0x21, 0x10, 0x04, 0x60]),
+				keyframe: k == 0,
+			};
+			HangContainer::Legacy(crate::container::Kind::Audio)
+				.write(&mut group, &[frame])
+				.unwrap();
+		}
+		group.finish().unwrap();
+		if sequence < 10 {
+			poll_frames(&mut export);
+		}
+	}
+	let (_, end) = drain_to_end(&mut export).await;
+	assert!(
+		matches!(end, Err(crate::Error::TimestampRewind(_))),
+		"a restart at zero fails the export: {end:?}"
+	);
+}
+
+/// An exporter joining a live broadcast starts at its newest group, the live edge, not at
+/// the oldest one its delay still reaches: otherwise its clock would carry that group's age,
+/// up to the delay, as latency for as long as it runs.
+#[tokio::test(start_paused = true)]
+async fn a_late_join_starts_at_the_live_edge() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let mut audio = aac_rendition(&mut broadcast, &mut catalog, "a.aac");
+	let start = kio::clock::now();
+	let mut export = None;
+	let mut out = Vec::new();
+	// One-second groups of 20 ms frames; the exporter joins 5.5 s in with a 2 s delay.
+	for k in 0..400u64 {
+		kio::clock::sleep_until(start.saturating_add(Duration::from_millis(k * 20))).await;
+		if k % 50 == 0 && k > 0 {
+			audio.cut(None).unwrap();
+		}
+		audio
+			.write(Frame {
+				timestamp: Timestamp::from_millis(60_000 + k * 20).unwrap(),
+				duration: None,
+				payload: Bytes::from_static(&[0x21, 0x10, 0x04, 0x60]),
+				keyframe: k % 50 == 0,
+			})
+			.unwrap();
+		if k == 275 {
+			let joined = open_export(crate::source::announced(&consumer).await, Duration::from_secs(2))
+				.await
+				.unwrap();
+			export = Some(joined);
+		}
+		if let Some(export) = export.as_mut() {
+			out.extend(poll_frames(export));
+		}
+	}
+	let _finished = audio.finish().unwrap();
+	let mut export = export.unwrap();
+	out.extend(drain_frames(&mut export).await);
+
+	let ts: Vec<u8> = out.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let (_, pts) = collect_pes_pts(&ts);
+	assert_eq!(
+		pts.first().copied(),
+		Some((60_000 + 5_000) * 90),
+		"the export starts at the newest group"
+	);
+}
+
+/// Publish a Legacy AAC rendition named `name`.
+fn aac_rendition<E: crate::catalog::hang::CatalogExt>(
+	broadcast: &mut moq_net::broadcast::Producer,
+	catalog: &mut crate::catalog::Producer<E>,
+	name: &str,
+) -> Producer<HangContainer> {
+	let track = broadcast
+		.create_track(name, hang::container::track_info(hang::catalog::PRIORITY.audio))
+		.unwrap();
+	let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+	cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
+	cfg.container = Container::Legacy;
+	catalog.modify().unwrap().audio.renditions.insert(name.to_string(), cfg);
+	Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data))
+}
+
+/// Write one AAC frame at `ms`, in a group of its own.
+fn write_aac(producer: &mut Producer<HangContainer>, ms: u64) {
+	producer
+		.write(Frame {
+			// A minute in, so a frame can go out the whole recording delay ahead of it.
+			timestamp: Timestamp::from_millis(60_000 + ms).unwrap(),
+			duration: None,
+			payload: Bytes::from_static(&[0x21, 0x10, 0x04, 0x60]),
+			keyframe: true,
+		})
+		.unwrap();
+	producer.cut(None).unwrap();
+}
+
+/// Count the PES packets across `frames`.
+fn pes_count(frames: &[Frame]) -> usize {
+	let bytes: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let mut reader = TsPacketReader::new(Cursor::new(bytes));
+	let mut count = 0;
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		if matches!(packet.payload, Some(TsPayload::PesStart(_))) {
+			count += 1;
+		}
+	}
+	count
+}
+
+/// Pull frames until the export ends, returning them and how it ended.
+async fn drain_to_end<S: crate::catalog::Stream>(export: &mut Export<S>) -> (Vec<Frame>, crate::Result<()>)
+where
+	S::Ext: tscat::Catalog,
+{
+	let mut out = Vec::new();
+	loop {
+		match kio::clock::timeout(DRAIN, export.next())
+			.await
+			.expect("the export ends")
+		{
+			Ok(Some(frame)) => out.push(frame),
+			Ok(None) => return (out, Ok(())),
+			Err(err) => return (out, Err(err)),
+		}
+	}
+}
+
+/// Packets whose continuity counter does not follow the last one on their PID, other than
+/// those flagging a discontinuity.
+fn continuity_errors(frames: &[Frame]) -> usize {
+	let mut last = std::collections::HashMap::new();
+	let mut errors = 0;
+	for packet in frames.iter().flat_map(|f| f.payload.as_chunks::<188>().0.iter()) {
+		let pid = u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+		// Only a packet carrying payload advances the counter.
+		if pid == 0x1fff || packet[3] & 0x10 == 0 {
+			continue;
+		}
+		let counter = packet[3] & 0x0f;
+		let flagged = packet[3] & 0x20 != 0 && packet[4] > 0 && packet[5] & 0x80 != 0;
+		if let Some(previous) = last.insert(pid, counter)
+			&& !flagged
+			&& counter != (previous + 1) & 0x0f
+		{
+			errors += 1;
+		}
+	}
+	errors
+}
+
+/// The output of an export reading the [`Moving`](crate::container::test_util::Moving)
+/// rendition's track `a` up to frame `read`, before the catalog moves the rendition to `track`
+/// in `broadcast` described by `sps`. Both tracks run on to frame 120 in step, the new one from
+/// frame `start`, marked 0xb0 before frame 60, a keyframe two seconds in, and 0xb1 from it.
+async fn moved_export(
+	(start, read): (u64, u64),
+	(track, broadcast, sps): (&str, Option<&str>, &'static [u8]),
+) -> Vec<Frame> {
+	use crate::container::test_util::{Moving, marked_frame};
+
+	let mut moving = Moving::new();
+	let mut export = open_export(moving.source().await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	let write = |moving: &mut Moving, i: u64, mark: u8| {
+		moving.a.write(marked_frame(i, mark)).unwrap();
+		let next = match broadcast {
+			None => &mut moving.b,
+			Some(_) => &mut moving.other,
+		};
+		if i >= start {
+			let mark = if i < 60 { 0xb0 } else { 0xb1 };
+			next.write(marked_frame(i, mark)).unwrap();
+		}
+	};
+	for i in 0..read {
+		write(&mut moving, i, 0xa1);
+	}
+	let mut frames = drain_frames(&mut export).await;
+
+	moving.point(track, broadcast, sps);
+	frames.extend(drain_frames(&mut export).await);
+	for i in read..120 {
+		write(&mut moving, i, 0xa2);
+		frames.extend(drain_frames(&mut export).await);
+	}
+	match broadcast {
+		None => moving.b.end_with(None).unwrap(),
+		Some(_) => moving.other.end_with(None).unwrap(),
+	}
+	moving.catalog.finish().unwrap();
+	let (rest, end) = drain_to_end(&mut export).await;
+	frames.extend(rest);
+	end.unwrap();
+	frames
+}
+
+/// A rendition the catalog moves to another track, in its broadcast or a sibling one, goes on
+/// out of the PID the PMT announced, with that track's media and none of the one it left. The
+/// continuity counters and the PCR clock run on through the move. Its
+/// parameter sets ride in-band, so the new track may carry another SPS.
+#[tokio::test(start_paused = true)]
+async fn a_moved_rendition_continues_on_its_pid() {
+	use crate::container::test_util::{Moving, marks};
+
+	for (track, broadcast, sps) in [("b", None, Moving::MAIN_SPS), ("a", Some("other"), SPS)] {
+		let frames = moved_export((60, 45), (track, broadcast, sps)).await;
+		let ts: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+		let video = reassemble_video(&ts, StreamType::H264);
+		let expected: Vec<u8> = [vec![0xa1; 45], vec![0xb1; 60]].concat();
+		assert_eq!(marks(&video), expected, "moved to {track} in {broadcast:?}");
+		assert_eq!(
+			video.windows(4).any(|w| w == &Moving::MAIN_SPS[..4]),
+			sps == Moving::MAIN_SPS,
+			"the new track's parameter sets go out in-band"
+		);
+		assert_eq!(continuity_errors(&frames), 0);
+		assert_skip_discontinuity(&frames, 0);
+		assert!(
+			pmts(&frames).iter().all(|(version, _)| *version == 0),
+			"the PMT stays as announced"
+		);
+	}
+}
+
+/// AAC's ADTS headers are written from the announced configuration as its frames go out, so
+/// a move to an AAC track configured differently is refused rather than framing the old
+/// track's queued frames as the new one's.
+#[tokio::test(start_paused = true)]
+async fn a_rendition_moved_to_another_aac_configuration_fails() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let mut old = aac_rendition(&mut broadcast, &mut catalog, "main");
+	let track = broadcast
+		.create_track("next", hang::container::track_info(hang::catalog::PRIORITY.audio))
+		.unwrap();
+	let mut next = Producer::new(track, HangContainer::Legacy(Kind::Data));
+
+	let mut export = open_export(crate::source::announced(&consumer).await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut old, ms);
+	}
+	assert!(!drain_frames(&mut export).await.is_empty(), "the PMT went out");
+
+	{
+		let mut guard = catalog.modify().unwrap();
+		let config = guard.audio.renditions.get_mut("main").unwrap();
+		config.track = Some("next".to_string());
+		config.sample_rate = 44_100;
+		config.description = Some(Bytes::from_static(&[0x12, 0x10]));
+	}
+	write_aac(&mut next, 200);
+	let err = kio::clock::timeout(DRAIN, async {
+		loop {
+			if let Err(err) = export.next().await {
+				break err;
+			}
+		}
+	})
+	.await
+	.expect("the export reads the catalog update");
+	assert!(err.to_string().contains("'main' moved to a track"), "{err}");
+}
+
+/// A track that leaves the catalog after the PMT is read to its own end rather than
+/// refused as a layout change. A publisher retires a rendition as its track ends, and
+/// that catalog update can land before the track's last frames and its finish do, so
+/// this retires the rendition first: the order in which the old check misread a clean
+/// end as a removed track.
+#[tokio::test(start_paused = true)]
+async fn a_track_leaving_the_catalog_is_read_to_its_end() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let mut kept = aac_rendition(&mut broadcast, &mut catalog, "a.aac");
+	let mut leaving = aac_rendition(&mut broadcast, &mut catalog, "b.aac");
+
+	let mut export = open_export(crate::source::announced(&consumer).await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut kept, ms);
+		write_aac(&mut leaving, ms);
+	}
+	// The program tables are built from the first frames, without waiting out the delay that
+	// would make the rest late.
+	let mut frames = poll_frames(&mut export);
+
+	catalog.modify().unwrap().audio.renditions.remove("b.aac");
+	for ms in (200..300).step_by(20) {
+		write_aac(&mut kept, ms);
+		write_aac(&mut leaving, ms);
+	}
+	let _finished = leaving.finish().unwrap();
+	for ms in (300..400).step_by(20) {
+		write_aac(&mut kept, ms);
+	}
+	let _finished = kept.finish().unwrap();
+	catalog.finish().unwrap();
+
+	let (rest, end) = drain_to_end(&mut export).await;
+	end.expect("a track leaving the catalog is not a layout change");
+	frames.extend(rest);
+	assert_eq!(pes_count(&frames), 20 + 15, "every frame of both tracks went out");
+}
+
+/// Publish an empty catalog at `live` under `route`.
+fn publish_live<E: crate::catalog::hang::CatalogExt>(
+	origin: &moq_net::origin::Producer,
+	route: moq_net::origin::RouteOptions,
+) -> (moq_net::origin::Route, crate::catalog::Producer<E>) {
+	let broadcast = origin.route("live", route).unwrap();
+	let config = crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<E>::default());
+	let catalog = crate::catalog::Producer::new(&mut broadcast.broadcast().clone(), config).unwrap();
+	(broadcast, catalog)
+}
+
+/// Publish a Legacy H.264 rendition named `name`, described out of band.
+fn h264_rendition<E: crate::catalog::hang::CatalogExt>(
+	broadcast: &mut moq_net::broadcast::Producer,
+	catalog: &mut crate::catalog::Producer<E>,
+	name: &str,
+) -> Producer<HangContainer> {
+	let track = broadcast
+		.create_track(name, hang::container::track_info(hang::catalog::PRIORITY.video))
+		.unwrap();
+	let mut cfg = VideoConfig::new(H264 {
+		profile: 0x42,
+		constraints: 0xc0,
+		level: 0x1f,
+		inline: false,
+	});
+	cfg.container = Container::Legacy;
+	cfg.description =
+		Some(crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap());
+	catalog.modify().unwrap().video.renditions.insert(name.to_string(), cfg);
+	Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data))
+}
+
+/// Write one 25 fps video frame at `ms`, a keyframe opening a group every fifth.
+fn write_h264(producer: &mut Producer<HangContainer>, ms: u64) {
+	let keyframe = ms.is_multiple_of(200);
+	if keyframe && ms > 0 {
+		producer.cut(None).unwrap();
+	}
+	let slice = if keyframe { [0x65u8; 64] } else { [0x41u8; 64] };
+	producer
+		.write(Frame {
+			timestamp: Timestamp::from_millis(60_000 + ms).unwrap(),
+			duration: None,
+			payload: length_prefixed(&[&slice]),
+			keyframe,
+		})
+		.unwrap();
+}
+
+/// Every PAT in `frames`: its version and the PMT PID it lists.
+fn pats(frames: &[Frame]) -> Vec<(u8, u16)> {
+	let bytes: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let mut reader = TsPacketReader::new(Cursor::new(bytes));
+	let mut out = Vec::new();
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		if let Some(TsPayload::Pat(pat)) = packet.payload {
+			out.push((pat.version_number.as_u8(), pat.table[0].program_map_pid.as_u16()));
+		}
+	}
+	out
+}
+
+/// Every PMT in `frames`: its version and the stream types it lists.
+fn pmts(frames: &[Frame]) -> Vec<(u8, Vec<StreamType>)> {
+	let bytes: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let mut reader = TsPacketReader::new(Cursor::new(bytes));
+	let mut out = Vec::new();
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		if let Some(TsPayload::Pmt(pmt)) = packet.payload {
+			let types = pmt.es_info.iter().map(|es| es.stream_type).collect();
+			out.push((pmt.version_number.as_u8(), types));
+		}
+	}
+	out
+}
+
+/// The PIDs whose first packet in `frames` does not flag a discontinuity.
+fn unflagged(frames: &[Frame]) -> Vec<u16> {
+	let mut seen = std::collections::HashSet::new();
+	let mut out = Vec::new();
+	for packet in frames.iter().flat_map(|f| f.payload.as_chunks::<188>().0.iter()) {
+		let pid = u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+		if pid == 0x1fff || !seen.insert(pid) {
+			continue;
+		}
+		if !(packet[3] & 0x20 != 0 && packet[4] > 0 && packet[5] & 0x80 != 0) {
+			out.push(pid);
+		}
+	}
+	out
+}
+
+/// The same instance back after every route went carries on in the same export, under the
+/// program already announced: the PSI keeps its version and the PCR clock continues.
+/// Both ways a broadcast ends, a clean finish and a drop, continue alike.
+async fn same_instance_returns(finish: bool) {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(instance.clone(), 0);
+
+	let (broadcast, mut catalog) = publish_live::<()>(&origin, route());
+	let mut track = aac_rendition(&mut broadcast.broadcast().clone(), &mut catalog, "a.aac");
+	let mut export = open_export(crate::source::resolved(&origin, "live").await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	let start = kio::clock::now();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut track, ms);
+	}
+	let mut frames = drain_frames(&mut export).await;
+	if finish {
+		track.end_with(None).unwrap();
+		catalog.finish().unwrap();
+	}
+	drop((broadcast, catalog, track));
+	let (rest, end) = drain_to_end(&mut export).await;
+	frames.extend(rest);
+	assert_eq!(end.is_ok(), finish, "a finish ends cleanly and a drop fails: {end:?}");
+
+	// Back under the same instance a second later, its media as far on as the wall clock, its
+	// catalog listing the track only in its second snapshot.
+	kio::clock::sleep(Duration::from_secs(1)).await;
+	let (broadcast, mut catalog) = publish_live::<()>(&origin, route());
+	std::ops::DerefMut::deref_mut(&mut catalog.modify().unwrap());
+	let back = origin
+		.consume()
+		.follow("live", None)
+		.unwrap()
+		.available()
+		.await
+		.unwrap()
+		.unwrap();
+	let stream = crate::catalog::Consumer::new(&back, Default::default()).await.unwrap();
+	let mut export = export.follow(back, stream).unwrap();
+	frames.extend(drain_frames(&mut export).await);
+	let mut track = aac_rendition(&mut broadcast.broadcast().clone(), &mut catalog, "a.aac");
+	let resumed = start.elapsed().as_millis() as u64;
+	for ms in (resumed..resumed + 200).step_by(20) {
+		write_aac(&mut track, ms);
+	}
+	frames.extend(drain_frames(&mut export).await);
+	let _finished = track.finish().unwrap();
+	catalog.finish().unwrap();
+	let (rest, end) = drain_to_end(&mut export).await;
+	frames.extend(rest);
+	end.unwrap();
+
+	assert_eq!(pes_count(&frames), 20, "every frame of both spans went out");
+	assert_skip_discontinuity(&frames, 0);
+	assert_eq!(export.discontinuity(), 0);
+	assert!(
+		pats(&frames).iter().all(|&(version, _)| version == 0),
+		"the PAT keeps its version"
+	);
+	assert!(
+		pmts(&frames).iter().all(|(version, _)| *version == 0),
+		"the PMT keeps its version"
+	);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_same_instance_continues_after_a_finish() {
+	same_instance_returns(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_same_instance_continues_after_a_drop() {
+	same_instance_returns(false).await;
+}
+
+/// A returning route serves the same publisher's catalog and monotonically numbered groups.
+#[tokio::test(start_paused = true)]
+async fn a_return_keeps_catalog_and_group_history() {
+	let wall = kio::clock::Wall::MOQ_EPOCH + Duration::from_millis(86_400_000);
+	crate::clock::fake_host_wall(wall);
+	let start = kio::clock::now();
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let route = moq_net::origin::RouteOptions::default().with_instance(instance.clone(), 0);
+	let (broadcast, mut catalog) = publish_live::<()>(&origin, route.clone());
+	let mut track = aac_rendition(&mut broadcast.broadcast().clone(), &mut catalog, "a.aac");
+	let mut groups = track.consume();
+	let clock = catalog.snapshot().media.clock;
+	let source = crate::source::resolved(&origin, "live").await;
+	let old = source.broadcast();
+	let mut export = open_export(source, RECORDING_MAX_AGE).await.unwrap().with_replay();
+	for (sequence, ms) in (0..200).step_by(20).enumerate() {
+		write_aac(&mut track, ms);
+		assert_eq!(groups.recv_group().await.unwrap().unwrap().sequence, sequence as u64);
+	}
+	let mut frames = drain_frames(&mut export).await;
+	assert_eq!(pes_count(&frames), 10);
+
+	broadcast.withdraw();
+	old.closed().await;
+	tokio::time::advance(Duration::from_secs(1)).await;
+	crate::clock::fake_host_wall(wall + start.elapsed());
+	broadcast.announce().unwrap();
+	assert_eq!(
+		catalog.snapshot().media.clock,
+		clock,
+		"a return must keep the catalog clock"
+	);
+	let back = origin
+		.consume()
+		.follow("live", None)
+		.unwrap()
+		.available()
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(back.info().instance.as_ref(), Some(&instance));
+	assert!(!back.is_clone(&old), "the withdrawn front is replaced");
+	let stream = crate::catalog::Consumer::new(&back, Default::default()).await.unwrap();
+	let mut export = export.follow(back, stream).unwrap();
+	let resumed = start.elapsed().as_millis() as u64;
+	for (sequence, ms) in (resumed..resumed + 200).step_by(20).enumerate() {
+		write_aac(&mut track, ms);
+		assert_eq!(
+			groups.recv_group().await.unwrap().unwrap().sequence,
+			10 + sequence as u64
+		);
+	}
+	let _finished = track.finish().unwrap();
+	catalog.finish().unwrap();
+	let (rest, end) = drain_to_end(&mut export).await;
+	frames.extend(rest);
+	end.expect("the publisher's final finish is clean");
+	assert_eq!(pes_count(&frames), 20, "each span goes out exactly once");
+	assert_skip_discontinuity(&frames, 0);
+	assert_eq!(export.discontinuity(), 0);
+	assert!(pats(&frames).iter().all(|&(version, _)| version == 0));
+	assert!(pmts(&frames).iter().all(|(version, _)| *version == 0));
+}
+
+/// A switch onto an instance that is itself replaced before it builds its tables still
+/// reaches the next program as a switch: its tables carry a new version, every PID's first
+/// packet flags the break, and pacing sees a new generation.
+#[tokio::test(start_paused = true)]
+async fn a_switch_carries_through_an_instance_that_never_built_its_tables() {
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+
+	let (old, mut old_catalog) = publish_live::<()>(&origin, route());
+	let mut old_audio = aac_rendition(&mut old.broadcast().clone(), &mut old_catalog, "a.aac");
+	let mut export = open_export(crate::source::resolved(&origin, "live").await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut old_audio, ms);
+	}
+	let before = drain_frames(&mut export).await;
+	assert!(!pats(&before).is_empty(), "the first program went out");
+
+	// Switched to an instance whose catalog lists nothing, so it never builds its tables...
+	let (_bare, _bare_catalog) = publish_live::<()>(&origin, route());
+	let bare = origin.consume().request("live", None).await.unwrap();
+	let stream = crate::catalog::Consumer::new(&bare, Default::default()).await.unwrap();
+	let mut export = export.follow(bare, stream).unwrap();
+	assert!(
+		pats(&drain_frames(&mut export).await).is_empty(),
+		"no tables for an empty catalog"
+	);
+
+	// ...and then to another.
+	let (new, mut new_catalog) = publish_live::<()>(&origin, route());
+	let mut new_audio = aac_rendition(&mut new.broadcast().clone(), &mut new_catalog, "b.aac");
+	let replacement = origin.consume().request("live", None).await.unwrap();
+	let stream = crate::catalog::Consumer::new(&replacement, Default::default())
+		.await
+		.unwrap();
+	let mut export = export.follow(replacement, stream).unwrap();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut new_audio, ms);
+	}
+	let after = drain_frames(&mut export).await;
+	assert!(!pats(&after).is_empty(), "the last program went out");
+	assert!(
+		pats(&after).iter().all(|&(version, _)| version >= 1),
+		"the PAT reads as new: {:?}",
+		pats(&after)
+	);
+	assert!(
+		pmts(&after).iter().all(|(version, _)| *version >= 1),
+		"the PMT reads as new"
+	);
+	assert_eq!(unflagged(&after), Vec::<u16>::new(), "every PID flags the break");
+	assert!(export.discontinuity() >= 1, "pacing sees a new generation");
+}
+
+/// Following another instance is a full program switch, even while the old one stays up and
+/// keeps writing: a new PMT version from the replacement's catalog, whatever its codecs and
+/// tracks, every PID's first packet flagging the break, each stream starting on a keyframe,
+/// and nothing of the old broadcast after it.
+#[tokio::test(start_paused = true)]
+async fn another_instance_is_a_full_program_switch() {
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+
+	let (old, mut old_catalog) = publish_live::<()>(&origin, route());
+	let mut old_audio = aac_rendition(&mut old.broadcast().clone(), &mut old_catalog, "a.aac");
+	let mut export = open_export(crate::source::resolved(&origin, "live").await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut old_audio, ms);
+	}
+	let before = drain_frames(&mut export).await;
+	assert_eq!(
+		pmts(&before).last().map(|(_, types)| types.clone()),
+		Some(vec![StreamType::AdtsAac])
+	);
+
+	let (new, mut new_catalog) = publish_live::<()>(&origin, route());
+	let mut video = h264_rendition(&mut new.broadcast().clone(), &mut new_catalog, "video.avc1");
+	let mut new_audio = aac_rendition(&mut new.broadcast().clone(), &mut new_catalog, "b.aac");
+	let replacement = origin.consume().request("live", None).await.unwrap();
+	let stream = crate::catalog::Consumer::new(&replacement, Default::default())
+		.await
+		.unwrap();
+	let mut export = export.follow(replacement, stream).unwrap();
+
+	// The old instance carries on ten seconds ahead, where none of it may land.
+	for ms in (10_000..10_200).step_by(20) {
+		write_aac(&mut old_audio, ms);
+	}
+	for ms in (0..400).step_by(40) {
+		write_h264(&mut video, ms);
+	}
+	for ms in (0..400).step_by(20) {
+		write_aac(&mut new_audio, ms);
+	}
+	let mut after = drain_frames(&mut export).await;
+	let _finished = video.finish().unwrap();
+	let _finished = new_audio.finish().unwrap();
+	new_catalog.finish().unwrap();
+	let (rest, end) = drain_to_end(&mut export).await;
+	after.extend(rest);
+	end.unwrap();
+
+	// Following keeps the previous program's clock tail until the new program
+	// actually goes out. No old media remained here, so that prefix is PCR only.
+	let switched = after
+		.iter()
+		.position(|frame| {
+			frame
+				.payload
+				.as_chunks::<188>()
+				.0
+				.iter()
+				.any(|packet| packet[1] & 0x1f == 0 && packet[2] == 0)
+		})
+		.expect("new PAT");
+	assert!(
+		after[..switched].iter().all(|frame| frame
+			.payload
+			.as_chunks::<188>()
+			.0
+			.iter()
+			.all(|packet| packet[3] & 0x30 == 0x20)),
+		"only the old clock tail precedes the program switch"
+	);
+	let after = after.split_off(switched);
+
+	assert!(pats(&before).iter().all(|&(version, _)| version == 0));
+	assert!(pmts(&before).iter().all(|(version, _)| *version == 0));
+	assert!(!pats(&after).is_empty() && pats(&after).iter().all(|&(version, _)| version == 1));
+	let tables = pmts(&after);
+	assert!(!tables.is_empty());
+	for (version, types) in tables {
+		assert_eq!(version, 1, "the replacement's PMT is a new version");
+		assert_eq!(types, [StreamType::AdtsAac, StreamType::H264]);
+	}
+	assert_eq!(
+		unflagged(&after),
+		Vec::<u16>::new(),
+		"every PID's first packet flags the break"
+	);
+	assert_eq!(export.discontinuity(), 1, "a pacing caller sees the new clock");
+
+	let bytes: Vec<u8> = after.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	let (video_pts, audio_pts) = collect_pes_pts(&bytes);
+	assert_eq!(
+		video_pts.first(),
+		Some(&(60_000 * 90)),
+		"the video starts on its keyframe"
+	);
+	assert_eq!(video_pts.len(), 10);
+	assert!(
+		audio_pts.iter().all(|&pts| pts < 60_400 * 90),
+		"nothing of the old broadcast after the break: {audio_pts:?}"
+	);
+}
+
+/// A switch that keeps the transport stream ID but moves the PMT advances the PAT version,
+/// or a demux caching the PAT by version keeps reading the old PMT PID.
+#[tokio::test(start_paused = true)]
+async fn a_switch_moving_the_pmt_advances_the_pat() {
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+	let publish = |pmt_pid: u16| {
+		let (broadcast, mut catalog) = publish_live::<tscat::Ext>(&origin, route());
+		let track = aac_rendition(&mut broadcast.broadcast().clone(), &mut catalog, "a.aac");
+		catalog.modify().unwrap().ext.mpegts.program = Some(tscat::Program {
+			transport_stream_id: 7,
+			program_number: 1,
+			pmt_pid,
+		});
+		(broadcast, catalog, track)
+	};
+
+	let (_old, _old_catalog, mut old_track) = publish(0x100);
+	let mut export = open_ts(
+		crate::source::resolved(&origin, "live").await,
+		crate::catalog::CatalogFormat::Hang,
+		RECORDING_MAX_AGE,
+	)
+	.await
+	.unwrap()
+	.with_replay();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut old_track, ms);
+	}
+	let before = drain_frames(&mut export).await;
+
+	let (_new, mut new_catalog, mut new_track) = publish(0x200);
+	let replacement = origin.consume().request("live", None).await.unwrap();
+	let stream = crate::catalog::Consumer::new(&replacement, Default::default())
+		.await
+		.unwrap();
+	let mut export = export.follow(replacement, stream).unwrap();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut new_track, ms);
+	}
+	let mut after = drain_frames(&mut export).await;
+	let _finished = new_track.finish().unwrap();
+	new_catalog.finish().unwrap();
+	let (rest, end) = drain_to_end(&mut export).await;
+	after.extend(rest);
+	end.unwrap();
+
+	assert!(!pats(&before).is_empty() && pats(&before).iter().all(|&pat| pat == (0, 0x100)));
+	let after = pats(&after);
+	assert!(!after.is_empty());
+	assert!(after.iter().all(|&pat| pat == (1, 0x200)), "{after:?}");
+}
+
+/// The stats count only output that was returned. A frame the muxer refuses fails the export
+/// with the span before it queued but not yet returned, and the same instance coming back
+/// carries on with it.
+#[tokio::test(start_paused = true)]
+async fn export_stats_count_only_returned_output() {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(instance.clone(), 0);
+	let units = |stats: stats::Export| stats.streams.values().map(|row| row.units).sum::<u64>() as usize;
+
+	let (broadcast, mut catalog) = publish_live::<()>(&origin, route());
+	let mut track = aac_rendition(&mut broadcast.broadcast().clone(), &mut catalog, "a.aac");
+	let mut export = open_export(crate::source::resolved(&origin, "live").await, RECORDING_MAX_AGE)
+		.await
+		.unwrap();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut track, ms);
+	}
+	// One byte past what an ADTS header can frame, after the frames [`write_aac`] wrote, and
+	// written with them: the jitter buffer would drop it as late once they had gone out.
+	track
+		.write(Frame {
+			timestamp: Timestamp::from_millis(60_200).unwrap(),
+			duration: None,
+			payload: Bytes::from(vec![0; 8185]),
+			keyframe: true,
+		})
+		.unwrap();
+	let (mut frames, end) = drain_to_end(&mut export).await;
+	assert!(end.is_err(), "an unframeable AAC frame fails the export");
+	assert!(pes_count(&frames) < 10, "the span before the failure stayed queued");
+	assert_eq!(units(export.stats()), pes_count(&frames));
+
+	drop((broadcast, catalog, track));
+	let (broadcast, mut catalog) = publish_live::<()>(&origin, route());
+	let mut track = aac_rendition(&mut broadcast.broadcast().clone(), &mut catalog, "a.aac");
+	let back = origin
+		.consume()
+		.follow("live", None)
+		.unwrap()
+		.available()
+		.await
+		.unwrap()
+		.unwrap();
+	let stream = crate::catalog::Consumer::new(&back, Default::default()).await.unwrap();
+	let mut export = export.follow(back, stream).unwrap();
+	for ms in (1_000..1_200).step_by(20) {
+		write_aac(&mut track, ms);
+	}
+	frames.extend(drain_frames(&mut export).await);
+	let _finished = track.finish().unwrap();
+	catalog.finish().unwrap();
+	let (rest, end) = drain_to_end(&mut export).await;
+	frames.extend(rest);
+	end.unwrap();
+	assert_eq!(units(export.stats()), pes_count(&frames));
+}
+
+/// Export 25 fps video and two AAC tracks for [`TICKS`] video frames, the video and the first
+/// audio track stopping after `stop` while the second carries on. Returns the stats sampled
+/// after `sample` and at the end, and the frames rendered in between.
+///
+/// Drained after every write, like [`export_twice`], so the export reads every frame and a row
+/// stops only because its track did.
+async fn export_liveness(sample: u64, stop: u64) -> (stats::Export, stats::Export, Vec<Frame>) {
+	let broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast.clone(), crate::catalog::Config::default()).unwrap();
+
+	let track = broadcast
+		.create_track("video.avc1", hang::container::track_info(hang::catalog::PRIORITY.video))
+		.unwrap();
+	let mut cfg = VideoConfig::new(H264 {
+		profile: 0x42,
+		constraints: 0xc0,
+		level: 0x1f,
+		inline: false,
+	});
+	cfg.container = Container::Legacy;
+	cfg.description =
+		Some(crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap());
+	catalog
+		.modify()
+		.unwrap()
+		.video
+		.renditions
+		.insert(track.name().to_string(), cfg);
+	let mut video = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+	let mut audio = [
+		aac_rendition(&mut broadcast.clone(), &mut catalog, "primary.aac"),
+		aac_rendition(&mut broadcast.clone(), &mut catalog, "secondary.aac"),
+	];
+
+	let mut export = open_export(crate::source::announced(&consumer).await, std::time::Duration::ZERO)
+		.await
+		.unwrap();
+	assert!(export.stats().streams.is_empty(), "no row before the program tables");
+	let (mut sampled, mut frames) = (None, Vec::new());
+	let mut audio_index = 0;
+	for tick in 0..TICKS {
+		if tick < stop {
+			let keyframe = tick % GOP == 0;
+			let slice = if keyframe {
+				vec![0x65u8; 3_000]
+			} else {
+				vec![0x41u8; 400]
+			};
+			video
+				.write(Frame {
+					timestamp: Timestamp::from_micros(tick * VIDEO_US).unwrap(),
+					duration: None,
+					payload: length_prefixed(&[&slice]),
+					keyframe,
+				})
+				.unwrap();
+		}
+		while audio_index * AUDIO_US < (tick + 1) * VIDEO_US {
+			let running = if tick < stop { &mut audio[..] } else { &mut audio[1..] };
+			for track in running {
+				track
+					.write(Frame {
+						timestamp: Timestamp::from_micros(audio_index * AUDIO_US).unwrap(),
+						duration: None,
+						payload: Bytes::from_iter((0..180u16).map(|i| (i ^ audio_index as u16) as u8)),
+						keyframe: audio_index % AUDIO_GROUP == 0,
+					})
+					.unwrap();
+			}
+			audio_index += 1;
+		}
+
+		let out = drain_frames(&mut export).await;
+		if sampled.is_some() {
+			frames.extend(out);
+		}
+		if tick + 1 == sample {
+			sampled = Some(export.stats());
+		}
+	}
+	(sampled.expect("sampled mid-run"), export.stats(), frames)
+}
+
+/// A healthy export advances every elementary stream's row, each quiet for no longer than
+/// its own frame spacing plus the mux buffer, and leaves the import-only counters at zero.
+#[tokio::test(start_paused = true)]
+async fn export_stats_advance_every_stream() {
+	let (mid, end, _) = export_liveness(TICKS / 2, TICKS).await;
+
+	let tracks: Vec<&str> = end.streams.values().map(|row| row.track.as_str()).collect();
+	assert_eq!(tracks, [".aac", ".aac", ".avc3"], "one row per elementary stream");
+	for (pid, row) in &end.streams {
+		let before = &mid.streams[pid];
+		assert!(before.units > 0, "PID {pid:#x} wrote nothing by mid-run");
+		assert!(
+			row.units > before.units,
+			"PID {pid:#x} stopped advancing: {before:?} -> {row:?}"
+		);
+		let quiet = row.quiet.expect("the output carries a PCR");
+		assert!(quiet < Duration::from_millis(200), "PID {pid:#x} quiet for {quiet:?}");
+		assert_eq!((row.resyncs, row.discarded, row.unconfirmed), (0, 0, 0));
+	}
+}
+
+/// The #3533 shape: video and the primary audio stop reaching the exporter while the
+/// secondary audio carries on. Their rows freeze and their quiet time grows on the output's
+/// own PCR, which keeps running on the surviving track, as do the PSI and that track's row.
+#[tokio::test(start_paused = true)]
+async fn export_stats_catch_a_track_that_stops() {
+	let stop = TICKS / 2;
+	// Sampled once the mux buffer has written out what the stopped tracks sent last.
+	let (sampled, end, after) = export_liveness(stop + 5, stop).await;
+	let stalled = Duration::from_micros((TICKS - stop) * VIDEO_US);
+
+	let advanced = |pid: &u16| end.streams[pid].units > sampled.streams[pid].units;
+	let (running, stopped): (Vec<u16>, Vec<u16>) = end.streams.keys().copied().partition(advanced);
+	let [running] = running[..] else {
+		panic!("expected one stream to keep advancing, got {running:?}: {end:?}");
+	};
+	assert_eq!(end.streams[&running].track, ".aac");
+	assert_eq!(stopped.len(), 2, "video and the primary audio stopped");
+
+	let quiet = |pid: u16| end.streams[&pid].quiet.expect("the output carries a PCR");
+	assert!(quiet(running) < Duration::from_millis(200), "{:?}", quiet(running));
+	for pid in stopped {
+		// The mux buffer holds the last span back, so the output's clock trails the media.
+		assert!(
+			quiet(pid) > stalled - Duration::from_millis(200),
+			"PID {pid:#x} quiet for only {:?} of a {stalled:?} stall",
+			quiet(pid)
+		);
+	}
+	assert!(
+		count_pid(&after, 0x0000) >= 3,
+		"the PAT kept repeating through the stall"
+	);
+	assert!(count_pid(&after, running) > 0, "the surviving track kept flowing");
+}
+
+/// A stopped track's silence counts the whole of a media gap on the surviving track, not just
+/// the one second of clock the exporter backfills: the output's PCR jumps across the rest
+/// with a discontinuity flag, and that jump is time the stopped track was silent.
+#[tokio::test(start_paused = true)]
+async fn export_stats_count_a_gap_longer_than_the_backfill() {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+	let mut stopped = aac_rendition(&mut broadcast, &mut catalog, "a.aac");
+	let mut running = aac_rendition(&mut broadcast, &mut catalog, "b.aac");
+
+	let mut export = open_export(crate::source::announced(&consumer).await, std::time::Duration::ZERO)
+		.await
+		.unwrap();
+	for ms in (0..2_000).step_by(20) {
+		write_aac(&mut stopped, ms);
+		write_aac(&mut running, ms);
+		drain_frames(&mut export).await;
+	}
+	// Five seconds with nothing on either track, then only the second resumes.
+	for ms in (7_000..8_000).step_by(20) {
+		write_aac(&mut running, ms);
+		drain_frames(&mut export).await;
+	}
+
+	let stats = export.stats();
+	let mut rows: Vec<_> = stats.streams.values().collect();
+	rows.sort_by_key(|row| row.units);
+	let [stopped, running] = rows[..] else {
+		panic!("expected two rows: {stats:?}");
+	};
+	assert!(stopped.units < running.units, "{stats:?}");
+	let quiet = stopped.quiet.expect("the output carries a PCR");
+	assert!(
+		quiet > Duration::from_millis(5_800),
+		"stopped at 2 s, quiet for only {quiet:?} at 8 s"
+	);
+	let quiet = running.quiet.expect("the output carries a PCR");
+	assert!(quiet < Duration::from_millis(200), "{quiet:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_large_pmt_is_split_across_packets() {
+	assert_eq!(large_pmt(24, None).await, 2);
+}
+
+/// A PMT spanning three packets at 20 Mb/s goes out at TBsys's rate: the PAT and PMT share its
+/// 512 bytes, which drain at Rxsys into Bsys's 1,536 (ISO 13818-1 2.4.2.3).
+#[tokio::test(start_paused = true)]
+async fn a_large_pmt_keeps_within_the_system_buffer() {
+	assert_eq!(large_pmt(48, Some(20_000_000)).await, 3);
+}
+
+/// Export `streams` language-tagged AAC streams, check the PMT reassembles across its packets
+/// and keeps within TBsys and Bsys at `mux_rate`, and return how many packets it spans.
+async fn large_pmt(streams: u16, mux_rate: Option<u64>) -> usize {
+	let broadcast = moq_net::broadcast::Info::new().produce();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast.clone(),
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	let mut config = tscat::Mpegts::default();
+	let mut producers = Vec::new();
+	for index in 0..streams {
+		let name = format!("audio{index:02}");
+		let track = broadcast
+			.create_track(
+				name.as_str(),
+				hang::container::track_info(hang::catalog::PRIORITY.audio),
+			)
+			.unwrap();
+		catalog
+			.modify()
+			.unwrap()
+			.audio
+			.renditions
+			.insert(name.clone(), crate::codec::aac::config(&[0x11, 0x90]).unwrap());
+		let mut entry = tscat::Track::new(0x1001 + index);
+		entry.descriptors = vec![tscat::Descriptor {
+			tag: 0x0a,
+			data: Bytes::from_static(b"eng\0"),
+		}];
+		config.tracks.insert(name, entry);
+		let mut producer = Producer::new(track, HangContainer::Legacy(Kind::Data));
+		producer
+			.write(Frame {
+				timestamp: Timestamp::ZERO,
+				duration: None,
+				keyframe: true,
+				payload: Bytes::from_static(b"aac"),
+			})
+			.unwrap();
+		let producer = producer.finish().unwrap();
+		producers.push(producer);
+	}
+	catalog.modify().unwrap().ext.mpegts = config;
+	let mut exporter = open_ts(
+		crate::source::announced(&broadcast.consume()).await,
+		Default::default(),
+		RECORDING_MAX_AGE,
+	)
+	.await
+	.unwrap();
+	if let Some(mux_rate) = mux_rate {
+		exporter = exporter.with_mux_rate(mux_rate);
+	}
+	let ts = drain_with(exporter).await;
+	let packets = ts.as_chunks::<188>().0;
+	let pid = |packet: &[u8; 188]| (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
+	if let Some(mux_rate) = mux_rate {
+		// A table packet's bytes leave TBsys at Rxsys once those ahead have, never before they
+		// arrive, into Bsys, which drains at Rsys (ISO 13818-1 2.4.2.3).
+		let wire = 1504.0 / mux_rate as f64;
+		let rsys = (mux_rate as f64 / 500.0).max(80_000.0);
+		let (mut leave, mut empty, mut tbsys, mut bsys) = (f64::MIN, f64::MIN, 0.0f64, 0.0f64);
+		for (k, _) in packets
+			.iter()
+			.enumerate()
+			.filter(|(_, packet)| [0, 0x1000].contains(&pid(packet)))
+		{
+			let start = k as f64 * wire;
+			let free = leave.max(start);
+			leave = (start + wire).max(free + 1504.0 / 1_000_000.0);
+			tbsys = tbsys.max((leave - start - wire) * 125_000.0);
+			empty = empty.max(free) + 1504.0 / rsys;
+			bsys = bsys.max((empty - leave) * rsys / 8.0);
+		}
+		assert!(tbsys <= 512.001, "TBsys peak {tbsys:.0} B");
+		assert!(bsys <= 1536.001, "Bsys peak {bsys:.0} B");
+	}
+	let mut section = Vec::new();
+	let mut counters = Vec::new();
+	for packet in packets {
+		if pid(packet) != 0x1000 {
+			continue;
+		}
+		counters.push(packet[3] & 0x0f);
+		let offset = if packet[3] & 0x20 != 0 {
+			5 + usize::from(packet[4])
+		} else {
+			4
+		};
+		if packet[1] & 0x40 != 0 {
+			assert!(section.is_empty());
+			assert_eq!(packet[offset], 0);
+			section.extend_from_slice(&packet[offset + 1..]);
+		} else {
+			section.extend_from_slice(&packet[offset..]);
+		}
+		let length = 3 + (((usize::from(section[1]) & 0x0f) << 8) | usize::from(section[2]));
+		if section.len() >= length {
+			section.truncate(length);
+			break;
+		}
+	}
+	for pair in counters.windows(2) {
+		assert_eq!(pair[1], (pair[0] + 1) & 0x0f);
+	}
+	assert!(super::psi::crc_ok(&section));
+	let pmt = super::psi::Pmt::parse(&section).unwrap();
+	assert_eq!(pmt.streams.len(), usize::from(streams));
+	for (index, stream) in pmt.streams.iter().enumerate() {
+		assert_eq!(stream.pid.as_u16(), 0x1001 + index as u16);
+		assert_eq!(stream.stream_type, 0x0f);
+		assert_eq!(stream.descriptors[0].data.as_ref(), b"eng\0");
+	}
+	counters.len()
+}
+
+/// Publish a catalog-only broadcast at `live`, for a test of what follows its end.
+fn publish_bare(
+	origin: &moq_net::origin::Producer,
+	instance: Option<&moq_net::Instance>,
+) -> (moq_net::origin::Route, crate::catalog::Producer<()>) {
+	let route = moq_net::origin::RouteOptions::default();
+	publish_live::<()>(
+		origin,
+		instance.map_or(route.clone(), |instance| route.with_instance(instance.clone(), 0)),
+	)
+}
+
+/// Follow the broadcast at `live` with a fresh export of it.
+async fn follower(origin: &moq_net::origin::Producer) -> super::Follower {
+	let source = crate::source::resolved(origin, "live").await;
+	super::Follower::new(open_export(source, std::time::Duration::ZERO).await.unwrap()).unwrap()
+}
+
+/// End a catalog-only broadcast cleanly.
+fn finish((broadcast, mut catalog): (moq_net::origin::Route, crate::catalog::Producer<()>)) {
+	catalog.finish().unwrap();
+	drop((broadcast, catalog));
+}
+
+/// A failure whose cause is not the publisher leaving is the export's own: it fails at once,
+/// however long the follow.
+#[tokio::test(start_paused = true)]
+async fn a_follower_fails_at_once_on_its_own_failure() {
+	let causes = [
+		moq_net::Error::Cancel,
+		moq_net::Error::Stream(moq_net::StreamError::Internal),
+		moq_net::Error::MalformedTrack,
+	];
+	for cause in causes {
+		let origin = crate::source::produce_origin();
+		let (broadcast, mut catalog) = publish_bare(&origin, Some(&moq_net::Instance::random()));
+		let track = aac_rendition(&mut broadcast.broadcast().clone(), &mut catalog, "a.aac");
+		let mut follower = follower(&origin).await.with_follow(Duration::from_secs(10));
+		assert!(
+			kio::clock::timeout(Duration::from_secs(1), follower.next())
+				.await
+				.is_err(),
+			"nothing to mux yet"
+		);
+
+		track.abort(cause.clone());
+		let start = kio::clock::now();
+		let end = follower.next().await;
+		assert!(
+			matches!(&end, Err(crate::Error::Moq(err)) if err.to_string() == cause.to_string()),
+			"{cause}: {end:?}"
+		);
+		assert_eq!(start.elapsed(), Duration::ZERO, "{cause}");
+	}
+}
+
+/// A track that lost its route, or whose session ended, says the publisher left even with the
+/// broadcast still announced: the follower waits out the follow for a return, then fails with
+/// that cause. moq-transport's PUBLISH_DONE has no code for a lost route, so a relay's copy
+/// reads there as an unregistered one.
+#[tokio::test(start_paused = true)]
+async fn a_follower_waits_out_the_follow_on_a_lost_route() {
+	let causes = [
+		moq_net::Error::Unroutable,
+		moq_net::Error::Stream(moq_net::StreamError::Unroutable),
+		moq_net::Error::Session(moq_net::SessionError::Cancel),
+		moq_net::Error::Remote(0),
+	];
+	for cause in causes {
+		let origin = crate::source::produce_origin();
+		let (broadcast, mut catalog) = publish_bare(&origin, Some(&moq_net::Instance::random()));
+		let track = aac_rendition(&mut broadcast.broadcast().clone(), &mut catalog, "a.aac");
+		let follow = Duration::from_secs(10);
+		let mut follower = follower(&origin).await.with_follow(follow);
+		assert!(
+			kio::clock::timeout(Duration::from_secs(1), follower.next())
+				.await
+				.is_err(),
+			"nothing to mux yet"
+		);
+
+		track.abort(cause.clone());
+		let start = kio::clock::now();
+		let end = follower.next().await;
+		assert!(
+			matches!(&end, Err(crate::Error::Moq(err)) if err.to_string() == cause.to_string()),
+			"{cause}: {end:?}"
+		);
+		assert_eq!(start.elapsed(), follow, "{cause}");
+	}
+}
+
+/// A replacement followed with stitching is awaited until its catalog arrives, with no deadline
+/// of its own: one whose catalog request is never answered keeps the follower waiting past the
+/// follow, until it goes.
+#[tokio::test(start_paused = true)]
+async fn a_follower_awaits_a_replacement_catalog_past_the_follow() {
+	let origin = crate::source::produce_origin();
+	let first = publish_bare(&origin, Some(&moq_net::Instance::random()));
+	let follow = Duration::from_secs(10);
+	let mut follower = follower(&origin).await.with_follow(follow).with_stitch(true);
+	finish(first);
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"following"
+	);
+
+	// Replaced, but the replacement's catalog request is never answered.
+	let second = origin
+		.route(
+			"live",
+			moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0),
+		)
+		.unwrap();
+	let unanswered = second.broadcast().requests();
+	assert!(
+		kio::clock::timeout(follow * 3, follower.next()).await.is_err(),
+		"awaiting the replacement's catalog past the follow"
+	);
+
+	drop((second, unanswered));
+	let end = kio::clock::timeout(Duration::from_secs(1), follower.next())
+		.await
+		.expect("the replacement going ends the wait");
+	assert!(matches!(end, Ok(None)), "the original clean end: {end:?}");
+}
+
+/// A return of the same instance whose catalog subscription is answered but never delivers a
+/// snapshot is awaited past the follow, and once it fails too, it was no return: the export
+/// ends as it did before it.
+#[tokio::test(start_paused = true)]
+async fn a_follower_awaits_a_return_catalog_until_it_fails() {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let first = publish_bare(&origin, Some(&instance));
+	let follow = Duration::from_secs(10);
+	let mut follower = follower(&origin).await.with_follow(follow);
+	finish(first);
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"following"
+	);
+
+	let second = origin
+		.route(
+			"live",
+			moq_net::origin::RouteOptions::default().with_instance(instance, 0),
+		)
+		.unwrap();
+	let silent = second
+		.broadcast()
+		.create_track(hang::Catalog::DEFAULT_NAME, None)
+		.unwrap();
+	assert!(
+		kio::clock::timeout(follow * 3, follower.next()).await.is_err(),
+		"awaiting the return's catalog past the follow"
+	);
+
+	silent.abort(moq_net::Error::Unroutable).unwrap();
+	let end = kio::clock::timeout(Duration::from_secs(1), follower.next())
+		.await
+		.expect("the failed return ends the wait");
+	assert!(matches!(end, Ok(None)), "the original clean end: {end:?}");
+	drop(second);
+}
+
+/// A return that goes again before its catalog resolves is no return yet: the follower keeps
+/// following, and with nothing else back it yields the original clean end at the deadline.
+#[tokio::test(start_paused = true)]
+async fn a_follower_keeps_following_when_a_return_goes_before_it_resolves() {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let first = publish_bare(&origin, Some(&instance));
+	let follow = Duration::from_secs(10);
+	let mut follower = follower(&origin).await.with_follow(follow);
+	let start = kio::clock::now();
+	finish(first);
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"following"
+	);
+
+	// Back, but its catalog request is never answered before it goes again.
+	let second = origin
+		.route(
+			"live",
+			moq_net::origin::RouteOptions::default().with_instance(instance, 0),
+		)
+		.unwrap();
+	let unanswered = second.broadcast().requests();
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"resolving the return"
+	);
+	drop((second, unanswered));
+
+	let end = kio::clock::timeout(follow * 3, follower.next())
+		.await
+		.expect("the follow bounds the wait");
+	assert!(matches!(end, Ok(None)), "the original clean end: {end:?}");
+	assert_eq!(start.elapsed(), follow);
+}
+
+/// Announce `instance` at `live`, refusing every track request with `NotFound` until the
+/// returned task is aborted, which ends the broadcast.
+fn publish_refusing(origin: &moq_net::origin::Producer, instance: &moq_net::Instance) -> tokio::task::JoinHandle<()> {
+	let broadcast = origin
+		.route(
+			"live",
+			moq_net::origin::RouteOptions::default().with_instance(instance.clone(), 0),
+		)
+		.unwrap();
+	let mut dynamic = broadcast.broadcast().requests();
+	tokio::spawn(async move {
+		let _broadcast = broadcast;
+		while let Ok(request) = dynamic.requested_track().await {
+			request.reject(moq_net::Error::NotFound);
+		}
+	})
+}
+
+/// A replacement that refuses its catalog while still announced is no return: the follower
+/// keeps following, and follows the next instance to serve.
+#[tokio::test(start_paused = true)]
+async fn a_follower_keeps_following_through_a_refused_return() {
+	let origin = crate::source::produce_origin();
+	let first = publish_bare(&origin, Some(&moq_net::Instance::random()));
+	let follow = Duration::from_secs(10);
+	let mut follower = follower(&origin).await.with_follow(follow).with_stitch(true);
+	let start = kio::clock::now();
+	finish(first);
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"following"
+	);
+
+	// Replaced, but the replacement refuses its catalog request.
+	let refusing = publish_refusing(&origin, &moq_net::Instance::random());
+	assert!(
+		kio::clock::timeout(Duration::from_secs(2), follower.next())
+			.await
+			.is_err(),
+		"the refusal keeps it following"
+	);
+	refusing.abort();
+
+	let mut second = publish_bare(&origin, Some(&moq_net::Instance::random()));
+	std::ops::DerefMut::deref_mut(&mut second.1.modify().unwrap());
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"following the next replacement"
+	);
+	assert!(follower.export().cataloged(), "the replacement served its catalog");
+	finish(second);
+	let end = follower.next().await;
+	assert!(matches!(end, Ok(None)), "the replacement's clean end: {end:?}");
+	assert_eq!(start.elapsed(), Duration::from_secs(4) + follow);
+}
+
+/// A return that stays announced but refuses its catalog fails the follower only once the
+/// follow runs out, with that refusal rather than the original clean end.
+#[tokio::test(start_paused = true)]
+async fn a_follower_reports_a_refused_return_at_the_follow() {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let first = publish_bare(&origin, Some(&instance));
+	let follow = Duration::from_secs(10);
+	let mut follower = follower(&origin).await.with_follow(follow);
+	let start = kio::clock::now();
+	finish(first);
+
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"following"
+	);
+	let _refusing = publish_refusing(&origin, &instance);
+	let end = kio::clock::timeout(follow * 3, follower.next())
+		.await
+		.expect("the follow bounds the wait");
+	assert!(
+		matches!(end, Err(crate::Error::Moq(moq_net::Error::NotFound))),
+		"the refusal surfaces at the follow: {end:?}"
+	);
+	assert_eq!(start.elapsed(), follow);
+}
+
+/// A stitch whose replacement goes before it resolves is no switch yet: the export stays on
+/// its own instance and follows the next replacement instead.
+#[tokio::test(start_paused = true)]
+async fn a_follower_stitches_onto_the_next_replacement_when_one_goes_before_it_resolves() {
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+	let first = publish_bare(&origin, Some(&moq_net::Instance::random()));
+	let mut follower = follower(&origin)
+		.await
+		.with_stitch(true)
+		.with_follow(Duration::from_secs(10));
+
+	// Replaced, but the replacement's catalog request is never answered before it goes.
+	let second = origin.route("live", route()).unwrap();
+	let unanswered = second.broadcast().requests();
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"resolving the replacement"
+	);
+	drop((second, unanswered));
+	let mut third = publish_bare(&origin, Some(&moq_net::Instance::random()));
+	std::ops::DerefMut::deref_mut(&mut third.1.modify().unwrap());
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"following the next replacement"
+	);
+	assert!(follower.export().cataloged(), "the replacement served its catalog");
+
+	// Once the first instance is gone too, the third one's end ends the export.
+	finish(first);
+	finish(third);
+	let end = kio::clock::timeout(Duration::from_secs(10), follower.next())
+		.await
+		.expect("the third instance's end ends the export");
+	assert!(matches!(end, Ok(None)), "{end:?}");
+}
+
+/// A stitch that fails to resolve while a return is still awaiting its catalog goes back to
+/// that return, which ending before its first snapshot never resumed: the export ends as it did
+/// before it, at the original follow.
+#[tokio::test(start_paused = true)]
+async fn a_follower_keeps_a_return_awaiting_its_catalog_when_a_stitch_goes() {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let first = publish_bare(&origin, Some(&instance));
+	let follow = Duration::from_secs(10);
+	let mut follower = follower(&origin).await.with_follow(follow).with_stitch(true);
+	let start = kio::clock::now();
+	finish(first);
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"following"
+	);
+
+	// Back, with a catalog yet to deliver its first snapshot.
+	let second = publish_bare(&origin, Some(&instance));
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"awaiting the return's catalog"
+	);
+
+	// Replaced, but the replacement's catalog request is never answered before it goes.
+	let third = origin
+		.route(
+			"live",
+			moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0),
+		)
+		.unwrap();
+	let unanswered = third.broadcast().requests();
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"resolving the replacement"
+	);
+	drop((third, unanswered));
+
+	finish(second);
+	let end = follower.next().await;
+	assert!(matches!(end, Ok(None)), "{end:?}");
+	assert_eq!(start.elapsed(), follow);
+}
+
+/// A program that ends while stitching, then returns after the unresolved replacement goes,
+/// resumes at normal priority.
+#[tokio::test(start_paused = true)]
+async fn a_return_after_an_abandoned_switch_restores_priority() {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let (old, mut old_catalog) = publish_bare(&origin, Some(&instance));
+	let mut old_audio = aac_rendition(&mut old.broadcast().clone(), &mut old_catalog, "a.aac");
+	write_aac(&mut old_audio, 0);
+	let export = open_export(
+		crate::source::resolved(&origin, "live").await,
+		Duration::from_millis(500),
+	)
+	.await
+	.unwrap()
+	.with_replay();
+	let mut follower = super::Follower::new(export)
+		.unwrap()
+		.with_follow(Duration::from_secs(10))
+		.with_stitch(true);
+	assert!(
+		follower.next().await.unwrap().is_some(),
+		"the old program emitted media"
+	);
+	pump(&mut follower).await;
+
+	// Replaced, but the replacement's catalog request is never answered.
+	let replacement = origin
+		.route(
+			"live",
+			moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0),
+		)
+		.unwrap();
+	let unanswered = replacement.broadcast().requests();
+	pump(&mut follower).await;
+	assert_eq!(
+		old_audio.track().subscription().unwrap().priority,
+		-1,
+		"the old program yields while acquiring"
+	);
+
+	// The old program ends mid-switch. The replacement goes without serving its catalog,
+	// allowing the older instance to serve again.
+	let _finished = old_audio.finish().unwrap();
+	finish((old, old_catalog));
+	pump(&mut follower).await;
+	drop((replacement, unanswered));
+	let (back, mut back_catalog) = publish_bare(&origin, Some(&instance));
+	let mut back_audio = aac_rendition(&mut back.broadcast().clone(), &mut back_catalog, "a.aac");
+	write_aac(&mut back_audio, 1000);
+	pump(&mut follower).await;
+	assert_eq!(
+		back_audio.track().subscription().unwrap().priority,
+		0,
+		"the resumed program keeps normal priority"
+	);
+	drop((back, back_catalog));
+
+	/// Take what the follower muxes until it idles for a second, well within the follow.
+	async fn pump(follower: &mut super::Follower) {
+		while let Ok(next) = kio::clock::timeout(Duration::from_secs(1), follower.next()).await {
+			assert!(next.unwrap().is_some(), "the follower keeps waiting");
+		}
+	}
+}
+
+/// A track that lost its route is the publisher leaving, so the return that follows is carried
+/// on into.
+#[tokio::test(start_paused = true)]
+async fn a_follower_follows_a_return_after_a_lost_route() {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let (broadcast, mut catalog) = publish_bare(&origin, Some(&instance));
+	let track = aac_rendition(&mut broadcast.broadcast().clone(), &mut catalog, "a.aac");
+	let mut follower = follower(&origin).await.with_follow(Duration::from_secs(10));
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"nothing to mux yet"
+	);
+
+	track.abort(moq_net::Error::Unroutable);
+	catalog.abort(moq_net::Error::Unroutable);
+	drop(broadcast);
+	let (broadcast, mut catalog) = publish_bare(&origin, Some(&instance));
+	let track = aac_rendition(&mut broadcast.broadcast().clone(), &mut catalog, "a.aac");
+	assert!(
+		kio::clock::timeout(Duration::from_secs(3), follower.next())
+			.await
+			.is_err(),
+		"carried on into the return"
+	);
+	assert!(follower.export().cataloged(), "the return served its catalog");
+
+	let _finished = track.finish().unwrap();
+	finish((broadcast, catalog));
+	let end = follower.next().await;
+	assert!(matches!(end, Ok(None)), "{end:?}");
+}
+
+/// A replacement that stays announced but refuses its catalog fails a stitch loudly, rather
+/// than leaving the export on the instance it replaced.
+#[tokio::test(start_paused = true)]
+async fn a_follower_fails_a_stitch_onto_a_replacement_that_refuses_its_catalog() {
+	let origin = crate::source::produce_origin();
+	let _first = publish_bare(&origin, Some(&moq_net::Instance::random()));
+	let mut follower = follower(&origin).await.with_stitch(true);
+
+	let _second = origin
+		.route(
+			"live",
+			moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0),
+		)
+		.unwrap();
+	let end = kio::clock::timeout(Duration::from_secs(10), follower.next())
+		.await
+		.expect("the refusal ends the export");
+	assert!(end.is_err(), "the refusal fails the export: {end:?}");
+}
+
+/// An export whose route went before the follower was built has already lost it, so the same
+/// instance announcing again is a return to follow.
+#[tokio::test(start_paused = true)]
+async fn a_follower_built_after_its_route_went_follows_the_return() {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let first = publish_bare(&origin, Some(&instance));
+	let export = open_export(
+		crate::source::resolved(&origin, "live").await,
+		std::time::Duration::ZERO,
+	)
+	.await
+	.unwrap();
+	let start = kio::clock::now();
+	finish(first);
+	kio::clock::sleep(Duration::from_secs(1)).await;
+
+	let follow = Duration::from_secs(10);
+	let mut follower = super::Follower::new(export).unwrap().with_follow(follow);
+	assert!(
+		kio::clock::timeout(Duration::from_secs(2), follower.next())
+			.await
+			.is_err(),
+		"following"
+	);
+	let mut second = publish_bare(&origin, Some(&instance));
+	std::ops::DerefMut::deref_mut(&mut second.1.modify().unwrap());
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"carried on"
+	);
+	assert!(follower.export().cataloged(), "the return served its catalog");
+
+	// Carried on into the return, so its end starts the follow over.
+	finish(second);
+	let end = follower.next().await;
+	assert!(matches!(end, Ok(None)), "{end:?}");
+	assert_eq!(start.elapsed(), Duration::from_secs(4) + follow);
+}
+
+/// The export's own instance winning the path back from a cheaper route that went is no
+/// replacement: its end ends the export cleanly, without stitching.
+#[tokio::test(start_paused = true)]
+async fn a_follower_takes_its_own_instance_winning_back_for_no_replacement() {
+	let origin = crate::source::produce_origin();
+	let route = |cost: u64| moq_net::origin::RouteOptions::default().with_cost(cost);
+
+	// The export resolves its own instance.
+	let served = origin
+		.route("pool/job", moq_net::origin::RouteOptions::hidden().with_cost(5))
+		.unwrap();
+	let mut catalog = crate::catalog::Producer::<()>::new(&mut served.broadcast().clone(), Default::default()).unwrap();
+	served.announce().unwrap();
+	let source = crate::source::resolved(&origin, "pool/job").await;
+	let mut follower = super::Follower::new(open_export(source, std::time::Duration::ZERO).await.unwrap()).unwrap();
+
+	// A cheaper route takes the path for a while, then goes.
+	let cheaper = origin.route("pool/job", route(1)).unwrap();
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"still on its own instance"
+	);
+	drop(cheaper);
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"its own instance wins back"
+	);
+
+	catalog.finish().unwrap();
+	let end = kio::clock::timeout(Duration::from_secs(10), follower.next())
+		.await
+		.expect("its own end ends the export");
+	assert!(matches!(end, Ok(None)), "{end:?}");
+}
+
+/// Without stitching, another instance taking the path fails the follower once the export
+/// ends, however long the follow.
+#[tokio::test(start_paused = true)]
+async fn a_follower_fails_on_a_replacement_without_stitch() {
+	let origin = crate::source::produce_origin();
+	let first = publish_bare(&origin, Some(&moq_net::Instance::random()));
+	let mut follower = follower(&origin).await.with_follow(Duration::from_secs(10));
+	finish(first);
+	let _second = publish_bare(&origin, Some(&moq_net::Instance::random()));
+
+	let start = kio::clock::now();
+	let err = follower.next().await.expect_err("a replacement fails the follower");
+	assert!(matches!(err, crate::Error::Replaced(_)), "{err}");
+	assert!(start.elapsed() < Duration::from_secs(1), "no wait for a return");
+}
+
+/// An unnamed route has no instance to match, so even its own return is a replacement.
+#[tokio::test(start_paused = true)]
+async fn a_follower_takes_an_unnamed_return_as_a_replacement() {
+	let origin = crate::source::produce_origin();
+	let first = publish_bare(&origin, None);
+	let mut follower = follower(&origin).await.with_follow(Duration::from_secs(10));
+	finish(first);
+	let _second = publish_bare(&origin, None);
+
+	let err = follower.next().await.expect_err("an unnamed return fails the follower");
+	assert!(matches!(err, crate::Error::Replaced(_)), "{err}");
+}
+
+/// The same instance coming back within the follow carries the export on: when it ends
+/// again, the follow starts over from there.
+#[tokio::test(start_paused = true)]
+async fn a_follower_continues_on_the_same_instance_returning() {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let first = publish_bare(&origin, Some(&instance));
+	let follow = Duration::from_secs(10);
+	let mut follower = follower(&origin).await.with_follow(follow);
+	let start = kio::clock::now();
+	finish(first);
+	assert!(
+		kio::clock::timeout(Duration::from_secs(2), follower.next())
+			.await
+			.is_err(),
+		"following"
+	);
+
+	let mut second = publish_bare(&origin, Some(&instance));
+	std::ops::DerefMut::deref_mut(&mut second.1.modify().unwrap());
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"carried on"
+	);
+	assert!(follower.export().cataloged(), "the return served its catalog");
+	finish(second);
+	let end = follower.next().await.unwrap();
+	assert!(end.is_none());
+	assert_eq!(start.elapsed(), Duration::from_secs(3) + follow);
+}
+
+/// Pull frames from `follower` until it ends, or until nothing more comes within the drain.
+async fn drain_follower(follower: &mut super::Follower) -> (Vec<Frame>, Option<crate::Result<()>>) {
+	let mut out = Vec::new();
+	loop {
+		match kio::clock::timeout(DRAIN, follower.next()).await {
+			Ok(Ok(Some(frame))) => out.push(frame),
+			Ok(Ok(None)) => return (out, Some(Ok(()))),
+			Ok(Err(err)) => return (out, Some(Err(err))),
+			Err(_) => return (out, None),
+		}
+	}
+}
+
+/// The route going and another of the same instance taking over after a gap that ended the
+/// export's request, with the follower unpolled across it, is its own instance returning: the
+/// export carries on through the new route under the program already announced, flagging
+/// the PCR only if the schedule skips empty slots.
+#[tokio::test(start_paused = true)]
+async fn a_follower_continues_through_a_same_instance_handoff_after_a_gap() {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let route = moq_net::origin::RouteOptions::default().with_instance(instance.clone(), 0);
+	let exact = origin.route("pool/job", route.clone()).unwrap();
+	let mut catalog = crate::catalog::Producer::<()>::new(&mut exact.broadcast().clone(), Default::default()).unwrap();
+	let mut track = aac_rendition(&mut exact.broadcast().clone(), &mut catalog, "a.aac");
+	let source = crate::source::resolved(&origin, "pool/job").await;
+	let export = open_export(source, RECORDING_MAX_AGE).await.unwrap().with_replay();
+	let mut follower = super::Follower::new(export)
+		.unwrap()
+		.with_follow(Duration::from_secs(10));
+	let start = kio::clock::now();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut track, ms);
+	}
+	let (mut frames, end) = drain_follower(&mut follower).await;
+	assert!(end.is_none(), "still exporting: {end:?}");
+
+	// Left unpolled across the handoff, and long enough for the first route's retraction to
+	// end the export's request before the second arrives.
+	track.abort(moq_net::Error::Unroutable);
+	catalog.abort(moq_net::Error::Unroutable);
+	drop(exact);
+	kio::clock::sleep(Duration::from_secs(1)).await;
+	let hidden = moq_net::origin::RouteOptions::hidden().with_instance(instance.clone(), 0);
+	let served = origin.route("pool/job", hidden).unwrap();
+	let mut catalog = crate::catalog::Producer::<()>::new(&mut served.broadcast().clone(), Default::default()).unwrap();
+	let mut track = aac_rendition(&mut served.broadcast().clone(), &mut catalog, "a.aac");
+	served.announce().unwrap();
+	let resumed = start.elapsed().as_millis() as u64;
+	for ms in (resumed..resumed + 200).step_by(20) {
+		write_aac(&mut track, ms);
+	}
+	let _finished = track.finish().unwrap();
+	catalog.finish().unwrap();
+	let (rest, end) = drain_follower(&mut follower).await;
+	frames.extend(rest);
+	assert!(
+		matches!(end, Some(Ok(()))),
+		"the second route's broadcast ends the export: {end:?}"
+	);
+
+	assert_eq!(pes_count(&frames), 20, "every frame of both routes went out");
+	assert_skip_discontinuity(&frames, 0);
+	assert_eq!(follower.export().discontinuity(), 0);
+	assert!(
+		pats(&frames).iter().all(|&(version, _)| version == 0),
+		"the PAT keeps its version"
+	);
+	assert!(
+		pmts(&frames).iter().all(|(version, _)| *version == 0),
+		"the PMT keeps its version"
+	);
+}
+
+/// A broader prefix starting, restarting, and ending while the exact route still serves the
+/// path changes nothing: the request resolves through the exact route, so none of it is a
+/// replacement, and the export ends cleanly with its own broadcast.
+#[tokio::test(start_paused = true)]
+async fn a_follower_ignores_a_covering_prefix_while_the_exact_route_serves() {
+	let origin = crate::source::produce_origin();
+	let route = |instance| moq_net::origin::RouteOptions::default().with_instance(instance, 0);
+	let exact = origin.route("pool/job", route(moq_net::Instance::random())).unwrap();
+	let catalog = crate::catalog::Producer::<()>::new(&mut exact.broadcast().clone(), Default::default()).unwrap();
+	let source = crate::source::resolved(&origin, "pool/job").await;
+	let mut follower = super::Follower::new(open_export(source, std::time::Duration::ZERO).await.unwrap()).unwrap();
+	let quiet = Duration::from_secs(1);
+
+	let pool = origin.claim("pool", moq_net::origin::RouteOptions::default()).unwrap();
+	assert!(kio::clock::timeout(quiet, follower.next()).await.is_err(), "a start");
+	drop(pool);
+	let pool = origin.claim("pool", moq_net::origin::RouteOptions::default()).unwrap();
+	assert!(kio::clock::timeout(quiet, follower.next()).await.is_err(), "a restart");
+	drop(pool);
+	assert!(kio::clock::timeout(quiet, follower.next()).await.is_err(), "an end");
+
+	finish((exact, catalog));
+	let end = follower.next().await;
+	assert!(matches!(end, Ok(None)), "no replacement: {end:?}");
+}
+
+/// A mid-stream stitch awaits the replacement's catalog with no deadline of its own, so even a
+/// zero follow switches to a cold replacement once its first snapshot arrives.
+#[tokio::test(start_paused = true)]
+async fn a_midstream_stitch_awaits_the_replacement_catalog() {
+	for follow in [Duration::ZERO, Duration::from_secs(10)] {
+		let origin = crate::source::produce_origin();
+		let _first = publish_bare(&origin, Some(&moq_net::Instance::random()));
+		let mut follower = follower(&origin).await.with_stitch(true).with_follow(follow);
+		let instance = moq_net::Instance::random();
+		let (_second, mut catalog) = publish_bare(&origin, Some(&instance));
+		assert!(
+			kio::clock::timeout(Duration::from_secs(60), follower.next())
+				.await
+				.is_err(),
+			"awaiting the replacement's catalog, follow={follow:?}"
+		);
+		assert!(!follower.export().cataloged(), "follow={follow:?}");
+
+		std::ops::DerefMut::deref_mut(&mut catalog.modify().unwrap());
+		assert!(
+			kio::clock::timeout(Duration::from_secs(1), follower.next())
+				.await
+				.is_err(),
+			"nothing to mux, follow={follow:?}"
+		);
+		assert!(
+			follower.export().cataloged(),
+			"the late snapshot switches, follow={follow:?}"
+		);
+		assert_eq!(follower.export().instance(), Some(&instance));
+	}
+}
+
+/// Once the follow retires the old catalog, a cancelled replacement still leaves a catalog
+/// format to subscribe the next instance with, and that instance can finish cleanly.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_replacement_after_the_follow_can_follow_again() {
+	use crate::catalog::CatalogFormat;
+
+	for format in [CatalogFormat::Hang, CatalogFormat::Msf] {
+		let origin = crate::source::produce_origin();
+		let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+		let first = origin.route("live", route()).unwrap();
+		let (name, snapshot) = match format {
+			CatalogFormat::Hang => (
+				hang::Catalog::DEFAULT_NAME,
+				serde_json::to_vec(&hang::Catalog::<()>::default()).unwrap(),
+			),
+			CatalogFormat::Msf => (
+				moq_msf::DEFAULT_NAME,
+				moq_msf::Catalog::<()>::new(Vec::new()).to_json().unwrap().into_bytes(),
+			),
+		};
+		let mut old_catalog = first
+			.broadcast()
+			.create_track(name, hang::Catalog::default_track_info())
+			.unwrap();
+		let mut group = old_catalog.append_group().unwrap();
+		group.write_frame(Timestamp::now(), snapshot).unwrap();
+		group.finish().unwrap();
+		let source = crate::source::resolved(&origin, "live").await;
+		let stream = source.catalog::<()>(format).await.unwrap();
+		let follow = Duration::from_secs(10);
+		let mut follower = super::Follower::new(Export::new(source, stream, std::time::Duration::ZERO))
+			.unwrap()
+			.with_stitch(true)
+			.with_follow(follow);
+		assert!(
+			kio::clock::timeout(Duration::from_secs(1), follower.next())
+				.await
+				.is_err(),
+			"the original catalog stays open"
+		);
+		assert!(old_catalog.subscription().is_some());
+
+		let (second, mut catalog) = publish_live::<()>(&origin, route());
+		let audio = aac_rendition(&mut second.broadcast().clone(), &mut catalog, "a.aac");
+		assert!(
+			kio::clock::timeout(Duration::from_secs(1), follower.next())
+				.await
+				.is_err(),
+			"the replacement has no media to commit"
+		);
+		assert!(follower.export().cataloged(), "the replacement served its snapshot");
+		assert!(
+			old_catalog.subscription().is_some(),
+			"the follow still retains the old catalog"
+		);
+		tokio::time::advance(follow).await;
+		assert!(
+			kio::clock::timeout(Duration::from_secs(1), follower.next())
+				.await
+				.is_err(),
+			"still awaiting replacement media after the follow"
+		);
+		// Observe the origin driver releasing the routed subscription before cancelling B.
+		kio::clock::timeout(Duration::from_secs(1), async {
+			while old_catalog.subscription().is_some() {
+				old_catalog.subscription_changed().await.unwrap();
+			}
+		})
+		.await
+		.expect("the expired follow releases the old catalog");
+
+		audio.abort(moq_net::Error::Unroutable);
+		catalog.abort(moq_net::Error::Unroutable);
+		drop(second);
+		assert!(
+			kio::clock::timeout(Duration::from_secs(1), follower.next())
+				.await
+				.is_err(),
+			"following after the replacement left"
+		);
+
+		let instance = moq_net::Instance::random();
+		let (_third, mut catalog) = publish_bare(&origin, Some(&instance));
+		std::ops::DerefMut::deref_mut(&mut catalog.modify().unwrap());
+		catalog.finish().unwrap();
+		let end = kio::clock::timeout(follow * 2, follower.next())
+			.await
+			.expect("the final instance ends the export");
+		assert!(matches!(end, Ok(None)), "{format:?}: {end:?}");
+		assert_eq!(follower.export().instance(), Some(&instance));
+		assert_eq!(follower.export().catalog_format(), format);
+	}
+}
+
+/// A mid-stream stitch keeps the old instance playing while the replacement's catalog request
+/// goes unanswered, rather than stalling the program on it.
+#[tokio::test(start_paused = true)]
+async fn a_midstream_stitch_keeps_the_old_instance_playing_until_it_switches() {
+	let origin = crate::source::produce_origin();
+	let (broadcast, mut catalog) = publish_bare(&origin, Some(&moq_net::Instance::random()));
+	let mut track = aac_rendition(&mut broadcast.broadcast().clone(), &mut catalog, "a.aac");
+	let export = open_export(crate::source::resolved(&origin, "live").await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	let mut follower = super::Follower::new(export).unwrap().with_stitch(true);
+
+	let second = origin
+		.route(
+			"live",
+			moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0),
+		)
+		.unwrap();
+	let _unanswered = second.broadcast().requests();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut track, ms);
+	}
+	let (frames, end) = drain_follower(&mut follower).await;
+	assert!(end.is_none(), "still exporting: {end:?}");
+	assert_eq!(pes_count(&frames), 10, "the old instance kept playing");
+}
+
+/// A stitch onto a replacement that goes before it resolves leaves the export awaiting its
+/// current replacement's catalog, which still completes the switch when it arrives.
+#[tokio::test(start_paused = true)]
+async fn a_nested_stitch_keeps_awaiting_the_pending_replacement() {
+	let origin = crate::source::produce_origin();
+	let _first = publish_bare(&origin, Some(&moq_net::Instance::random()));
+	let mut follower = follower(&origin)
+		.await
+		.with_stitch(true)
+		.with_follow(Duration::from_secs(10));
+
+	// Switched onto a replacement whose catalog has no snapshot yet.
+	let instance = moq_net::Instance::random();
+	let (_second, mut catalog) = publish_bare(&origin, Some(&instance));
+	assert!(
+		kio::clock::timeout(Duration::from_secs(2), follower.next())
+			.await
+			.is_err(),
+		"awaiting the replacement's catalog"
+	);
+
+	// Replaced again, but that one's catalog request is never answered before it goes.
+	let third = origin
+		.route(
+			"live",
+			moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0),
+		)
+		.unwrap();
+	let unanswered = third.broadcast().requests();
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"resolving the next replacement"
+	);
+	drop((third, unanswered));
+	assert!(
+		kio::clock::timeout(Duration::from_secs(30), follower.next())
+			.await
+			.is_err(),
+		"awaiting the second replacement's catalog again"
+	);
+
+	std::ops::DerefMut::deref_mut(&mut catalog.modify().unwrap());
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"nothing to mux"
+	);
+	assert!(
+		follower.export().cataloged(),
+		"the second replacement served its catalog"
+	);
+	assert_eq!(follower.export().instance(), Some(&instance));
+}
+
+/// A replacement whose catalog closes before its first snapshot fails the stitch, rather than
+/// ending the export cleanly.
+#[tokio::test(start_paused = true)]
+async fn a_midstream_stitch_catalog_closed_without_a_snapshot_fails() {
+	let origin = crate::source::produce_origin();
+	let _first = publish_bare(&origin, Some(&moq_net::Instance::random()));
+	let mut follower = follower(&origin)
+		.await
+		.with_stitch(true)
+		.with_follow(Duration::from_secs(10));
+
+	let (_second, mut catalog) = publish_bare(&origin, Some(&moq_net::Instance::random()));
+	assert!(
+		kio::clock::timeout(Duration::from_secs(1), follower.next())
+			.await
+			.is_err(),
+		"awaiting the replacement's catalog"
+	);
+
+	catalog.finish().unwrap();
+	drop(catalog);
+	let end = kio::clock::timeout(Duration::from_secs(30), follower.next())
+		.await
+		.expect("the closed catalog ends the export");
+	let err = end.expect_err("a replacement without a catalog fails");
+	assert!(err.to_string().contains("catalog"), "{err}");
+}
+
+/// The audio PTS in `frames`.
+fn audio_pts(frames: &[Frame]) -> Vec<u64> {
+	let bytes: Vec<u8> = frames.iter().flat_map(|f| f.payload.iter().copied()).collect();
+	collect_pes_pts(&bytes).1
+}
+
+/// A rendition the catalog lists only after another instance took the path reads the instance
+/// the export resolved, never the replacement, even on an unnamed route.
+#[tokio::test(start_paused = true)]
+async fn a_late_rendition_never_reads_a_replacement() {
+	let origin = crate::source::produce_origin();
+	let (old, mut old_catalog) = publish_live::<()>(&origin, Default::default());
+	let mut export = open_export(crate::source::resolved(&origin, "live").await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	assert!(drain_frames(&mut export).await.is_empty(), "nothing listed yet");
+
+	// Another instance takes the path, its audio ten seconds ahead.
+	let (new, mut new_catalog) = publish_live::<()>(&origin, Default::default());
+	let mut new_audio = aac_rendition(&mut new.broadcast().clone(), &mut new_catalog, "a.aac");
+	for ms in (10_000..10_200).step_by(20) {
+		write_aac(&mut new_audio, ms);
+	}
+
+	let mut old_audio = aac_rendition(&mut old.broadcast().clone(), &mut old_catalog, "a.aac");
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut old_audio, ms);
+	}
+	let pts = audio_pts(&drain_frames(&mut export).await);
+	assert_eq!(pts.len(), 10, "the old instance's audio went out: {pts:?}");
+	assert!(
+		pts.iter().all(|&pts| pts < 60_200 * 90),
+		"nothing of the replacement: {pts:?}"
+	);
+}
+
+/// An SI entry repointed after another instance took the path reads the instance the export
+/// resolved, never the replacement, even on an unnamed route.
+#[tokio::test(start_paused = true)]
+async fn a_repointed_si_entry_never_reads_a_replacement() {
+	let sdt_a = make_long_section(0x42, 1, 0, 0, 0, &[0xaa; 8]);
+	let sdt_b = make_long_section(0x42, 1, 1, 0, 0, &[0xbb; 8]);
+	let sdt_new = make_long_section(0x42, 1, 2, 0, 0, &[0xcc; 8]);
+	let entry = |track: &str| tscat::SiEntry {
+		track: track.to_string(),
+		interval: Some(Duration::from_secs(1)),
+		..Default::default()
+	};
+	let si_track = |broadcast: &mut moq_net::broadcast::Producer, name: &str, sdt: &[u8]| {
+		let mut track = broadcast.create_track(name, timed()).unwrap();
+		track.write_frame(Timestamp::ZERO, Bytes::copy_from_slice(sdt)).unwrap();
+		track
+	};
+
+	let origin = crate::source::produce_origin();
+	let (old, mut catalog) = publish_live::<tscat::Ext>(&origin, Default::default());
+	let mut video = h264_rendition(&mut old.broadcast().clone(), &mut catalog, "video.avc1");
+	let _a = si_track(&mut old.broadcast().clone(), "a.si", &sdt_a);
+	let _b = si_track(&mut old.broadcast().clone(), "b.si", &sdt_b);
+	catalog
+		.modify()
+		.unwrap()
+		.ext
+		.mpegts
+		.si
+		.entry(0x0011)
+		.or_default()
+		.insert(0x42, entry("a.si"));
+	let mut export = open_ts(
+		crate::source::resolved(&origin, "live").await,
+		crate::catalog::CatalogFormat::Hang,
+		RECORDING_MAX_AGE,
+	)
+	.await
+	.unwrap()
+	.with_replay();
+	for ms in (0..1_000).step_by(40) {
+		write_h264(&mut video, ms);
+	}
+	let before: Vec<u8> = drain_frames(&mut export)
+		.await
+		.iter()
+		.flat_map(|f| f.payload.iter().copied())
+		.collect();
+
+	// Another instance takes the path with its own `b.si`, and only then is the entry repointed.
+	let new = origin.route("live", Default::default()).unwrap();
+	let _new_b = si_track(&mut new.broadcast().clone(), "b.si", &sdt_new);
+	catalog
+		.modify()
+		.unwrap()
+		.ext
+		.mpegts
+		.si
+		.get_mut(&0x0011)
+		.unwrap()
+		.insert(0x42, entry("b.si"));
+	for ms in (1_000..3_000).step_by(40) {
+		write_h264(&mut video, ms);
+	}
+	let after: Vec<u8> = drain_frames(&mut export)
+		.await
+		.iter()
+		.flat_map(|f| f.payload.iter().copied())
+		.collect();
+
+	let contains = |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
+	assert!(contains(&before, &sdt_a), "the original entry went out (control)");
+	assert!(contains(&after, &sdt_b), "the repointed entry reads the old instance");
+	assert!(!contains(&after, &sdt_new), "nothing of the replacement");
+}
+
+/// A switch onto an instance that is itself replaced before the switched export requests a
+/// track still reads the instance it switched to.
+#[tokio::test(start_paused = true)]
+async fn a_switch_reads_the_instance_it_followed() {
+	let origin = crate::source::produce_origin();
+	let (_old, _old_catalog) = publish_live::<()>(&origin, Default::default());
+	let export = open_export(crate::source::resolved(&origin, "live").await, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+
+	let (followed, mut followed_catalog) = publish_live::<()>(&origin, Default::default());
+	let mut followed_audio = aac_rendition(&mut followed.broadcast().clone(), &mut followed_catalog, "a.aac");
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut followed_audio, ms);
+	}
+	let broadcast = origin.consume().request("live", None).await.unwrap();
+
+	// Replaced again, ten seconds ahead, before the switched export requests its track.
+	let (newer, mut newer_catalog) = publish_live::<()>(&origin, Default::default());
+	let mut newer_audio = aac_rendition(&mut newer.broadcast().clone(), &mut newer_catalog, "a.aac");
+	for ms in (10_000..10_200).step_by(20) {
+		write_aac(&mut newer_audio, ms);
+	}
+
+	let stream = crate::catalog::Consumer::new(&broadcast, Default::default())
+		.await
+		.unwrap();
+
+	let mut export = export.follow(broadcast, stream).unwrap();
+	let pts = audio_pts(&drain_frames(&mut export).await);
+	assert_eq!(pts.len(), 10, "the followed instance's audio went out: {pts:?}");
+	assert!(
+		pts.iter().all(|&pts| pts < 60_200 * 90),
+		"nothing of the newer instance: {pts:?}"
+	);
+}
+
+/// A sink stall leaves arrived media in its source rather than draining it into the jitter buffer.
+#[tokio::test(start_paused = true)]
+async fn a_backlog_stays_in_the_source_until_due() {
+	use crate::container::test_util::{Live, raw_frame};
+
+	for delay in [Duration::ZERO, Duration::from_millis(100)] {
+		let mut config = AudioConfig::new(AAC { profile: 2 }, 44100, 2);
+		config.description = Some(Bytes::from_static(&[0x12, 0x10]));
+		let mut live = Live::audio(config);
+		let mut export = open_export(live.source().await, delay).await.unwrap();
+		let start = kio::clock::now();
+		live.track.write(raw_frame(0, b"first", true)).unwrap();
+		// A zero-delay slot needs a later frame to prove it is complete.
+		live.track.write(raw_frame(40_000, b"warm", false)).unwrap();
+		while !export
+			.next()
+			.await
+			.unwrap()
+			.unwrap()
+			.payload
+			.windows(5)
+			.any(|part| part == b"first")
+		{}
+		// Acquiring the first clock advances mock time; the publisher keeps capturing on it.
+		let base = 40_000 + start.elapsed().as_micros() as u64;
+		for index in 1..=50 {
+			tokio::time::advance(Duration::from_millis(20)).await;
+			live.track
+				.write(raw_frame(base + index * 20_000, b"backlog", false))
+				.unwrap();
+		}
+		// Settle the final zero-delay slot while the publication stays live.
+		live.track.write(raw_frame(base + 1_040_000, b"tail", false)).unwrap();
+		// Keep the sink stalled until every backlog frame has reached its deadline.
+		tokio::time::advance(delay).await;
+		let mut frames = 0;
+		while frames < 50 {
+			let frame = kio::clock::timeout(DRAIN, export.next())
+				.await
+				.unwrap_or_else(|_| {
+					panic!(
+						"{delay:?}: {frames}/50 frames released, {} buffered, {} dropped",
+						export.buffered(),
+						export.dropped()
+					)
+				})
+				.unwrap()
+				.unwrap();
+			frames += frame.payload.windows(7).filter(|part| *part == b"backlog").count();
+			assert!(
+				export.buffered() <= 1,
+				"{delay:?}: {} frames buffered",
+				export.buffered()
+			);
+		}
+		assert_eq!(frames, 50);
+		assert_eq!(export.dropped(), 0, "the sink's stall does not make arrived media late");
+	}
+}
+
+/// Video whose PTS stops advancing past the reorder lookahead in an open group: the export
+/// holds no more than what arrives within the lookahead and the delay. Flat PTS waits the
+/// catalog `jitter`; PTS running backward reads as reordering up to the deepest supported.
+#[tokio::test(start_paused = true)]
+async fn stalled_presentation_time_keeps_the_export_bounded() {
+	use crate::container::test_util::{Live, video_frame};
+
+	let step = Duration::from_millis(20);
+	let delay = Duration::from_millis(100);
+	let jitter = Duration::from_millis(120);
+	let deepest = Duration::from_secs(2);
+	let flat: fn(u64) -> u64 = |_| 10_000_000;
+	let backward: fn(u64) -> u64 = |index| 10_000_000 - index * 10_000;
+	for (name, pts, lookahead) in [("flat", flat, jitter), ("backward", backward, deepest)] {
+		let mut live = Live::avc3();
+		for config in live.catalog.modify().unwrap().video.renditions.values_mut() {
+			config.jitter = Some(jitter);
+		}
+		let mut export = open_export(live.source().await, delay).await.unwrap();
+		live.track.write(video_frame(pts(0), true)).unwrap();
+		let mut most = 0;
+		for index in 1..500 {
+			tokio::time::advance(step).await;
+			live.track.write(video_frame(pts(index), false)).unwrap();
+			poll_frames(&mut export);
+			most = most.max(export.buffered());
+		}
+		// What arrived within the wait, the frame just read, and one due to go out.
+		let bound = ((lookahead + delay).as_millis() / step.as_millis()) as usize + 2;
+		assert!(most <= bound, "{name}: {most} frames buffered, over {bound}");
+	}
+}
+
+/// The PID of the whole-PES private data track in the tests below.
+const PLACED_PID: u16 = 0x104;
+
+/// A program carrying a `pesPacket` track, for [`export_placed`].
+struct Placed {
+	/// The PTS in ms of each video frame, the first a keyframe; none leaves AAC to clock it.
+	video: Vec<u64>,
+	/// The private data track's `mpegts.tracks` entry.
+	entry: tscat::Track,
+	/// Each frame's placement in ms, and its bytes: one PES packet.
+	pes: Vec<(u64, Vec<u8>)>,
+	/// Also describe the private data track as an AAC rendition.
+	rendition: bool,
+	mux_rate: Option<u64>,
+}
+
+impl Placed {
+	fn new(pes: Vec<(u64, Vec<u8>)>) -> Self {
+		let mut entry = tscat::Track::new(PLACED_PID);
+		entry.pes_packet = Some(tscat::PesPacket::new(0x06));
+		Self {
+			video: Vec::new(),
+			entry,
+			pes,
+			rendition: false,
+			mux_rate: None,
+		}
+	}
+}
+
+/// Export `placed` beside an AAC rendition running past its last PES, returning every slice.
+async fn export_placed(placed: Placed) -> crate::Result<Vec<Frame>> {
+	let broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let mut catalog = crate::catalog::Producer::new(
+		&mut broadcast.clone(),
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+
+	let mut video = None;
+	if !placed.video.is_empty() {
+		let track = broadcast
+			.create_track(
+				broadcast.unique_name(".avc1"),
+				hang::container::track_info(hang::catalog::PRIORITY.video),
+			)
+			.unwrap();
+		let mut cfg = VideoConfig::new(H264 {
+			profile: 0x42,
+			constraints: 0xc0,
+			level: 0x1f,
+			inline: false,
+		});
+		cfg.container = Container::Legacy;
+		cfg.description =
+			Some(crate::codec::h264::build_avcc(&[Bytes::from_static(SPS)], &[Bytes::from_static(PPS)]).unwrap());
+		catalog
+			.modify()
+			.unwrap()
+			.video
+			.renditions
+			.insert(track.name().to_string(), cfg);
+		video = Some(Producer::new(
+			track,
+			HangContainer::Legacy(crate::container::Kind::Video),
+		));
+	}
+
+	let mut aac = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+
+	aac.description = Some(Bytes::from_static(&[0x11, 0x90]));
+	aac.container = Container::Legacy;
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".aac"),
+			hang::container::track_info(hang::catalog::PRIORITY.audio),
+		)
+		.unwrap();
+	catalog
+		.modify()
+		.unwrap()
+		.audio
+		.renditions
+		.insert(track.name().to_string(), aac.clone());
+	let mut audio = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Audio));
+
+	let track = broadcast
+		.create_track(
+			broadcast.unique_name(".ts"),
+			hang::container::track_info(hang::catalog::PRIORITY.video),
+		)
+		.unwrap();
+	{
+		let mut guard = catalog.modify().unwrap();
+		guard.ext.mpegts.tracks.insert(track.name().to_string(), placed.entry);
+		if placed.rendition {
+			guard.audio.renditions.insert(track.name().to_string(), aac);
+		}
+	}
+	let mut data = Producer::new(track, HangContainer::Legacy(crate::container::Kind::Data));
+
+	for (k, &pts) in placed.video.iter().enumerate() {
+		let slice = vec![if k == 0 { 0x65u8 } else { 0x41 }; 400];
+		video
+			.as_mut()
+			.unwrap()
+			.write(Frame {
+				timestamp: Timestamp::from_millis(pts).unwrap(),
+				duration: None,
+				payload: length_prefixed(&[&slice]),
+				keyframe: k == 0,
+			})
+			.unwrap();
+	}
+	let end = placed
+		.pes
+		.iter()
+		.map(|&(ms, _)| ms)
+		.chain(placed.video.iter().copied())
+		.max();
+	let end = (end.unwrap_or(0) + 500) * 1_000;
+	let mut index = 0;
+	while index * AUDIO_US < end {
+		audio
+			.write(Frame {
+				timestamp: Timestamp::from_micros(index * AUDIO_US).unwrap(),
+				duration: None,
+				payload: Bytes::from(vec![index as u8; 180]),
+				keyframe: index.is_multiple_of(AUDIO_GROUP),
+			})
+			.unwrap();
+		index += 1;
+	}
+	for (ms, pes) in placed.pes {
+		data.write(Frame {
+			timestamp: Timestamp::from_millis(ms).unwrap(),
+			duration: None,
+			payload: Bytes::from(pes),
+			keyframe: true,
+		})
+		.unwrap();
+	}
+	if let Some(video) = video.as_mut() {
+		video.end_with(None).unwrap();
+	}
+	let _finished = audio.finish().unwrap();
+	let _finished = data.finish().unwrap();
+
+	let mut exporter = open_ts(
+		crate::source::announced(&consumer).await,
+		crate::catalog::CatalogFormat::Hang,
+		RECORDING_MAX_AGE,
+	)
+	.await?
+	.with_replay();
+	if let Some(rate) = placed.mux_rate {
+		exporter = exporter.with_mux_rate(rate);
+	}
+	let mut out = Vec::new();
+	while let Ok(next) = kio::clock::timeout(DRAIN, exporter.next()).await {
+		match next? {
+			Some(frame) => out.push(frame),
+			None => break,
+		}
+	}
+	Ok(out)
+}
+
+/// Where a PES went out: the slice it began in, its first byte's offset into the slice, and
+/// the bytes in its packets' payloads.
+#[derive(Debug)]
+struct PlacedOut {
+	slice: usize,
+	offset: usize,
+	bytes: Vec<u8>,
+}
+
+/// Every PES on [`PLACED_PID`], reassembled from its packets' payloads.
+fn placed_out(slices: &[Frame]) -> Vec<PlacedOut> {
+	let mut out: Vec<PlacedOut> = Vec::new();
+	for (slice, frame) in slices.iter().enumerate() {
+		for (position, packet) in frame.payload.as_chunks::<188>().0.iter().enumerate() {
+			let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
+			if pid != PLACED_PID {
+				continue;
+			}
+			let start = 4 + if packet[3] & 0x20 != 0 {
+				usize::from(packet[4]) + 1
+			} else {
+				0
+			};
+			if packet[1] & 0x40 != 0 {
+				out.push(PlacedOut {
+					slice,
+					offset: position * 188 + start,
+					bytes: Vec::new(),
+				});
+			}
+			out.last_mut()
+				.expect("a continuation before any PES start")
+				.bytes
+				.extend_from_slice(&packet[start..]);
+		}
+	}
+	out
+}
+
+/// A 33-bit PTS or DTS field behind its 4-bit `prefix`, as ISO 13818-1 2.4.3.7 lays it out.
+fn pes_clock(prefix: u8, ticks: u64) -> [u8; 5] {
+	[
+		prefix << 4 | ((ticks >> 29) & 0x0e) as u8 | 1,
+		(ticks >> 22) as u8,
+		((ticks >> 14) & 0xfe) as u8 | 1,
+		(ticks >> 7) as u8,
+		((ticks << 1) & 0xfe) as u8 | 1,
+	]
+}
+
+/// A PES with an optional header: `marker` is its first flags byte ('10' then scrambling,
+/// priority, alignment, copyright, original), `flags` its second, `fields` the optional
+/// fields those flags name, then `stuffing` bytes of 0xFF.
+fn pes_with(stream_id: u8, marker: u8, flags: u8, fields: &[u8], stuffing: usize, payload: &[u8]) -> Vec<u8> {
+	let header = fields.len() + stuffing;
+	let mut pes = vec![0, 0, 1, stream_id];
+	pes.extend_from_slice(&((3 + header + payload.len()) as u16).to_be_bytes());
+	pes.extend_from_slice(&[marker, flags, header as u8]);
+	pes.extend_from_slice(fields);
+	pes.resize(pes.len() + stuffing, 0xff);
+	pes.extend_from_slice(payload);
+	pes
+}
+
+/// A PES of a `stream_id` with no optional header (private_stream_2, padding, ...).
+fn pes_bare(stream_id: u8, payload: &[u8]) -> Vec<u8> {
+	let mut pes = vec![0, 0, 1, stream_id];
+	pes.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+	pes.extend_from_slice(payload);
+	pes
+}
+
+/// Each whole PES goes out exactly as written, whatever its header holds: PTS 0 or none, a
+/// DTS apart from its PTS, every optional field, `data_alignment_indicator` clear, the
+/// stream IDs without an optional header, and sizes on either side of a packet's payload.
+#[tokio::test(start_paused = true)]
+async fn placed_pes_goes_out_byte_for_byte() {
+	let mut extension = vec![0x80 | 0x10 | 0x01];
+	extension.extend_from_slice(&[0x5a; 16]);
+	extension.extend_from_slice(&[0x60, 0x20]);
+	extension.extend_from_slice(&[0x80 | 3, 1, 2, 3]);
+	let mut optional = pes_clock(0b0010, 90_000).to_vec();
+	optional.extend_from_slice(&[0x80, 0x01, 0x01]);
+	optional.push(0x1f);
+	optional.push(0xa5);
+	optional.extend_from_slice(&[0x12, 0x34]);
+	optional.extend_from_slice(&extension);
+	let mut both = pes_clock(0b0011, 180_000).to_vec();
+	both.extend_from_slice(&pes_clock(0b0001, 171_000));
+
+	let packets = vec![
+		pes_with(0xbd, 0x84, 0x80, &pes_clock(0b0010, 0), 0, b"pts zero"),
+		pes_with(0xbd, 0x84, 0x00, &[], 0, b"no pts"),
+		pes_with(0xbd, 0x84, 0xc0, &both, 0, b"pts and dts"),
+		pes_with(0xbd, 0x84, 0x80 | 0x1f, &optional, 4, b"every optional field"),
+		pes_with(0xbd, 0x80, 0x80, &pes_clock(0b0010, 1), 0, b"unaligned"),
+		pes_bare(0xbf, b"private_stream_2"),
+		pes_bare(0xbe, &[0xff; 40]),
+		pes_with(0xbd, 0x84, 0x00, &[], 0, &[0x33; 500]),
+		// Exactly one packet's payload, and one byte short of it.
+		pes_with(0xbd, 0x84, 0x00, &[], 0, &[0x44; 184 - 9]),
+		pes_with(0xbd, 0x84, 0x00, &[], 0, &[0x55; 183 - 9]),
+	];
+	let pes = packets
+		.iter()
+		.enumerate()
+		.map(|(k, pes)| (1_000 + 100 * k as u64, pes.clone()))
+		.collect();
+	let out = placed_out(&export_placed(Placed::new(pes)).await.unwrap());
+	let bytes: Vec<&Vec<u8>> = out.iter().map(|pes| &pes.bytes).collect();
+	assert_eq!(bytes, packets.iter().collect::<Vec<_>>());
+}
+
+/// The PCR, in nanoseconds, that opens a slice: in its first packet's adaptation field.
+fn slice_pcr(frame: &Frame) -> u128 {
+	let packet = &frame.payload[..188];
+	assert!(
+		packet[3] & 0x20 != 0 && packet[5] & 0x10 != 0,
+		"the slice opens with its PCR"
+	);
+	let b = &packet[6..12];
+	let base = u64::from(b[0]) << 25
+		| u64::from(b[1]) << 17
+		| u64::from(b[2]) << 9
+		| u64::from(b[3]) << 1
+		| u64::from(b[4] >> 7);
+	let extension = u64::from(b[4] & 1) << 8 | u64::from(b[5]);
+	u128::from(base * 300 + extension) * 1_000 / 27
+}
+
+/// A PES goes out at its placement, never earlier: at a multiplex rate, whose byte
+/// positions keep time, its first byte lands at the first position past it, with the TS
+/// header just ahead; unpadded, in the first slot that opens at or after it.
+#[tokio::test(start_paused = true)]
+async fn placed_pes_goes_out_at_its_placement() {
+	const RATE: u64 = 2_000_000;
+	let pes = pes_with(0xbd, 0x84, 0x00, &[], 0, b"placed");
+	// Off the 25 ms grid, so neither slot edge lines up with it.
+	let placements = [1_010, 1_533, 2_017];
+	let written = || placements.iter().map(|&ms| (ms, pes.clone())).collect();
+
+	let slices = export_placed(Placed {
+		mux_rate: Some(RATE),
+		..Placed::new(written())
+	})
+	.await
+	.unwrap();
+	let out = placed_out(&slices);
+	assert_eq!(out.len(), placements.len());
+	let packet = 188 * 8 * 1_000_000_000 / u128::from(RATE);
+	for (pes, &ms) in out.iter().zip(&placements) {
+		let first = slice_pcr(&slices[pes.slice]) + pes.offset as u128 * 8 * 1_000_000_000 / u128::from(RATE);
+		let place = u128::from(ms) * 1_000_000;
+		assert!(
+			first >= place,
+			"{ms} ms: first byte at {first} ns, ahead of its placement"
+		);
+		assert!(
+			first < place + packet,
+			"{ms} ms: first byte at {first} ns, a packet past its placement"
+		);
+	}
+
+	let slices = export_placed(Placed::new(written())).await.unwrap();
+	let out = placed_out(&slices);
+	assert_eq!(out.len(), placements.len());
+	for (pes, &ms) in out.iter().zip(&placements) {
+		let opens = slice_pcr(&slices[pes.slice]);
+		let place = u128::from(ms) * 1_000_000;
+		assert!(opens >= place, "{ms} ms: the slot opening at {opens} ns is ahead of it");
+		assert!(
+			opens < place + PCR_INTERVAL.as_nanos(),
+			"{ms} ms: the slot opening at {opens} ns is a slot late"
+		);
+	}
+}
+
+/// Tune-in drops a PES placed before the keyframe departs, and keeps one placed beside it,
+/// after it departs but before its PTS, as well as one placed after it among the media,
+/// each in the slot of its placement. Comparing placement with the keyframe's PTS would drop
+/// the one beside it.
+#[tokio::test(start_paused = true)]
+async fn placed_pes_survives_tune_in_beside_the_keyframe() {
+	// Level 3.1 without an HRD reaches a second ahead, so the keyframe at 2 s departs at 1 s.
+	let video: Vec<u64> = (0..25).map(|k| 2_000 + 40 * k).collect();
+	let before = pes_with(0xbd, 0x84, 0x00, &[], 0, b"before");
+	let beside = pes_with(0xbd, 0x84, 0x00, &[], 0, b"beside");
+	let after = pes_with(0xbd, 0x84, 0x00, &[], 0, b"after");
+	let slices = export_placed(Placed {
+		video,
+		..Placed::new(vec![(500, before), (1_500, beside.clone()), (2_500, after.clone())])
+	})
+	.await
+	.unwrap();
+	let out = placed_out(&slices);
+	let bytes: Vec<&Vec<u8>> = out.iter().map(|pes| &pes.bytes).collect();
+	assert_eq!(
+		bytes,
+		vec![&beside, &after],
+		"only the PES before the keyframe departs is dropped"
+	);
+	for (pes, ms) in out.iter().zip([1_500u128, 2_500]) {
+		assert_eq!(
+			slices[pes.slice].timestamp.as_micros(),
+			(ms * 1_000).div_ceil(PCR_INTERVAL.as_micros()) * PCR_INTERVAL.as_micros() + PCR_INTERVAL.as_micros(),
+			"{ms} ms: rides the first slot opening after its placement"
+		);
+	}
+	// The keyframe is the first video PES out.
+	let keyframe = slices
+		.iter()
+		.position(|slice| {
+			slice.payload.as_chunks::<188>().0.iter().any(|packet| {
+				let start = 4 + if packet[3] & 0x20 != 0 {
+					usize::from(packet[4]) + 1
+				} else {
+					0
+				};
+				packet[1] & 0x40 != 0 && packet[start..].starts_with(&[0, 0, 1, 0xe0])
+			})
+		})
+		.expect("the keyframe went out");
+	assert!(keyframe < out[0].slice, "the keyframe leads the PES beside it");
+}
+
+/// A frame that is not exactly one well-formed PES packet fails the export.
+#[tokio::test(start_paused = true)]
+async fn placed_pes_refuses_a_malformed_frame() {
+	let mut short = pes_with(0xbd, 0x84, 0x00, &[], 0, b"payload");
+	short.pop();
+	let err = export_placed(Placed::new(vec![(1_000, short)])).await.unwrap_err();
+	assert!(err.to_string().contains("malformed PES packet"), "{err}");
+}
+
+/// An entry naming both carriages, or carrying a track that is also a media rendition, has
+/// two ways to write one PID, so the export refuses it.
+#[tokio::test(start_paused = true)]
+async fn placed_pes_refuses_an_ambiguous_entry() {
+	let pes = || vec![(1_000, pes_with(0xbd, 0x84, 0x00, &[], 0, b"payload"))];
+	let mut both = Placed::new(pes());
+	both.entry.verbatim = Some(tscat::Verbatim::new(0x06, tscat::Framing::Section));
+	let err = export_placed(both).await.unwrap_err();
+	assert!(err.to_string().contains("names both"), "{err}");
+
+	let err = export_placed(Placed {
+		rendition: true,
+		..Placed::new(pes())
+	})
+	.await
+	.unwrap_err();
+	assert!(err.to_string().contains("media rendition"), "{err}");
+}
+
+/// DVB AC-3 carried whole keeps every sync frame of a PES in it, unsplit.
+#[tokio::test(start_paused = true)]
+async fn placed_ac3_pes_keeps_its_sync_frames_together() {
+	let payload: Vec<u8> = (0..3).flat_map(ac3_frame).collect();
+	let pes = pes_with(0xbd, 0x84, 0x80, &pes_clock(0b0010, 90 * 1_100), 0, &payload);
+	let mut placed = Placed::new(vec![(1_000, pes.clone())]);
+	placed.entry.descriptors = vec![tscat::Descriptor {
+		tag: 0x6a,
+		data: Bytes::from_static(&[0x00]),
+	}];
+	let out = placed_out(&export_placed(placed).await.unwrap());
+	assert_eq!(out.len(), 1);
+	assert_eq!(out[0].bytes, pes);
+}
+
+/// Section placement is an arrival, so cues beside the tune-in keyframe precede its PTS.
+#[tokio::test(start_paused = true)]
+async fn placed_section_survives_tune_in_beside_the_keyframe() {
+	let mut input = Placed::new(vec![(500, CUE.to_vec()), (1_500, CUE.to_vec()), (2_500, CUE.to_vec())]);
+	input.video = (0..25).map(|k| 2_000 + 40 * k).collect();
+	input.entry.pes_packet = None;
+	input.entry.verbatim = Some(tscat::Verbatim::new(0x86, tscat::Framing::Section));
+	let slices = export_placed(input).await.unwrap();
+	let starts: Vec<_> = slices
+		.iter()
+		.filter(|slice| {
+			slice.payload.as_chunks::<188>().0.iter().any(|packet| {
+				(u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2])) == PLACED_PID && packet[1] & 0x40 != 0
+			})
+		})
+		.map(slice_pcr)
+		.collect();
+	assert_eq!(
+		starts,
+		vec![1_500_000_000, 2_500_000_000],
+		"only the cue before the keyframe departs is dropped"
+	);
+}
+
+/// A cue's first section byte keeps its source position when remuxed onto a new constant rate.
+#[tokio::test(start_paused = true)]
+async fn placed_sections_keep_their_source_positions() {
+	const RATE: u64 = 2_000_000;
+	const PID: u16 = 0x21;
+	let data = include_bytes!("test_data/scte35/ffmpeg.ts");
+	let mut clocks = Vec::new();
+	let mut starts = Vec::new();
+	for (k, packet) in data.as_chunks::<188>().0.iter().enumerate() {
+		if let Some(pcr) = super::import::pcr(packet) {
+			clocks.push(((k * 188 + 10) as u64, pcr));
+		}
+		let pid = u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+		if pid == PID && packet[1] & 0x40 != 0 {
+			let payload = 4 + if packet[3] & 0x20 != 0 {
+				1 + usize::from(packet[4])
+			} else {
+				0
+			};
+			starts.push((k * 188 + payload + 1 + usize::from(packet[payload])) as u64);
+		}
+	}
+	let source: Vec<_> = starts
+		.iter()
+		.map(|&at| {
+			let before = clocks.iter().rposition(|&(byte, _)| byte <= at).unwrap();
+			let (a, b) = match clocks.get(before + 1) {
+				Some(&after) => (clocks[before], after),
+				None => (clocks[before - 1], clocks[before]),
+			};
+			(a.1 + (at - a.0) * (b.1 - a.1) / (b.0 - a.0)) / 27
+		})
+		.collect();
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let consumer = broadcast.consume();
+	let catalog = crate::catalog::Producer::new(
+		&mut broadcast,
+		crate::catalog::Config::default().with_catalog(crate::catalog::hang::Catalog::<tscat::Ext>::default()),
+	)
+	.unwrap();
+	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
+	import.decode(data).unwrap();
+	let _finished = import.finish().unwrap();
+	let name = scte_track(&catalog.snapshot()).unwrap();
+	let cues = read_cues(&consumer, &name).await;
+	assert_eq!(
+		cues.iter().map(|(_, time)| time.as_micros() as u64).collect::<Vec<_>>(),
+		source
+	);
+	let mut exporter = open_ts(
+		crate::source::announced(&consumer).await,
+		crate::catalog::CatalogFormat::Hang,
+		RECORDING_MAX_AGE,
+	)
+	.await
+	.unwrap()
+	.with_replay()
+	.with_mux_rate(RATE);
+	let mut output = Vec::new();
+	while let Ok(Some(slice)) = kio::clock::timeout(DRAIN, exporter.next())
+		.await
+		.map(|next| next.unwrap())
+	{
+		for (k, packet) in slice.payload.as_chunks::<188>().0.iter().enumerate() {
+			let pid = u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2]);
+			if pid == PID && packet[1] & 0x40 != 0 {
+				let payload = 4 + if packet[3] & 0x20 != 0 {
+					1 + usize::from(packet[4])
+				} else {
+					0
+				};
+				let byte = k * 188 + payload + 1 + usize::from(packet[payload]);
+				output.push(slice_pcr(&slice) + byte as u128 * 8 * 1_000_000_000 / u128::from(RATE));
+			}
+		}
+	}
+	assert_eq!(output.len(), source.len());
+	let packet = 188 * 8 * 1_000_000_000 / u128::from(RATE);
+	for (&first, &source) in output.iter().zip(&source) {
+		let place = u128::from(source) * 1_000;
+		assert!(
+			first >= place && first < place + packet,
+			"source first byte at {place} ns, export at {first} ns"
+		);
+	}
+}
+
+/// Returns of one instance whose catalogs rename the track on its PID retire each one left
+/// out once the next holds the PID: the export keeps one track however many returns come.
+#[tokio::test(start_paused = true)]
+async fn a_track_renamed_on_its_pid_across_returns_retires_the_one_before() {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(instance.clone(), 0);
+	let rendition = |broadcast: &mut moq_net::broadcast::Producer,
+	                 catalog: &mut crate::catalog::Producer<tscat::Ext>,
+	                 name: &str| {
+		let track = aac_rendition(broadcast, catalog, name);
+		catalog
+			.modify()
+			.unwrap()
+			.ext
+			.mpegts
+			.tracks
+			.insert(name.to_string(), tscat::Track::new(0x101));
+		track
+	};
+
+	let (broadcast, mut catalog) = publish_live::<tscat::Ext>(&origin, route());
+	let mut track = rendition(&mut broadcast.broadcast().clone(), &mut catalog, "0.aac");
+	let source = crate::source::resolved(&origin, "live").await;
+	let mut export = open_ts(source, crate::catalog::CatalogFormat::Hang, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	let start = kio::clock::now();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut track, ms);
+	}
+	drain_frames(&mut export).await;
+	drop((broadcast, catalog, track));
+	let _ = drain_to_end(&mut export).await;
+
+	for round in 1..=4 {
+		kio::clock::sleep(Duration::from_secs(1)).await;
+		let (broadcast, mut catalog) = publish_live::<tscat::Ext>(&origin, route());
+		let back = origin
+			.consume()
+			.follow("live", None)
+			.unwrap()
+			.available()
+			.await
+			.unwrap()
+			.unwrap();
+		let stream = crate::catalog::Consumer::new(&back, Default::default()).await.unwrap();
+		export = export.follow(back, stream).unwrap();
+		drain_frames(&mut export).await;
+		let mut track = rendition(
+			&mut broadcast.broadcast().clone(),
+			&mut catalog,
+			&format!("{round}.aac"),
+		);
+		let resumed = start.elapsed().as_millis() as u64;
+		for ms in (resumed..resumed + 200).step_by(20) {
+			write_aac(&mut track, ms);
+		}
+		drain_frames(&mut export).await;
+		drop((broadcast, catalog, track));
+		let _ = drain_to_end(&mut export).await;
+	}
+	assert_eq!(export.tracks(), 1);
+}
+
+/// A track a same-instance return renames on its PID counts its silence from its own listing,
+/// not from the last unit of the stale one before it, which retires only once it is listed.
+#[tokio::test(start_paused = true)]
+async fn a_track_renamed_on_its_pid_across_a_return_is_quiet_from_its_listing() {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(instance.clone(), 0);
+	let rendition = |broadcast: &mut moq_net::broadcast::Producer,
+	                 catalog: &mut crate::catalog::Producer<tscat::Ext>,
+	                 name: &str| {
+		let track = aac_rendition(broadcast, catalog, name);
+		catalog
+			.modify()
+			.unwrap()
+			.ext
+			.mpegts
+			.tracks
+			.insert(name.to_string(), tscat::Track::new(0x101));
+		track
+	};
+
+	let (broadcast, mut catalog) = publish_live::<tscat::Ext>(&origin, route());
+	let mut track = rendition(&mut broadcast.broadcast().clone(), &mut catalog, "0.aac");
+	let source = crate::source::resolved(&origin, "live").await;
+	let mut export = open_ts(source, crate::catalog::CatalogFormat::Hang, Duration::from_secs(1))
+		.await
+		.unwrap()
+		.with_replay();
+	let start = kio::clock::now();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut track, ms);
+	}
+	drain_frames(&mut export).await;
+	drop((broadcast, catalog, track));
+	let _ = drain_to_end(&mut export).await;
+	let (before, _) = export.liveness(0x101);
+
+	kio::clock::sleep(Duration::from_secs(10)).await;
+	let (broadcast, mut catalog) = publish_live::<tscat::Ext>(&origin, route());
+	let back = origin
+		.consume()
+		.follow("live", None)
+		.unwrap()
+		.available()
+		.await
+		.unwrap()
+		.unwrap();
+	let stream = crate::catalog::Consumer::new(&back, Default::default()).await.unwrap();
+	let mut export = export.follow(back, stream).unwrap();
+	drain_frames(&mut export).await;
+	let mut track = rendition(&mut broadcast.broadcast().clone(), &mut catalog, "1.aac");
+	let resumed = start.elapsed().as_millis() as u64;
+	let mut quiet = Vec::new();
+	for ms in (resumed..resumed + 4000).step_by(20) {
+		write_aac(&mut track, ms);
+		poll_frames(&mut export);
+		let (units, since) = export.liveness(0x101);
+		if export.listed_on(0x101) == Some("1.aac") && units == before {
+			quiet.push(since);
+		}
+		kio::clock::sleep(Duration::from_millis(20)).await;
+	}
+	assert!(!quiet.is_empty(), "the track was listed with none of its units out");
+	assert!(
+		quiet
+			.iter()
+			.all(|since| since.is_some_and(|since| since < Duration::from_secs(1))),
+		"{quiet:?}"
+	);
+	drop((broadcast, catalog, track));
+}
+
+/// A PMT revision no slot laid before a switch reached no receiver: the replacement's PMT
+/// follows the last one out by one version.
+#[tokio::test(start_paused = true)]
+async fn a_switch_follows_the_last_pmt_out() {
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+
+	let (old, mut old_catalog) = publish_live::<tscat::Ext>(&origin, route());
+	let mut audio = aac_rendition(&mut old.broadcast().clone(), &mut old_catalog, "a.aac");
+	let source = crate::source::resolved(&origin, "live").await;
+	let mut export = open_ts(source, crate::catalog::CatalogFormat::Hang, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut audio, ms);
+	}
+	let mut frames = drain_frames(&mut export).await;
+	old_catalog.modify().unwrap().ext.mpegts.program_descriptors = vec![tscat::Descriptor {
+		tag: 0x80,
+		data: Bytes::from_static(&[0xaa; 4]),
+	}];
+	frames.extend(drain_frames(&mut export).await);
+
+	let (new, mut new_catalog) = publish_live::<tscat::Ext>(&origin, route());
+	let mut audio = aac_rendition(&mut new.broadcast().clone(), &mut new_catalog, "b.aac");
+	let replacement = origin.consume().request("live", None).await.unwrap();
+	let stream = crate::catalog::Consumer::new(&replacement, Default::default())
+		.await
+		.unwrap();
+	let mut export = export.follow(replacement, stream).unwrap();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut audio, ms);
+	}
+	frames.extend(drain_frames(&mut export).await);
+	let _finished = audio.finish().unwrap();
+	new_catalog.finish().unwrap();
+	let (rest, end) = drain_to_end(&mut export).await;
+	frames.extend(rest);
+	end.unwrap();
+
+	let mut versions: Vec<u8> = pmts(&frames).iter().map(|(version, _)| *version).collect();
+	versions.dedup();
+	assert_eq!(versions, [0, 1]);
+	drop((old, old_catalog));
+}
+
+/// A PMT move no slot laid before a switch reached no receiver: the replacement's PAT follows
+/// the last one out by one version.
+#[tokio::test(start_paused = true)]
+async fn a_switch_follows_the_last_pat_out() {
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+
+	let (old, mut old_catalog) = publish_live::<tscat::Ext>(&origin, route());
+	let mut audio = aac_rendition(&mut old.broadcast().clone(), &mut old_catalog, "a.aac");
+	let source = crate::source::resolved(&origin, "live").await;
+	let mut export = open_ts(source, crate::catalog::CatalogFormat::Hang, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut audio, ms);
+	}
+	let mut frames = drain_frames(&mut export).await;
+	old_catalog.modify().unwrap().ext.mpegts.program = Some(tscat::Program {
+		transport_stream_id: 1,
+		program_number: 1,
+		pmt_pid: 0x30,
+	});
+	frames.extend(drain_frames(&mut export).await);
+
+	let (new, mut new_catalog) = publish_live::<tscat::Ext>(&origin, route());
+	let mut audio = aac_rendition(&mut new.broadcast().clone(), &mut new_catalog, "b.aac");
+	let replacement = origin.consume().request("live", None).await.unwrap();
+	let stream = crate::catalog::Consumer::new(&replacement, Default::default())
+		.await
+		.unwrap();
+	let mut export = export.follow(replacement, stream).unwrap();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut audio, ms);
+	}
+	frames.extend(drain_frames(&mut export).await);
+	let _finished = audio.finish().unwrap();
+	new_catalog.finish().unwrap();
+	let (rest, end) = drain_to_end(&mut export).await;
+	frames.extend(rest);
+	end.unwrap();
+
+	let mut versions: Vec<u8> = pats(&frames).iter().map(|&(version, _)| version).collect();
+	versions.dedup();
+	assert_eq!(versions, [0, 1]);
+	drop((old, old_catalog));
+}
+
+/// A switch onto an instance replaced after it built its tables but before a slot laid them
+/// numbers the next program's from the last PMT out, not from the one that never went.
+#[tokio::test(start_paused = true)]
+async fn a_switch_past_an_instance_that_laid_no_tables_follows_the_last_pmt_out() {
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+	let follow = async |export: Export<_>| {
+		let replacement = origin.consume().request("live", None).await.unwrap();
+		let stream = crate::catalog::Consumer::new(&replacement, Default::default())
+			.await
+			.unwrap();
+		export.follow(replacement, stream).unwrap()
+	};
+
+	let (first, mut first_catalog) = publish_live::<tscat::Ext>(&origin, route());
+	let mut audio = aac_rendition(&mut first.broadcast().clone(), &mut first_catalog, "a.aac");
+	let source = crate::source::resolved(&origin, "live").await;
+	let mut export = open_ts(source, crate::catalog::CatalogFormat::Hang, RECORDING_MAX_AGE)
+		.await
+		.unwrap()
+		.with_replay();
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut audio, ms);
+	}
+	let mut frames = drain_frames(&mut export).await;
+
+	// Built from what it holds, and replaced before its first slot.
+	let (second, mut second_catalog) = publish_live::<tscat::Ext>(&origin, route());
+	let mut audio = aac_rendition(&mut second.broadcast().clone(), &mut second_catalog, "b.aac");
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut audio, ms);
+	}
+	let mut export = follow(export).await;
+	assert!(poll_frames(&mut export).is_empty());
+
+	let (third, mut third_catalog) = publish_live::<tscat::Ext>(&origin, route());
+	let mut audio = aac_rendition(&mut third.broadcast().clone(), &mut third_catalog, "c.aac");
+	let mut export = follow(export).await;
+	for ms in (0..200).step_by(20) {
+		write_aac(&mut audio, ms);
+	}
+	frames.extend(drain_frames(&mut export).await);
+	let _finished = audio.finish().unwrap();
+	third_catalog.finish().unwrap();
+	let (rest, end) = drain_to_end(&mut export).await;
+	frames.extend(rest);
+	end.unwrap();
+
+	let mut versions: Vec<u8> = pmts(&frames).iter().map(|(version, _)| *version).collect();
+	versions.dedup();
+	assert_eq!(versions, [0, 1]);
+	drop((first, first_catalog, second, second_catalog));
+}
+
+/// A program switch must keep the healthy old leg's already held frames while
+/// the replacement has not delivered anything that can acquire its clock.
+#[tokio::test(start_paused = true)]
+async fn a_stitched_switch_keeps_the_healthy_legs_held_frames() {
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+	let (old, mut old_catalog) = publish_live::<()>(&origin, route());
+	let mut old_audio = aac_rendition(&mut old.broadcast().clone(), &mut old_catalog, "a.aac");
+	let mut export = open_export(crate::source::resolved(&origin, "live").await, Duration::from_secs(3))
+		.await
+		.unwrap()
+		.with_replay();
+	for ms in (0..1000).step_by(20) {
+		write_aac(&mut old_audio, ms);
+	}
+	assert!(export.next().await.unwrap().is_some());
+	for ms in (1000..2000).step_by(20) {
+		write_aac(&mut old_audio, ms);
+	}
+	let _ = export.poll_next(&kio::Waiter::noop());
+	let held = export.buffered();
+	assert!(held > 0, "the old healthy leg has future output buffered");
+	let (new, mut new_catalog) = publish_live::<()>(&origin, route());
+	let _new_audio = aac_rendition(&mut new.broadcast().clone(), &mut new_catalog, "a.aac");
+	let replacement = origin.consume().request("live", None).await.unwrap();
+	let stream = crate::catalog::Consumer::new(&replacement, Default::default())
+		.await
+		.unwrap();
+	let export = export.follow(replacement, stream).unwrap();
+	assert!(
+		export.buffered() >= held,
+		"a new instance discarded the healthy old leg before the replacement clock acquired: before={held}, after={}",
+		export.buffered()
+	);
+}
+
+/// Both instances keep sending while the replacement acquires an unrelated clock.
+/// A healthy old leg feeds beyond the route switch, and no output slot is lost.
+#[tokio::test(start_paused = true)]
+async fn a_healthy_stitch_feeds_the_old_generation_until_the_new_clock_acquires() {
+	use std::task::Poll;
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+	let (old, mut old_catalog) = publish_live::<()>(&origin, route());
+	let mut old_audio = aac_rendition(&mut old.broadcast().clone(), &mut old_catalog, "a.aac");
+	let export = open_export(crate::source::resolved(&origin, "live").await, Duration::from_secs(3))
+		.await
+		.unwrap();
+	let mut follower = super::Follower::new(export)
+		.unwrap()
+		.with_stitch(true)
+		.with_follow(Duration::from_secs(10));
+	let mut replacement = None;
+	let mut demoted = false;
+	let mut frames = Vec::new();
+	let step = Duration::from_millis(20);
+	let start = kio::clock::now();
+	for ms in (0..14_000).step_by(20) {
+		write_aac(&mut old_audio, ms);
+		if ms == 4000 {
+			let (new, mut catalog) = publish_live::<()>(&origin, route());
+			let audio = aac_rendition(&mut new.broadcast().clone(), &mut catalog, "a.aac");
+			replacement = Some((new, catalog, audio));
+		}
+		if let Some((_, _, audio)) = replacement.as_mut() {
+			write_aac(audio, 100_000 + ms - 4000);
+		}
+		tokio::task::yield_now().await;
+		loop {
+			match follower.poll_next(&kio::Waiter::noop()) {
+				Poll::Ready(Ok(Some(frame))) => {
+					frames.push((start.elapsed(), follower.export().discontinuity(), frame))
+				}
+				Poll::Ready(end) => panic!("both publishers are healthy: {end:?}"),
+				Poll::Pending => break,
+			}
+		}
+		if let Some((_, _, audio)) = &replacement {
+			if let Some(subscription) = old_audio.track().subscription() {
+				demoted |= subscription.priority == -1;
+			}
+			if let Some(subscription) = audio.track().subscription() {
+				assert_eq!(subscription.priority, 0, "the replacement keeps normal priority");
+			}
+		}
+		tokio::time::advance(step).await;
+	}
+	assert!(demoted, "the healthy old program yielded to the acquiring one");
+	let switch = frames
+		.iter()
+		.position(|(_, epoch, _)| *epoch == 1)
+		.expect("the replacement went out");
+	let old_frames: Vec<_> = frames[..switch].iter().map(|(_, _, frame)| frame.clone()).collect();
+	let old_pts = audio_pts(&old_frames);
+	assert!(
+		old_pts.last().is_some_and(|pts| *pts > 64_000 * 90),
+		"the old subscription must feed past the route switch: {old_pts:?}"
+	);
+	let gap = frames[switch].0 - frames[switch - 1].0;
+	assert!(gap <= PCR_INTERVAL + step, "healthy switch lost output slots: {gap:?}");
+	let next: Vec<_> = frames[switch..].iter().map(|(_, _, frame)| frame.clone()).collect();
+	assert!(
+		audio_pts(&next).iter().all(|pts| *pts >= 160_000 * 90),
+		"each instance has its own timestamps"
+	);
+	assert_eq!(unflagged(&next), Vec::<u16>::new());
+	assert_eq!(follower.export().discontinuity(), 1);
+}
+
+/// Every stitched switch drops the old program's tail rather than playing it first, so
+/// each replacement goes out at the delay, latency does not build up switch after switch,
+/// and the output stays in order with no hole at any switch.
+#[tokio::test(start_paused = true)]
+async fn repeated_stitches_keep_the_delay() {
+	use std::task::Poll;
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+	// Publisher `k` stamps its media `k * 100 s` on, so each one has its own timeline.
+	const SPACING: u64 = 100_000;
+	const SWITCH: u64 = 4_000;
+	let mut publishers = Vec::new();
+	let (first, mut catalog) = publish_live::<()>(&origin, route());
+	let audio = aac_rendition(&mut first.broadcast().clone(), &mut catalog, "a.aac");
+	publishers.push((first, catalog, audio));
+	let export = open_export(crate::source::resolved(&origin, "live").await, Duration::from_secs(1))
+		.await
+		.unwrap();
+	let mut follower = super::Follower::new(export)
+		.unwrap()
+		.with_stitch(true)
+		.with_follow(Duration::from_secs(10));
+	let step = Duration::from_millis(20);
+	let start = kio::clock::now();
+	// Each frame out: when, and its epoch.
+	let mut frames = Vec::new();
+	for ms in (0..4 * SWITCH).step_by(20) {
+		if ms > 0 && ms % SWITCH == 0 {
+			let (new, mut catalog) = publish_live::<()>(&origin, route());
+			let audio = aac_rendition(&mut new.broadcast().clone(), &mut catalog, "a.aac");
+			publishers.push((new, catalog, audio));
+		}
+		for (k, (_, _, audio)) in publishers.iter_mut().enumerate() {
+			write_aac(audio, k as u64 * SPACING + ms);
+		}
+		tokio::task::yield_now().await;
+		loop {
+			match follower.poll_next(&kio::Waiter::noop()) {
+				Poll::Ready(Ok(Some(frame))) => {
+					frames.push((start.elapsed(), follower.export().discontinuity(), frame))
+				}
+				Poll::Ready(end) => panic!("every publisher is healthy: {end:?}"),
+				Poll::Pending => break,
+			}
+		}
+		tokio::time::advance(step).await;
+	}
+	assert_eq!(follower.export().discontinuity(), 3, "every replacement went out");
+
+	// How far each PTS went out behind the wall time its frame was written, per epoch.
+	let mut latency: std::collections::BTreeMap<u64, Vec<Duration>> = Default::default();
+	let mut last: Option<(u64, u64)> = None;
+	let slices: Vec<Frame> = frames.iter().map(|(_, _, frame)| frame.clone()).collect();
+	for ((elapsed, epoch, _), pts) in frames.iter().zip(audio_pts_by_slice(&slices)) {
+		for pts in pts {
+			assert!(
+				last.is_none_or(|last| last < (*epoch, pts)),
+				"out of order at {elapsed:?}: {last:?} then {:?}",
+				(epoch, pts)
+			);
+			last = Some((*epoch, pts));
+			let written = Duration::from_millis(pts / 90 - 60_000 - epoch * SPACING);
+			latency.entry(*epoch).or_default().push(*elapsed - written);
+		}
+	}
+	let settled: Vec<Duration> = latency
+		.values()
+		.map(|latency| latency[latency.len() / 2..].iter().copied().max().unwrap())
+		.collect();
+	for (epoch, latency) in settled.iter().enumerate() {
+		assert!(
+			latency.abs_diff(settled[0]) <= PCR_INTERVAL + step,
+			"epoch {epoch} settled at {latency:?} against {:?} before any switch: {settled:?}",
+			settled[0]
+		);
+	}
+	for epoch in 1..=3 {
+		let switch = frames.iter().position(|(_, e, _)| *e == epoch).unwrap();
+		let gap = frames[switch].0 - frames[switch - 1].0;
+		assert!(gap <= PCR_INTERVAL + step, "switch {epoch} left a hole: {gap:?}");
+	}
+}
+
+/// A hard follow deadline can expose a hole even while A is healthy: its input
+/// stops at the deadline, its held tail drains, and B may still not be usable.
+#[tokio::test(start_paused = true)]
+async fn an_expired_follow_stops_healthy_input_but_drains_its_buffered_tail() {
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+	let (old, mut old_catalog) = publish_live::<()>(&origin, route());
+	let mut old_audio = aac_rendition(&mut old.broadcast().clone(), &mut old_catalog, "a.aac");
+	let delay = Duration::from_millis(500);
+	let follow = Duration::from_millis(100);
+	let selected = Duration::from_millis(1000);
+	let deadline = selected + follow;
+	let media = Duration::from_millis(2000);
+	let step = Duration::from_millis(20);
+	let mut export = open_export(crate::source::resolved(&origin, "live").await, delay)
+		.await
+		.unwrap();
+	let mut replacement = None;
+	let mut frames = Vec::new();
+	let start = kio::clock::now();
+	for ms in (0..4000).step_by(20) {
+		let elapsed = Duration::from_millis(ms);
+		write_aac(&mut old_audio, ms);
+		if elapsed == selected {
+			let (new, mut catalog) = publish_live::<()>(&origin, route());
+			let audio = aac_rendition(&mut new.broadcast().clone(), &mut catalog, "a.aac");
+			let target = origin
+				.consume()
+				.follow("live", None)
+				.unwrap()
+				.available()
+				.await
+				.unwrap()
+				.unwrap();
+			let stream = crate::catalog::Consumer::new(&target, Default::default())
+				.await
+				.unwrap();
+			export.followed(&target, stream, follow).unwrap();
+			replacement = Some((new, catalog, audio));
+		}
+		if elapsed >= media {
+			write_aac(&mut replacement.as_mut().unwrap().2, 100_000 + ms - 2000);
+		}
+		tokio::task::yield_now().await;
+		while let std::task::Poll::Ready(next) = export.poll_next(&kio::Waiter::noop()) {
+			frames.push((
+				start.elapsed(),
+				export.discontinuity(),
+				next.unwrap().expect("B is still live"),
+			));
+		}
+		// The in-process origin propagates the subscription drop through its request task.
+		tokio::task::yield_now().await;
+		if elapsed == deadline - step {
+			assert!(
+				old_audio.track().subscription().is_some(),
+				"A remains subscribed until the selected deadline"
+			);
+		}
+		if elapsed == deadline {
+			assert_eq!(
+				start.elapsed(),
+				deadline,
+				"subscription propagation did not advance the clock"
+			);
+			assert!(
+				old_audio.track().subscription().is_none(),
+				"A stops at the bound while its publisher stays live"
+			);
+			assert!(export.buffered() > 0, "the selected deadline preserves A's held tail");
+		}
+		tokio::time::advance(step).await;
+	}
+	let switch = frames
+		.iter()
+		.position(|(_, epoch, _)| *epoch == 1)
+		.expect("B eventually goes out");
+	let old_frames: Vec<_> = frames[..switch].iter().map(|(_, _, frame)| frame.clone()).collect();
+	let pts = audio_pts(&old_frames);
+	assert_eq!(
+		pts.last().copied(),
+		Some(61_080 * 90),
+		"all A media read before the bound drains"
+	);
+	assert!(
+		frames[switch - 1].0 > deadline,
+		"the old tail goes out after its input stops"
+	);
+	assert!(frames[switch].0 >= media, "B cannot go out before it supplies media");
+	let gap = frames[switch].0 - frames[switch - 1].0;
+	eprintln!(
+		"follow deadline={deadline:?}, last old={:?}, first new={:?}, gap={gap:?}",
+		frames[switch - 1].0,
+		frames[switch].0
+	);
+	assert!(gap > delay, "no input can bridge B's post-deadline wait: {gap:?}");
+}
+
+/// A publisher that leaves still gets what the export buffered of it out on schedule, and only
+/// then does the export report it gone. Reported at once, the tail sat unpolled while a
+/// follower waited, and went out late, behind the gap, ahead of whatever came back.
+#[tokio::test(start_paused = true)]
+async fn a_publisher_that_leaves_drains_its_buffered_tail_before_the_end() {
+	let origin = crate::source::produce_origin();
+	let (old, mut catalog) = publish_live::<()>(&origin, Default::default());
+	let audio = aac_rendition(&mut old.broadcast().clone(), &mut catalog, "a.aac");
+	let mut publisher = Some((catalog, audio));
+	let delay = Duration::from_millis(500);
+	let left = Duration::from_millis(2000);
+	let step = Duration::from_millis(20);
+	let mut export = open_export(crate::source::resolved(&origin, "live").await, delay)
+		.await
+		.unwrap();
+	let start = kio::clock::now();
+	let mut frames = Vec::new();
+	let end = loop {
+		let elapsed = start.elapsed();
+		if elapsed < left {
+			write_aac(&mut publisher.as_mut().unwrap().1, elapsed.as_millis() as u64);
+		} else if let Some((catalog, audio)) = publisher.take() {
+			audio.abort(moq_net::Error::Unroutable);
+			catalog.abort(moq_net::Error::Unroutable);
+		}
+		tokio::task::yield_now().await;
+		let end = loop {
+			match export.poll_next(&kio::Waiter::noop()) {
+				std::task::Poll::Ready(Ok(Some(frame))) => frames.push((start.elapsed(), frame)),
+				std::task::Poll::Ready(end) => break Some(end),
+				std::task::Poll::Pending => break None,
+			}
+		};
+		if let Some(end) = end {
+			break end;
+		}
+		assert!(
+			elapsed < left + 4 * delay,
+			"the export never reported the publisher gone"
+		);
+		tokio::time::advance(step).await;
+	};
+	let ended = start.elapsed();
+	assert!(
+		matches!(&end, Err(err) if super::follower::left(err)),
+		"the end reports the publisher leaving: {end:?}"
+	);
+	let slices: Vec<Frame> = frames.iter().map(|(_, frame)| frame.clone()).collect();
+	// When each audio PTS went out, after the publisher left.
+	let tail: Vec<(Duration, u64)> = frames
+		.iter()
+		.zip(audio_pts_by_slice(&slices))
+		.filter(|((at, _), _)| *at >= left)
+		.flat_map(|((at, _), pts)| pts.into_iter().map(move |pts| (*at, pts)))
+		.collect();
+	let (last, pts) = *tail.last().expect("a tail went out after the publisher left");
+	assert!(
+		pts >= (60_000 + left.as_millis() as u64 - 100) * 90,
+		"the tail buffered when the publisher left goes out: {tail:?}"
+	);
+	assert!(
+		last >= left + delay - PCR_INTERVAL - step,
+		"the tail goes out on schedule, not in a burst: {tail:?}"
+	);
+	assert!(ended >= last, "the end follows the tail");
+}
+
+/// A replacement that leaves while it acquires is no switch: the healthy old program plays on.
+#[tokio::test(start_paused = true)]
+async fn a_replacement_leaving_before_it_commits_keeps_the_old_program() {
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+	let (old, mut old_catalog) = publish_live::<()>(&origin, route());
+	let mut old_audio = aac_rendition(&mut old.broadcast().clone(), &mut old_catalog, "a.aac");
+	let mut export = open_export(
+		crate::source::resolved(&origin, "live").await,
+		Duration::from_millis(500),
+	)
+	.await
+	.unwrap();
+	let mut replacement = None;
+	let mut frames = Vec::new();
+	for ms in (0..4000).step_by(20) {
+		write_aac(&mut old_audio, ms);
+		if ms == 1000 {
+			let (new, mut catalog) = publish_live::<()>(&origin, route());
+			let audio = aac_rendition(&mut new.broadcast().clone(), &mut catalog, "a.aac");
+			let target = origin
+				.consume()
+				.follow("live", None)
+				.unwrap()
+				.available()
+				.await
+				.unwrap()
+				.unwrap();
+			let stream = crate::catalog::Consumer::new(&target, Default::default())
+				.await
+				.unwrap();
+			export.source().priority(-1).unwrap();
+			export.followed(&target, stream, Duration::from_secs(10)).unwrap();
+			replacement = Some((new, catalog, audio));
+		}
+		if let Some((_, _, audio)) = replacement.as_mut() {
+			write_aac(audio, 100_000 + ms);
+		}
+		// Before the replacement's clock acquires, a delay after its first frame.
+		if ms == 1200 {
+			let (new, catalog, audio) = replacement.take().unwrap();
+			audio.abort(moq_net::Error::Unroutable);
+			catalog.abort(moq_net::Error::Unroutable);
+			drop(new);
+		}
+		tokio::task::yield_now().await;
+		while let std::task::Poll::Ready(next) = export.poll_next(&kio::Waiter::noop()) {
+			frames.push(next.unwrap().expect("A is still live"));
+		}
+		tokio::time::advance(Duration::from_millis(20)).await;
+	}
+	assert_eq!(
+		old_audio.track().subscription().unwrap().priority,
+		0,
+		"a cancelled switch restores priority"
+	);
+	assert_eq!(export.discontinuity(), 0, "the replacement never went out");
+	let pts = audio_pts(&frames);
+	assert!(
+		pts.last().is_some_and(|pts| *pts >= 63_000 * 90),
+		"A plays on after the replacement left: {pts:?}"
+	);
+}
+
+/// A newer route can arrive after B's first frame is held behind A's mux tail,
+/// but before B actually goes out. That unselected frame must never use A's metadata.
+#[tokio::test(start_paused = true)]
+async fn a_newer_pending_instance_discards_the_unemitted_held_replacement() {
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+	let (a, mut a_catalog) = publish_live::<()>(&origin, route());
+	let mut a_audio = aac_rendition(&mut a.broadcast().clone(), &mut a_catalog, "a.aac");
+	let mut export = open_export(crate::source::resolved(&origin, "live").await, Duration::from_secs(3))
+		.await
+		.unwrap()
+		.with_replay();
+	for ms in (0..1000).step_by(20) {
+		write_aac(&mut a_audio, ms);
+	}
+	let mut out = vec![export.next().await.unwrap().unwrap()];
+	for ms in (1000..4000).step_by(20) {
+		write_aac(&mut a_audio, ms);
+		tokio::task::yield_now().await;
+		if let std::task::Poll::Ready(Ok(Some(frame))) = export.poll_next(&kio::Waiter::noop()) {
+			out.push(frame);
+		}
+	}
+	let (b, mut b_catalog) = publish_live::<()>(&origin, route());
+	let mut b_audio = aac_rendition(&mut b.broadcast().clone(), &mut b_catalog, "a.aac");
+	for ms in (0..1000).step_by(20) {
+		write_aac(&mut b_audio, 100_000 + ms);
+	}
+	let replacement = origin.consume().request("live", None).await.unwrap();
+	let catalog = crate::catalog::Consumer::new(&replacement, Default::default())
+		.await
+		.unwrap();
+	let mut export = export.follow(replacement, catalog).unwrap();
+	while !export.holding_replacement() && export.discontinuity() == 0 {
+		out.push(export.next().await.unwrap().expect("A still has its tail"));
+	}
+	assert!(export.holding_replacement(), "B must be held behind A's tail");
+	let (c, mut c_catalog) = publish_live::<()>(&origin, route());
+	let mut c_audio = aac_rendition(&mut c.broadcast().clone(), &mut c_catalog, "a.aac");
+	for ms in (0..1000).step_by(20) {
+		write_aac(&mut c_audio, 200_000 + ms);
+	}
+	let replacement = origin.consume().request("live", None).await.unwrap();
+	let catalog = crate::catalog::Consumer::new(&replacement, Default::default())
+		.await
+		.unwrap();
+	let mut export = export.follow(replacement, catalog).unwrap();
+	let _finished = c_audio.finish().unwrap();
+	c_catalog.finish().unwrap();
+	let (rest, end) = drain_to_end(&mut export).await;
+	out.extend(rest);
+	end.unwrap();
+	let pts = audio_pts(&out);
+	assert!(
+		pts.iter().all(|pts| *pts < 160_000 * 90 || *pts >= 260_000 * 90),
+		"B leaked into A/C output: {pts:?}"
+	);
+	assert!(pts.iter().any(|pts| *pts >= 260_000 * 90), "C went out");
+	assert_eq!(export.discontinuity(), 1, "B never became an emitted program");
+}
+
+/// A valid empty replacement ends only after the old leg's selected follow
+/// window and already-buffered output, rather than cutting that output off.
+#[tokio::test(start_paused = true)]
+async fn an_empty_finished_replacement_drains_the_old_program() {
+	let origin = crate::source::produce_origin();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(moq_net::Instance::random(), 0);
+	let (old, mut catalog) = publish_live::<()>(&origin, route());
+	let mut audio = aac_rendition(&mut old.broadcast().clone(), &mut catalog, "a.aac");
+	let mut export = open_export(crate::source::resolved(&origin, "live").await, Duration::from_secs(3))
+		.await
+		.unwrap()
+		.with_replay();
+	for ms in (0..1000).step_by(20) {
+		write_aac(&mut audio, ms);
+	}
+	let mut out = vec![export.next().await.unwrap().unwrap()];
+	for ms in (1000..2000).step_by(20) {
+		write_aac(&mut audio, ms);
+	}
+	if let std::task::Poll::Ready(Ok(Some(frame))) = export.poll_next(&kio::Waiter::noop()) {
+		out.push(frame);
+	}
+	let (_new, mut empty) = publish_live::<()>(&origin, route());
+	empty.finish().unwrap();
+	let replacement = origin
+		.consume()
+		.follow("live", None)
+		.unwrap()
+		.available()
+		.await
+		.unwrap()
+		.unwrap();
+	let stream = crate::catalog::Consumer::new(&replacement, Default::default())
+		.await
+		.unwrap();
+	export
+		.followed(&replacement, stream, Duration::from_millis(100))
+		.unwrap();
+	let (rest, end) = drain_to_end(&mut export).await;
+	out.extend(rest);
+	end.unwrap();
+	assert!(
+		audio_pts(&out).contains(&(61_980 * 90)),
+		"the old buffered tail must go out"
+	);
+	assert!(
+		pats(&out).iter().all(|(version, _)| *version == 0),
+		"no program for the empty snapshot"
+	);
+}
+
+/// Before any PSI, no layout or failed reader should survive a same-instance return.
+async fn cold_same_instance_return(pending: bool) {
+	let origin = crate::source::produce_origin();
+	let instance = moq_net::Instance::random();
+	let route = || moq_net::origin::RouteOptions::default().with_instance(instance.clone(), 0);
+	let (old, mut old_catalog) = publish_live::<()>(&origin, route());
+	let mut old_video = h264_rendition(&mut old.broadcast().clone(), &mut old_catalog, "v.avc1");
+	let mut old_audio = aac_rendition(&mut old.broadcast().clone(), &mut old_catalog, "a.aac");
+	let mut export = open_export(crate::source::resolved(&origin, "live").await, Duration::from_secs(3))
+		.await
+		.unwrap()
+		.with_replay();
+	let mut prefix = Vec::new();
+	let returned_instance = if pending {
+		for ms in (0..400).step_by(40) {
+			write_h264(&mut old_video, ms);
+		}
+		for ms in (0..400).step_by(20) {
+			write_aac(&mut old_audio, ms);
+		}
+		prefix.push(export.next().await.unwrap().unwrap());
+		let next_instance = moq_net::Instance::random();
+		let (cold, mut catalog) = publish_live::<()>(
+			&origin,
+			moq_net::origin::RouteOptions::default().with_instance(next_instance.clone(), 0),
+		);
+		let video = h264_rendition(&mut cold.broadcast().clone(), &mut catalog, "v.avc1");
+		let audio = aac_rendition(&mut cold.broadcast().clone(), &mut catalog, "a.aac");
+		let _finished = video.finish().unwrap();
+		let _finished = audio.finish().unwrap();
+		catalog.finish().unwrap();
+		let target = origin
+			.consume()
+			.follow("live", None)
+			.unwrap()
+			.available()
+			.await
+			.unwrap()
+			.unwrap();
+		let stream = crate::catalog::Consumer::new(&target, Default::default())
+			.await
+			.unwrap();
+		export.followed(&target, stream, Duration::from_secs(10)).unwrap();
+		if let std::task::Poll::Ready(Ok(Some(frame))) = export.poll_next(&kio::Waiter::noop()) {
+			prefix.push(frame);
+		}
+		cold.withdraw();
+		next_instance
+	} else {
+		let _finished = old_video.finish().unwrap();
+		let _finished = old_audio.finish().unwrap();
+		old_catalog.finish().unwrap();
+		assert!(export.next().await.unwrap().is_none());
+		old.withdraw();
+		instance
+	};
+	let (back, mut catalog) = publish_live::<()>(
+		&origin,
+		moq_net::origin::RouteOptions::default().with_instance(returned_instance, 0),
+	);
+	let mut video = h264_rendition(&mut back.broadcast().clone(), &mut catalog, "v.avc1");
+	let mut audio = aac_rendition(&mut back.broadcast().clone(), &mut catalog, "a.aac");
+	let target = origin
+		.consume()
+		.follow("live", None)
+		.unwrap()
+		.available()
+		.await
+		.unwrap()
+		.unwrap();
+	let stream = crate::catalog::Consumer::new(&target, Default::default())
+		.await
+		.unwrap();
+	let mut export = export.follow(target, stream).unwrap();
+	for ms in (0..400).step_by(40) {
+		write_h264(&mut video, ms);
+	}
+	for ms in (0..400).step_by(20) {
+		write_aac(&mut audio, ms);
+	}
+	let _finished = video.finish().unwrap();
+	let _finished = audio.finish().unwrap();
+	catalog.finish().unwrap();
+	let (out, end) = drain_to_end(&mut export).await;
+	end.unwrap();
+	prefix.extend(out);
+	let out = prefix;
+	assert!(
+		!audio_pts(&out).is_empty(),
+		"the returned media goes out, pending={pending}"
+	);
+	assert!(
+		pats(&out).iter().any(|(version, _)| *version == u8::from(pending)),
+		"returned program went out"
+	);
+	assert_eq!(export.discontinuity(), u64::from(pending));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_same_instance_return_before_psi_rebuilds_cold_readers() {
+	cold_same_instance_return(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pending_same_instance_return_rebuilds_cold_readers() {
+	cold_same_instance_return(true).await;
+}
+
+/// Construction-time pacing keeps buffered PES ahead of the decoder clock.
+#[tokio::test(start_paused = true)]
+async fn fixed_delay_keeps_buffered_pes_ahead_of_the_clock() {
+	let origin = crate::source::produce_origin();
+	let (live, mut catalog) = publish_live::<()>(&origin, Default::default());
+	let mut audio = aac_rendition(&mut live.broadcast().clone(), &mut catalog, "a.aac");
+	let mut export = open_export(crate::source::resolved(&origin, "live").await, Duration::from_secs(3))
+		.await
+		.unwrap()
+		.with_replay();
+	for ms in (0..5000).step_by(20) {
+		write_aac(&mut audio, ms);
+	}
+	let mut all = vec![export.next().await.unwrap().unwrap()];
+	assert!(export.buffered() > 1, "several PES remain buffered");
+
+	let _finished = audio.finish().unwrap();
+	catalog.finish().unwrap();
+	let (frames, end) = drain_to_end(&mut export).await;
+	end.unwrap();
+	all.extend(frames);
+	assert_decodes_after_the_clock(&all);
+	// Joining retains half the delay plus its boundary frame.
+	assert_eq!(pes_count(&all), 76);
+	assert_skip_discontinuity(&all, 0);
 }

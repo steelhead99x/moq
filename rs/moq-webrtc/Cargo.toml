@@ -1,0 +1,86 @@
+[package]
+name = "moq-webrtc"
+description = "Media over QUIC - WebRTC: the WHIP/WHEP gateway"
+authors = ["Luke Curley <kixelated@gmail.com>"]
+repository = "https://github.com/moq-dev/moq"
+license = "MIT OR Apache-2.0"
+
+version = "0.3.12"
+edition = "2024"
+rust-version.workspace = true
+
+keywords = ["webrtc", "whip", "whep", "moq", "media"]
+categories = ["multimedia", "network-programming", "web-programming"]
+# The vendored stack's RTP captures are only read by its tests.
+exclude = ["src/vendor/str0m/tests/data"]
+
+# Vendored modules are loaded through path attributes.
+[package.metadata.cargo-shear]
+ignored-paths = ["src/vendor/**/*.rs"]
+
+[features]
+default = ["server"]
+# The bundled axum routers and the `pub use axum`. An embedder that owns its HTTP
+# stack and calls `whip::accept` / `whep::accept` drops them with
+# `default-features = false`.
+server = ["dep:axum"]
+
+# Pure library: the WHIP/WHEP <-> MoQ gateway (axum routers + WHEP/WHIP client). The CLI
+# lives in `moq-cli` (the `rtc` subcommand); embedders mount the routers / dial with
+# `Client` against their own origin.
+[dependencies]
+# The vendored stack's AES-CCM DTLS suites.
+aes = { workspace = true }
+arrayvec = { workspace = true }
+axum = { workspace = true, optional = true }
+bytes = { workspace = true }
+ccm = { workspace = true }
+# The vendored stack's SDP parser.
+combine = { workspace = true }
+crc = { workspace = true }
+fastrand = { workspace = true }
+hang = { workspace = true }
+# Drives each WebRTC connection over its UDP socket.
+kio = { workspace = true, features = ["runtime"] }
+# Refuses a CPU rind can't run on, and gives the WHIP/WHEP client rind's rustls provider.
+moq-crypto = { workspace = true, features = ["provider"] }
+moq-mux = { workspace = true, features = ["async"] }
+moq-net = { workspace = true }
+# `RedactedUrl` keeps a dialed URL's query token and userinfo out of the logs.
+moq-tokio = { workspace = true }
+# The vendored DTLS's record parser.
+nom = { workspace = true }
+once_cell = { workspace = true }
+rand = { workspace = true }
+# The vendored DTLS's self-signed certificates.
+rcgen = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-no-provider"] }
+# The vendored stack's crypto: DTLS, SRTP, and STUN MESSAGE-INTEGRITY.
+rind = { workspace = true }
+rind-rcgen = { workspace = true }
+serde = { workspace = true }
+spki = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["formatting"] }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+# The vendored DTLS's certificate parsing.
+x509-cert = { workspace = true }
+
+[dev-dependencies]
+# The tests host their broadcasts on `origin::spawn`, and dial a session over TCP.
+moq-tokio = { workspace = true, features = ["net", "tcp"] }
+# The vendored stack's tests replay RTP captures.
+pcap-file = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-test = { workspace = true }
+workspace-hack = { path = "../workspace-hack" }
+x509-parser = { workspace = true }
+
+[lints]
+workspace = true

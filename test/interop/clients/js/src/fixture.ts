@@ -1,0 +1,371 @@
+/**
+ * The deterministic publisher: a self-describing broadcast whose media says what it is.
+ *
+ * The fake camera is fine for "did any pixel arrive", but it cannot answer "is the picture
+ * advancing" or "is the audio the audio that belongs with this picture". This publishes a canvas
+ * painting {@link Pattern.paint} and a tone stepping through {@link Pattern.stepFrequency}, both
+ * indexed off one `AudioContext` clock, so a subscriber can measure both from its own sinks.
+ *
+ * Faults are injected here rather than at the subscriber, so the negative controls exercise the
+ * same assertions the real cases do.
+ *
+ * The picture reaches the encoder as a {@link Publish.Video.FrameSource}, not a canvas capture track.
+ * Chromium's MediaStreamTrackProcessor discards a frame still in flight inside it when torn down, without
+ * closing it, and the page then logs it as garbage collected unclosed: a stop would fail the console
+ * check on a frame no script ever held. The publish page's camera still covers that capture path.
+ *
+ * @module
+ */
+
+import { Duration, Instant, now } from "@moq/clock";
+import * as Moq from "@moq/net";
+import * as Publish from "@moq/publish";
+import { Effect, Signal } from "@moq/signals";
+import type { AudioCodec, Fault, FixtureState } from "./contract";
+import {
+	ALT_AUDIO,
+	CHANGED_SAMPLE_RATE,
+	FIXTURE_EVENT,
+	KEYFRAME_INTERVAL_MS,
+	OFFSET_STEPS,
+	SAMPLE_RATE,
+} from "./contract";
+import * as Pattern from "./pattern";
+
+/** Cap the encoder rather than letting it track a bandwidth estimate, so runs are comparable. */
+const MAX_BITRATE = 1_000_000;
+
+/** Short GOP so a late subscriber tunes in quickly and a rejoin is not dominated by keyframe wait. */
+const KEYFRAME_INTERVAL = Duration.millis(KEYFRAME_INTERVAL_MS);
+
+/** How far ahead the tone table is scheduled on the audio clock. */
+const SCHEDULE_AHEAD = 2; // seconds
+
+/** Peak amplitude of the tone. Low enough to leave Opus headroom, high enough to dominate noise. */
+const AMPLITUDE = 0.5;
+
+/**
+ * A running fixture publisher.
+ *
+ * Construct one per broadcast; {@link close} releases the capture, the audio graph, and the
+ * session. The host element carries the state a driver polls.
+ */
+export class Fixture {
+	readonly host: HTMLElement;
+
+	readonly #signals = new Effect();
+	readonly #audio: AudioContext;
+	readonly #frameId = new Signal(-1);
+	readonly #audioState = new Signal<AudioContextState>("suspended");
+	readonly #videoEnabled = new Signal(true);
+	#timer: number | undefined;
+	readonly #canvas: HTMLCanvasElement;
+	readonly #video: Publish.Video.Encoder;
+	readonly #broadcast: Publish.Broadcast;
+	readonly #audioCapture: Publish.Audio.Capture;
+	readonly #audioEncoder: Publish.Audio.Encoder;
+	readonly #alt = new Signal<Publish.Audio.Encoder | undefined>(undefined);
+	#generation = 0;
+
+	constructor(
+		host: HTMLElement,
+		{
+			url,
+			name,
+			fault,
+			versions,
+			generation = 0,
+			audioCodec = "opus",
+		}: {
+			url: string;
+			name: string;
+			fault: Fault;
+			versions?: string[];
+			generation?: number;
+			audioCodec?: AudioCodec;
+		},
+	) {
+		this.#generation = generation;
+		this.host = host;
+
+		const canvas = document.createElement("canvas");
+		this.#canvas = canvas;
+		canvas.width = Pattern.WIDTH;
+		canvas.height = Pattern.HEIGHT;
+		host.appendChild(canvas);
+
+		const ctx = canvas.getContext("2d");
+		if (!ctx) throw new Error("2d canvas context unavailable");
+
+		// Each frame is made off the canvas for a read already waiting, so none is ever queued where a
+		// cancel would drop it unclosed. A tick with no read waiting skips the frame, as a slow capture
+		// track would. The frames carry `now()` stamps, the epoch capture uses.
+		let waiting: (() => void) | undefined;
+		let deliver: ((frame: VideoFrame) => void) | undefined;
+		const frames = new ReadableStream<VideoFrame>(
+			{
+				start: (controller) => {
+					deliver = (frame) => controller.enqueue(frame);
+				},
+				pull: () =>
+					new Promise<void>((resolve) => {
+						waiting = resolve;
+					}),
+				cancel: () => {
+					waiting?.();
+					waiting = undefined;
+					deliver = undefined;
+				},
+			},
+			{ highWaterMark: 0 },
+		);
+		const take = () => {
+			const resolve = waiting;
+			if (!resolve || !deliver) return;
+			waiting = undefined;
+			deliver(new VideoFrame(canvas, { timestamp: Math.round(now().since(Instant.ZERO).asMicros()) }));
+			resolve();
+		};
+
+		this.#audio = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: "interactive" });
+		this.#signals.cleanup(() => void this.#audio.close());
+
+		const destination = this.#audio.createMediaStreamDestination();
+		const gain = new GainNode(this.#audio, { gain: fault === "silent-audio" ? 0 : AMPLITUDE });
+		const oscillator = new OscillatorNode(this.#audio, { type: "sine" });
+		oscillator.connect(gain).connect(destination);
+		this.#signals.cleanup(() => oscillator.disconnect());
+
+		const audioTrack = destination.stream.getAudioTracks()[0] as unknown as Publish.Audio.StreamTrack;
+		this.#signals.cleanup(() => audioTrack.stop());
+
+		const connection = new Moq.Connection({ url: new URL(url), enabled: true, versions });
+		this.#signals.cleanup(() => connection.close());
+
+		const capture = new Publish.Video.Capture({ source: { frames, frameRate: Pattern.FPS } });
+		this.#signals.cleanup(() => capture.close());
+
+		const broadcast = new Publish.Broadcast({
+			origin: connection.origin,
+			enabled: true,
+			name: Moq.Path.from(name),
+			display: capture.out.display,
+		});
+		this.#broadcast = broadcast;
+		this.#signals.cleanup(() => broadcast.close());
+
+		const video = new Publish.Video.Encoder("video", {
+			broadcast,
+			capture,
+			enabled: this.#videoEnabled,
+			config: {
+				codec: "avc1",
+				frameRate: Pattern.FPS,
+				join: KEYFRAME_INTERVAL,
+				maxBitrate: MAX_BITRATE,
+			},
+		});
+		this.#video = video;
+		this.#signals.cleanup(() => video.close());
+
+		// Mark the codec change only once the probe has published it. Marking on request would paint the
+		// new generation into pictures the old codec still encodes onto the old track.
+		// Read the catalog before the generation check, so a rerun after marking still tracks a signal.
+		this.#signals.run((effect) => {
+			const codec = effect.get(video.out.catalog)?.codec;
+			if (this.#generation === 0 && codec?.startsWith("vp8")) this.#generation = 1;
+		});
+
+		// Handed the source at page load, before any gesture, like a pre-granted microphone. Readiness
+		// then requires an audio catalog after the click, which covers the capture resuming its own
+		// suspended graph.
+		//
+		// Forced to mono, so every media check also covers the explicit Web Audio downmix a requested
+		// channel count puts in front of the AudioWorklet, the path a macOS microphone takes. The tone
+		// is the same in both channels, so the downmix changes nothing a check reads.
+		const audioCapture = new Publish.Audio.Capture({
+			source: { track: audioTrack, kind: "music" },
+			channelCount: 1,
+		});
+		this.#audioCapture = audioCapture;
+		this.#signals.cleanup(() => audioCapture.close());
+
+		const audio = new Publish.Audio.Encoder("audio", {
+			broadcast,
+			capture: audioCapture,
+			enabled: true,
+			codec: audioCodec,
+		});
+		this.#audioEncoder = audio;
+		this.#signals.cleanup(() => audio.close());
+		this.#signals.cleanup(() => this.#alt.peek()?.close());
+
+		// The tone and the picture share this clock, so neither can start until the audio graph runs.
+		// Without the permissive launch flags that takes a real gesture, and `resume()` on a
+		// suspended context simply never settles, so drive it from the state instead of awaiting.
+		let started = false;
+		const begin = () => {
+			if (started || this.#audio.state !== "running") return;
+			started = true;
+
+			const start = this.#audio.currentTime + 0.2;
+			oscillator.start(start);
+			this.#runTone(oscillator, start, fault);
+			this.#runPicture(ctx, take, start, fault);
+		};
+		const unlock = () => void this.#audio.resume().catch(() => {});
+
+		this.#audioState.set(this.#audio.state);
+		this.#signals.event(this.#audio, "statechange", () => {
+			this.#audioState.set(this.#audio.state);
+			begin();
+		});
+		this.#signals.event(document, "pointerdown", unlock);
+		this.#signals.event(document, "keydown", unlock);
+		unlock();
+		begin();
+
+		let readyAt: number | undefined;
+		this.#signals.run((effect) => {
+			const ready =
+				effect.get(connection.status) === "connected" &&
+				effect.get(video.out.catalog) !== undefined &&
+				effect.get(audio.out.catalog) !== undefined;
+			if (ready) readyAt ??= Date.now();
+			const state: FixtureState = {
+				frameId: effect.get(this.#frameId),
+				audioState: effect.get(this.#audioState),
+				ready,
+				readyAt,
+				videoActive: effect.get(video.out.active),
+				audioActive: effect.get(audio.out.active),
+				encodedFrames: effect.get(video.out.stats).frames,
+				videoEnabled: effect.get(video.out.catalog)?.enabled !== false,
+				audio: Object.fromEntries(
+					[audio, effect.get(this.#alt)].flatMap((encoder) => {
+						const config = encoder && effect.get(encoder.out.catalog);
+						return config
+							? [
+									[
+										encoder.name,
+										{
+											codec: config.codec,
+											sampleRate: config.sampleRate,
+											numberOfChannels: config.numberOfChannels,
+										},
+									],
+								]
+							: [];
+					}),
+				),
+			};
+			console.debug(FIXTURE_EVENT + JSON.stringify(state));
+		});
+	}
+
+	// Schedule the tone table on the audio clock, always a couple of seconds ahead of playout.
+	#runTone(oscillator: OscillatorNode, start: number, fault: Fault): void {
+		const offset = fault === "audio-offset" ? OFFSET_STEPS : 0;
+		let step = 0;
+
+		const schedule = () => {
+			const horizon = this.#audio.currentTime + SCHEDULE_AHEAD;
+			while (start + (step * Pattern.STEP_MS) / 1000 < horizon) {
+				const at = start + (step * Pattern.STEP_MS) / 1000;
+				oscillator.frequency.setValueAtTime(Pattern.stepFrequency(step + offset), at);
+				step++;
+			}
+		};
+
+		schedule();
+		this.#signals.interval(schedule, Duration.millis((SCHEDULE_AHEAD * 1000) / 4));
+	}
+
+	// Paint and hand the capture a frame per pattern tick. Encoding can finish later. The counter
+	// comes from the audio clock, so a coalesced tick skips a frame instead of drifting the two apart.
+	#runPicture(ctx: CanvasRenderingContext2D, take: () => void, start: number, fault: Fault): void {
+		let painted = -1;
+
+		const tick = () => {
+			const elapsed = this.#audio.currentTime - start;
+			if (elapsed < 0) return;
+
+			const frameId = Math.floor(elapsed * Pattern.FPS);
+			if (frameId === painted) return;
+			painted = frameId;
+
+			Pattern.paint(ctx, fault === "frozen-video" ? 0 : frameId, this.#generation);
+			take();
+			this.#frameId.set(frameId);
+		};
+
+		// Twice the frame rate: a tick that lands between frames is a no-op, and one that lands late
+		// still hands over the frame the clock is on.
+		this.#timer = self.setInterval(tick, 1000 / Pattern.FPS / 2);
+		this.#signals.cleanup(() => {
+			if (this.#timer !== undefined) self.clearInterval(this.#timer);
+			this.#timer = undefined;
+		});
+	}
+
+	/** Enable or disable the video rendition, which stays in the catalog either way. */
+	setVideo(enabled: boolean): void {
+		this.#videoEnabled.set(enabled);
+	}
+
+	/** Switch codecs on the existing rendition, marking pictures once the catalog advertises VP8. */
+	changeVideoCodec(): void {
+		this.#video.config.update((config) => ({ ...config, codec: "vp8" }));
+	}
+
+	/** Grow past the accepted coded-size ceiling without changing the VP8 codec. */
+	resizeVideo(): void {
+		this.#generation = 2;
+		this.#canvas.width = Pattern.WIDTH * 2;
+		this.#canvas.height = Pattern.HEIGHT * 2;
+	}
+
+	/** Switch the audio rendition from Opus to AAC, which re-mints its track. */
+	changeAudioCodec(): void {
+		this.#audioEncoder.codec.set("aac");
+	}
+
+	/** Rebuild the capture graph at a rate Opus carries natively, which re-mints the audio track. */
+	changeAudioRate(): void {
+		this.#audioCapture.sampleRate.set(CHANGED_SAMPLE_RATE);
+	}
+
+	/** Capture the tone in stereo, which re-mints the audio track. The tone is the same in both channels. */
+	changeAudioChannels(): void {
+		this.#audioCapture.channelCount.set(2);
+	}
+
+	/**
+	 * Publish {@link ALT_AUDIO} beside the main rendition, encoding the same capture at twice the
+	 * bitrate, so a player has a second rendition of the same tone to switch to.
+	 */
+	addAudioRendition(): void {
+		if (this.#alt.peek()) return;
+		this.#alt.set(
+			new Publish.Audio.Encoder(ALT_AUDIO, {
+				broadcast: this.#broadcast,
+				capture: this.#audioCapture,
+				enabled: true,
+				codec: { mime: "opus", bitrate: 64_000 },
+			}),
+		);
+	}
+
+	/** Stop publishing {@link ALT_AUDIO}, dropping it from the catalog. */
+	removeAudioRendition(): void {
+		this.#alt.peek()?.close();
+		this.#alt.set(undefined);
+	}
+
+	/** Stop publishing and release the capture, audio graph, and session. */
+	close(): void {
+		this.#signals.close();
+		this.host.replaceChildren();
+		console.debug(`${FIXTURE_EVENT}null`);
+	}
+}

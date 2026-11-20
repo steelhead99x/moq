@@ -17,8 +17,11 @@
 //! - <https://www.ietf.org/archive/id/draft-ietf-moq-msf-01.txt>
 //! - <https://www.ietf.org/archive/id/draft-ietf-moq-cmsf-00.txt>
 
+#![warn(missing_docs)]
+
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -35,12 +38,16 @@ pub const DEFAULT_NAME: &str = "catalog";
 /// resolved tracks with inline [`Track::init_data`]. Parsing accepts both
 /// draft-00 and draft-01 catalogs; serializing always emits the newest draft.
 ///
+/// Generic over an application extension `E` (defaulting to `()` for none), which is
+/// serialized as a flat union with the members MSF defines: `ext`'s own members and
+/// `tracks` share one JSON object on the wire. See [`CatalogExt`].
+///
 /// Marked `#[non_exhaustive]` because the MSF drafts continue to grow optional
 /// root fields. External callers build a catalog with [`Catalog::new`] or
 /// [`Catalog::default`] and then assign whichever optional fields they need.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[non_exhaustive]
-pub struct Catalog {
+pub struct Catalog<E: CatalogExt = ()> {
 	/// Catalog generation time as Unix epoch milliseconds.
 	pub generated_at: Option<u64>,
 
@@ -49,7 +56,45 @@ pub struct Catalog {
 
 	/// The tracks in this catalog snapshot.
 	pub tracks: Vec<Track>,
+
+	/// The application extension: root members beyond the ones MSF defines.
+	pub ext: E,
 }
+
+/// An application's catalog extension: a plain serde struct of extra root members,
+/// serialized as a flat union with the members MSF itself defines.
+///
+/// Any type that serializes to a JSON object qualifies, so a caller names its own
+/// struct and never touches `serde_json`:
+///
+/// ```
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Serialize, Deserialize, Clone, Default)]
+/// struct Mpegts {
+///     program_number: u16,
+/// }
+///
+/// #[derive(Serialize, Deserialize, Clone, Default)]
+/// struct MpegtsExt {
+///     #[serde(skip_serializing_if = "Option::is_none")]
+///     mpegts: Option<Mpegts>,
+/// }
+///
+/// let mut catalog = moq_msf::Catalog::<MpegtsExt>::default();
+/// catalog.ext.mpegts = Some(Mpegts { program_number: 1 });
+/// ```
+///
+/// `()` is the no-extension case, so [`Catalog<()>`] carries only what MSF defines and
+/// drops the rest. For passthrough of members that aren't known at compile time, use
+/// `serde_json::Map<String, serde_json::Value>`, which keeps them verbatim.
+///
+/// An extension MUST NOT name a member after one MSF defines (`version`, `generatedAt`,
+/// `isComplete`, `tracks`, `initDataList`); the wire JSON would carry a duplicate key.
+pub trait CatalogExt: Serialize + serde::de::DeserializeOwned + Default + Clone + Send + Unpin + 'static {}
+
+// Blanket, so a caller writes no impl: naming the trait is only about readable bounds.
+impl<T: Serialize + serde::de::DeserializeOwned + Default + Clone + Send + Unpin + 'static> CatalogExt for T {}
 
 /// A single track in the MSF catalog.
 ///
@@ -67,6 +112,9 @@ pub struct Track {
 	/// Unique track name (case-sensitive).
 	pub name: String,
 
+	/// The track's absolute namespace; absent inherits the catalog's namespace.
+	pub namespace: Option<String>,
+
 	/// Packaging mode.
 	pub packaging: Packaging,
 
@@ -80,6 +128,12 @@ pub struct Track {
 
 	/// Content role.
 	pub role: Option<Role>,
+
+	/// A human-readable label for the track.
+	pub label: Option<String>,
+
+	/// The BCP-47 language tag of the track.
+	pub lang: Option<String>,
 
 	/// WebCodecs codec string.
 	pub codec: Option<String>,
@@ -102,17 +156,12 @@ pub struct Track {
 	/// Bitrate in bits per second.
 	pub bitrate: Option<u64>,
 
-	/// Whether the publisher recommends temporarily avoiding this track.
-	///
-	/// This is a non-standard extension shared with the hang catalog.
-	pub stalled: Option<bool>,
-
-	/// Resolved base64 initialization data.
+	/// Resolved base64 initialization data, shared by tracks with the same `initRef`.
 	///
 	/// On the wire this is carried indirectly through draft-01's `initDataList` +
 	/// `initRef`; [`Catalog`] (de)serialization resolves it so callers always see
 	/// the inline payload here. draft-00's inline `initData` is also accepted.
-	pub init_data: Option<String>,
+	pub init_data: Option<Arc<str>>,
 
 	/// Wire-only pointer into the catalog's `initDataList` (draft-01). Populated
 	/// only while (de)serializing; resolved into `init_data` on parse and never
@@ -142,15 +191,34 @@ pub struct Track {
 	/// Serialized as a JSON number of milliseconds, matching the hang catalog.
 	#[serde_as(as = "Option<DurationMilliSecondsWithFrac>")]
 	pub jitter: Option<Duration>,
+
+	/// How far this rendition trails the broadcast's earliest rendition (non-standard
+	/// extension; not in the MSF/CMSF drafts).
+	///
+	/// Serialized as a JSON number of milliseconds, matching [`jitter`](Self::jitter). Absent on
+	/// the earliest rendition. A consumer holds `delay + jitter` and does not subtract one
+	/// rendition's `delay` from another's.
+	#[serde_as(as = "Option<DurationMilliSecondsWithFrac>")]
+	pub delay: Option<Duration>,
 }
 
-impl Catalog {
+impl Catalog<()> {
 	/// Construct a catalog with tracks and no root-level optional fields.
+	///
+	/// This is the no-extension case. Use [`with_ext`](Catalog::with_ext) to carry one.
 	pub fn new(tracks: Vec<Track>) -> Self {
+		Self::with_ext(tracks, ())
+	}
+}
+
+impl<E: CatalogExt> Catalog<E> {
+	/// Construct a catalog with tracks and an application extension ([`CatalogExt`]).
+	pub fn with_ext(tracks: Vec<Track>, ext: E) -> Self {
 		Self {
 			generated_at: None,
 			is_complete: false,
 			tracks,
+			ext,
 		}
 	}
 
@@ -158,10 +226,13 @@ impl Catalog {
 	pub fn to_json(&self) -> Result<String, serde_json::Error> {
 		serde_json::to_string(self)
 	}
+}
+
+impl<E: CatalogExt> FromStr for Catalog<E> {
+	type Err = serde_json::Error;
 
 	/// Deserialize an MSF catalog from a JSON string.
-	#[allow(clippy::should_implement_trait)]
-	pub fn from_str(s: &str) -> Result<Self, serde_json::Error> {
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		serde_json::from_str(s)
 	}
 }
@@ -169,21 +240,63 @@ impl Catalog {
 /// The newest MSF draft string this crate emits.
 const CURRENT_VERSION: &str = "draft-01";
 
-impl Serialize for Catalog {
+/// The extension's first member that collides with one MSF defines, if any.
+///
+/// Serializes the extension to inspect its member names, so it is only called under
+/// `debug_assertions`.
+#[cfg(debug_assertions)]
+fn colliding_member<E: CatalogExt>(ext: &E) -> Option<String> {
+	match serde_json::to_value(ext) {
+		Ok(serde_json::Value::Object(members)) => members.into_iter().map(|(name, _)| name).find(|n| reserved_root(n)),
+		// Not an object (the `()` no-extension case) or unserializable: nothing to collide.
+		_ => None,
+	}
+}
+
+/// Whether `name` is a root member MSF itself defines, which an extension MUST NOT reuse.
+///
+/// An extension is serialized flat, so a member by one of these names emits a duplicate JSON
+/// key: serde does not reject it, and a reader keeps whichever came last. A typed extension
+/// fixes its member names at compile time, but one built at runtime (a `serde_json::Map`)
+/// needs this check wherever it accepts a name.
+pub fn reserved_root(name: &str) -> bool {
+	matches!(
+		name,
+		"version" | "generatedAt" | "isComplete" | "tracks" | "initDataList"
+	)
+}
+
+impl<E: CatalogExt> Serialize for Catalog<E> {
 	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
 		use std::collections::HashMap;
+
+		// An extension member named after one MSF defines emits a duplicate JSON key, which serde
+		// writes without complaint and a reader resolves by keeping the last. A typed extension
+		// fixes its member names at compile time, so this is a bug in the extension rather than
+		// something a peer can trigger: check it where it costs nothing to ship. A `cfg` block
+		// rather than `debug_assert!`, whose arguments a release build still compiles.
+		#[cfg(debug_assertions)]
+		if let Some(name) = colliding_member(&self.ext) {
+			panic!("MSF catalog extension member {name:?} collides with a reserved root member");
+		}
 
 		// Hoist inline init payloads into a shared, deduplicated initDataList and
 		// point each track at its entry via initRef. That's the draft-01 wire
 		// shape; identical payloads across tracks collapse to one entry.
 		let mut init_data_list: Vec<InitData> = Vec::new();
-		let mut ids: HashMap<String, String> = HashMap::new();
+		let mut ids: HashMap<Arc<str>, String> = HashMap::new();
+		let mut pointers: HashMap<(usize, usize), String> = HashMap::new();
 		let mut tracks = Vec::with_capacity(self.tracks.len());
 
 		for track in &self.tracks {
 			let mut track = track.clone();
 			if let Some(payload) = track.init_data.take() {
-				let id = if let Some(id) = ids.get(&payload) {
+				// A parsed initRef shares one Arc across tracks. Avoid hashing its
+				// entire payload again for each track when writing a catalog.
+				let pointer = (payload.as_ptr() as usize, payload.len());
+				let id = if let Some(id) = pointers.get(&pointer) {
+					id.clone()
+				} else if let Some(id) = ids.get(&payload) {
 					id.clone()
 				} else {
 					let id = format!("init{}", init_data_list.len());
@@ -195,6 +308,7 @@ impl Serialize for Catalog {
 					ids.insert(payload, id.clone());
 					id
 				};
+				pointers.insert(pointer, id.clone());
 				track.init_ref = Some(id);
 			}
 			tracks.push(track);
@@ -206,29 +320,40 @@ impl Serialize for Catalog {
 			is_complete: self.is_complete,
 			tracks,
 			init_data_list: (!init_data_list.is_empty()).then_some(init_data_list),
+			ext: self.ext.clone(),
 		}
 		.serialize(serializer)
 	}
 }
 
-impl<'de> Deserialize<'de> for Catalog {
+impl<'de, E: CatalogExt> Deserialize<'de> for Catalog<E> {
 	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
 		use std::collections::HashMap;
 
-		let wire = Wire::deserialize(deserializer)?;
+		let wire = Wire::<E>::deserialize(deserializer)?;
 		let init_data_list = wire.init_data_list.unwrap_or_default();
 
 		// id -> init data entry, built once so resolution is linear in the number
-		// of tracks rather than tracks x entries.
-		let by_id: HashMap<&str, &InitData> = init_data_list.iter().map(|e| (e.id.as_str(), e)).collect();
+		// of tracks rather than tracks x entries. A repeated id is refused: readers
+		// that kept different entries would disagree on a track's init bytes.
+		let mut by_id: HashMap<&str, &InitData> = HashMap::with_capacity(init_data_list.len());
+		for entry in &init_data_list {
+			if by_id.insert(entry.id.as_str(), entry).is_some() {
+				return Err(serde::de::Error::custom(format!(
+					"MSF catalog has duplicate initData id {:?}",
+					entry.id
+				)));
+			}
+		}
 
 		let tracks = wire
 			.tracks
 			.into_iter()
 			.map(|mut track| -> Result<Track, D::Error> {
 				// Resolve draft-01 initRef into inline init_data so callers never
-				// see the indirection. Inline init_data (draft-00) is kept as-is,
-				// but a catalog that carries both forms must not disagree.
+				// see the indirection. Inline init_data (draft-00) that matches its
+				// initRef entry shares that entry's allocation; a catalog that
+				// carries both forms must not disagree.
 				if let Some(id) = track.init_ref.take() {
 					let entry = by_id.get(id.as_str()).ok_or_else(|| {
 						serde::de::Error::custom(format!(
@@ -244,16 +369,13 @@ impl<'de> Deserialize<'de> for Catalog {
 						)));
 					}
 
-					match &track.init_data {
-						Some(inline) if inline != &entry.data => {
-							return Err(serde::de::Error::custom(format!(
-								"MSF track {:?} carries conflicting initData and initRef {:?}",
-								track.name, id
-							)));
-						}
-						Some(_) => {}
-						None => track.init_data = Some(entry.data.clone()),
+					if track.init_data.as_ref().is_some_and(|inline| inline != &entry.data) {
+						return Err(serde::de::Error::custom(format!(
+							"MSF track {:?} carries conflicting initData and initRef {:?}",
+							track.name, id
+						)));
 					}
+					track.init_data = Some(entry.data.clone());
 				}
 				track.init_ref = None;
 				Ok(track)
@@ -264,6 +386,7 @@ impl<'de> Deserialize<'de> for Catalog {
 			generated_at: wire.generated_at,
 			is_complete: wire.is_complete,
 			tracks,
+			ext: wire.ext,
 		})
 	}
 }
@@ -276,7 +399,8 @@ fn is_false(value: &bool) -> bool {
 #[serde_with::skip_serializing_none]
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Wire {
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: serde::de::DeserializeOwned"))]
+struct Wire<E> {
 	version: WireVersion,
 	generated_at: Option<u64>,
 	#[serde(default, skip_serializing_if = "is_false")]
@@ -284,6 +408,10 @@ struct Wire {
 	#[serde(default)]
 	tracks: Vec<Track>,
 	init_data_list: Option<Vec<InitData>>,
+
+	/// The extension's own root members, written flat alongside the ones above.
+	#[serde(flatten)]
+	ext: E,
 }
 
 /// Wire encoding of the catalog version. Deserialization accepts draft-00's
@@ -354,7 +482,7 @@ struct InitData {
 	#[serde(rename = "type")]
 	kind: String,
 	/// The init payload, interpreted per `kind`. For `"inline"`, base64.
-	data: String,
+	data: Arc<str>,
 }
 
 impl Track {
@@ -367,9 +495,12 @@ impl Track {
 	pub fn new(name: impl Into<String>, packaging: Packaging) -> Self {
 		Self {
 			name: name.into(),
+			namespace: None,
 			packaging,
 			is_live: false,
 			role: None,
+			label: None,
+			lang: None,
 			codec: None,
 			width: None,
 			height: None,
@@ -377,7 +508,6 @@ impl Track {
 			samplerate: None,
 			channel_config: None,
 			bitrate: None,
-			stalled: None,
 			init_data: None,
 			init_ref: None,
 			render_group: None,
@@ -385,6 +515,7 @@ impl Track {
 			max_grp_sap_starting_type: None,
 			max_obj_sap_starting_type: None,
 			jitter: None,
+			delay: None,
 		}
 	}
 }
@@ -513,14 +644,29 @@ impl<'de> Deserialize<'de> for Role {
 
 #[cfg(test)]
 mod test {
+	#[test]
+	fn track_namespace_round_trips() {
+		for version in ["1", "\"draft-01\""] {
+			let wire = format!(
+				r#"{{"version": {version}, "tracks": [{{"name": "video", "namespace": "room/left", "packaging": "loc"}}]}}"#
+			);
+			let catalog = Catalog::<()>::from_str(&wire).unwrap();
+			let encoded: serde_json::Value = serde_json::from_str(&catalog.to_json().unwrap()).unwrap();
+			assert_eq!(encoded["tracks"][0]["namespace"], "room/left");
+		}
+	}
+
 	use super::*;
 
 	fn video_track() -> Track {
 		Track {
 			name: "video0".to_string(),
+			namespace: None,
 			packaging: Packaging::Legacy,
 			is_live: true,
 			role: Some(Role::Video),
+			label: None,
+			lang: None,
 			codec: Some("avc3.64001f".to_string()),
 			width: Some(1280),
 			height: Some(720),
@@ -528,7 +674,6 @@ mod test {
 			samplerate: None,
 			channel_config: None,
 			bitrate: Some(6_000_000),
-			stalled: Some(true),
 			init_data: None,
 			init_ref: None,
 			render_group: Some(1),
@@ -536,15 +681,19 @@ mod test {
 			max_grp_sap_starting_type: None,
 			max_obj_sap_starting_type: None,
 			jitter: None,
+			delay: None,
 		}
 	}
 
 	fn audio_track() -> Track {
 		Track {
 			name: "audio0".to_string(),
+			namespace: None,
 			packaging: Packaging::Legacy,
 			is_live: true,
 			role: Some(Role::Audio),
+			label: None,
+			lang: None,
 			codec: Some("opus".to_string()),
 			width: None,
 			height: None,
@@ -552,7 +701,6 @@ mod test {
 			samplerate: Some(48_000),
 			channel_config: Some("2".to_string()),
 			bitrate: Some(128_000),
-			stalled: None,
 			init_data: None,
 			init_ref: None,
 			render_group: Some(1),
@@ -560,15 +708,19 @@ mod test {
 			max_grp_sap_starting_type: None,
 			max_obj_sap_starting_type: None,
 			jitter: None,
+			delay: None,
 		}
 	}
 
 	fn track_with_sap_and_jitter() -> Track {
 		Track {
 			name: "video0".to_string(),
+			namespace: None,
 			packaging: Packaging::Cmaf,
 			is_live: true,
 			role: Some(Role::Video),
+			label: None,
+			lang: None,
 			codec: Some("avc1.640028".to_string()),
 			width: Some(1920),
 			height: Some(1080),
@@ -576,7 +728,6 @@ mod test {
 			samplerate: None,
 			channel_config: None,
 			bitrate: Some(5_000_000),
-			stalled: None,
 			init_data: None,
 			init_ref: None,
 			render_group: Some(1),
@@ -584,6 +735,7 @@ mod test {
 			max_grp_sap_starting_type: Some(1),
 			max_obj_sap_starting_type: Some(2),
 			jitter: Some(Duration::from_millis(15)),
+			delay: None,
 		}
 	}
 
@@ -592,7 +744,7 @@ mod test {
 		let catalog = Catalog::new(vec![video_track()]);
 
 		let json = catalog.to_json().unwrap();
-		let parsed = Catalog::from_str(&json).unwrap();
+		let parsed = Catalog::<()>::from_str(&json).unwrap();
 		assert_eq!(catalog, parsed);
 
 		// Verify audio fields are not present in JSON.
@@ -605,7 +757,7 @@ mod test {
 		assert!(track.get("maxGrpSapStartingType").is_none());
 		assert!(track.get("maxObjSapStartingType").is_none());
 		assert!(track.get("jitter").is_none());
-		assert_eq!(track["stalled"], true);
+		assert!(track.get("delay").is_none());
 	}
 
 	#[test]
@@ -613,7 +765,7 @@ mod test {
 		let catalog = Catalog::new(vec![audio_track()]);
 
 		let json = catalog.to_json().unwrap();
-		let parsed = Catalog::from_str(&json).unwrap();
+		let parsed = Catalog::<()>::from_str(&json).unwrap();
 		assert_eq!(catalog, parsed);
 
 		// Verify video fields are not present in JSON.
@@ -661,7 +813,7 @@ mod test {
 	fn roundtrip_empty() {
 		let catalog = Catalog::new(vec![]);
 		let json = catalog.to_json().unwrap();
-		let parsed = Catalog::from_str(&json).unwrap();
+		let parsed = Catalog::<()>::from_str(&json).unwrap();
 		assert_eq!(catalog, parsed);
 	}
 
@@ -673,13 +825,13 @@ mod test {
 		track.max_grp_sap_starting_type = None;
 		track.max_obj_sap_starting_type = None;
 		track.jitter = None;
-		track.init_data = Some("AQID".to_string());
+		track.init_data = Some("AQID".into());
 
 		let catalog = Catalog::new(vec![track]);
 
 		let json = catalog.to_json().unwrap();
 		assert!(json.contains("\"packaging\":\"cmaf\""));
-		let parsed = Catalog::from_str(&json).unwrap();
+		let parsed = Catalog::<()>::from_str(&json).unwrap();
 		assert_eq!(catalog, parsed);
 		assert_eq!(parsed.tracks[0].init_data.as_deref(), Some("AQID"));
 	}
@@ -723,11 +875,12 @@ mod test {
 			}]
 		}"#;
 
-		let catalog = Catalog::from_str(json).unwrap();
+		let catalog = Catalog::<()>::from_str(json).unwrap();
 		let track = &catalog.tracks[0];
 		assert_eq!(track.max_grp_sap_starting_type, None);
 		assert_eq!(track.max_obj_sap_starting_type, None);
 		assert_eq!(track.jitter, None);
+		assert_eq!(track.delay, None);
 	}
 
 	#[test]
@@ -735,7 +888,7 @@ mod test {
 		let original = Catalog::new(vec![track_with_sap_and_jitter()]);
 
 		let json = original.to_json().unwrap();
-		let parsed = Catalog::from_str(&json).unwrap();
+		let parsed = Catalog::<()>::from_str(&json).unwrap();
 		assert_eq!(original, parsed);
 		assert_eq!(parsed.tracks[0].max_grp_sap_starting_type, Some(1));
 		assert_eq!(parsed.tracks[0].max_obj_sap_starting_type, Some(2));
@@ -756,7 +909,7 @@ mod test {
 			}]
 		}"#;
 
-		let catalog = Catalog::from_str(json).expect("fractional jitter must decode");
+		let catalog = Catalog::<()>::from_str(json).expect("fractional jitter must decode");
 		assert_eq!(catalog.tracks[0].jitter, Some(Duration::from_millis(15)));
 
 		let value: serde_json::Value = serde_json::from_str(&catalog.to_json().unwrap()).unwrap();
@@ -764,9 +917,23 @@ mod test {
 	}
 
 	#[test]
+	fn delay_roundtrips() {
+		let mut track = track_with_sap_and_jitter();
+		track.delay = Some(Duration::from_millis(200));
+		let original = Catalog::new(vec![track]);
+
+		let json = original.to_json().unwrap();
+		let parsed = Catalog::<()>::from_str(&json).unwrap();
+		assert_eq!(parsed.tracks[0].delay, Some(Duration::from_millis(200)));
+
+		let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+		assert_eq!(value["tracks"][0]["delay"].as_f64(), Some(200.0));
+	}
+
+	#[test]
 	fn serialize_emits_draft01_version() {
 		// Callers never set a version; we always emit the newest draft string.
-		let json = Catalog::default().to_json().unwrap();
+		let json = Catalog::<()>::default().to_json().unwrap();
 		let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 		assert_eq!(value["version"], serde_json::json!("draft-01"));
 	}
@@ -775,7 +942,7 @@ mod test {
 	fn draft00_numeric_version_decodes_and_normalizes() {
 		// draft-00 put the JSON number 1 in `version`. It must decode, and on
 		// re-serialize we normalize to the current draft string.
-		let catalog = Catalog::from_str(r#"{"version":1,"tracks":[]}"#).unwrap();
+		let catalog = Catalog::<()>::from_str(r#"{"version":1,"tracks":[]}"#).unwrap();
 		assert!(catalog.tracks.is_empty());
 
 		let value: serde_json::Value = serde_json::from_str(&catalog.to_json().unwrap()).unwrap();
@@ -783,30 +950,24 @@ mod test {
 	}
 
 	#[test]
-	fn draft01_string_version_decodes() {
-		let catalog = Catalog::from_str(r#"{"version":"draft-01","tracks":[]}"#).unwrap();
-		assert!(catalog.tracks.is_empty());
-	}
-
-	#[test]
 	fn unknown_version_string_is_accepted() {
 		// A future draft we don't specifically recognize still decodes; we don't
 		// expose the version, so callers are unaffected.
-		assert!(Catalog::from_str(r#"{"version":"draft-99","tracks":[]}"#).is_ok());
+		assert!(Catalog::<()>::from_str(r#"{"version":"draft-99","tracks":[]}"#).is_ok());
 	}
 
 	#[test]
 	fn unsupported_numeric_version_errors() {
 		// Numbers other than 1 never had a defined meaning, so reject them.
-		assert!(Catalog::from_str(r#"{"version":2,"tracks":[]}"#).is_err());
+		assert!(Catalog::<()>::from_str(r#"{"version":2,"tracks":[]}"#).is_err());
 	}
 
 	#[test]
 	fn float_numeric_version_is_accepted() {
 		// `1.0` is a valid JSON spelling of the draft-00 version; accept it so we
 		// don't reject a catalog the JS decoder would happily parse.
-		assert!(Catalog::from_str(r#"{"version":1.0,"tracks":[]}"#).is_ok());
-		assert!(Catalog::from_str(r#"{"version":2.0,"tracks":[]}"#).is_err());
+		assert!(Catalog::<()>::from_str(r#"{"version":1.0,"tracks":[]}"#).is_ok());
+		assert!(Catalog::<()>::from_str(r#"{"version":2.0,"tracks":[]}"#).is_err());
 	}
 
 	#[test]
@@ -824,7 +985,7 @@ mod test {
 			]
 		}"#;
 
-		let err = Catalog::from_str(json).expect_err("dangling initRef must fail");
+		let err = Catalog::<()>::from_str(json).expect_err("dangling initRef must fail");
 		assert!(err.to_string().contains("missing initData"), "unexpected error: {err}");
 	}
 
@@ -843,8 +1004,31 @@ mod test {
 			]
 		}"#;
 
-		let err = Catalog::from_str(json).expect_err("unsupported initRef type must fail");
+		let err = Catalog::<()>::from_str(json).expect_err("unsupported initRef type must fail");
 		assert!(err.to_string().contains("unsupported type"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn duplicate_init_data_id_errors() {
+		// Keeping either entry would let two readers hand different init bytes to
+		// different parties for the same broadcast.
+		let json = r#"{
+			"version": "draft-01",
+			"initDataList": [
+				{ "id": "v", "type": "inline", "data": "AQID" },
+				{ "id": "v", "type": "inline", "data": "BAUG" }
+			],
+			"tracks": [
+				{ "name": "video0", "packaging": "cmaf", "isLive": true, "role": "video",
+				  "codec": "avc1.640028", "initRef": "v" }
+			]
+		}"#;
+
+		let err = Catalog::<()>::from_str(json).expect_err("duplicate initData id must fail");
+		assert!(
+			err.to_string().contains("duplicate initData"),
+			"unexpected error: {err}"
+		);
 	}
 
 	#[test]
@@ -860,7 +1044,7 @@ mod test {
 			]
 		}"#;
 
-		let err = Catalog::from_str(json).expect_err("conflicting initData/initRef must fail");
+		let err = Catalog::<()>::from_str(json).expect_err("conflicting initData/initRef must fail");
 		assert!(err.to_string().contains("conflicting"), "unexpected error: {err}");
 	}
 
@@ -873,12 +1057,18 @@ mod test {
 			],
 			"tracks": [
 				{ "name": "video0", "packaging": "cmaf", "isLive": true, "role": "video",
+				  "codec": "avc1.640028", "initData": "AQID", "initRef": "v0" },
+				{ "name": "video1", "packaging": "cmaf", "isLive": true, "role": "video",
 				  "codec": "avc1.640028", "initData": "AQID", "initRef": "v0" }
 			]
 		}"#;
 
-		let catalog = Catalog::from_str(json).unwrap();
-		assert_eq!(catalog.tracks[0].init_data.as_deref(), Some("AQID"));
+		let catalog = Catalog::<()>::from_str(json).unwrap();
+		let first = catalog.tracks[0].init_data.as_ref().unwrap();
+		let second = catalog.tracks[1].init_data.as_ref().unwrap();
+		assert_eq!(first.as_ref(), "AQID");
+		// The matching inline copies are dropped in favor of the shared initRef payload.
+		assert!(Arc::ptr_eq(first, second));
 	}
 
 	#[test]
@@ -896,8 +1086,38 @@ mod test {
 			]
 		}"#;
 
-		let catalog = Catalog::from_str(json).unwrap();
+		let catalog = Catalog::<()>::from_str(json).unwrap();
 		assert_eq!(catalog.tracks[0].init_data.as_deref(), Some("AQID"));
+	}
+
+	#[test]
+	fn draft01_shared_init_ref_keeps_one_payload() {
+		let data = "A".repeat(64 * 1024);
+		let tracks = (0..32)
+			.map(|n| {
+				serde_json::json!({
+					"name": format!("video{n}"), "packaging": "cmaf",
+					"isLive": true, "role": "video", "initRef": "shared"
+				})
+			})
+			.collect::<Vec<_>>();
+		let json = serde_json::json!({
+			"version": "draft-01",
+			"initDataList": [{ "id": "shared", "type": "inline", "data": data }],
+			"tracks": tracks
+		})
+		.to_string();
+
+		let catalog = Catalog::<()>::from_str(&json).unwrap();
+		let first = catalog.tracks[0].init_data.as_ref().unwrap();
+		assert!(
+			catalog
+				.tracks
+				.iter()
+				.all(|track| Arc::ptr_eq(first, track.init_data.as_ref().unwrap()))
+		);
+		let encoded: serde_json::Value = serde_json::from_str(&catalog.to_json().unwrap()).unwrap();
+		assert_eq!(encoded["initDataList"].as_array().unwrap().len(), 1);
 	}
 
 	#[test]
@@ -907,10 +1127,10 @@ mod test {
 		// inline initData left on the tracks.
 		let mut a = video_track();
 		a.name = "a".to_string();
-		a.init_data = Some("AQID".to_string());
+		a.init_data = Some("AQID".into());
 		let mut b = video_track();
 		b.name = "b".to_string();
-		b.init_data = Some("AQID".to_string());
+		b.init_data = Some("AQID".into());
 
 		let catalog = Catalog::new(vec![a, b]);
 		let value: serde_json::Value = serde_json::from_str(&catalog.to_json().unwrap()).unwrap();
@@ -927,7 +1147,7 @@ mod test {
 		}
 
 		// And it round-trips back to inline init_data for both tracks.
-		let parsed = Catalog::from_str(&catalog.to_json().unwrap()).unwrap();
+		let parsed = Catalog::<()>::from_str(&catalog.to_json().unwrap()).unwrap();
 		assert_eq!(parsed.tracks[0].init_data.as_deref(), Some("AQID"));
 		assert_eq!(parsed.tracks[1].init_data.as_deref(), Some("AQID"));
 	}
@@ -936,7 +1156,7 @@ mod test {
 	fn draft00_example_av_decodes() {
 		// Example 1 from draft-ietf-moq-msf-00: time-aligned audio/video. Exercises the
 		// numeric version, integer framerate into an f64 field, preserved generatedAt,
-		// and unmodeled fields (namespace, targetLatency) which must be ignored.
+		// and unmodeled fields (targetLatency) which must be ignored.
 		let json = r#"{
 			"version": 1,
 			"generatedAt": 1746104606044,
@@ -970,7 +1190,7 @@ mod test {
 			]
 		}"#;
 
-		let catalog = Catalog::from_str(json).expect("draft-00 AV catalog must decode");
+		let catalog = Catalog::<()>::from_str(json).expect("draft-00 AV catalog must decode");
 		assert_eq!(catalog.generated_at, Some(1746104606044));
 		assert_eq!(catalog.tracks.len(), 2);
 		assert_eq!(catalog.tracks[0].framerate, Some(30.0));
@@ -1007,7 +1227,7 @@ mod test {
 			]
 		}"#;
 
-		let catalog = Catalog::from_str(json).expect("draft-00 timeline catalog must decode");
+		let catalog = Catalog::<()>::from_str(json).expect("draft-00 timeline catalog must decode");
 		assert_eq!(catalog.tracks.len(), 2);
 		// The timeline track had no isLive; it must default rather than fail the parse.
 		assert!(!catalog.tracks[0].is_live);
@@ -1023,7 +1243,7 @@ mod test {
 			"isComplete": true,
 			"tracks": []
 		}"#;
-		let catalog = Catalog::from_str(json).expect("draft-00 completion catalog must decode");
+		let catalog = Catalog::<()>::from_str(json).expect("draft-00 completion catalog must decode");
 		assert_eq!(catalog.generated_at, Some(1746104606044));
 		assert!(catalog.is_complete);
 		assert!(catalog.tracks.is_empty());
@@ -1035,8 +1255,101 @@ mod test {
 
 	#[test]
 	fn default_catalog_omits_completion_fields() {
-		let value: serde_json::Value = serde_json::from_str(&Catalog::default().to_json().unwrap()).unwrap();
+		let value: serde_json::Value = serde_json::from_str(&Catalog::<()>::default().to_json().unwrap()).unwrap();
 		assert!(value.get("generatedAt").is_none());
 		assert!(value.get("isComplete").is_none());
+	}
+
+	/// A typed extension rides the catalog root without the caller touching serde_json.
+	#[test]
+	fn typed_extension_roundtrip() {
+		#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+		#[serde(rename_all = "camelCase")]
+		struct Program {
+			program_number: u16,
+			pmt_pid: u16,
+		}
+
+		#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+		struct MpegtsExt {
+			#[serde(default, skip_serializing_if = "Option::is_none")]
+			mpegts: Option<Program>,
+		}
+
+		let ext = MpegtsExt {
+			mpegts: Some(Program {
+				program_number: 1,
+				pmt_pid: 100,
+			}),
+		};
+		let catalog = Catalog::with_ext(vec![video_track()], ext.clone());
+
+		let json = catalog.to_json().unwrap();
+		let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+		assert_eq!(
+			value["mpegts"]["pmtPid"],
+			serde_json::json!(100),
+			"written flat: {json}"
+		);
+
+		let parsed = Catalog::<MpegtsExt>::from_str(&json).expect("typed extension must decode");
+		assert_eq!(parsed.ext, ext);
+		assert_eq!(parsed.tracks.len(), 1);
+	}
+
+	/// A typed extension whose member name collides with one MSF defines trips the debug
+	/// assertion: nothing else catches it, since serde writes the duplicate key happily.
+	#[test]
+	#[should_panic(expected = "collides with a reserved root member")]
+	fn colliding_typed_extension_trips_the_debug_assertion() {
+		#[derive(Serialize, Deserialize, Clone, Default)]
+		struct BadExt {
+			tracks: Vec<String>,
+		}
+
+		let _ = Catalog::with_ext(Vec::new(), BadExt::default()).to_json();
+	}
+
+	/// Root members the extension does not model are dropped, exactly as the hang catalog
+	/// drops sections its extension does not declare.
+	#[test]
+	fn unmodeled_root_members_are_dropped() {
+		let json = r#"{ "version": "draft-01", "tracks": [], "somethingElse": [1, 2, 3] }"#;
+		let catalog = Catalog::<()>::from_str(json).expect("an unknown member must not fail the parse");
+		let value: serde_json::Value = serde_json::from_str(&catalog.to_json().unwrap()).unwrap();
+		assert!(value.get("somethingElse").is_none());
+	}
+
+	/// The untyped extension: a serde_json map keeps every unmodeled member verbatim, for a
+	/// caller that does not know the sections at compile time.
+	#[test]
+	fn untyped_extension_is_passthrough() {
+		type Extra = serde_json::Map<String, serde_json::Value>;
+
+		let json = r#"{
+			"version": "draft-01",
+			"tracks": [],
+			"mpegts": { "program": { "pmtPid": 100 } },
+			"somethingElse": [1, 2, 3]
+		}"#;
+		let catalog = Catalog::<Extra>::from_str(json).expect("passthrough must decode");
+		assert_eq!(catalog.ext.len(), 2);
+
+		let value: serde_json::Value = serde_json::from_str(&catalog.to_json().unwrap()).unwrap();
+		assert_eq!(value["mpegts"]["program"]["pmtPid"], serde_json::json!(100));
+		assert_eq!(value["somethingElse"], serde_json::json!([1, 2, 3]));
+	}
+
+	#[test]
+	fn shared_extension_names_roundtrip() {
+		type Extra = serde_json::Map<String, serde_json::Value>;
+		let raw = include_str!("../fixtures/catalog-names.json");
+		let mut expected: Extra = serde_json::from_str(raw).unwrap();
+		expected.remove("version");
+		expected.remove("tracks");
+		let catalog = Catalog::<Extra>::from_str(raw).unwrap();
+		assert_eq!(catalog.ext, expected);
+		let wire: serde_json::Value = serde_json::from_str(&catalog.to_json().unwrap()).unwrap();
+		assert_eq!(wire, serde_json::from_str::<serde_json::Value>(raw).unwrap());
 	}
 }

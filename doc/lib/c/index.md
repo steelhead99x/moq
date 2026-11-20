@@ -1,49 +1,143 @@
 ---
 title: C
-description: libmoq, the stable C ABI over the Rust core
+description: moq-c, the stable C ABI over the Rust core
 ---
 
 # C
 
-[![GitHub release](https://img.shields.io/github/v/release/moq-dev/moq?filter=libmoq-v*\&label=libmoq)](https://github.com/moq-dev/moq/releases?q=libmoq)
+[![GitHub release](https://img.shields.io/github/v/release/moq-dev/moq?filter=moq-c-v*\&label=moq-c)](https://github.com/moq-dev/moq/releases?q=moq-c)
 
-`libmoq` exposes MoQ to C, C++, and any language with a C FFI through a
+`moq-c` exposes MoQ to C and any language with a C FFI through a
 stable ABI: a generated `moq.h`, a static `libmoq.a` that links the whole Rust
-runtime in, and a pkg-config file for its native link dependencies. The
-[OBS plugin](/bin/obs) is built on it.
+runtime in, and a pkg-config file for its native link dependencies. Releases
+through 0.6 were named `libmoq`. C++ projects should prefer the
+[C++ package](/lib/cpp/) (`moq-cpp`): the same core as RAII objects and
+futures instead of handles and callbacks.
 
 ## Install
 
-Each [`libmoq-v*` release](https://github.com/moq-dev/moq/releases?q=libmoq)
-ships `moq-<version>-<target>.tar.gz` with `include/moq.h`, `lib/`, and a
-pkg-config file listing the system libraries the static archive needs.
+Each [`moq-c-v*` release](https://github.com/moq-dev/moq/releases?q=moq-c)
+ships `moq-c-<version>-<target>.tar.gz` with `include/moq.h`, `lib/libmoq.a`, and
+a pkg-config file listing the system libraries the archive needs. They are a
+matched pair: compile against the header that came with the archive you link.
 Targets: Linux x86\_64 and aarch64, macOS arm64, Windows x64.
 
 ```bash
-export PKG_CONFIG_PATH="moq-$ver-$target/lib/pkgconfig"
-cc app.c $(pkg-config --cflags --libs --static moq) -o app
+export PKG_CONFIG_PATH="moq-c-$ver-$target/lib/pkgconfig"
+cc app.c $(pkg-config --cflags --libs --static moq-c) -o app
 ```
 
-From source: `cargo build --release -p libmoq` writes the library and header
-under `target/release/`.
+With CMake, point `CMAKE_PREFIX_PATH` at the extracted archive, then
+`find_package(moq-c)` and link `moq::c`.
 
-## Shape of the API
+From source, `add_subdirectory(rs/moq-c)` in CMake gives the same `moq::c`
+target, and `nix build .#moq-c` produces the release layout. A bare
+`cargo build -p moq-c` leaves `moq.h` in a hashed `OUT_DIR`, writes no
+pkg-config file, and omits the OpenH264 software fallback unless given
+`--features openh264`.
 
-- **Handles and callbacks.** Every object is an integer handle; every async result arrives on a callback with a `void *user_data`. A status `> 0` is a live result, `0` a clean close, `< 0` an error, and the last two are terminal: libmoq never touches `user_data` again, so free it there. `*_close` only requests shutdown; the terminal callback still fires.
-- **Errors.** Negative return codes, with `moq_error()` giving the reason for the last failure on the calling thread. Auth rejections (401, 403) have their own codes so you don't retry them.
-- **Threading.** Any function from any thread. Raw publish calls block until the codec takes the frame, which paces a publisher.
-- **Client config.** `moq_client_create()` plus one setter per knob (`moq_client_set_versions`, `_tls_fingerprints`, `_tls_roots`, `_tls_cert`/`_key`, `_backend`, `_connect_timeout`, `_websocket_enabled`, `_quic_congestion_control`, reconnect backoff, and so on), with getters that report defaults. One setter per knob is what keeps the ABI stable when a knob is added.
-- **Everything the bindings can do** ([list](/lib/#what-every-binding-can-do)): media publish and consume with the catalog managed for you, raw pixels and PCM with the codec inside (`moq_publish_video_raw`, `moq_publish_audio_raw`, and the `_consume_*_raw` mirrors), raw tracks with timestamps and datagrams, JSON snapshot and stream tracks, group fetch, dynamic tracks and broadcasts, catalog sections, shared video properties, and stalled hints.
+`moq-c` and the C++ package each link in their own copy of the Rust core, so a
+program links one of the two, never both.
+
+Encoded media callbacks from `moq_consume_audio` and `moq_consume_video` deliver read
+handles. Inspect each with `moq_consume_read` and match `moq_media_read.kind`, using the
+same frame/gap/end tags as decoded audio and video. Release every kind with
+`moq_consume_read_free`; frame payload pointers borrow that handle. A gap breaks
+continuity. An encoder end is not callback EOF: frames before its endpoint are the old
+encoder's drain, and the first at or past it starts fresh. Callback 0 ends the stream.
+These consumers include the rendition's catalog `warmup` in both the history fetched at
+join and the subscription budget. Feed that history to your decoder before presenting
+output; the requested max delay still controls steady-state skips.
+
+## Connect
 
 ```c
-int client = moq_client_create();
-struct moq_string fp = { hex_sha256, strlen(hex_sha256) };
-if (moq_client_set_tls_fingerprints(client, &fp, 1) < 0)
-    return fail(moq_error());   // never dial without the pin you asked for
-int session = moq_client_connect(url, url_len, client, origin, 0, on_status, user_data);
-moq_client_close(client);   // the config was copied into the session
+moq_client_config config;
+memset(&config, 0, sizeof(config));   // zeroed means "the defaults", every field
+
+moq_string fp = { hex_sha256, strlen(hex_sha256) };
+config.tls_fingerprints = &fp;        // trust one self-signed relay
+config.tls_fingerprints_len = 1;
+
+int session = moq_session_connect(url, url_len, &config, origin, 0, on_state, user_data);
+if (session < 0)
+    return fail(moq_error());
 ```
 
-The header is the reference; each function carries a doc comment. Source and
-a worked example: [`rs/libmoq`](https://github.com/moq-dev/moq/tree/main/rs/libmoq),
-API docs on [docs.rs/libmoq](https://docs.rs/libmoq).
+## Publish
+
+```c
+const char *path = "my-stream.hang";
+moq_route_options options;
+memset(&options, 0, sizeof(options)); // zeroed means visible, cost 0, a fresh instance
+options.hidden = true;                // fill the catalog before anyone finds it
+int route = moq_origin_route(origin, path, strlen(path), &options);
+if (route < 0)
+    return fail(moq_error());
+int broadcast = moq_route_broadcast((uint32_t)route);
+// Fill tracks on broadcast here, then make the route visible.
+if (moq_route_announce((uint32_t)route) < 0)
+    return fail(moq_error());
+```
+
+The route keeps the broadcast announced: `moq_route_free()` retracts it, and
+`moq_publish_close()` ends both. A route carries a cost, the stream's instance, and optionally a credential (`moq_route_set_auth()`);
+relays add the hops. `moq_origin_route()` mints a fresh instance (`moq_route_instance()`) and
+keeps it across `moq_route_withdraw()` and `moq_route_announce()`, so a restarted publisher,
+being a new route, is a new stream that `moq_origin_follow` hands viewers instead of a stalled
+broadcast; the path stays `MOQ_ANNOUNCE_KIND_PRESENT` throughout. The follow callback
+reports each instance as `MOQ_FOLLOW_EVENT_ONLINE` with its handle,
+`MOQ_FOLLOW_EVENT_OFFLINE` when the path goes offline, and one `MOQ_FOLLOW_EVENT_END`. Set `instance` only for a publisher that continues its group sequences
+across restarts, and raise `epoch` on each: readers stitch every route of one instance
+together, so restarting the sequences under an old instance splices unrelated groups into
+their tracks. To serve paths on demand, `moq_origin_claim()` returns a claim handle and delivers each request to
+answer with `moq_broadcast_request_serve()`, `moq_broadcast_request_route()`, or
+`moq_broadcast_request_reject()`; `moq_claim_announce()`, `moq_claim_withdraw()`,
+`moq_claim_set_cost()`, `moq_claim_set_auth()`, and `moq_claim_free()` control the claim. Unless one is named, a claim moves to a fresh
+instance (`moq_claim_instance()`) each time a job holding its current one ends, and a job from
+`moq_broadcast_request_route()` takes the claim's, so on moq-lite 07 a reader resolved through the
+claim does not restart; older wires mint another instance for the job's route, restarting it.
+
+An instance is a handle: `moq_route_instance()` and `moq_claim_instance()` return one you free
+with `moq_instance_free()`, and an announcement's `route.instance` lives as long as the
+announcement. `moq_instance_parse()` names one from text; `moq_instance_text()`,
+`moq_instance_minted()`, and `moq_instance_equal()` read it. A session mints an instance for a
+route whose wire (moq-lite 06 or older, or moq-transport) carries none, and only a session can,
+so pass the handle a route or announcement reported, not its text, to pin
+`moq_origin_request()` or `moq_origin_follow()` to that stream.
+
+Raw video encoders take an exact numerator/denominator frame rate, such as 30000/1001. Publication track names stay separate from codec settings. For simulcast, give each rendition the next one down as the `lower` handle in its `moq_video_encode_options`: it stops encoding, advertised as disabled, while its bandwidth grant cannot fund it, and resumes once the grant recovers. A rung only disables while the session probes for bandwidth, which on native transports takes moq-quic with BBR3. For pre-encoded video, publish from the lowest rendition up and set `moq_video_init.lower` to the next lower media handle. Reserve each track with `moq_allocator_reserve_media`, then bind its reservation with `moq_rate_control_create` and call `moq_rate_control_update` on every frame. Apply changed targets to your encoder and `moq_publish_media_set_enabled`, resuming video on a keyframe; close the control and reservation separately when done.
+
+## Things to know
+
+The rest of the [shared feature list](/lib/#what-every-binding-can-do) is
+here, from media publish and consume to raw pixels and PCM with the codec
+inside. The header is the reference: each function carries a doc comment.
+[Layers](/lib/layers) maps each wrapped Rust layer to its function prefixes.
+
+- **Handles and callbacks.** Every object is an integer handle, and every async result arrives on a `moq_status_callback` with your `void *user_data`. A status `> 0` is a live result, `0` a clean close, and `< 0` an error. The last two are terminal: moq-c never touches `user_data` again, so free it there. `*_close` and `*_cancel` only request shutdown; the terminal callback still fires. A session reports on a `moq_state_callback` instead: each `moq_connection_state` carries its `phase`, `connects`, and that phase's own `data`: the negative `failure` of the latest attempt while offline or migrating, and the live `version` while connected or migrating. The `MOQ_CONNECTION_PHASE_CLOSED` snapshot is terminal, delivered after the handle is released. `moq_session_close()` drains finished tracks for dialed and accepted sessions; wait for that terminal snapshot to learn the result.
+- **Errors.** Negative return codes are named by `MOQ_ERROR_*`, and `moq_error()` gives the reason on the calling thread. Auth rejections have their own codes so you don't retry them. For the peer's protocol code use `moq_error_protocol()`; do not parse `moq_error()`. A panic in a binding background task reports `MOQ_ERROR_PANIC` through its terminal callback; unrelated objects keep running. A session closed because its credential expired has kind `MOQ_PROTOCOL_KIND_EXPIRED`, and a request refused for an expired token returns `MOQ_ERROR_EXPIRED`; refresh the token before retrying. Malformed credentials report `MOQ_PROTOCOL_KIND_MALFORMED_AUTH_TOKEN`; correct the token before reconnecting with it. A catalog that needs a newer moq-hang draft than this build reads returns `MOQ_ERROR_UNSUPPORTED_CATALOG`; upgrade the library to read it. A request-cap closure has kind `MOQ_PROTOCOL_KIND_TOO_MANY_REQUESTS`; reduce the workload or adjust the relay's [session limits](/bin/relay/config#session-and-peer) before reconnecting.
+- **Tokens.** Set `moq_client_config.tokens` instead of putting the credential in the URL. The first is the connection credential, sent in SETUP and, while an offered version can't carry it there (lite before 07), as the URL's `?jwt=`; each other token widens the grant over AUTH. A `?jwt=` already in the URL stays the connection credential, which is how to reach a relay older than this release. `moq_session_tokens_set()` replaces them before they expire: the next dial presents them, and a live AUTH session at once. A live session without AUTH (lite before 07, or moq-transport without the extension) keeps the old credential until it redials, and `moq_session_tokens_answered()` reports `MOQ_ERROR_UNSUPPORTED` for it. Otherwise that call reports the peer's verdict. Follow what the peer granted with `moq_session_grants()`. For a per-request token, `moq_session_credential()` presents it on the live session, or the next one while offline, and returns a credential handle at once: name it with `moq_route_set_auth()` or `moq_claim_set_auth()`, and setting a new one renews the announcement in place, without redialing. Only the session that minted it carries it, a dialed one across its reconnects; another session announcing the same route uses its own scope. `moq_credential_answered()` reports the peer's verdict: moq-transport accepts at once, since only the request carries it, moq-lite needs AUTH, where the grant joins the session's, and is `MOQ_ERROR_UNSUPPORTED` without it. `moq_credential_free()` withdraws the token once no route or claim names it, answered or not, and ends a wait still pending.
+- **Threading.** Call any function from any thread. Callbacks run on moq-c's runtime thread; the callback and its `user_data` must be safe to use there. Synchronize access to data shared with other threads, and dispatch UI work to your UI thread. Raw publish calls block until the codec takes the frame, which paces a publisher.
+- **Zeroed config is the default.** A zeroed `moq_client_config` means the default for every field, so new fields don't break callers. A field whose default isn't zero has a `has_*` flag: `backoff_timeout_us = 0` means "retry forever" only with `has_backoff_timeout = true`.
+- **Subscription defaults.** A zeroed `moq_subscription`, a NULL pointer, and `moq_subscription_defaults()` all mean moq-net's defaults, whose zero `delay` starts at the newest group and skips a superseded one at once. Set `delay.max_unlimited` for no subscriber limit, and `delay.min_unstated` to leave the target latency unstated.
+- **Compressed tracks.** `moq_track_info.compression` set to `MOQ_COMPRESSION_DEFLATE` on a raw track sends each group DEFLATE-compressed to opt-in `moq-lite-07-wip` peers; other peers, and every reader here, get the original frames.
+- **fMP4 import.** `MOQ_CONTAINER_FORMAT_FMP4` splits each fragment into one frame per sample.
+- **Audio needs cuts.** Video groups at its keyframes, but audio forms a group only where you call `moq_publish_media_cut`: after every frame, or less often to batch frames into fewer groups. Pass that cadence as `moq_audio_init.hint.join_us`.
+- **Catalog hints.** Give the catalog what the encoder knows instead of having it estimated: `moq_video_init.hint` (coded size, bitrate, frame rate, join) and `moq_audio_init.hint` (bitrate, join). A supplied bitrate is never re-estimated. `join_us` is the time between join points, the longest span between two group starts: the GOP, or your cut cadence. Leave a field's `has_*` flag false to have it measured. A bitrate or `join_us` flag set with a 0 value returns `MOQ_ERROR_INVALID_CONFIG`.
+- **Discovery.** Announcement captures are always a list of wildcard matches, empty when the filter has no wildcards.
+- **Ending cleanly.** When the input ends, finish every track, then call `moq_publish_catalog_finish()` to finish the catalog, which ends the content. The broadcast stays announced and keeps serving the finished tracks, so a subscriber still catching up can drain them, until `moq_publish_close()` or `moq_route_free()` takes it offline. How long to keep it up is yours to decide. A track still open at the close ends with `UNROUTABLE` (an internal error over moq-transport, which has no such code), and its handle is released. Readers follow a publisher's runs by announcement, not by that error: see [identity and recovery](/concept/identity).
+- **Timeline breaks.** On a seek or pause, call `moq_publish_media_discontinuity`, then keep timestamps moving forward and resume video on a keyframe.
+- **Timestamps.** A `moq_timestamp` is exact: `value` units at `scale` units per second, so a 90 kHz tick survives a read and republish. Frames, datagrams, and JSON values point `timestamp` at theirs, NULL on an untimed track and valid as long as the payload. Stream tracks moq-c creates are timed, so their raw writes need one. Datagram tracks are separate and default to untimed; set their timescale when creating them to require timestamps. Stamp media frames and JSON writes from `moq_publish_catalog_now()`, the broadcast clock every track in the broadcast shares; media on a timeline of its own advertises the gap to the JSON tracks as catalog `delay`. JSON writes are converted to their track's milliseconds. A NULL timestamp on any JSON write (snapshot update, stream append, window push or pop) fails with `MOQ_ERROR_INVALID_POINTER` and publishes nothing. A zero scale or an out-of-range value fails with `MOQ_ERROR_TIMESTAMP_OVERFLOW`.
+- **JSON values.** `moq_consume_json_value` fills `moq_json_value` with the document and its frame's timestamp. A snapshot consumer's callback fires for each state in order, but a group superseded before it is read is skipped.
+- **JSON windows.** `moq_publish_json_window` publishes a sliding run of records: `moq_publish_json_window_push` appends at the back, `moq_publish_json_window_pop` drops from the front, and `moq_publish_json_window_cut` closes the open group at a natural boundary. The catalog has no window mode, so a reader names the track. `moq_consume_json_window_event` fills `moq_json_window_event` with a push (the record at `start`, in `json`), a pop of `[start, end)`, or a skip of `[start, end)` that this reader joined too late to receive. Set `checkpoint_records` to bound what each new group restates for a window you never pop.
+- **Decoded reads.** `moq_decode_audio` and `moq_decode_video` deliver read ids in order: a frame, a gap where media was lost, or an end where the publisher stopped its encoder. Check `kind` on what `moq_decode_audio_read` or `moq_decode_video_read` writes. Free each id with `moq_decode_audio_read_free` or `moq_decode_video_read_free` promptly: a held video frame holds a decoder buffer, and the decoder stalls. A decoder reads everything the track still holds unless a live player sets `start` to `MOQ_DECODE_START_LATEST`, which joins at the newest group and skips the cached backlog. A decoder setup refusal reports `MOQ_ERROR_UNSUPPORTED_CONFIG` on its terminal callback, so the caller can try another rendition; later peer or decode failures retain their own error codes.
+- **Stats.** `moq_session_stats()` fills `moq_connection_stats` with `rtt_us`, `estimated_send_rate_bps`, and the byte and packet counters (`bytes_sent`, `bytes_received`, `bytes_lost`, `packets_sent`, `packets_received`, `packets_lost`), and `datagrams_unrouted`, the datagrams received for a subscription with no datagram track, reported only on moq-lite 05 and later, which carry datagrams. Each has a `<field>_valid` flag, false when the transport does not report it, which is not the same as zero. `moq_session_snapshot()` adds the negotiated `version`. A failed dial or dropped connection reaches the session's `on_state` with its `failure` code, and `moq_error()` gives the reason during that callback. Hold the handle returned by `moq_session_recv_bandwidth()` to request receive estimates. `moq_bandwidth_consumer_peek()` reads the estimate and `moq_bandwidth_consumer_changed()` waits for a change. `moq_bandwidth_consumer_close()` releases demand; the last consumer stops PROBE. Stats snapshots do not request it.
+- **Viewers.** `moq_session_viewers()` returns a handle that divides the receive estimate among the broadcasts you watch, max-min fair by each one's ceiling. `moq_viewers_watch()` returns a viewer claiming up to `max_bps`, the bitrate of the largest rendition you would switch to; `moq_viewer_rate()` reads its share in bits per second, with `present` false while there is no estimate (keep the current rendition), and `moq_viewer_update()` changes the ceiling. Holding a viewer requests the estimate like a `moq_session_recv_bandwidth()` consumer, and `moq_viewer_close()` releases the claim. The session sends the summed ceilings as its PROBE target; `moq_viewers_set_target()` with `present` true overrides that, a `0` target sends none, and `present` false follows the viewers again. `moq_viewers_watch()`, `moq_viewer_update()`, and `moq_viewers_set_target()` return `MOQ_ERROR_OUT_OF_RANGE`, changing nothing, when the ceilings or the target would pass 2^53 - 1 bps, the most a PROBE target carries. `moq_viewers_close()` releases the registry handle; viewers watched through it stay until each is closed.
+- **Demand.** A watcher from `moq_publish_track_demand()` (or the media, video, and audio variants) calls back `MOQ_DEMAND_WANTED` or `MOQ_DEMAND_UNWANTED`, again whenever the wanted group moves. `moq_publish_demand_wanted()` reads that group: start a new one once it passes your largest. Set `refresh` in `moq_track_info` to have a joining subscriber ask for a new group once the newest has grown past `refresh` times its first frame. A producer publishes everything you write, subscribed or not, so a late subscriber can fetch the recent past. Capturing only while the watcher reports `MOQ_DEMAND_WANTED` is an opt-in that saves the encode but leaves nothing from before the first subscriber.
+- **Disabled renditions.** Audio and video consumers and decoders reject a rendition with `enabled: false`. Query the latest catalog with `moq_consume_audio_enabled` or `moq_consume_video_enabled` before selecting a rendition and opening a decoder. Among the video renditions you can decode, prefer the highest `preference`; `0` is the default and `-1` marks a compatibility transcode.
+
+## Reference
+
+- API source: [rs/moq-c/src](https://github.com/moq-dev/moq/tree/main/rs/moq-c/src)
+- Source and a worked example: [`rs/moq-c`](https://github.com/moq-dev/moq/tree/main/rs/moq-c)

@@ -2,7 +2,7 @@
 //!
 //! Shared by [`encode::Sink`](crate::encode::Sink) and
 //! [`decode::Sink`](crate::decode::Sink), which differ only in the requests they
-//! serve. The reason both need it is the same: on Windows a Media Foundation
+//! serve and the outputs they queue. The reason both need it is the same: on Windows a Media Foundation
 //! transform's COM apartment is per-thread, so the codec has to be created,
 //! driven, and dropped on one thread, and a `!Send`-in-practice handle cannot be
 //! left to migrate between executor workers or FFI callers.
@@ -11,25 +11,59 @@
 //! the cancellation poison, joining on drop). Each codec supplies its own
 //! request type and serve loop.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use tokio::sync::{mpsc, oneshot};
 
 use crate::Error;
 
+/// Outputs the codec thread readied and the caller has not popped yet.
+///
+/// The thread fills it before replying to the call that readied them, so a
+/// caller that awaited that call pops synchronously. Reused, so it stops
+/// allocating once it has held one call's worth.
+pub(crate) struct Queue<T>(Arc<Mutex<VecDeque<T>>>);
+
+impl<T> Queue<T> {
+	/// Lock the queue. A thread that panicked holding it left only whole items.
+	pub(crate) fn lock(&self) -> MutexGuard<'_, VecDeque<T>> {
+		self.0.lock().unwrap_or_else(|err| err.into_inner())
+	}
+
+	/// Pop the oldest output.
+	pub(crate) fn pop(&self) -> Option<T> {
+		self.lock().pop_front()
+	}
+}
+
+impl<T> Default for Queue<T> {
+	fn default() -> Self {
+		Self(Arc::default())
+	}
+}
+
+impl<T> Clone for Queue<T> {
+	fn clone(&self) -> Self {
+		Self(self.0.clone())
+	}
+}
+
 /// The reply channel a worker thread uses to report that its codec is built.
 ///
-/// Sending the name hands the caller a live worker; sending an error fails its
-/// `open`. Dropping it without either (the thread panicked) fails it too.
-pub(crate) struct Ready(oneshot::Sender<Result<String, Error>>);
+/// Sending what the codec resolved to (`I`, at least its backend name) hands the
+/// caller a live worker; sending an error fails its `open`. Dropping it without
+/// either (the thread panicked) fails it too.
+pub(crate) struct Ready<I>(oneshot::Sender<Result<I, Error>>);
 
-impl Ready {
-	/// Report the codec as open, under the backend name it resolved to. `false`
-	/// means the caller gave up already, so the thread should exit without
-	/// serving anything.
+impl<I> Ready<I> {
+	/// Report the codec as open, with what it resolved to. `false` means the
+	/// caller gave up already, so the thread should exit without serving
+	/// anything.
 	#[must_use]
-	pub(crate) fn ok(self, name: &str) -> bool {
-		self.0.send(Ok(name.to_string())).is_ok()
+	pub(crate) fn ok(self, info: I) -> bool {
+		self.0.send(Ok(info)).is_ok()
 	}
 
 	/// Report that the codec could not be built.
@@ -40,19 +74,20 @@ impl Ready {
 
 /// A codec running on its own thread, and the channel to it.
 ///
-/// `R` is the request type the codec's serve loop matches on.
-pub(crate) struct Worker<R> {
+/// `R` is the request type the codec's serve loop matches on, and `I` what the
+/// codec reported resolving to when it opened.
+pub(crate) struct Worker<R, I> {
 	/// `Option` so `Drop` can drop the sender (signalling the thread to exit)
 	/// before joining.
 	tx: Option<mpsc::UnboundedSender<R>>,
 	handle: Option<JoinHandle<()>>,
-	name: String,
+	info: I,
 	/// Set between queueing a request and taking its reply, so a cancelled call
 	/// is caught rather than silently skipped. See [`Worker::request`].
 	abandoned: bool,
 }
 
-impl<R: Send + 'static> Worker<R> {
+impl<R: Send + 'static, I: Send + 'static> Worker<R, I> {
 	/// Spawn `run` on a thread called `thread_name` and wait for it to report
 	/// its codec open, so a bad config surfaces here rather than on first use.
 	///
@@ -61,36 +96,34 @@ impl<R: Send + 'static> Worker<R> {
 	/// created and dropped there, which is the point.
 	pub(crate) async fn open(
 		thread_name: &'static str,
-		run: impl FnOnce(Ready, mpsc::UnboundedReceiver<R>) + Send + 'static,
+		run: impl FnOnce(Ready<I>, mpsc::UnboundedReceiver<R>) + Send + 'static,
 	) -> Result<Self, Error> {
 		let (req_tx, req_rx) = mpsc::unbounded_channel::<R>();
-		let (ready_tx, ready_rx) = oneshot::channel::<Result<String, Error>>();
+		let (ready_tx, ready_rx) = oneshot::channel::<Result<I, Error>>();
 
 		let handle = std::thread::Builder::new()
 			.name(thread_name.into())
 			.spawn(move || run(Ready(ready_tx), req_rx))
-			.map_err(|err| Error::Codec(anyhow::anyhow!("failed to spawn the {thread_name} thread: {err}")))?;
+			.map_err(|err| Error::CodecGone(format!("failed to spawn the {thread_name} thread: {err}")))?;
 
 		match ready_rx.await {
-			Ok(Ok(name)) => Ok(Self {
+			Ok(Ok(info)) => Ok(Self {
 				tx: Some(req_tx),
 				handle: Some(handle),
-				name,
+				info,
 				abandoned: false,
 			}),
 			Ok(Err(err)) => Err(err),
 			Err(_) => {
 				let _ = handle.join();
-				Err(Error::Codec(anyhow::anyhow!(
-					"{thread_name} thread exited before opening"
-				)))
+				Err(Error::CodecGone(format!("{thread_name} thread exited before opening")))
 			}
 		}
 	}
 
-	/// The backend name the codec resolved to, e.g. `"mediafoundation"`.
-	pub(crate) fn name(&self) -> &str {
-		&self.name
+	/// What the codec reported resolving to when it opened.
+	pub(crate) fn info(&self) -> &I {
+		&self.info
 	}
 
 	/// Queue a request without waiting for it, mapping a dead thread onto an
@@ -127,7 +160,7 @@ impl<R: Send + 'static> Worker<R> {
 	}
 }
 
-impl<R> Drop for Worker<R> {
+impl<R, I> Drop for Worker<R, I> {
 	fn drop(&mut self) {
 		// Drop the sender so the thread's `blocking_recv` returns `None` and it
 		// exits, dropping the codec on its own thread; then join so teardown (COM
@@ -141,11 +174,20 @@ impl<R> Drop for Worker<R> {
 }
 
 fn gone() -> Error {
-	Error::Codec(anyhow::anyhow!("codec thread stopped unexpectedly"))
+	Error::CodecGone("the codec thread stopped unexpectedly".to_owned())
 }
 
 fn abandoned() -> Error {
-	Error::Codec(anyhow::anyhow!(
-		"a cancelled call left the codec ahead of this stream; drop it and open another"
-	))
+	Error::CodecGone("a cancelled call left the codec ahead of this stream".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn an_init_that_drops_its_reply_is_a_worker_failure() {
+		let result = Worker::<(), ()>::open("test-codec", |_, _| {}).await;
+		assert!(matches!(result, Err(Error::CodecGone(_))));
+	}
 }

@@ -7,10 +7,21 @@ infrastructure.
 | ----------- | --------------- | --------------- | --------------------------------------- |
 | `infra/apt` | `apt.moq.dev`   | `apt-moq-dev`   | Debian/Ubuntu package repository        |
 | `infra/rpm` | `rpm.moq.dev`   | `rpm-moq-dev`   | Fedora/RHEL package repository          |
+| `infra/moq-sh` | `moq.sh`     |                 | The `moq` installer script              |
+| `infra/mbx` |                 | `mbx-moq-dev`   | Private Rust build cache for CI         |
+| `infra/nix` | `nix.moq.dev`   | `nix-moq-dev`, `nix-ci-moq-dev` | Nix binary cache        |
+| `infra/corpus` | `corpus.moq.dev` | `corpus-moq-dev`, `corpus-private-moq-dev` | Video-quality corpus |
+| `infra/go`  | `go.moq.dev`    | `go-moq-dev`    | Go module proxy for `moq.dev/moq-ffi`   |
 
 Each worker is a standalone bun package with a `wrangler.jsonc` and a
-small TypeScript handler that proxies GETs out of the R2 bucket with
-appropriate `Content-Type` and `Cache-Control` headers for the file kind.
+small TypeScript handler. The apt, rpm, and go workers proxy GETs out of the R2
+bucket with appropriate `Content-Type` and `Cache-Control` headers for the
+file kind, and the nix worker does the same across its two buckets. The
+moq.sh worker serves `install.sh` from its bundle at every path, with the
+newest `moq-cli` release filled in as the default version.
+`infra/mbx` has no Worker: CI reaches its bucket directly through mbx's S3
+client. `infra/corpus` has none either: R2 serves the open bucket on its custom
+domain, and CI reads the private one over S3.
 
 ## Deploying a worker
 
@@ -19,11 +30,60 @@ From the repo root:
 ```bash
 just infra apt deploy
 just infra rpm deploy
+just infra moq-sh deploy
+just infra nix deploy
+just infra go deploy
 ```
 
 Each recipe runs `bun install` and `bun wrangler deploy`. The
 `custom_domain: true` route entry in the wrangler config auto-provisions
 the DNS record on first deploy.
+
+moq.sh also deploys from CI (`.github/workflows/moq-sh.yml`): on a push to
+`release` that touches `infra/moq-sh/`, and after every `moq-cli` release.
+Its `CLOUDFLARE_API_TOKEN` secret has the account-wide Workers Editor role,
+which can update an existing worker but not create one or change its route.
+So the first deploy, and any change to the custom domain, runs by hand under a
+maintainer's `wrangler login`. Whether Editor alone passes wrangler's
+custom-domain check on every deploy is unproven until the first `release`
+run; [the deploy quest](../quest/m3/release/moq-sh-deploy.md) tracks it.
+
+## Write credentials
+
+Any branch pushed to this repository runs its own workflows with the
+repository's Actions secrets, so a credential that can write or publish lives
+in an Environment whose deployment policy admits only protected refs. A job
+names the Environment, and a branch that is not on the list fails to start it.
+
+| Environment | Deployable from | Holds |
+| --- | --- | --- |
+| `bot` | `main`, `release`, `moq-ffi-v*` | The moq-bot key (`APP_CLIENT_ID`, `APP_PRIVATE_KEY`) alone |
+| `publish` | `release`, `moq-ffi-v*`, `moq-relay-v*`, `moq-cli-v*` | Registry, signing, and deploy credentials, and the moq-bot key for jobs that also need one of those |
+| `alert` | `main` | `DISCORD_WEBHOOK`, for `alert.yml`'s failure posts |
+| `cache-write` | `main`, its merge queue, binary release tags | The mbx and Nix cache write keys ([below](#bootstrapping-the-rust-build-cache)) |
+| `corpus` | `main` | The private corpus's read key ([below](#bootstrapping-the-video-corpus)) |
+| `npm` | `release` | Nothing; npm's trusted publisher names it |
+| `pypi` | `main`, `release`, `moq-ffi-v*` | Nothing; PyPI's trusted publisher names it |
+| `pub.dev` | `moq-dart-v*`, `moq-ffi-v*` | Nothing; pub.dev's automated publishing names it |
+| `github-pages` | `main` | Nothing |
+
+`workflow_run`, schedule, and default dispatch jobs run as `main`, so no job
+that names `publish` runs that way: a tag's own run calls its publishers as
+reusable workflows or dispatches them with `--ref` naming the tag or `release`
+(`sh/gh/trigger-repo-publish.sh`). The `workflow_run` publishers that remain
+need only the moq-bot key and name `bot`. `publish` admits only `release` and
+the release tags.
+A job that needs only the moq-bot key, such as Dependabot's, names `bot`; the merge queue's
+build holds no secrets, and the queue watcher runs on the maintainer's host, outside Actions. A job that also runs dry on other refs names the Environment
+only when it publishes, as in `environment: ${{ github.ref_type == 'tag' &&
+'publish' || '' }}`. Read-only secrets, such as the mbx read key, stay at the
+repository level, unless what they read is private.
+
+A tag policy only helps if the tag itself is protected, so the `release tags`
+ruleset ([below](#bootstrapping-the-nix-cache)) also covers `moq-ffi-v*`
+and `moq-dart-v*`. A `workflow_run` job that checks out the triggering commit
+first requires its `head_branch` to be such a tag at that commit, since a
+branch can share a release's name.
 
 ## Bootstrapping a new package repository
 
@@ -76,8 +136,8 @@ domain, and signing key already exist. To stand them up the first time:
      --file moq-keyring.asc --remote
    ```
 
-5. **Configure GitHub Actions secrets** (Settings -> Secrets and variables
-   -> Actions):
+5. **Configure GitHub Actions secrets** in the `publish` Environment (see
+   [Write credentials](#write-credentials)):
 
    - `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`: R2 API token with
      object read/write on both buckets.
@@ -86,9 +146,95 @@ domain, and signing key already exist. To stand them up the first time:
      Maven Central release workflow; the apt/rpm publishers reuse them.
 
 After this, every release that publishes a `.deb` or `.rpm` (one of the
-`moq-relay-v*`, `moq-cli-v*`, `moq-token-cli-v*`, `moq-gst-v*` tags)
+`moq-relay-v*`, `moq-cli-v*`, `moq-gst-v*` tags)
 triggers `apt-repo.yml` / `rpm-repo.yml`, which downloads the assets,
 regenerates the repository metadata, signs it, and uploads the diff.
+
+## The landing gate
+
+PRs land through GitHub's merge queue, one at a time with squash merges. Each
+`merge_group` build runs `just ci "$BASE"` against the group's base on the
+self-hosted runner `nixos-moq-ci` (label `moq-queue`, with its local caches and
+`/dev/kvm`), read-only and without secrets (`.github/workflows/queue.yml`). The
+main ruleset requires its `Queue` context and the merge queue, so only the
+queue (or the administrator bypass) lands on `main`. moq-dev/quest's queue
+watcher, `quest land watch`, runs on the maintainer's NixOS host
+(kixel-ai/dotfiles, `nixos/modules/quest-land.nix`)
+with moq-bot's key: it comments on each PR the queue drops, runs the Codex
+fixer, and re-enqueues the result.
+See [`CONTRIBUTING.md`](../CONTRIBUTING.md#landing-gate) for requesting a landing.
+
+## Bootstrapping the Rust build cache
+
+`.github/actions/rust-cache` points mbx at the private `mbx-moq-dev` bucket,
+namespaced per runner OS and architecture. Hosted jobs on `main` write what
+they compile. The merge queue's self-hosted build uses its persistent local store and has no R2
+credentials.
+Pull request jobs only read (main PRs run Check only while ready), and
+fork pull requests, which get no secrets, build cold.
+
+The write key is what enforces that: it lives in a GitHub Environment that
+only those refs can deploy to, and each writer job names that Environment only
+when it runs on one of them. mbx on its own trusts only a push to a protected
+branch, which leaves out Nightly's schedule, so the action sets
+`MBX_REMOTE_TRUST_WRITES` for writers and the Environment is the only boundary.
+
+All of this runs once, by a maintainer. Steps 1, 2, and 4 are done, and step 3
+is done for `main`.
+
+1. **Create the bucket and its lifecycle rule** under your `wrangler login`:
+
+   ```bash
+   just infra mbx create
+   ```
+
+   `lifecycle.json` deletes every object 7 days after upload and aborts
+   multipart uploads left incomplete for a day. mbx writes each compilation
+   once and never refreshes it, so a result still in use expires too; the
+   next writer that misses it compiles and uploads it again. After editing
+   the rules, `just infra mbx lifecycle` applies them.
+
+2. **Create two R2 API tokens** in the dashboard (R2 -> Manage API tokens ->
+   Create Account API token), both scoped to `mbx-moq-dev` only. Wrangler
+   cannot create R2 tokens. Each shows an Access Key ID and a Secret Access
+   Key once.
+
+   - `mbx-read`: **Object Read only**.
+   - `mbx-write`: **Object Read & Write**.
+
+3. **Create the `cache-write` Environment**, deployable from `main` and the
+   protected release tags configured below.
+   A protected-branches policy would admit `release` as
+   well, so name the branches instead:
+
+   ```bash
+   gh api -X PUT repos/moq-dev/moq/environments/cache-write --input - <<'EOF'
+   {"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+   EOF
+   gh api -X POST repos/moq-dev/moq/environments/cache-write/deployment-branch-policies \
+     -f name=main -f type=branch
+   ```
+
+   The merge queue's `gh-readonly-queue/main/*` builds need no branch policy:
+   they run on the self-hosted runner and never deploy `cache-write`.
+
+4. **Store the keys under the same two names at both levels.** An Environment
+   secret shadows a repository secret of the same name, so writers get the
+   write key and every other job the read key, all through one pair of names:
+
+   ```bash
+   # mbx-write, readable only by jobs in the cache-write Environment
+   gh secret set MBX_R2_ACCESS_KEY_ID --env cache-write --repo moq-dev/moq
+   gh secret set MBX_R2_SECRET_ACCESS_KEY --env cache-write --repo moq-dev/moq
+
+   # mbx-read, for every other job
+   gh secret set MBX_R2_ACCESS_KEY_ID --repo moq-dev/moq
+   gh secret set MBX_R2_SECRET_ACCESS_KEY --repo moq-dev/moq
+   ```
+
+Without the repository secrets, readers warn and build cold. A writer without
+its key fails rather than publish nothing, and so does a key the bucket
+refuses, in any job.
 
 ## Rotating the signing key
 
@@ -115,6 +261,246 @@ ARTIFACTS_DIR=artifacts \
 Or trigger the GitHub Actions workflow manually:
 
 ```bash
-gh workflow run apt-repo.yml -f tag=moq-relay-v1.2.3
-gh workflow run rpm-repo.yml -f tag=moq-relay-v1.2.3
+gh workflow run apt-repo.yml --ref release -f tag=moq-relay-v1.2.3
+gh workflow run rpm-repo.yml --ref release -f tag=moq-relay-v1.2.3
 ```
+
+## Bootstrapping the Nix cache
+
+`nix.moq.dev` serves two buckets as one binary cache. `nix-moq-dev` holds
+released packages, pushed by `release-nix.yml` on a release tag, and never
+expires. `nix-ci-moq-dev` holds the dev shells `cache.yml` pushes after every
+merge to `main`, for x86 Linux, ARM Linux, and ARM macOS. It publishes the full
+build closure from `nix develop --profile`, uploading only missing paths, plus
+`moq-libav`, its wasm build, and its downloaded sources, which `bun install`
+builds outside the dev shell. An independent x86 Linux job builds and pushes
+the `moq-relay`, `moq`, and `moq-boy` closures that Smoke's nix channel and
+demo deploys pin by commit (`just gh cache-rev`), which read them without
+write keys. They build one derivation per crate (`nix/crates.nix`), and the
+crates they link (`.#<package>.deps`) are published first, so a later build
+rebuilds only the crates whose source, features, or dependencies changed. The other
+platforms have no Smoke nix lane. Runtime warms serialize: the active run
+finishes and new pushes replace only the pending run, avoiding duplicate
+builds without starving publication or delaying the dev-shell matrix.
+Its lifecycle rule (`infra/nix/lifecycle.json`) deletes each object 14 days
+after upload. `nix copy` never re-uploads a path the bucket already has, so a
+path many commits reuse keeps its first upload's age. Each job therefore
+records the store paths it pushed under `roots/<commit>/`, the runtime job its
+dependency crates too, since no runtime closure references them, then copies every
+object in that commit's recorded closures that is over a week old onto itself,
+restarting its age; it fails if any is already gone. The newest cached
+commit, the one Smoke pins, therefore substitutes in full while `main` keeps
+merging; older commits' paths still expire. `flake.nix` sets `fallback = true` because
+that expiry can remove a path before one that depends on it.
+
+The Worker logs R2 internal errors (10001) and service-unavailable errors
+(10043) and treats the failed read as a miss: the other bucket can still
+serve the path, and otherwise the 404 is non-cacheable so Nix builds from
+source.
+Other errors, including invalid object names, permissions, and bucket
+configuration, still fail the request. A failure after the archive body
+starts streaming remains a failed download, covered by `fallback`.
+
+Nix only trusts paths signed by the key in `flake.nix`, so the signing key is
+the trust boundary, not the bucket keys. It lives in the `cache-write`
+Environment beside one R2 token for both buckets. Only `main` and the five
+release tag patterns can deploy there; anything that can reach
+the key can sign any path, so a second Environment for releases would only
+guard the bucket. Readers need no secret.
+
+All of this runs once, by a maintainer, in this order. All five steps are
+done.
+
+1. **Restrict the release tags.** Anyone with write access can push a tag
+   today, and `cache-write` admits any commit carrying one. Limit creating,
+   moving, and deleting them to moq-bot, the GitHub App release-plz tags
+   with, plus the role the `release` branch ruleset already lets bypass:
+
+   ```bash
+   gh api -X POST repos/moq-dev/moq/rulesets --input - <<'EOF'
+   {
+     "name": "release tags",
+     "target": "tag",
+     "enforcement": "active",
+     "conditions": {"ref_name": {"exclude": [], "include": [
+       "refs/tags/moq-relay-v*", "refs/tags/moq-cli-v*",
+       "refs/tags/moq-c-v*", "refs/tags/moq-gst-v*",
+       "refs/tags/moq-ffi-v*", "refs/tags/moq-dart-v*"
+     ]}},
+     "rules": [{"type": "creation"}, {"type": "update"}, {"type": "deletion"}],
+     "bypass_actors": [
+       {"actor_type": "Integration", "actor_id": 1039466, "bypass_mode": "always"},
+       {"actor_type": "RepositoryRole", "actor_id": 2, "bypass_mode": "always"}
+     ]
+   }
+   EOF
+   ```
+
+2. **Create the buckets and deploy the Worker** under your `wrangler login`:
+
+   ```bash
+   just infra nix create   # both buckets, plus the CI lifecycle rule
+   just infra nix deploy   # nix.moq.dev
+   ```
+
+   After editing the rules, `just infra nix lifecycle` applies them.
+
+3. **Admit the release tags to `cache-write`**, which the Rust build cache
+   bootstrap created:
+
+   ```bash
+   for tag in 'moq-relay-v*' 'moq-cli-v*' 'moq-c-v*' 'moq-gst-v*'; do
+     gh api -X POST repos/moq-dev/moq/environments/cache-write/deployment-branch-policies \
+       -f name="$tag" -f type=tag
+   done
+   ```
+
+4. **Create one R2 API token** in the dashboard (R2 -> Manage API tokens ->
+   Create Account API token) with **Object Read & Write** on `nix-moq-dev` and
+   `nix-ci-moq-dev` only. Wrangler cannot create R2 tokens.
+
+   ```bash
+   gh secret set NIX_R2_ACCESS_KEY_ID --env cache-write --repo moq-dev/moq
+   gh secret set NIX_R2_SECRET_ACCESS_KEY --env cache-write --repo moq-dev/moq
+   ```
+
+5. **Generate the signing key.** This stores it as `NIX_SIGNING_KEY` in
+   `cache-write` without writing it to disk, and prints the public key:
+
+   ```bash
+   just infra nix keygen
+   ```
+
+   Put the printed `nix.moq.dev-1:...` key in `flake.nix`'s `nixConfig`.
+
+A job missing its secrets fails rather than skip the push. A job naming an
+Environment that does not exist yet creates it with no deployment policy, so
+if a workflow ran before the Rust bootstrap, check the policy before adding
+secrets.
+
+To rotate the key, run `keygen` again and add the new public key next to the
+old one in `flake.nix`. Drop the old key once nothing signed with it matters:
+never for released ones unless they are re-signed, and for CI paths only after
+emptying `nix-ci-moq-dev`, since the refresh keeps the newest cached commit's
+paths, with their old signatures, indefinitely. The next Cache push refills it.
+
+## Bootstrapping the Go module proxy
+
+`go.moq.dev` serves `moq.dev/moq-ffi` in the GOPROXY protocol out of the
+`go-moq-dev` bucket, so its static libraries stay out of git. moq.dev's vanity
+page (`worker/vanity.ts` in moq-dev/moq.dev) points the go command there with
+a `mod` go-import tag, which proxy.golang.org and `GOPROXY=direct` both follow.
+A 404 is final: nothing falls back past this proxy.
+
+`release-go-ffi.yml` publishes each `moq-ffi-v*` tag with `just go publish-ffi`
+from the `publish` Environment, reusing its `R2_ACCESS_KEY_ID` and
+`R2_SECRET_ACCESS_KEY`. Until the cutover below, it reads moq.dev's go-import
+tag (`just go ffi-origin`) and keeps publishing to the moq-dev/moq-go-ffi git
+mirror. sum.golang.org pins the first hash it sees for each version, so the
+upload never replaces an object: a rerun skips identical files and fails on
+different ones.
+
+All of this runs once, by a maintainer, in this order, with no `moq-ffi`
+release in flight between steps 3 and 5.
+
+1. **Create the bucket and deploy the Worker** under your `wrangler login`:
+
+   ```bash
+   just infra go create
+   just infra go deploy
+   curl -fsS https://go.moq.dev/   # prints the proxy's banner
+   ```
+
+2. **Let the `publish` Environment's R2 token write the bucket.** If the token
+   behind `R2_ACCESS_KEY_ID` is scoped to buckets, add `go-moq-dev` with
+   **Object Read & Write** in the dashboard (R2 -> Manage API tokens). Wrangler
+   cannot edit R2 tokens.
+
+3. **Backfill and verify** every published version, with that token in the
+   environment, from the dev shell with rclone added (`nix shell .#packaging`):
+
+   ```bash
+   export R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=...
+   just infra go backfill
+   just infra go verify
+   ```
+
+   `backfill` copies every version proxy.golang.org lists, byte for byte as
+   `go mod download` checked it against sum.golang.org. `verify` downloads each
+   one through `https://go.moq.dev` from a clean module cache, so the go
+   command checks it against sum.golang.org again, and fails if any listed
+   version is missing.
+
+4. **Cut over moq.dev.** In moq-dev/moq.dev's `worker/vanity.ts`, serve
+   `<meta name="go-import" content="moq.dev/moq-ffi mod https://go.moq.dev">`
+   for `/moq-ffi` and drop its `go-source` tag, since the generated `moq.go`
+   lives in no repository. Once deployed (the page caches for an hour):
+
+   ```bash
+   just go ffi-origin   # prints mod
+   ```
+
+5. **Catch up and verify the paths users take**, from a clean module cache:
+
+   ```bash
+   just infra go backfill   # any release the mirror took before the cutover
+   just infra go verify --proxy direct
+   just infra go verify --proxy https://proxy.golang.org
+   ```
+
+6. **Archive the mirror** once a `moq-ffi` release has published through
+   go.moq.dev (its `Publish to Go module mirror` job runs `Publish to
+   go.moq.dev`). Archiving keeps every tag readable for anyone who imported
+   the old `github.com/moq-dev/moq-go-ffi` path:
+
+   ```bash
+   gh repo archive moq-dev/moq-go-ffi --yes
+   ```
+
+## Bootstrapping the video corpus
+
+The nightly video-quality job, which [the harness
+quest](../quest/m9/video-quality/harness.md) adds, reads its clips from two
+buckets.
+`corpus-moq-dev` holds open clips and is public at `corpus.moq.dev`.
+`corpus-private-moq-dev` holds clips that cannot be redistributed. It has no
+custom domain and its r2.dev URL is off, since R2's public access exposes a
+whole bucket. The harness's manifest records each object's sha256, so a
+replaced clip fails the run. Uploading clips is a maintainer action.
+
+The private bucket's read key lives in the `corpus` Environment, deployable
+from `main` only. A dispatched run uses the workflow file from the branch it
+names, so a job-level `if` cannot keep the key from other branches.
+
+All of this runs once, by a maintainer. All four steps are done.
+
+1. **Create the buckets and the custom domain** under your `wrangler login`:
+
+   ```bash
+   just infra corpus create
+   ```
+
+2. **Create one R2 API token** in the dashboard (R2 -> Manage API tokens ->
+   Create Account API token) with **Object Read only** on
+   `corpus-private-moq-dev` only. Wrangler cannot create R2 tokens. It must
+   not share write credentials with the caches.
+
+3. **Create the `corpus` Environment**, deployable from `main` only:
+
+   ```bash
+   gh api -X PUT repos/moq-dev/moq/environments/corpus --input - <<'EOF'
+   {"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+   EOF
+   gh api -X POST repos/moq-dev/moq/environments/corpus/deployment-branch-policies \
+     -f name=main -f type=branch
+   ```
+
+4. **Store the key** in it:
+
+   ```bash
+   gh secret set CORPUS_R2_ACCESS_KEY_ID --env corpus --repo moq-dev/moq
+   gh secret set CORPUS_R2_SECRET_ACCESS_KEY --env corpus --repo moq-dev/moq
+   ```
+
+   The endpoint is `https://dd618f5dbd5da77b8296f1613c301f5c.r2.cloudflarestorage.com`,
+   as for mbx, so no account id secret is needed.
